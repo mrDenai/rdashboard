@@ -184,9 +184,18 @@ impl CloudflareAccessVerifier {
     ) -> Result<CloudflareAccessIdentity, CloudflareAccessVerificationError> {
         let header = decode_header(assertion)
             .map_err(|_| CloudflareAccessVerificationError::Denied("header_invalid"))?;
-        if header.alg != Algorithm::RS256 || header.typ.as_deref() != Some("JWT") {
+        if header.alg != Algorithm::RS256 {
             return Err(CloudflareAccessVerificationError::Denied(
-                "header_algorithm_or_type_invalid",
+                "header_algorithm_invalid",
+            ));
+        }
+        if header
+            .typ
+            .as_deref()
+            .is_some_and(|token_type| !token_type.eq_ignore_ascii_case("JWT"))
+        {
+            return Err(CloudflareAccessVerificationError::Denied(
+                "header_type_invalid",
             ));
         }
         let key_id = header.kid.filter(|value| valid_key_id(value)).ok_or(
@@ -603,9 +612,13 @@ MwIDAQAB
     }
 
     fn token(claims: &CloudflareAccessClaims) -> String {
+        token_with_type(claims, Some("JWT"))
+    }
+
+    fn token_with_type(claims: &CloudflareAccessClaims, token_type: Option<&str>) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("test-key".to_owned());
-        header.typ = Some("JWT".to_owned());
+        header.typ = token_type.map(str::to_owned);
         encode(
             &header,
             claims,
@@ -622,6 +635,34 @@ MwIDAQAB
             DecodingKey::from_rsa_pem(TEST_PUBLIC_KEY)
                 .unwrap_or_else(|error| panic!("public key: {error}")),
         )
+    }
+
+    #[tokio::test]
+    async fn access_token_type_is_optional_and_case_insensitive_when_present() {
+        let verifier = verifier();
+        let now = unix_time_secs().unwrap_or_else(|error| panic!("clock: {error}"));
+        for token_type in [None, Some("JWT"), Some("jwt")] {
+            let encoded = token_with_type(&claims(now), token_type);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                ACCESS_ASSERTION_HEADER,
+                HeaderValue::from_str(&encoded).unwrap_or_else(|error| panic!("header: {error}")),
+            );
+            assert!(verifier.authenticate(&headers).await.is_ok());
+        }
+
+        let encoded = token_with_type(&claims(now), Some("not-a-jwt"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCESS_ASSERTION_HEADER,
+            HeaderValue::from_str(&encoded).unwrap_or_else(|error| panic!("header: {error}")),
+        );
+        assert_eq!(
+            verifier.authenticate(&headers).await,
+            Err(CloudflareAccessVerificationError::Denied(
+                "header_type_invalid"
+            ))
+        );
     }
 
     #[test]
