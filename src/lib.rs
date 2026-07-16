@@ -1,0 +1,76 @@
+#![forbid(unsafe_code)]
+
+#[cfg(unix)]
+pub mod adapter;
+#[cfg(unix)]
+pub mod adapter_entrypoint;
+#[cfg(unix)]
+pub mod adapter_identity;
+#[cfg(unix)]
+pub mod adapter_phase;
+pub mod adapter_result;
+pub mod authorization;
+pub mod backup;
+#[cfg(unix)]
+pub mod backup_adapter;
+#[cfg(unix)]
+pub mod backup_driver;
+pub mod build;
+pub mod build_attestation;
+pub mod build_source;
+pub mod controller;
+#[cfg(unix)]
+pub mod deploy_driver;
+pub mod domain;
+pub mod executor;
+#[cfg(unix)]
+pub mod executor_authority;
+pub mod executor_intent;
+#[cfg(unix)]
+pub mod executor_socket;
+#[cfg(unix)]
+pub mod fence_adapter;
+#[cfg(unix)]
+pub mod fence_job;
+#[cfg(unix)]
+pub mod installed_clock;
+#[cfg(unix)]
+pub mod installed_deploy;
+#[cfg(unix)]
+pub mod installed_effects;
+#[cfg(unix)]
+pub mod installed_intent_resolver;
+#[cfg(unix)]
+pub mod installed_policy;
+#[cfg(unix)]
+pub mod installed_source;
+#[cfg(unix)]
+pub mod kamal_adapter;
+pub mod metrics;
+#[cfg(unix)]
+pub mod mutation_admission;
+#[cfg(unix)]
+pub mod oci_handoff;
+pub mod phase6;
+pub mod policy;
+pub mod projects;
+pub mod protocol;
+#[cfg(unix)]
+pub mod rimg_adapter;
+#[cfg(unix)]
+pub mod root_adapter_runtime;
+#[cfg(unix)]
+pub mod root_fence_runtime;
+pub mod source;
+#[cfg(unix)]
+pub mod source_socket;
+pub mod store;
+pub mod web;
+
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+
+/// Returns the current Unix time in milliseconds without silently accepting a broken host clock.
+pub fn unix_time_ms() -> Result<i64, SystemTimeError> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    Ok(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+}

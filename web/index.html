@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Состояние production | rdashboard</title>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script src="/assets/app.js" type="module"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">К основному содержимому</a>
+
+    <header class="topbar">
+      <div class="identity">
+        <span class="product-mark" aria-hidden="true">RD</span>
+        <div>
+          <h1>Production control</h1>
+          <p>Локальный контур наблюдения</p>
+        </div>
+      </div>
+      <dl class="connection-summary">
+        <div>
+          <dt>Поток</dt>
+          <dd id="connection-status" data-state="loading">Подключение…</dd>
+        </div>
+        <div>
+          <dt>Снимок</dt>
+          <dd id="sample-age">Нет данных</dd>
+        </div>
+        <div>
+          <dt>Последовательность</dt>
+          <dd id="event-sequence">—</dd>
+        </div>
+      </dl>
+      <button id="retry-connection" class="secondary-action" type="button" hidden>
+        Подключиться снова
+      </button>
+    </header>
+
+    <main id="content" tabindex="-1">
+      <noscript>
+        <p class="critical-banner">Для потоковых обновлений требуется JavaScript.</p>
+      </noscript>
+
+      <section class="host-overview" aria-labelledby="host-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Текущий узел</p>
+            <h2 id="host-heading">Ресурсы сервера</h2>
+          </div>
+          <p id="host-observation-status" class="state-label" data-state="unknown">
+            ◌ Ожидание первого измерения
+          </p>
+        </div>
+
+        <dl class="metric-strip">
+          <div class="metric-block">
+            <dt>CPU</dt>
+            <dd id="metric-cpu">—</dd>
+            <small id="metric-load">Load —</small>
+          </div>
+          <div class="metric-block">
+            <dt>Память</dt>
+            <dd id="metric-memory">—</dd>
+            <small id="metric-memory-detail">Нет данных</small>
+          </div>
+          <div class="metric-block">
+            <dt>Диск</dt>
+            <dd id="metric-disk">—</dd>
+            <small id="metric-disk-detail">Нет данных</small>
+          </div>
+          <div class="metric-block">
+            <dt>Сеть</dt>
+            <dd id="metric-network">—</dd>
+            <small id="metric-network-detail">Нет данных</small>
+          </div>
+          <div class="metric-block">
+            <dt>PSI CPU / RAM / IO</dt>
+            <dd id="metric-psi">—</dd>
+            <small>avg10, % времени ожидания</small>
+          </div>
+        </dl>
+      </section>
+
+      <section id="partial-panel" class="partial-panel" aria-labelledby="partial-heading" hidden>
+        <h2 id="partial-heading">Неполное наблюдение</h2>
+        <p>Некоторые источники недоступны; отсутствующие значения не считаются нулевыми.</p>
+        <ul id="partial-reasons"></ul>
+      </section>
+
+      <section class="operation-workspace" aria-labelledby="operations-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Изменения production</p>
+            <h2 id="operations-heading">Контур операций</h2>
+          </div>
+          <p id="mutation-capability" class="state-label" data-state="unknown">
+            ◌ Проверка конфигурации
+          </p>
+        </div>
+
+        <div class="operation-grid">
+          <section aria-labelledby="new-operation-heading">
+            <h3 id="new-operation-heading">Новая операция</h3>
+            <p class="body-copy">
+              Запуск требует отдельной авторизации и подписанного одноразового разрешения.
+            </p>
+            <div class="operation-actions" aria-describedby="mutation-start-reason">
+              <button class="primary-action" type="button" disabled>Подготовить деплой</button>
+              <button class="secondary-action" type="button" disabled>Создать резервную копию</button>
+            </div>
+            <p id="mutation-start-reason" class="availability-reason">
+              Авторизатор действий не подключён. Запуск операций остаётся заблокированным.
+            </p>
+          </section>
+
+          <section aria-labelledby="operation-status-heading">
+            <h3 id="operation-status-heading">Наблюдение за операцией</h3>
+            <form id="mutation-status-form" novalidate>
+              <div class="identifier-fields">
+                <div class="form-field">
+                  <label for="mutation-intent-id">Intent ID</label>
+                  <input
+                    id="mutation-intent-id"
+                    name="intent_id"
+                    type="text"
+                    inputmode="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                    aria-describedby="mutation-intent-hint mutation-intent-error"
+                    required
+                  >
+                  <small id="mutation-intent-hint">UUID из подготовленной операции</small>
+                  <span id="mutation-intent-error" class="field-error" hidden></span>
+                </div>
+                <div class="form-field">
+                  <label for="mutation-attempt-id">Attempt ID</label>
+                  <input
+                    id="mutation-attempt-id"
+                    name="attempt_id"
+                    type="text"
+                    inputmode="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                    aria-describedby="mutation-attempt-hint mutation-attempt-error"
+                    required
+                  >
+                  <small id="mutation-attempt-hint">UUID конкретной попытки выполнения</small>
+                  <span id="mutation-attempt-error" class="field-error" hidden></span>
+                </div>
+              </div>
+              <button id="mutation-status-submit" class="secondary-action" type="submit" disabled>
+                Показать состояние
+              </button>
+            </form>
+
+            <p id="mutation-status-message" class="body-copy" role="status">
+              Наблюдение станет доступно после подключения root executor.
+            </p>
+            <dl id="mutation-status-detail" class="operation-status-detail" hidden>
+              <div>
+                <dt>Состояние</dt>
+                <dd id="mutation-state" data-state="unknown">—</dd>
+              </div>
+              <div>
+                <dt>Проект / операция</dt>
+                <dd id="mutation-operation">—</dd>
+              </div>
+              <div>
+                <dt>Текущая фаза</dt>
+                <dd id="mutation-phase">—</dd>
+              </div>
+              <div>
+                <dt>Завершённые фазы</dt>
+                <dd id="mutation-completed-phases">—</dd>
+              </div>
+              <div>
+                <dt>Последнее изменение</dt>
+                <dd id="mutation-updated-at">—</dd>
+              </div>
+            </dl>
+            <button id="mutation-status-retry" class="secondary-action" type="button" hidden>
+              Повторить запрос
+            </button>
+          </section>
+        </div>
+      </section>
+
+      <section class="project-workspace" aria-labelledby="projects-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Управляемые процессы</p>
+            <h2 id="projects-heading">Проекты</h2>
+          </div>
+          <p id="project-count" class="section-meta">0 подключено</p>
+        </div>
+        <div class="table-scroll" tabindex="0" aria-label="Прокручиваемая таблица проектов">
+          <table>
+            <caption>Состояние проектов и свежесть наблюдений</caption>
+            <thead>
+              <tr>
+                <th scope="col">Проект</th>
+                <th scope="col">Состояние</th>
+                <th scope="col">Наблюдение</th>
+                <th scope="col">Подробности</th>
+              </tr>
+            </thead>
+            <tbody id="project-rows">
+              <tr>
+                <td colspan="4" class="empty-cell">Проекты ещё не подключены.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="lower-grid">
+        <section class="diagnostic-panel" aria-labelledby="control-heading">
+          <div class="section-heading compact">
+            <h2 id="control-heading">Контур наблюдения</h2>
+          </div>
+          <dl class="diagnostic-list">
+            <div>
+              <dt>SQLite</dt>
+              <dd id="sqlite-version">—</dd>
+            </div>
+            <div>
+              <dt>Операция запуска</dt>
+              <dd id="observation-operation">—</dd>
+            </div>
+            <div>
+              <dt>Интервал</dt>
+              <dd id="sample-interval">—</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="diagnostic-panel" aria-labelledby="stream-heading">
+          <div class="section-heading compact">
+            <h2 id="stream-heading">Доставка обновлений</h2>
+          </div>
+          <p id="stream-detail" class="body-copy">
+            Загружается первоначальный снимок; после него браузер перейдёт на SSE.
+          </p>
+        </section>
+      </div>
+    </main>
+
+    <div id="polite-announcer" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+    <div id="assertive-announcer" class="visually-hidden" aria-live="assertive" aria-atomic="true"></div>
+  </body>
+</html>

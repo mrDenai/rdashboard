@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 0 )); then
+  echo "ERROR: bin/ci accepts no arguments." >&2
+  exit 64
+fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+# Keep native dependency builds hermetic when the host compiler is wrapped by ccache.
+export CCACHE_DIR="${CCACHE_DIR:-$root/target/ccache}"
+export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-$root/target/ccache-tmp}"
+mkdir -p "$CCACHE_DIR" "$CCACHE_TEMPDIR"
+
+if [[ ! -f Cargo.lock ]]; then
+  echo "ERROR: Cargo.lock is required; generate and review it before running CI." >&2
+  exit 66
+fi
+
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v1.json
+node --check web/app.js
+node --test tests/browser_status.test.js
+cargo build --workspace --all-targets --all-features --release --locked

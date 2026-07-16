@@ -1,0 +1,46 @@
+[Unit]
+Description=rdashboard controller and web dashboard
+After=network-online.target rdashboard-executor.service
+Wants=network-online.target
+Requires=rdashboard-executor.service
+
+[Service]
+Type=simple
+User=rdashboard
+Group=rdashboard
+ExecStart=/usr/libexec/rdashboard/rdashboardd
+Environment=RDASHBOARD_LISTEN=127.0.0.1:3100
+Environment=RDASHBOARD_DATA_DIR=/var/lib/rdashboard
+Environment=RDASHBOARD_EXECUTOR_SOCKET=/run/rdashboard/executor.sock
+EnvironmentFile=-/etc/rdashboard/controller.env
+StateDirectory=rdashboard
+StateDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+TasksMax=256
+LimitNOFILE=4096
+MemoryMax=256M
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProjectManifestV1",
+  "type": "object",
+  "properties": {
+    "build": {
+      "$ref": "#/$defs/BuildPolicy"
+    },
+    "ci": {
+      "$ref": "#/$defs/CiPolicy"
+    },
+    "data_volumes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DataVolumePolicy"
+      }
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "health_checks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/HealthCheckPolicy"
+      }
+    },
+    "migration": {
+      "$ref": "#/$defs/MigrationPolicy"
+    },
+    "notifications": {
+      "$ref": "#/$defs/NotificationPolicy"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "rollback": {
+      "$ref": "#/$defs/RollbackPolicy"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "source": {
+      "$ref": "#/$defs/SourcePolicy"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_id",
+    "display_name",
+    "source",
+    "ci",
+    "build",
+    "health_checks",
+    "data_volumes",
+    "migration",
+    "rollback",
+    "notifications"
+  ],
+  "$defs": {
+    "BuildContext": {
+      "type": "string",
+      "enum": [
+        "repository_root"
+      ]
+    },
+    "BuildPolicy": {
+      "type": "object",
+      "properties": {
+        "context": {
+          "$ref": "#/$defs/BuildContext"
+        },
+        "dockerfile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "context",
+        "dockerfile"
+      ]
+    },
+    "CanonicalBranch": {
+      "type": "string",
+      "enum": [
+        "main"
+      ]
+    },
+    "CiPolicy": {
+      "type": "string",
+      "enum": [
+        "bin_ci"
+      ]
+    },
+    "DataClass": {
+      "type": "string",
+      "enum": [
+        "stateful",
+        "derived",
+        "ephemeral"
+      ]
+    },
+    "DataVolumePolicy": {
+      "type": "object",
+      "properties": {
+        "backup_required": {
+          "type": "boolean"
+        },
+        "class": {
+          "$ref": "#/$defs/DataClass"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "class",
+        "backup_required"
+      ]
+    },
+    "HealthCheckPolicy": {
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "type": "string"
+        },
+        "expected_status": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "name": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "endpoint",
+        "expected_status",
+        "timeout_seconds"
+      ]
+    },
+    "MigrationEntrypoint": {
+      "type": "string",
+      "enum": [
+        "none",
+        "application_migrate"
+      ]
+    },
+    "MigrationPolicy": {
+      "type": "object",
+      "properties": {
+        "entrypoint": {
+          "$ref": "#/$defs/MigrationEntrypoint"
+        },
+        "write_fence": {
+          "$ref": "#/$defs/WriteFencePolicy"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "entrypoint",
+        "write_fence"
+      ]
+    },
+    "NotificationPolicy": {
+      "type": "object",
+      "properties": {
+        "maintenance_suppression": {
+          "type": "boolean"
+        },
+        "route": {
+          "$ref": "#/$defs/NotificationRoute"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "route",
+        "maintenance_suppression"
+      ]
+    },
+    "NotificationRoute": {
+      "type": "string",
+      "enum": [
+        "telegram_default"
+      ]
+    },
+    "RollbackPolicy": {
+      "type": "object",
+      "properties": {
+        "code_rollback": {
+          "type": "boolean"
+        },
+        "soak_seconds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code_rollback",
+        "soak_seconds"
+      ]
+    },
+    "SourcePolicy": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "$ref": "#/$defs/CanonicalBranch"
+        },
+        "remote_url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "remote_url",
+        "branch"
+      ]
+    },
+    "WriteFencePolicy": {
+      "type": "string",
+      "enum": [
+        "unsupported",
+        "application_protocol_v1"
+      ]
+    }
+  }
+}

@@ -1,0 +1,290 @@
+# systemd deployment inputs
+
+The dedicated source broker runs as `rdashboard-source` from
+`/usr/libexec/rdashboard/rdashboard-source`. Install `rdashboard-source.service`, create the matching
+system user/group plus the `rdashboard-build-readers` group, and apply `rdashboard-tmpfiles.conf`.
+Its StateDirectory and repository root are owned only by that account; the controller and executor
+never receive write access to the canonical Git object store. The source process receives the build
+reader group only so its setgid export directory can publish immutable archives to the non-root
+builder; it receives no access to candidate signing credentials or builder-owned output paths.
+`ProtectSystem=strict` remains enabled; the unit's sole explicit external writable path is
+`/var/lib/rdashboard-build/source-exports`. Its private `StateDirectory` is managed separately by
+systemd.
+
+The source runtime directory is the narrow transport exception: systemd creates
+`/run/rdashboard-source` as `rdashboard-source:rdashboard-source` mode `0750`, and the broker creates
+`source.sock` as the same owner/group mode `0660`. The capability-free executor receives the
+`rdashboard-source` supplementary group only with the mutation-authority drop-in. The protocol
+still authenticates every connection as peer UID 0, so group membership grants transport access,
+not source authority. The controller must not be a member of `rdashboard-source`.
+
+Install one canonical-JCS `/etc/rdashboard/source.json`, root-owned and not group/other writable.
+`InstalledSourceConfigV1` schema v2 binds the fixed socket, database, repository and build-source
+export paths, the numeric source UID and build-reader GID, root executor peer UID, connection/time
+limits, reconcile interval, attestation key identity and public key, and each project's exact
+remote-derived repository identity and owner-policy identity. Its `document_digest` covers the
+complete document. The service refuses path overrides, duplicate projects, mutable policy
+versions, rollback release classes, key substitution and a remote URL whose derived repository
+identity differs from the installed value.
+
+Install the corresponding 32-byte Ed25519 seed at
+`/etc/rdashboard/credentials/source-attestation-seed`; systemd exposes it only as the fixed
+`source-attestation-seed` service credential. The broker checks file type, ownership, mode, inode,
+exact size and derived non-weak Ed25519 public key, and zeroizes the raw seed buffer after
+constructing the signer.
+Initialize each canonical bare repository below
+`/var/lib/rdashboard-source/repositories/<project>.git` as the `rdashboard-source` account using the
+reviewed `files` ref backend and owner-only modes before starting the service. Startup validates the
+repository identity/configuration and durable source ledger before serving root-only requests on
+`/run/rdashboard-source/source.sock`.
+
+The broker must complete a bounded remote-main reconciliation for every configured project before
+it binds the socket and sends systemd `READY=1` through the fixed `/usr/bin/systemd-notify`; an
+unavailable or divergent startup source therefore fails closed under systemd restart rather than
+serving a stale local head or releasing ordered dependents early. After each successful ready-head
+reconciliation it also runs a fixed `git archive` itself and atomically publishes a source-owned,
+reader-group `0440` tar plus canonical manifest below
+`/var/lib/rdashboard-build/source-exports/<project>`. The manifest binds the exact head, sequence,
+source attestation, repository and installed policy to the archive byte count and SHA-256. The
+broker rejects symlinks, hard links, special Git entries and `.gitattributes` archive rewriting;
+the build identity never sees the private bare repository. It then repeats reconciliation at the
+installed interval. Shutdown waits for an already-running bounded Git fetch/export before dropping
+the owned socket, keeping process and socket lifecycle aligned. Its Unix protocol is
+length-bounded, versioned, request-bound and restricted to UID 0 by peer credentials. Synchronous
+broker work runs outside the async reactor, while the full read/handle/write exchange remains
+subject to the configured deadline. It exposes only the current signed snapshot and exact
+live-ticket check/complete/abort operations; it does not expose Git paths or arbitrary commands.
+Webhook and forced-push ingress are not yet routed by this unit and remain disabled until their
+dedicated HTTP/SSH front doors are installed and tested.
+
+The executor always serves the bounded observation protocol and can optionally enable the admitted
+backup and first-bootstrap mutation paths described below. Install the binary at
+`/usr/libexec/rdashboard/rdashboard-executor`, create the
+system group `rdashboard`, keep `/etc/rdashboard` root-owned and not group/other writable, and
+install a root-owned `/etc/rdashboard/executor.json` with mode `0640` or stricter:
+
+```json
+{
+  "schema_version": 1,
+  "controller_uid": 991,
+  "socket_path": "/run/rdashboard/executor.sock",
+  "metrics_disk_path": "/",
+  "max_connections": 16,
+  "request_timeout_ms": 2000
+}
+```
+
+`controller_uid` is an installation value, not a reusable default: replace `991` with the actual
+non-root UID assigned to `rdashboardd`. The socket group permits the controller to connect, while
+the executor independently requires the configured peer UID on every accepted connection.
+
+Do not add Docker, arbitrary command, writable project-tree or adapter credential access to this
+long-running unit. Admitted backup and bootstrap effects run only in separately constrained
+transient units.
+
+The root executor configuration accepts an optional `mutation_authority` object. Omitting it keeps
+the current read-only behavior and does not require a signing credential. When mutation authority
+is staged, the object must contain the exact action-grant issuer/audience, a bounded Ed25519 public
+verification keyring with lifecycle timestamps and minimum epoch, plus the executor-intent
+issuer/audience, active key ID/epoch and expected public key. Public keys use canonical unpadded
+base64url encoding of exactly 32 bytes.
+
+Install the executor-intent private seed as exactly 32 raw bytes at
+`/etc/rdashboard/credentials/executor-intent-seed`, owned by root and mode `0600`. Then install
+`rdashboard-executor-mutation-authority.conf` as a systemd drop-in for
+`rdashboard-executor.service`. systemd exposes the secret only through the fixed
+`executor-intent-seed` service credential; the executor rejects symlinks, wrong ownership or mode,
+size changes, inode replacement and a seed that does not match the configured public key. Do not
+put the private seed in `executor.json` or an environment variable. The same drop-in grants only
+the three read/connect groups needed by bootstrap: `rdashboard-build-readers`, `rdashboard-source`
+and the host's `chrony` group. These groups must exist before the unit is reloaded.
+
+Loading this authority enables the installed backup resolver plus the first-bootstrap deploy
+resolver and their shared sequential worker. The service opens its root-only journal at
+`/var/lib/rdashboard-executor/security.sqlite`, acknowledges a grant only after durable
+intent/grant admission, then runs the long operation outside the two-second socket request. Startup
+and a 30-second recovery scan reconstruct pending work from exact accepted records and phase
+receipts, with a fresh start time for each sequential job. On executor shutdown, the worker cancels
+the blocking adapter wait and explicitly kills/stops the active transient unit; the scan stops
+before starting another queued job, and the intent-persisted journal remains replayable on the next
+start. Omitting the authority keeps mutation unavailable.
+
+The backup intent resolver additionally defines one canonical root-owned input at
+`/etc/rdashboard/projects/rimg/backup-mutation-policy.jcs`, mode `0600`. It binds exactly the `rimg`
+project, `backup_only`, the owner policy identity, the installed rimg policy digest, exact backup
+unit and age-recipient fingerprints, backup staging/growth byte budgets, a 30-second to five-minute
+intent lifetime and its own canonical document digest. The signed intent/action grant bind that
+complete document digest rather than only its nested owner identity. Every non-replayed preparation
+reopens this file and requires the same project and rimg-policy digest in both
+`adapter-runtime.jcs` and `backup-runtime.jcs`. That resolver rejects deploy and rollback requests;
+deploy is handled by the separate exact-candidate boundary below, while rollback remains disabled.
+
+The full root policy is installed separately as canonical
+`/etc/rdashboard/projects/rimg/installed-rimg-policy.jcs`, mode `0600`. Loading it reconstructs the
+Kamal policy and then the rimg policy through their validating constructors, recomputes the
+credential, Kamal and rimg policy digests, and rejects a noncanonical document or any substituted
+derived field. The backup driver must compare this policy's owner identity and rimg digest with the
+backup mutation policy before authorizing a phase.
+
+The backup-capture slice additionally requires these root-owned installed files:
+
+- `/usr/libexec/rdashboard/backup-adapter`, built from this repository;
+- `/usr/libexec/rdashboard/rimg-cli`, the exact rimg executable whose SHA-256 is pinned by
+  `/etc/rdashboard/projects/rimg/adapter-runtime.jcs`;
+- `rdashboard-tmpfiles.conf` installed under `/usr/lib/tmpfiles.d/` and applied before starting the
+  executor, creating the journal, backup, lock and release-bundle directories under the separate
+  root-owned mode-`0700` `/var/lib/rdashboard-executor` tree. Privileged data must not be placed
+  below the controller-owned `/var/lib/rdashboard` StateDirectory.
+
+The installed rimg backup unit must describe the two root-owned snapshot artifacts produced by
+this adapter: the SQLite object and the deterministic masters bundle, both mode `0600`. The
+adapter reads live masters only from `/var/lib/rimg/masters`; it never receives a caller-selected
+source or output path. Base capture drains and resumes the exact durable epoch/token. Cutover
+capture requires the already-held fence and deliberately leaves it held.
+
+The encryption and Google Drive slices additionally require these root-owned, non-symlinked
+installed inputs:
+
+- `/usr/libexec/rdashboard/age` and `/usr/libexec/rdashboard/rclone`, executable only through the
+  fixed adapter profiles and pinned by SHA-256 in the runtime document;
+- `/etc/rdashboard/projects/rimg/backup-runtime.jcs`, canonical JCS, mode `0600`, binding the exact
+  rimg policy, age X25519 recipient and fingerprint, tool digests, Google Drive root folder,
+  provider credential version and service-account digest;
+- `/etc/rdashboard/projects/rimg/rclone.conf`, canonical and secret-free, mode `0600`, containing
+  only the configured Drive remote, `type = drive`, `scope = drive.file`, and the pinned
+  `root_folder_id`;
+- `/etc/rdashboard/credentials/rimg-drive-service-account.json`, root-owned and mode `0600`.
+
+The service-account file is loaded only into the upload and independent-readback transient units
+with systemd `LoadCredential=`. It is read inside the unit from
+`/run/credentials/<transient-unit>.service/rimg-drive-service-account.json`; it must never be put
+in rclone configuration, an environment variable or an adapter job directory. The transient
+sandbox makes the source `/etc/rdashboard/credentials` directory inaccessible after systemd has
+loaded the selected credential. Encryption streams the deterministic archive directly into age
+through a pre-created mode-`0600` output descriptor, fsyncs it, and publishes only ciphertext plus
+its canonical state. Upload uses a content-addressed object key and fail-closed duplicate
+detection. A replay after a successful remote write but before local receipt publication
+independently reads and hashes the existing object before accepting it.
+
+## First-bootstrap candidate handoff
+
+Create a dedicated `rdashboard-build` system user and a separate
+`rdashboard-build-readers` system group. Make `rdashboard-build` the owner of the candidate tree and
+add only `rdashboard-executor.service` to the reader group through the installed unit's
+`SupplementaryGroups=` setting. Do not add `rdashboardd` or its controller account to this group.
+Apply `rdashboard-tmpfiles.conf` after both identities exist. It creates the candidate stores with
+these exact ownership and access boundaries:
+
+- `/var/lib/rdashboard-build/source-exports/rimg`, owned by
+  `rdashboard-source:rdashboard-build-readers`, mode `2750`;
+- `/var/lib/rdashboard-build/release-bundles/rimg` and
+  `/var/lib/rdashboard-build/attestations/rimg`, owned by
+  `rdashboard-build:rdashboard-build-readers`, mode `2750`;
+- `/var/lib/rdashboard-build/oci-archives/rimg`, owned by
+  `rdashboard-build:rdashboard-build-readers`, mode `2750`;
+- `/var/lib/rdashboard-executor/oci-archives/rimg`, owned by `root:root`, mode `0700`.
+
+After every successful accepted-head reconciliation, `rdashboard-source` exports the exact Git tree
+as `<head>-<sequence>.tar` plus a canonical manifest in the source-export store. Both files are
+source-owned, reader-group-readable, immutable publications. The build identity must reopen and
+verify that manifest, archive hash, accepted head, sequence, source attestation, repository identity
+and installed policy before using any byte.
+
+Install canonical `/etc/rdashboard/projects/rimg/deploy-mutation-policy.jcs`, root-owned and mode
+`0600`. Schema v2 binds the installed owner/rimg policies, numeric `build_uid`, numeric
+`build_reader_gid`, build signing key ID/epoch/public key, exact `/usr/bin/chronyc` SHA-256, disk
+budgets and intent lifetime. The numeric group must be the installed
+`rdashboard-build-readers` GID. The executor has no DAC-bypass capability: it can consume a
+candidate only through this exact read-only group handoff.
+
+The candidate producer remains an external non-root integration point in this milestone; no
+`rdashboard-build` service is shipped. It is responsible for consuming the verified source export,
+running the fixed isolated `CI=true bin/ci` and immutable-context image build, exporting the exact
+result as an OCI archive, and using the policy-pinned build signing key. It must publish only these
+final files atomically, without symlinks or retained hard links:
+
+- release bundle:
+  `/var/lib/rdashboard-build/release-bundles/rimg/<release-bundle-sha256>`, canonical JCS, at most
+  64 KiB, owner `rdashboard-build`, group `rdashboard-build-readers`, mode `0440`;
+- build attestation:
+  `/var/lib/rdashboard-build/attestations/rimg/<full-git-commit>.jcs`, canonical JCS, at most
+  256 KiB, the same owner/group, mode `0440`;
+- OCI archive:
+  `/var/lib/rdashboard-build/oci-archives/rimg/<release-bundle-sha256>.oci.tar`, at most 16 GiB,
+  plus `<release-bundle-sha256>.manifest.jcs`, both the same owner/group and mode `0440`.
+
+The attestation uses domain `rdashboard.build-release-attestation.v1`, has a maximum 24-hour
+validity window, names the exact bundle digest and source head/sequence/attestation, binds the
+installed policy and rimg-policy digest, and carries the Testing, Building and Preflight artifacts.
+Release-bundle schema v3 binds the OCI archive SHA-256 in addition to the registry digest and local
+Docker image ID. The OCI manifest independently binds those identities, project, full source head,
+bundle digest, byte count and publication time. The executor reopens the live source snapshot and
+every installed policy, verifies the signature and exact file identities before and after reading,
+rebinds only the live root disk reservation, copies the verified archive into its private root-owned
+store and rejects a stale, substituted, permissively readable or multiply linked candidate. A
+producer that merely signs caller-supplied evidence does not satisfy this contract.
+
+Before the first accepted deploy, install canonical
+`/var/lib/rdashboard-executor/releases/rimg.jcs`, root-owned and mode `0600`, as generation 1 with
+both `current_release_bundle_digest` and `last_known_good_release_bundle_digest` absent and with the
+same installed policy/rimg-policy identities. The bootstrap worker permits only this
+`NeverInstalled` state. After a terminal Soak receipt it promotes the exact bundle to the root store
+and atomically advances release state; restart after either durable boundary replays receipts
+without reapplying Kamal, health or soak effects. Once a current release exists, subsequent deploy
+and rollback requests fail closed until the stable-routing/rollback driver is installed.
+
+The host must run a synchronized local chrony daemon exposing `/run/chrony/chronyd.sock`. The
+executor calls only the policy-pinned `/usr/bin/chronyc` with fixed tracking arguments and rejects a
+changed binary, stale reference time, unsynchronized leap state or ambiguous/non-finite report.
+The installed mutation drop-in includes the host's `chrony` group because the capability-free
+executor cannot otherwise traverse the daemon's mode-`0750` runtime directory. On a distribution
+using a different chrony group name, replace that one group token with the actual group owning
+`/run/chrony` and verify the socket remains non-world-accessible.
+
+The Kamal deploy and rollback profiles additionally require these root-owned installed inputs:
+
+- `/usr/libexec/rdashboard/kamal` at exactly Kamal `2.12.0`, `/usr/bin/docker` and
+  `/usr/bin/skopeo`, all pinned by SHA-256 in
+  `/etc/rdashboard/projects/rimg/kamal-adapter-runtime.jcs`;
+- a registry image referenced by an exact digest and its exact local Docker image ID, plus a bounded
+  128 MiB to 16 GiB registry tmpfs budget, in canonical
+  `rdashboard.installed-kamal-adapter-runtime.v2` schema;
+- the immutable release bundle store at `/var/lib/rdashboard-executor/release-bundles`;
+- the private OCI archive store at `/var/lib/rdashboard-executor/oci-archives`;
+- `/etc/rdashboard/credentials/rimg-kamal-secrets.env`, containing exactly the authorized dotenv
+  keys with substitution-free bounded values, and
+  `/etc/rdashboard/credentials/rimg-kamal-ssh-key`, both root-owned and mode `0600`.
+
+Only Kamal profiles receive the two credentials through `LoadCredential=`. Before Kamal starts, the
+adapter verifies the promoted archive digest, imports it into the local Docker store with `skopeo`,
+checks the exact signed local image ID, starts a bounded read-only digest-pinned registry only on
+`127.0.0.1:5555`, copies and re-verifies the archive through that registry, and removes only a
+container carrying the exact owned image ID and ownership label. A foreign container using the
+reserved name fails closed. Registry cleanup is mandatory on both success and failure; registry
+state is never release or rollback authority. `skopeo` TLS verification is disabled only for this
+exact loopback transport; OCI archive inspection and every non-loopback reference retain their
+normal verification behavior. The adapter then generates the complete secret-free JSON
+configuration in its operation directory, binds it to the embedded
+deployment plan and installed template/policy/credential digests, rejects ERB markers, disables
+hooks, SSH agent forwarding and user SSH configuration, and accepts only the fixed `kamal` Docker
+network. The only published service ports bind to loopback. It independently observes the running
+full Git SHA afterward; an already matching
+SHA is treated as crash replay rather than a second deployment. Repository `config/deploy.yml`,
+`.kamal`, hooks, destinations and the managed checkout are never read.
+
+This bootstrap profile is deliberately single-host: the installed Kamal `target_host` must SSH
+back to the same VPS whose executor owns the Docker daemon and loopback registry. In Kamal's
+generated configuration, `localhost:5555` is therefore the registry on that target's own Docker
+host. A remote Docker target or multi-host fleet is unsupported by this milestone and must not be
+installed until it has a separately authenticated registry transport and rollout design.
+
+`rdashboard.service` enables the fixed executor socket. It starts and remains available if an
+individual executor observation fails; that sample is persisted as `signal_lost` with no invented
+metric values. Put only the internal rimg health origin in the root-owned controller environment:
+
+```text
+RDASHBOARD_RIMG_BASE_URL=http://127.0.0.1:8080
+```
+
+The controller unit has no Docker socket, production credentials, project checkout write access or
+privileged capabilities.
