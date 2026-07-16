@@ -16,7 +16,10 @@ use rdashboard::{
     projects::{RimgConfigError, RimgHealthCollector},
     store::{ControlStore, MetricsStore},
     unix_time_ms,
-    web::{DashboardMutationApiV1, DashboardState, EventHub, router},
+    web::{
+        CloudflareAccessConfig, CloudflareAccessConfigError, CloudflareAccessVerifier,
+        DashboardMutationApiV1, DashboardState, EventHub, router_with_access,
+    },
 };
 use tokio::{net::TcpListener, sync::Mutex};
 use tracing::{error, info, warn};
@@ -36,6 +39,10 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 async fn main() -> Result<(), DynError> {
     init_tracing()?;
     let config = Config::from_env()?;
+    let access = match config.access.clone() {
+        Some(access) => Some(Arc::new(CloudflareAccessVerifier::connect(access).await?)),
+        None => None,
+    };
     std::fs::create_dir_all(&config.data_dir)?;
 
     let control_store = ControlStore::open(config.data_dir.join("control.sqlite"))?;
@@ -106,7 +113,7 @@ async fn main() -> Result<(), DynError> {
 
     let listener = TcpListener::bind(config.listen).await?;
     info!(listen = %config.listen, data_dir = %config.data_dir.display(), "rdashboardd listening");
-    axum::serve(listener, router(state))
+    axum::serve(listener, router_with_access(state, access))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
@@ -263,6 +270,7 @@ struct Config {
     data_dir: PathBuf,
     rimg_collector: RimgHealthCollector,
     executor_socket: Option<PathBuf>,
+    access: Option<CloudflareAccessConfig>,
 }
 
 impl Config {
@@ -305,11 +313,13 @@ impl Config {
                 return Err(ConfigError::NonUnicodeExecutorSocket);
             }
         };
+        let access = CloudflareAccessConfig::from_env()?;
         Ok(Self {
             listen,
             data_dir,
             rimg_collector,
             executor_socket,
+            access,
         })
     }
 }
@@ -380,6 +390,8 @@ enum ConfigError {
     InvalidExecutorSocket,
     #[error("RDASHBOARD_EXECUTOR_SOCKET must be valid Unicode")]
     NonUnicodeExecutorSocket,
+    #[error(transparent)]
+    Access(#[from] CloudflareAccessConfigError),
 }
 
 #[cfg(test)]

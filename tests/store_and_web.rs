@@ -621,8 +621,13 @@ async fn health_reports_retention_failure_and_future_sample_time() {
         .unwrap_or_else(|error| panic!("read retention health response: {error}"))
         .to_bytes();
     assert!(
-        body.windows(b"retention: rollup JSON is corrupt".len())
-            .any(|window| window == b"retention: rollup JSON is corrupt")
+        body.windows(b"critical retention failed".len())
+            .any(|window| window == b"critical retention failed")
+    );
+    assert!(
+        !body
+            .windows(b"rollup JSON is corrupt".len())
+            .any(|window| window == b"rollup JSON is corrupt")
     );
 
     *state.retention_error.write().await = None;

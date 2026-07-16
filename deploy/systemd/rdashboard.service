@@ -12,6 +12,7 @@ ExecStart=/usr/libexec/rdashboard/rdashboardd
 Environment=RDASHBOARD_LISTEN=127.0.0.1:3100
 Environment=RDASHBOARD_DATA_DIR=/var/lib/rdashboard
 Environment=RDASHBOARD_EXECUTOR_SOCKET=/run/rdashboard/executor.sock
+Environment=RDASHBOARD_ACCESS_REQUIRED=true
 EnvironmentFile=-/etc/rdashboard/controller.env
 StateDirectory=rdashboard
 StateDirectoryMode=0750

@@ -1,12 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Query, State},
     http::{HeaderValue, StatusCode, header},
+    middleware,
     response::{Html, IntoResponse, Response, Sse},
     routing::{get, post},
 };
+use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -27,7 +29,10 @@ use crate::{
     unix_time_ms,
 };
 
-use super::{EventHub, HubError, RequestedAfter};
+use super::{
+    CloudflareAccessIdentity, CloudflareAccessVerifier, EventHub, EventStream, HubError,
+    RequestedAfter, require_cloudflare_access,
+};
 
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 const APP_CSS: &str = include_str!("../../web/app.css");
@@ -80,7 +85,14 @@ impl DashboardState {
 }
 
 pub fn router(state: DashboardState) -> Router {
-    Router::new()
+    router_with_access(state, None)
+}
+
+pub fn router_with_access(
+    state: DashboardState,
+    access: Option<Arc<CloudflareAccessVerifier>>,
+) -> Router {
+    let protected = Router::new()
         .route("/", get(index))
         .route("/assets/app.css", get(stylesheet))
         .route("/assets/app.js", get(script))
@@ -92,8 +104,40 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/v1/mutations/prepare", post(prepare_mutation))
         .route("/api/v1/mutations/execute", post(execute_mutation))
         .route("/api/v1/mutations/status", get(mutation_status))
+        .fallback(not_found);
+    let protected = access.map_or(protected.clone(), |verifier| {
+        protected.layer(middleware::from_fn_with_state(
+            verifier,
+            require_cloudflare_access,
+        ))
+    });
+    Router::new()
         .route("/health", get(health))
-        .fallback(not_found)
+        .merge(protected)
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=300"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("camera=(), geolocation=(), microphone=()"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("cross-origin-opener-policy"),
+            HeaderValue::from_static("same-origin-allow-popups"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("cross-origin-resource-policy"),
+            HeaderValue::from_static("same-origin"),
+        ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::REFERRER_POLICY,
             HeaderValue::from_static("no-referrer"),
@@ -189,10 +233,14 @@ struct EventQuery {
     after: Option<String>,
 }
 
-async fn events(State(state): State<DashboardState>, Query(query): Query<EventQuery>) -> Response {
+async fn events(
+    State(state): State<DashboardState>,
+    identity: Option<Extension<CloudflareAccessIdentity>>,
+    Query(query): Query<EventQuery>,
+) -> Response {
     let requested = RequestedAfter::parse(query.after.as_deref());
     match state.hub.subscribe(requested) {
-        Ok(stream) => Sse::new(stream)
+        Ok(stream) => Sse::new(bound_event_stream(stream, identity.as_ref()))
             .keep_alive(
                 axum::response::sse::KeepAlive::new()
                     .interval(Duration::from_secs(15))
@@ -214,17 +262,29 @@ async fn events(State(state): State<DashboardState>, Query(query): Query<EventQu
     }
 }
 
+fn bound_event_stream(
+    stream: EventStream,
+    identity: Option<&Extension<CloudflareAccessIdentity>>,
+) -> EventStream {
+    let Some(identity) = identity else {
+        return stream;
+    };
+    let now = unix_time_ms()
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+        .map_or(identity.expires_at, |value| value / 1_000);
+    let lifetime = identity.expires_at.saturating_sub(now).min(5 * 60);
+    Box::pin(stream.take_until(tokio::time::sleep(Duration::from_secs(lifetime))))
+}
+
 async fn health(State(state): State<DashboardState>) -> Response {
-    let now = match unix_time_ms() {
-        Ok(now) => now,
-        Err(error) => {
-            return ApiProblem::response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "clock_invalid",
-                &error.to_string(),
-            )
-            .into_response();
-        }
+    let Ok(now) = unix_time_ms() else {
+        return ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "clock_invalid",
+            "The host clock is unavailable.",
+        )
+        .into_response();
     };
     let collection_error = state.collection_error.read().await.clone();
     let retention_error = state.retention_error.read().await.clone();
@@ -252,15 +312,15 @@ async fn health(State(state): State<DashboardState>) -> Response {
         .unwrap_or(i64::MAX)
         .saturating_mul(3);
     let critical_error = collection_error
-        .map(|error| format!("collection: {error}"))
-        .or_else(|| retention_error.map(|error| format!("retention: {error}")));
-    if let Some(error) = critical_error {
+        .map(|_| "critical collection failed")
+        .or_else(|| retention_error.map(|_| "critical retention failed"));
+    if let Some(detail) = critical_error {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(HealthResponse {
                 status: "degraded",
                 sample_age_ms: age_ms,
-                detail: Some(error),
+                detail: Some(detail.to_owned()),
             }),
         )
             .into_response();

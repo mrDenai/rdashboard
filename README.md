@@ -3,7 +3,7 @@
 Low-resource Rust operations dashboard and deployment control plane.
 
 The implementation is being built in gated vertical slices described in
-[PLAN.md](PLAN.md). The browser surface remains deliberately loopback-only: it records real Linux
+[PLAN.md](PLAN.md). The browser process remains deliberately bound to loopback: it records real Linux
 host and `rimg` health observations in SQLite, exposes resumable SSE updates and presents the
 installed operation capabilities plus durable mutation status. The controller mutation API can
 acquire a tab lease, prepare a root-signed intent, admit an authorizer grant and follow the resulting
@@ -42,6 +42,37 @@ cargo run --locked --bin rdashboardd
 ```
 
 Runtime databases default to `./var`. Override this with `RDASHBOARD_DATA_DIR`.
+
+## Production browser access
+
+An external route must be protected twice: Cloudflare Access decides who may reach the application,
+and `rdashboardd` independently verifies the signed Access assertion at the origin. Configure all
+three variables together in `/etc/rdashboard/controller.env`:
+
+```sh
+RDASHBOARD_ACCESS_TEAM_DOMAIN=https://example.cloudflareaccess.com
+RDASHBOARD_ACCESS_AUDIENCE=replace-with-the-application-aud
+RDASHBOARD_ACCESS_ALLOWED_EMAILS=operator@example.com
+```
+
+The team domain must be the exact lower-case HTTPS origin shown by Cloudflare, the audience must be
+the exact Application Audience tag for this self-hosted application, and the comma-separated email
+list is an additional exact origin-side allowlist. Partial or invalid configuration prevents
+startup. The production systemd unit also sets `RDASHBOARD_ACCESS_REQUIRED=true`, so removing all
+three values cannot silently disable authorization. With Access configured, every route except the
+deliberately minimal `/health` probe
+requires a valid RS256 Access token with the exact issuer, audience and allowed email. Signing keys
+are fetched only from the fixed team-domain JWKS endpoint; an unknown key triggers one bounded
+refresh. Event streams close at token expiry or after five minutes, whichever comes first, so a
+long-lived browser connection must be reauthorized.
+
+Do not publish a proxy route until the Access application and policy exist and the origin
+configuration is active. The production host uses the existing Kamal Proxy, not nginx. The
+dashboard itself stays on `127.0.0.1:3100`; the supplied systemd socket bridge exposes it only on
+the host address of the private `kamal` Docker network for Kamal Proxy to reach. Direct origin
+requests still fail closed because `rdashboardd`, rather than the proxy, validates the Access JWT.
+See [`deploy/systemd/README.md`](deploy/systemd/README.md) for the exact boundary and activation
+order.
 
 Production-style host collection can be routed through the fixed executor boundary by setting
 `RDASHBOARD_EXECUTOR_SOCKET=/run/rdashboard/executor.sock`. The executor reads its strict,

@@ -1,0 +1,11 @@
+[Unit]
+Description=Private Kamal network listener for rdashboard
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Socket]
+ListenStream=172.19.0.1:3100
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

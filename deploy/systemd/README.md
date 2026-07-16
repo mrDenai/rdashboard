@@ -1,5 +1,50 @@
 # systemd deployment inputs
 
+## Controller and browser boundary
+
+Install `rdashboard.service` and the controller binary at
+`/usr/libexec/rdashboard/rdashboardd`. The service binds only `127.0.0.1:3100` and reads optional
+browser-access settings from `/etc/rdashboard/controller.env`. For a public route, create the
+Cloudflare Access self-hosted application first, then install all three values together in that
+file, owned by `root:rdashboard` and mode `0640` or stricter:
+
+```sh
+RDASHBOARD_ACCESS_TEAM_DOMAIN=https://example.cloudflareaccess.com
+RDASHBOARD_ACCESS_AUDIENCE=replace-with-the-application-aud
+RDASHBOARD_ACCESS_ALLOWED_EMAILS=operator@example.com
+```
+
+The values are identifiers rather than credentials, but they define the authorization boundary.
+The production unit sets `RDASHBOARD_ACCESS_REQUIRED=true`: `rdashboardd` therefore refuses missing,
+partial or malformed configuration and fetches the team's public signing keys before it starts
+listening. All browser, asset, snapshot, event and mutation routes then require an
+origin-verified Access JWT whose signature, issuer, application audience and email allowlist match.
+Only the minimal `/health` route remains unauthenticated for the upstream health check; it never
+returns internal collection or retention error text.
+
+The production path is Cloudflare -> the existing Kamal Proxy -> the private bridge -> loopback
+`rdashboardd`. nginx is neither installed nor part of this deployment. Kamal Proxy runs in the
+`kamal` Docker network and cannot reach host loopback directly, so install
+`rdashboard-kamal-bridge.socket` and `rdashboard-kamal-bridge.service`. The socket is intentionally
+bound to the host gateway address `172.19.0.1:3100`, not `0.0.0.0`; verify the installed `kamal`
+network gateway before enabling it and adjust the unit if the gateway differs. The bridge forwards
+only to `127.0.0.1:3100` using systemd's fixed socket proxy and carries no TLS or authorization
+logic.
+
+Activation order is fail-closed:
+
+1. Create the Cloudflare Access application and exact allow policy for the dashboard hostname.
+2. Install `controller.env`, restart `rdashboard.service`, and verify an unauthenticated protected
+   request is rejected locally while `/health` succeeds.
+3. Enable `rdashboard-kamal-bridge.socket` and verify the same behavior from the `kamal` network.
+4. Add the TLS host route to the already-running Kamal Proxy, targeting `172.19.0.1:3100` with
+   `/health` as its health path.
+5. Verify authorized browser access, then verify direct-origin and missing/invalid-token requests
+   cannot retrieve the dashboard or API.
+
+Removing the Kamal Proxy host route and disabling the bridge socket closes external reachability
+without changing the observation services or their local data.
+
 The dedicated source broker runs as `rdashboard-source` from
 `/usr/libexec/rdashboard/rdashboard-source`. Install `rdashboard-source.service`, create the matching
 system user/group plus the `rdashboard-build-readers` group, and apply `rdashboard-tmpfiles.conf`.
