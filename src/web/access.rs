@@ -11,9 +11,12 @@ use axum::{
     middleware::Next,
     response::{IntoResponse as _, Response},
 };
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind, jwk::JwkSet,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use tracing::warn;
 use url::Url;
 
 const ACCESS_ASSERTION_HEADER: &str = "cf-access-jwt-assertion";
@@ -122,7 +125,7 @@ impl std::fmt::Debug for CloudflareAccessVerifier {
             .debug_struct("CloudflareAccessVerifier")
             .field("issuer", &"[redacted]")
             .field("audience", &"[redacted]")
-            .field("allowed_email_count", &self.config.allowed_emails.len())
+            .field("allowed_emails", &"[redacted]")
             .finish_non_exhaustive()
     }
 }
@@ -156,15 +159,21 @@ impl CloudflareAccessVerifier {
         let mut assertions = headers.get_all(ACCESS_ASSERTION_HEADER).iter();
         let assertion = assertions
             .next()
-            .ok_or(CloudflareAccessVerificationError::Denied)?;
+            .ok_or(CloudflareAccessVerificationError::Denied(
+                "assertion_missing",
+            ))?;
         if assertions.next().is_some() {
-            return Err(CloudflareAccessVerificationError::Denied);
+            return Err(CloudflareAccessVerificationError::Denied(
+                "assertion_duplicated",
+            ));
         }
         let assertion = assertion
             .to_str()
-            .map_err(|_| CloudflareAccessVerificationError::Denied)?;
+            .map_err(|_| CloudflareAccessVerificationError::Denied("assertion_not_ascii"))?;
         if assertion.is_empty() || assertion.len() > MAX_ACCESS_TOKEN_BYTES {
-            return Err(CloudflareAccessVerificationError::Denied);
+            return Err(CloudflareAccessVerificationError::Denied(
+                "assertion_size_invalid",
+            ));
         }
         self.verify(assertion).await
     }
@@ -173,15 +182,16 @@ impl CloudflareAccessVerifier {
         &self,
         assertion: &str,
     ) -> Result<CloudflareAccessIdentity, CloudflareAccessVerificationError> {
-        let header =
-            decode_header(assertion).map_err(|_| CloudflareAccessVerificationError::Denied)?;
+        let header = decode_header(assertion)
+            .map_err(|_| CloudflareAccessVerificationError::Denied("header_invalid"))?;
         if header.alg != Algorithm::RS256 || header.typ.as_deref() != Some("JWT") {
-            return Err(CloudflareAccessVerificationError::Denied);
+            return Err(CloudflareAccessVerificationError::Denied(
+                "header_algorithm_or_type_invalid",
+            ));
         }
-        let key_id = header
-            .kid
-            .filter(|value| valid_key_id(value))
-            .ok_or(CloudflareAccessVerificationError::Denied)?;
+        let key_id = header.kid.filter(|value| valid_key_id(value)).ok_or(
+            CloudflareAccessVerificationError::Denied("header_key_id_invalid"),
+        )?;
         let key = self.key(&key_id).await?;
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[self.config.audience.as_str()]);
@@ -192,30 +202,66 @@ impl CloudflareAccessVerifier {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        let token = decode::<CloudflareAccessClaims>(assertion, &key, &validation)
-            .map_err(|_| CloudflareAccessVerificationError::Denied)?;
+        let token =
+            decode::<CloudflareAccessClaims>(assertion, &key, &validation).map_err(|error| {
+                CloudflareAccessVerificationError::Denied(jwt_validation_reason(&error))
+            })?;
         let claims = token.claims;
         let now = unix_time_secs().map_err(|_| CloudflareAccessVerificationError::Unavailable)?;
-        let email =
-            normalize_email(&claims.email).ok_or(CloudflareAccessVerificationError::Denied)?;
-        if claims.token_type != "app"
-            || claims.subject.is_empty()
-            || claims.subject.len() > 256
-            || claims.issued_at > now.saturating_add(CLOCK_LEEWAY_SECS)
-            || claims.not_before > now.saturating_add(CLOCK_LEEWAY_SECS)
-            || claims.issued_at > claims.expires_at
-            || claims.not_before > claims.expires_at
-            || claims.expires_at <= now
-            || now.saturating_sub(claims.issued_at) > MAX_ACCESS_TOKEN_LIFETIME_SECS
+        let email = normalize_email(&claims.email).ok_or(
+            CloudflareAccessVerificationError::Denied("email_claim_invalid"),
+        )?;
+        if claims.token_type != "app" {
+            return Err(CloudflareAccessVerificationError::Denied(
+                "token_type_invalid",
+            ));
+        }
+        if claims.subject.is_empty() || claims.subject.len() > 256 {
+            return Err(CloudflareAccessVerificationError::Denied(
+                "subject_claim_invalid",
+            ));
+        }
+        if claims.issued_at > now.saturating_add(CLOCK_LEEWAY_SECS) {
+            return Err(CloudflareAccessVerificationError::Denied(
+                "issued_at_in_future",
+            ));
+        }
+        if claims.not_before > now.saturating_add(CLOCK_LEEWAY_SECS) {
+            return Err(CloudflareAccessVerificationError::Denied(
+                "not_before_in_future",
+            ));
+        }
+        if claims.issued_at > claims.expires_at || claims.not_before > claims.expires_at {
+            return Err(CloudflareAccessVerificationError::Denied(
+                "token_time_order_invalid",
+            ));
+        }
+        if claims.expires_at <= now {
+            return Err(CloudflareAccessVerificationError::Denied("token_expired"));
+        }
+        if now.saturating_sub(claims.issued_at) > MAX_ACCESS_TOKEN_LIFETIME_SECS
             || claims.expires_at.saturating_sub(claims.issued_at) > MAX_ACCESS_TOKEN_LIFETIME_SECS
-            || !claims
-                .audience
-                .iter()
-                .any(|value| value == &self.config.audience)
-            || claims.issuer != self.config.issuer
-            || !self.config.allowed_emails.contains(&email)
         {
-            return Err(CloudflareAccessVerificationError::Denied);
+            return Err(CloudflareAccessVerificationError::Denied(
+                "token_lifetime_invalid",
+            ));
+        }
+        if !claims
+            .audience
+            .iter()
+            .any(|value| value == &self.config.audience)
+        {
+            return Err(CloudflareAccessVerificationError::Denied(
+                "audience_mismatch",
+            ));
+        }
+        if claims.issuer != self.config.issuer {
+            return Err(CloudflareAccessVerificationError::Denied("issuer_mismatch"));
+        }
+        if !self.config.allowed_emails.contains(&email) {
+            return Err(CloudflareAccessVerificationError::Denied(
+                "email_not_allowed",
+            ));
         }
         Ok(CloudflareAccessIdentity {
             email,
@@ -233,12 +279,9 @@ impl CloudflareAccessVerifier {
             return Ok(key);
         }
         self.refresh_keys().await?;
-        self.keys
-            .read()
-            .await
-            .get(key_id)
-            .cloned()
-            .ok_or(CloudflareAccessVerificationError::Denied)
+        self.keys.read().await.get(key_id).cloned().ok_or(
+            CloudflareAccessVerificationError::Denied("signing_key_unknown"),
+        )
     }
 
     async fn refresh_keys(&self) -> Result<(), CloudflareAccessVerificationError> {
@@ -337,11 +380,17 @@ pub async fn require_cloudflare_access(
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
-        Err(CloudflareAccessVerificationError::Denied) => access_problem(
-            StatusCode::FORBIDDEN,
-            "access_denied",
-            "Cloudflare Access authorization is required.",
-        ),
+        Err(CloudflareAccessVerificationError::Denied(reason)) => {
+            warn!(
+                denial_reason = reason,
+                "Cloudflare Access authorization denied"
+            );
+            access_problem(
+                StatusCode::FORBIDDEN,
+                "access_denied",
+                "Cloudflare Access authorization is required.",
+            )
+        }
         Err(CloudflareAccessVerificationError::Unavailable) => access_problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "access_verification_unavailable",
@@ -367,10 +416,51 @@ struct AccessProblem {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum CloudflareAccessVerificationError {
-    #[error("Cloudflare Access denied the request")]
-    Denied,
+    #[error("Cloudflare Access denied the request: {0}")]
+    Denied(&'static str),
     #[error("Cloudflare Access verification is unavailable")]
     Unavailable,
+}
+
+fn jwt_validation_reason(error: &jsonwebtoken::errors::Error) -> &'static str {
+    match error.kind() {
+        ErrorKind::InvalidSignature => "signature_invalid",
+        ErrorKind::MissingRequiredClaim(claim) => match claim.as_str() {
+            "aud" => "audience_claim_missing",
+            "email" => "email_claim_missing",
+            "exp" => "expires_at_claim_missing",
+            "iat" => "issued_at_claim_missing",
+            "iss" => "issuer_claim_missing",
+            "nbf" => "not_before_claim_missing",
+            "sub" => "subject_claim_missing",
+            _ => "required_claim_missing",
+        },
+        ErrorKind::InvalidClaimFormat(claim) => match claim.as_str() {
+            "aud" => "audience_claim_format_invalid",
+            "exp" => "expires_at_claim_format_invalid",
+            "iss" => "issuer_claim_format_invalid",
+            "nbf" => "not_before_claim_format_invalid",
+            "sub" => "subject_claim_format_invalid",
+            _ => "claim_format_invalid",
+        },
+        ErrorKind::ExpiredSignature => "token_expired",
+        ErrorKind::InvalidIssuer => "issuer_mismatch",
+        ErrorKind::InvalidAudience => "audience_mismatch",
+        ErrorKind::InvalidSubject => "subject_mismatch",
+        ErrorKind::ImmatureSignature => "not_before_in_future",
+        ErrorKind::InvalidAlgorithm | ErrorKind::InvalidAlgorithmName => "algorithm_invalid",
+        ErrorKind::InvalidToken
+        | ErrorKind::Base64(_)
+        | ErrorKind::Json(_)
+        | ErrorKind::Utf8(_) => "token_encoding_invalid",
+        ErrorKind::InvalidEcdsaKey
+        | ErrorKind::InvalidEddsaKey
+        | ErrorKind::InvalidRsaKey(_)
+        | ErrorKind::InvalidKeyFormat
+        | ErrorKind::MissingAlgorithm
+        | ErrorKind::Provider(_) => "verification_key_invalid",
+        _ => "token_validation_failed",
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -535,6 +625,84 @@ MwIDAQAB
     }
 
     #[test]
+    fn jwt_validation_errors_map_to_fixed_non_sensitive_categories() {
+        use jsonwebtoken::errors::{Error, new_error};
+
+        let assert_reason = |error: Error, expected_reason| {
+            let reason = jwt_validation_reason(&error);
+            assert_eq!(reason, expected_reason);
+            assert!(
+                reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            );
+        };
+        for (claim, expected_reason) in [
+            ("aud", "audience_claim_missing"),
+            ("email", "email_claim_missing"),
+            ("exp", "expires_at_claim_missing"),
+            ("iat", "issued_at_claim_missing"),
+            ("iss", "issuer_claim_missing"),
+            ("nbf", "not_before_claim_missing"),
+            ("sub", "subject_claim_missing"),
+            ("sensitive-future-claim", "required_claim_missing"),
+        ] {
+            assert_reason(
+                new_error(ErrorKind::MissingRequiredClaim(claim.to_owned())),
+                expected_reason,
+            );
+        }
+        for (claim, expected_reason) in [
+            ("aud", "audience_claim_format_invalid"),
+            ("exp", "expires_at_claim_format_invalid"),
+            ("iss", "issuer_claim_format_invalid"),
+            ("nbf", "not_before_claim_format_invalid"),
+            ("sub", "subject_claim_format_invalid"),
+            ("sensitive-future-claim", "claim_format_invalid"),
+        ] {
+            assert_reason(
+                new_error(ErrorKind::InvalidClaimFormat(claim.to_owned())),
+                expected_reason,
+            );
+        }
+        for (error, expected_reason) in [
+            (new_error(ErrorKind::InvalidSignature), "signature_invalid"),
+            (new_error(ErrorKind::ExpiredSignature), "token_expired"),
+            (new_error(ErrorKind::InvalidIssuer), "issuer_mismatch"),
+            (new_error(ErrorKind::InvalidAudience), "audience_mismatch"),
+            (new_error(ErrorKind::InvalidSubject), "subject_mismatch"),
+            (
+                new_error(ErrorKind::ImmatureSignature),
+                "not_before_in_future",
+            ),
+            (new_error(ErrorKind::InvalidAlgorithm), "algorithm_invalid"),
+            (
+                new_error(ErrorKind::InvalidAlgorithmName),
+                "algorithm_invalid",
+            ),
+            (new_error(ErrorKind::InvalidToken), "token_encoding_invalid"),
+            (
+                new_error(ErrorKind::InvalidRsaKey("sensitive-detail".to_owned())),
+                "verification_key_invalid",
+            ),
+            (
+                new_error(ErrorKind::Provider("sensitive-detail".to_owned())),
+                "verification_key_invalid",
+            ),
+            (
+                new_error(ErrorKind::RsaFailedSigning),
+                "token_validation_failed",
+            ),
+            (
+                new_error(ErrorKind::Signing("sensitive-detail".to_owned())),
+                "token_validation_failed",
+            ),
+        ] {
+            assert_reason(error, expected_reason);
+        }
+    }
+
+    #[test]
     fn access_config_rejects_partial_origins_and_ambiguous_email_lists() {
         assert_eq!(
             CloudflareAccessConfig::from_values(Some("true"), None, None, None),
@@ -591,7 +759,11 @@ MwIDAQAB
         wrong_email.email = "intruder@example.com".to_owned();
         let mut wrong_type = claims(now);
         wrong_type.token_type = "org".to_owned();
-        for rejected in [wrong_audience, wrong_email, wrong_type] {
+        for (rejected, expected_reason) in [
+            (wrong_audience, "audience_mismatch"),
+            (wrong_email, "email_not_allowed"),
+            (wrong_type, "token_type_invalid"),
+        ] {
             let mut rejected_headers = HeaderMap::new();
             rejected_headers.insert(
                 ACCESS_ASSERTION_HEADER,
@@ -600,7 +772,7 @@ MwIDAQAB
             );
             assert_eq!(
                 verifier.authenticate(&rejected_headers).await,
-                Err(CloudflareAccessVerificationError::Denied)
+                Err(CloudflareAccessVerificationError::Denied(expected_reason))
             );
         }
     }
@@ -610,7 +782,9 @@ MwIDAQAB
         let verifier = verifier();
         assert_eq!(
             verifier.authenticate(&HeaderMap::new()).await,
-            Err(CloudflareAccessVerificationError::Denied)
+            Err(CloudflareAccessVerificationError::Denied(
+                "assertion_missing"
+            ))
         );
         let now = unix_time_secs().unwrap_or_else(|error| panic!("clock: {error}"));
         let mut too_long = claims(now);
@@ -622,7 +796,9 @@ MwIDAQAB
         duplicated.append(ACCESS_ASSERTION_HEADER, value);
         assert_eq!(
             verifier.authenticate(&duplicated).await,
-            Err(CloudflareAccessVerificationError::Denied)
+            Err(CloudflareAccessVerificationError::Denied(
+                "assertion_duplicated"
+            ))
         );
     }
 }
