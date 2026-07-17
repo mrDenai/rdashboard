@@ -133,8 +133,17 @@ the same SQLite transaction into mergeable one-minute relative-log sketches reta
 raw rows are deleted only after both host and project rollups are durable. Databases created by the
 earlier timestamp-key schema are migrated transactionally on first open. `GET /api/v1/host-history`
 combines the remaining raw samples and durable rollups into aligned completed-minute windows. It
-returns medians plus explicit covered/expected-minute counts for one hour, one day, one week and 30
-days, so a newly installed or interrupted collector cannot display a partial period as complete.
+returns resource medians, monotonic-counter receive/send traffic totals and explicit
+covered/expected-minute counts for one hour, one day, one week and 30 days. Network counter resets
+leave the unknowable interval out of both the total and its traffic-specific coverage instead of
+inventing bytes. A newly installed or interrupted collector therefore cannot display a partial
+period as complete.
+
+The browser keeps the production overview dense: host pressure diagnostics remain collected but
+are not part of the primary resource table, and every project occupies one semantic table row with
+state, resources, deploys, backups, repository, dependency updates and errors as columns. Raw health
+contracts and executor/source diagnostics stay out of that summary; unavailable integrations use a
+bounded operator-facing state.
 
 `RDASHBOARD_RIMG_BASE_URL` is optional and must be a bare internal `http://` origin without
 credentials, path, query or fragment. When it is absent, the `rimg` row remains visible as

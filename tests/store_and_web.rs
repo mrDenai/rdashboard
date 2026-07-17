@@ -453,9 +453,15 @@ fn host_history_combines_retained_rollups_and_raw_samples_into_named_medians() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
     let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
         .unwrap_or_else(|error| panic!("open metrics: {error}"));
-    for (observed_at_ms, cpu_percent) in [(10_000, 10.0), (70_000, 20.0), (130_000, 30.0)] {
+    for (observed_at_ms, cpu_percent, network_rx, network_tx) in [
+        (10_000, 10.0, 100, 200),
+        (70_000, 20.0, 160, 260),
+        (130_000, 30.0, 260, 300),
+    ] {
         let mut sample = host_sample(observed_at_ms);
         sample.cpu_percent = Some(cpu_percent);
+        sample.network_rx_bytes = Some(network_rx);
+        sample.network_tx_bytes = Some(network_tx);
         metrics
             .record_host_sample(&sample)
             .unwrap_or_else(|error| panic!("record history fixture: {error}"));
@@ -469,7 +475,7 @@ fn host_history_combines_retained_rollups_and_raw_samples_into_named_medians() {
     let history = metrics
         .host_history(3_600_500)
         .unwrap_or_else(|error| panic!("calculate host history: {error}"));
-    assert_eq!(history.schema_version, 1);
+    assert_eq!(history.schema_version, 2);
     assert_eq!(history.complete_through_ms, 3_600_000);
     assert_eq!(history.windows.len(), 4);
     let hour = history
@@ -493,6 +499,46 @@ fn host_history_combines_retained_rollups_and_raw_samples_into_named_medians() {
             .memory_used_percent
             .is_some_and(|value| (49.0..=51.0).contains(&value))
     );
+    assert_eq!(hour.totals.network_rx_bytes, Some(160));
+    assert_eq!(hour.totals.network_tx_bytes, Some(100));
+    assert_eq!(hour.totals.network_rx_covered_ms, 120_000);
+    assert_eq!(hour.totals.network_tx_covered_ms, 120_000);
+}
+
+#[test]
+fn host_history_excludes_counter_reset_intervals_from_network_traffic() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
+        .unwrap_or_else(|error| panic!("open metrics: {error}"));
+    for (observed_at_ms, network_rx, network_tx) in [
+        (10_000, 1_000, 2_000),
+        (70_000, 1_100, 2_200),
+        (130_000, 50, 80),
+        (190_000, 90, 110),
+    ] {
+        let mut sample = host_sample(observed_at_ms);
+        sample.network_rx_bytes = Some(network_rx);
+        sample.network_tx_bytes = Some(network_tx);
+        metrics
+            .record_host_sample(&sample)
+            .unwrap_or_else(|error| panic!("record reset fixture: {error}"));
+    }
+    metrics
+        .apply_retention(180_000, -30_i64 * 24 * 60 * 60 * 1_000)
+        .unwrap_or_else(|error| panic!("roll up reset fixture: {error}"));
+
+    let history = metrics
+        .host_history(3_600_500)
+        .unwrap_or_else(|error| panic!("calculate reset history: {error}"));
+    let hour = history
+        .windows
+        .iter()
+        .find(|window| window.window == HostHistoryWindowKind::Hour)
+        .unwrap_or_else(|| panic!("hour history window is missing"));
+    assert_eq!(hour.totals.network_rx_bytes, Some(140));
+    assert_eq!(hour.totals.network_tx_bytes, Some(230));
+    assert_eq!(hour.totals.network_rx_covered_ms, 120_000);
+    assert_eq!(hour.totals.network_tx_covered_ms, 120_000);
 }
 
 #[test]
@@ -592,7 +638,12 @@ async fn http_surface_is_loopback_slice_with_strict_headers_and_truthful_empty_s
     assert!(html.contains("<caption>"));
     assert!(html.contains("Проекты ещё не подключены"));
     assert!(html.contains("За месяц"));
-    assert!(html.contains("медианные значения за завершённые периоды"));
+    assert!(html.contains("<table class=\"project-table\">"));
+    assert!(html.contains("<tbody id=\"project-list\">"));
+    assert!(html.contains("Трафик"));
+    assert!(!html.contains("Текущий узел"));
+    assert!(!html.contains("История ещё накапливается"));
+    assert!(!html.contains("metric-psi"));
     assert!(!html.contains("Контур операций"));
     assert!(!html.contains("<script>"));
 
@@ -679,7 +730,7 @@ async fn host_history_http_surface_returns_all_named_windows() {
             .to_bytes(),
     )
     .unwrap_or_else(|error| panic!("decode host history: {error}"));
-    assert_eq!(history["schema_version"], 1);
+    assert_eq!(history["schema_version"], 2);
     assert_eq!(history["windows"].as_array().map(Vec::len), Some(4));
 }
 

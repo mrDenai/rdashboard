@@ -5,7 +5,6 @@ import {
   formatHistoryCoverage,
   formatSampleAge,
   operationKindLabel,
-  operationPhaseLabel,
   operationResultPresentation,
   projectConditionPresentation,
   repositorySizeChange,
@@ -33,7 +32,6 @@ const elements = Object.freeze({
   diskDetail: document.querySelector("#metric-disk-detail"),
   network: document.querySelector("#metric-network"),
   networkDetail: document.querySelector("#metric-network-detail"),
-  psi: document.querySelector("#metric-psi"),
   partialPanel: document.querySelector("#partial-panel"),
   partialReasons: document.querySelector("#partial-reasons"),
   projectCount: document.querySelector("#project-count"),
@@ -113,6 +111,7 @@ async function loadHostHistory(announceFailure = false) {
     renderHostHistory(await response.json());
     runtime.historyFailed = false;
   } catch (error) {
+    elements.historyStatus.hidden = false;
     elements.historyStatus.dataset.state = "error";
     elements.historyStatus.textContent = error.message;
     for (const cell of elements.historyCells) {
@@ -130,7 +129,7 @@ async function loadHostHistory(announceFailure = false) {
 
 function renderHostHistory(history) {
   if (
-    history?.schema_version !== 1
+    history?.schema_version !== 2
     || !Number.isFinite(history.complete_through_ms)
     || !Array.isArray(history.windows)
   ) {
@@ -147,11 +146,8 @@ function renderHostHistory(history) {
   for (const cell of elements.historyCells) {
     renderHistoryCell(cell, windows.get(cell.dataset.historyWindow));
   }
-  const partialWindows = HOST_HISTORY_WINDOWS.filter((name) => !windows.get(name).complete);
-  elements.historyStatus.dataset.state = partialWindows.length === 0 ? "fresh" : "partial";
-  elements.historyStatus.textContent = partialWindows.length === 0
-    ? "Медианы рассчитаны по полной истории завершённых минут."
-    : "История ещё накапливается; медианы рассчитаны только по имеющимся завершённым минутам.";
+  elements.historyStatus.hidden = true;
+  elements.historyStatus.textContent = "";
 }
 
 function validHistoryWindow(window, expectedName) {
@@ -166,7 +162,20 @@ function validHistoryWindow(window, expectedName) {
     && typeof window.complete === "boolean"
     && window.complete === (window.covered_minutes === window.expected_minutes)
     && typeof window.medians === "object"
-    && window.medians !== null;
+    && window.medians !== null
+    && validTrafficTotals(window.totals);
+}
+
+function validTrafficTotals(totals) {
+  return totals !== null
+    && typeof totals === "object"
+    && [totals.network_rx_bytes, totals.network_tx_bytes].every(
+      (value) => value === null || (Number.isSafeInteger(value) && value >= 0),
+    )
+    && Number.isSafeInteger(totals.network_rx_covered_ms)
+    && totals.network_rx_covered_ms >= 0
+    && Number.isSafeInteger(totals.network_tx_covered_ms)
+    && totals.network_tx_covered_ms >= 0;
 }
 
 function renderHistoryCell(cell, window) {
@@ -188,21 +197,15 @@ function renderHistoryCell(cell, window) {
   } else if (metric === "memory_used_percent" || metric === "disk_used_percent") {
     primary.textContent = formatPercent(window.medians[metric]);
   } else if (metric === "network") {
-    primary.textContent = `↓ ${formatRate(window.medians.network_rx_bytes_per_second)}`;
-    secondary.textContent = `↑ ${formatRate(window.medians.network_tx_bytes_per_second)}`;
-  } else if (metric === "psi") {
-    primary.textContent = [
-      window.medians.psi_cpu_some_avg10,
-      window.medians.psi_memory_some_avg10,
-      window.medians.psi_io_some_avg10,
-    ].map((value) => (Number.isFinite(value) ? percentFormatter.format(value) : "—")).join(" / ");
+    primary.textContent = `↓ ${formatBytes(window.totals.network_rx_bytes)}`;
+    secondary.textContent = `↑ ${formatBytes(window.totals.network_tx_bytes)}`;
   }
   cell.append(primary);
   if (secondary.textContent) cell.append(secondary);
 }
 
 function formatBytes(value) {
-  if (!Number.isFinite(value) || value < 0) return "Нет данных";
+  if (!Number.isSafeInteger(value) || value < 0) return "Нет данных";
   const units = ["Б", "КиБ", "МиБ", "ГиБ", "ТиБ"];
   let scaled = value;
   let unit = 0;
@@ -211,10 +214,6 @@ function formatBytes(value) {
     unit += 1;
   }
   return `${byteFormatter.format(scaled)} ${units[unit]}`;
-}
-
-function formatRate(value) {
-  return Number.isFinite(value) ? `${formatBytes(value)}/с` : "Нет данных";
 }
 
 function formatPercent(value) {
@@ -255,15 +254,8 @@ function renderSnapshot(snapshot, serverReferenceMs) {
     ? `${formatBytes(host.disk_available_bytes)} свободно из ${formatBytes(host.disk_total_bytes)}`
     : "Нет данных";
 
-  elements.network.textContent = `↓ ${formatRate(host.network_rx_bytes_per_second)}`;
-  elements.networkDetail.textContent = `↑ ${formatRate(host.network_tx_bytes_per_second)}`;
-  elements.psi.textContent = [
-    host.psi.cpu_some_avg10,
-    host.psi.memory_some_avg10,
-    host.psi.io_some_avg10,
-  ]
-    .map((value) => (Number.isFinite(value) ? percentFormatter.format(value) : "—"))
-    .join(" / ");
+  elements.network.textContent = `↓ ${formatBytes(host.network_rx_bytes)}`;
+  elements.networkDetail.textContent = `↑ ${formatBytes(host.network_tx_bytes)}`;
 
   renderPartialReasons(host.partial_reasons);
   renderProjects(snapshot.projects);
@@ -289,87 +281,82 @@ function renderProjects(projects) {
   elements.projectList.replaceChildren();
   const connectedProjects = Array.isArray(projects) ? projects : [];
   const count = connectedProjects.length;
-  elements.projectCount.textContent = `${count} подключено`;
+  elements.projectCount.textContent = formatProjectCount(count);
   if (count === 0) {
-    const empty = document.createElement("p");
+    const row = document.createElement("tr");
+    const empty = document.createElement("td");
     empty.className = "empty-state";
+    empty.colSpan = 8;
     empty.textContent = "Проекты ещё не подключены.";
-    elements.projectList.append(empty);
+    row.append(empty);
+    elements.projectList.append(row);
     return;
   }
   for (const project of connectedProjects) {
-    elements.projectList.append(createProjectOverview(project, true));
+    elements.projectList.append(createProjectRow(project, true));
   }
 }
 
-function createProjectOverview(project, loadIntegrations) {
-  const projectId = String(project.project_id);
-  const article = document.createElement("article");
-  article.className = "project-overview";
-  article.dataset.projectId = projectId;
+function formatProjectCount(count) {
+  const ending = count % 10 === 1 && count % 100 !== 11
+    ? "проект"
+    : count % 10 >= 2 && count % 10 <= 4 && !(count % 100 >= 12 && count % 100 <= 14)
+      ? "проекта"
+      : "проектов";
+  return `${count} ${ending}`;
+}
 
-  const header = document.createElement("header");
-  header.className = "project-header";
-  const identity = document.createElement("div");
-  const heading = document.createElement("h3");
-  heading.textContent = String(project.display_name);
-  const identifier = document.createElement("code");
-  identifier.textContent = projectId;
-  identity.append(heading, identifier);
+function createProjectRow(project, loadIntegrations) {
+  const projectId = String(project.project_id);
+  const row = document.createElement("tr");
+  row.className = "project-row";
+  row.dataset.projectId = projectId;
+
+  const identity = document.createElement("th");
+  identity.scope = "row";
+  const name = document.createElement("strong");
+  name.textContent = String(project.display_name);
+  identity.append(name);
+  if (String(project.display_name) !== projectId) {
+    const identifier = document.createElement("code");
+    identifier.textContent = projectId;
+    identity.append(identifier);
+  }
+
   const condition = String(project.condition);
   const presentation = projectConditionPresentation(condition, "fresh");
+  const conditionCell = document.createElement("td");
   const conditionLabel = document.createElement("p");
   conditionLabel.className = "project-condition";
   conditionLabel.dataset.condition = condition;
   conditionLabel.dataset.state = presentation.state;
   conditionLabel.textContent = presentation.label;
-  header.append(identity, conditionLabel);
-
-  const health = document.createElement("dl");
-  health.className = "project-health";
-  appendDefinition(health, "Последний ответ", Number.isFinite(project.observed_at_ms)
-    ? new Date(project.observed_at_ms).toLocaleString("ru-RU")
-    : "Нет данных");
-  appendDefinition(health, "Проверка", String(project.detail));
+  conditionCell.append(conditionLabel);
 
   const operations = runtime.projectOperations.get(projectId);
   const repository = runtime.projectRepositories.get(projectId);
-  const operationalGrid = document.createElement("div");
-  operationalGrid.className = "project-operational-grid";
-  operationalGrid.append(
-    createOperationSection(
-      "Деплои",
+  row.append(
+    identity,
+    conditionCell,
+    createUnavailableCell(),
+    createOperationCell(
       operations,
       (operation) => ["deploy", "code_rollback"].includes(operation.operation_kind),
-      "Деплоев через rdashboard ещё не было.",
     ),
-    createOperationSection(
-      "Резервные копии",
+    createOperationCell(
       operations,
       (operation) => operation.operation_kind === "backup_only",
-      "Операций резервного копирования через rdashboard ещё не было.",
     ),
-    createUnavailableSection(
-      "Ресурсы проекта",
-      "Сбор CPU, памяти, диска и сети контейнеров пока не настроен.",
-    ),
-    createRepositorySection(repository),
-    createUnavailableSection(
-      "Обновления",
-      "Источник обновлений зависимостей пока не настроен.",
-    ),
-    createUnavailableSection(
-      "Ошибки",
-      "Интеграция GlitchTip пока не настроена.",
-    ),
+    createRepositoryCell(repository),
+    createUnavailableCell(),
+    createUnavailableCell(),
   );
 
-  article.append(header, health, operationalGrid);
   if (loadIntegrations) {
     loadProjectOperations(projectId, false);
     loadProjectRepository(projectId, false);
   }
-  return article;
+  return row;
 }
 
 function refreshProjectOverview(projectId) {
@@ -377,162 +364,96 @@ function refreshProjectOverview(projectId) {
     (candidate) => String(candidate.project_id) === projectId,
   );
   if (!project) return;
-  const current = Array.from(elements.projectList.querySelectorAll(".project-overview"))
-    .find((article) => article.dataset.projectId === projectId);
+  const current = Array.from(elements.projectList.querySelectorAll(".project-row"))
+    .find((row) => row.dataset.projectId === projectId);
   if (!current) return;
-  current.replaceWith(createProjectOverview(project, false));
+  current.replaceWith(createProjectRow(project, false));
   updateSampleAge();
 }
 
-function appendDefinition(list, termText, detailText) {
-  const item = document.createElement("div");
-  const term = document.createElement("dt");
-  const detail = document.createElement("dd");
-  term.textContent = termText;
-  detail.textContent = detailText;
-  item.append(term, detail);
-  list.append(item);
-}
-
-function createRepositorySection(cached) {
-  const section = document.createElement("section");
-  section.className = "operational-section repository-section";
-  const heading = document.createElement("h4");
-  heading.textContent = "Репозиторий";
-  section.append(heading);
+function createRepositoryCell(cached) {
   if (!cached) {
-    const loading = document.createElement("p");
-    loading.className = "integration-loading";
-    loading.textContent = "Загружается почасовая история…";
-    section.append(loading);
-    return section;
+    return createSummaryCell("Загрузка…", "loading");
   }
   if (cached.error && cached.samples.length === 0) {
-    const error = document.createElement("p");
-    error.className = "integration-error";
-    error.textContent = cached.error;
-    section.append(error);
-    return section;
+    return createSummaryCell("Недоступно", "unknown");
   }
   if (cached.samples.length === 0) {
-    const empty = document.createElement("p");
-    empty.className = "integration-empty";
-    empty.textContent = "Первый почасовой снимок ещё не получен.";
-    section.append(empty);
-    return section;
+    return createSummaryCell("Нет данных", "unknown");
   }
 
   const latest = cached.samples.at(-1);
-  const total = document.createElement("strong");
-  total.className = "repository-total";
-  total.textContent = formatBytes(latest.total_bytes);
-  const detail = document.createElement("p");
-  detail.className = "repository-detail";
-  detail.textContent = `${latest.file_count.toLocaleString("ru-RU")} файлов · ${new Date(latest.observed_at_ms).toLocaleString("ru-RU")}`;
-  const head = document.createElement("code");
-  head.textContent = latest.head.slice(0, 12);
-  section.append(total, detail, head);
-
-  const history = document.createElement("dl");
-  history.className = "repository-history";
+  const cell = createSummaryCell(
+    formatBytes(latest.total_bytes),
+    cached.error ? "partial" : "fresh",
+    `${latest.file_count.toLocaleString("ru-RU")} файлов · ${latest.head.slice(0, 8)}`,
+  );
+  const changes = document.createElement("small");
+  changes.className = "project-cell-detail repository-changes";
+  const values = [];
   for (const [label, periodMs] of REPOSITORY_PERIODS) {
     const change = repositorySizeChange(cached.samples, periodMs);
-    appendDefinition(history, label, formatByteChange(change));
+    values.push(`${label}: ${formatByteChange(change)}`);
   }
-  section.append(history);
+  changes.textContent = values.join(" · ");
+  cell.append(changes);
   if (cached.error) {
-    const error = document.createElement("p");
-    error.className = "integration-error";
-    error.textContent = `Последние данные сохранены. ${cached.error}`;
-    section.append(error);
+    const stale = document.createElement("small");
+    stale.className = "project-cell-detail";
+    stale.textContent = "Последние сохранённые данные";
+    cell.append(stale);
   }
-  return section;
+  return cell;
 }
 
 function formatByteChange(value) {
-  if (!Number.isSafeInteger(value)) return "История накапливается";
-  if (value === 0) return "Без изменений";
+  if (!Number.isSafeInteger(value)) return "—";
+  if (value === 0) return "0 Б";
   return `${value > 0 ? "+" : "−"}${formatBytes(Math.abs(value))}`;
 }
 
-function createUnavailableSection(titleText, detailText) {
-  const section = document.createElement("section");
-  section.className = "operational-section";
-  const heading = document.createElement("h4");
-  const detail = document.createElement("p");
-  heading.textContent = titleText;
-  detail.className = "integration-unavailable";
-  detail.textContent = detailText;
-  section.append(heading, detail);
-  return section;
+function createUnavailableCell() {
+  return createSummaryCell("Не настроено", "unknown");
 }
 
-function createOperationSection(titleText, cached, predicate, emptyText) {
-  const section = document.createElement("section");
-  section.className = "operational-section";
-  const heading = document.createElement("h4");
-  heading.textContent = titleText;
-  section.append(heading);
+function createOperationCell(cached, predicate) {
   if (!cached) {
-    const loading = document.createElement("p");
-    loading.className = "integration-loading";
-    loading.textContent = "Загружается история операций…";
-    section.append(loading);
-    return section;
+    return createSummaryCell("Загрузка…", "loading");
   }
   if (cached.error) {
-    const error = document.createElement("p");
-    error.className = "integration-error";
-    error.textContent = cached.error;
-    section.append(error);
-    return section;
+    return createSummaryCell("Недоступно", "error");
   }
   const matching = cached.operations.filter(predicate);
   if (matching.length === 0) {
-    const empty = document.createElement("p");
-    empty.className = "integration-empty";
-    empty.textContent = emptyText;
-    section.append(empty);
-    return section;
+    return createSummaryCell("Нет", "unknown");
   }
-  const list = document.createElement("ol");
-  list.className = "operation-list";
-  for (const operation of matching.slice(0, 5)) {
-    list.append(createOperationItem(operation));
-  }
-  section.append(list);
-  return section;
+  const latest = matching.reduce((selected, operation) => (
+    Number(operation.updated_at_ms) > Number(selected.updated_at_ms) ? operation : selected
+  ));
+  const result = operationResultPresentation(latest.result);
+  const kind = latest.operation_kind === "code_rollback"
+    ? `${operationKindLabel(latest.operation_kind)} · `
+    : "";
+  const updated = Number.isFinite(latest.updated_at_ms)
+    ? new Date(latest.updated_at_ms).toLocaleString("ru-RU")
+    : "Время неизвестно";
+  return createSummaryCell(`${kind}${result.label}`, result.state, updated);
 }
 
-function createOperationItem(operation) {
-  const item = document.createElement("li");
-  const summary = document.createElement("div");
-  summary.className = "operation-summary";
-  const kind = document.createElement("strong");
-  kind.textContent = operationKindLabel(operation.operation_kind);
-  const result = operationResultPresentation(operation.result);
-  const state = document.createElement("span");
-  state.dataset.state = result.state;
-  state.textContent = result.label;
-  summary.append(kind, state);
-  const detail = document.createElement("p");
-  const updated = Number.isFinite(operation.updated_at_ms)
-    ? new Date(operation.updated_at_ms).toLocaleString("ru-RU")
-    : "время неизвестно";
-  detail.textContent = `${operationPhaseLabel(operation.phase)} · ${updated}`;
-  item.append(summary, detail);
-  if (typeof operation.target_commit === "string") {
-    const target = document.createElement("code");
-    target.textContent = operation.target_commit.slice(0, 12);
-    item.append(target);
+function createSummaryCell(primaryText, state, detailText = null) {
+  const cell = document.createElement("td");
+  cell.className = "project-summary-cell";
+  cell.dataset.state = state;
+  const primary = document.createElement("strong");
+  primary.textContent = primaryText;
+  cell.append(primary);
+  if (detailText) {
+    const detail = document.createElement("small");
+    detail.className = "project-cell-detail";
+    detail.textContent = detailText;
+    cell.append(detail);
   }
-  if (operation.failure?.summary) {
-    const failure = document.createElement("p");
-    failure.className = "operation-failure";
-    failure.textContent = `${operation.failure.code}: ${operation.failure.summary}`;
-    item.append(failure);
-  }
-  return item;
+  return cell;
 }
 
 async function loadProjectOperations(projectId, refresh) {

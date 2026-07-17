@@ -45,21 +45,16 @@
 
       <section class="host-overview" aria-labelledby="host-heading">
         <div class="section-heading">
-          <div>
-            <p class="eyebrow">Текущий узел</p>
-            <h2 id="host-heading">Ресурсы сервера</h2>
-          </div>
+          <h2 id="host-heading">Ресурсы сервера</h2>
           <p id="host-observation-status" class="state-label" data-state="unknown">
             ◌ Ожидание первого измерения
           </p>
         </div>
 
-        <p id="host-history-status" class="history-status" role="status">
-          Загружается история измерений.
-        </p>
+        <p id="host-history-status" class="history-status" data-state="loading" hidden></p>
         <div class="table-scroll resource-table-scroll" tabindex="0" aria-label="Ресурсы сервера по периодам">
           <table class="resource-table">
-            <caption>Текущие ресурсы сервера и медианные значения за завершённые периоды</caption>
+            <caption>Ресурсы сервера сейчас и за завершённые периоды</caption>
             <thead>
               <tr>
                 <th scope="col">Ресурс</th>
@@ -96,20 +91,12 @@
                 <td data-history-window="month" data-history-metric="disk_used_percent">—</td>
               </tr>
               <tr>
-                <th scope="row">Сеть <small>приём / передача</small></th>
+                <th scope="row">Трафик <small>принято / передано</small></th>
                 <td><strong id="metric-network">—</strong><small id="metric-network-detail">Нет данных</small></td>
                 <td data-history-window="hour" data-history-metric="network">—</td>
                 <td data-history-window="day" data-history-metric="network">—</td>
                 <td data-history-window="week" data-history-metric="network">—</td>
                 <td data-history-window="month" data-history-metric="network">—</td>
-              </tr>
-              <tr>
-                <th scope="row">PSI <small>CPU / RAM / IO, avg10</small></th>
-                <td><strong id="metric-psi">—</strong></td>
-                <td data-history-window="hour" data-history-metric="psi">—</td>
-                <td data-history-window="day" data-history-metric="psi">—</td>
-                <td data-history-window="week" data-history-metric="psi">—</td>
-                <td data-history-window="month" data-history-metric="psi">—</td>
               </tr>
             </tbody>
           </table>
@@ -128,10 +115,29 @@
             <p class="eyebrow">Управляемые процессы</p>
             <h2 id="projects-heading">Проекты</h2>
           </div>
-          <p id="project-count" class="section-meta">0 подключено</p>
+          <p id="project-count" class="section-meta">0 проектов</p>
         </div>
-        <div id="project-list" class="project-list">
-          <p class="empty-state">Проекты ещё не подключены.</p>
+        <div class="table-scroll project-table-scroll" tabindex="0" aria-label="Сводка по проектам">
+          <table class="project-table">
+            <caption>Состояние production-проектов и подключённых источников</caption>
+            <thead>
+              <tr>
+                <th scope="col">Проект</th>
+                <th scope="col">Состояние</th>
+                <th scope="col">Ресурсы</th>
+                <th scope="col">Деплои</th>
+                <th scope="col">Бэкапы</th>
+                <th scope="col">Репозиторий</th>
+                <th scope="col">Обновления</th>
+                <th scope="col">Ошибки</th>
+              </tr>
+            </thead>
+            <tbody id="project-list">
+              <tr>
+                <td class="empty-state" colspan="8">Проекты ещё не подключены.</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </section>
 

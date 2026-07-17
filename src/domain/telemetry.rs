@@ -67,6 +67,15 @@ pub struct HostMetricMedians {
     pub psi_io_some_avg10: Option<f64>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostMetricTotals {
+    pub network_rx_bytes: Option<u64>,
+    pub network_tx_bytes: Option<u64>,
+    pub network_rx_covered_ms: u64,
+    pub network_tx_covered_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostHistoryWindow {
@@ -78,6 +87,7 @@ pub struct HostHistoryWindow {
     pub expected_minutes: u64,
     pub complete: bool,
     pub medians: HostMetricMedians,
+    pub totals: HostMetricTotals,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]

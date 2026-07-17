@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     HostHistorySnapshot, HostHistoryWindow, HostHistoryWindowKind, HostMetricMedians,
-    HostTelemetry, ObservationStatus, ProjectCondition, ProjectId, ProjectRepositorySample,
-    ProjectTelemetry, PsiMeasurement, truncate_utf8,
+    HostMetricTotals, HostTelemetry, ObservationStatus, ProjectCondition, ProjectId,
+    ProjectRepositorySample, ProjectTelemetry, PsiMeasurement, truncate_utf8,
 };
 use crate::source::SourceTreeObservationV1;
 
@@ -22,7 +22,7 @@ const LOG_SKETCH_RELATIVE_ACCURACY: f64 = 0.01;
 const ROLLUP_DETAIL_MAX_BYTES: usize = 1_024;
 const ROLLUP_REASON_MAX_BYTES: usize = 512;
 const ROLLUP_REASON_LIMIT: usize = 8;
-const HOST_HISTORY_SCHEMA_VERSION: u16 = 1;
+const HOST_HISTORY_SCHEMA_VERSION: u16 = 2;
 pub const PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS: i64 = 60 * 60 * 1_000;
 pub const PROJECT_REPOSITORY_HISTORY_LIMIT: usize = 24 * 31 + 1;
 const HOST_HISTORY_WINDOWS: [(HostHistoryWindowKind, i64, u64); 4] = [
@@ -238,6 +238,137 @@ impl HostMetricSketches {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
+pub struct MonotonicCounterDelta {
+    first_observed_at_ms: Option<i64>,
+    first_value: Option<u64>,
+    last_observed_at_ms: Option<i64>,
+    last_value: Option<u64>,
+    total_increase: u64,
+    covered_ms: u64,
+}
+
+impl MonotonicCounterDelta {
+    fn add(&mut self, observed_at_ms: i64, value: Option<u64>) {
+        let Some(value) = value else { return };
+        let (Some(last_at), Some(last_value)) = (self.last_observed_at_ms, self.last_value) else {
+            self.set_first_and_last(observed_at_ms, value);
+            return;
+        };
+        if observed_at_ms <= last_at {
+            return;
+        }
+        self.add_interval(last_at, last_value, observed_at_ms, value);
+        self.last_observed_at_ms = Some(observed_at_ms);
+        self.last_value = Some(value);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        let (Some(self_first_at), Some(self_last_at)) =
+            (self.first_observed_at_ms, self.last_observed_at_ms)
+        else {
+            self.clone_from(other);
+            return;
+        };
+        let (Some(other_first_at), Some(other_last_at)) =
+            (other.first_observed_at_ms, other.last_observed_at_ms)
+        else {
+            return;
+        };
+        if self_last_at <= other_first_at {
+            self.append(other);
+        } else if other_last_at <= self_first_at {
+            let mut combined = other.clone();
+            combined.append(self);
+            *self = combined;
+        } else {
+            self.merge_overlapping(other);
+        }
+    }
+
+    const fn total(&self) -> Option<u64> {
+        if self.covered_ms == 0 {
+            None
+        } else {
+            Some(self.total_increase)
+        }
+    }
+
+    const fn covered_ms(&self) -> u64 {
+        self.covered_ms
+    }
+
+    fn set_first_and_last(&mut self, observed_at_ms: i64, value: u64) {
+        self.first_observed_at_ms = Some(observed_at_ms);
+        self.first_value = Some(value);
+        self.last_observed_at_ms = Some(observed_at_ms);
+        self.last_value = Some(value);
+    }
+
+    fn append(&mut self, later: &Self) {
+        let (Some(last_at), Some(last_value), Some(first_at), Some(first_value)) = (
+            self.last_observed_at_ms,
+            self.last_value,
+            later.first_observed_at_ms,
+            later.first_value,
+        ) else {
+            return;
+        };
+        self.total_increase = self.total_increase.saturating_add(later.total_increase);
+        self.covered_ms = self.covered_ms.saturating_add(later.covered_ms);
+        self.add_interval(last_at, last_value, first_at, first_value);
+        self.last_observed_at_ms = later.last_observed_at_ms;
+        self.last_value = later.last_value;
+    }
+
+    fn merge_overlapping(&mut self, other: &Self) {
+        if other.first_observed_at_ms < self.first_observed_at_ms {
+            self.first_observed_at_ms = other.first_observed_at_ms;
+            self.first_value = other.first_value;
+        }
+        if other.last_observed_at_ms > self.last_observed_at_ms {
+            self.last_observed_at_ms = other.last_observed_at_ms;
+            self.last_value = other.last_value;
+        }
+        self.total_increase = self.total_increase.max(other.total_increase);
+        self.covered_ms = self.covered_ms.max(other.covered_ms);
+    }
+
+    fn add_interval(&mut self, first_at: i64, first: u64, last_at: i64, last: u64) {
+        if last_at <= first_at || last < first {
+            return;
+        }
+        let Some(duration) = last_at.checked_sub(first_at) else {
+            return;
+        };
+        let Ok(duration_ms) = u64::try_from(duration) else {
+            return;
+        };
+        self.total_increase = self.total_increase.saturating_add(last - first);
+        self.covered_ms = self.covered_ms.saturating_add(duration_ms);
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct NetworkTrafficRollup {
+    pub rx: MonotonicCounterDelta,
+    pub tx: MonotonicCounterDelta,
+}
+
+impl NetworkTrafficRollup {
+    fn add(&mut self, sample: &HostTelemetry) {
+        self.rx.add(sample.observed_at_ms, sample.network_rx_bytes);
+        self.tx.add(sample.observed_at_ms, sample.network_tx_bytes);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.rx.merge(&other.rx);
+        self.tx.merge(&other.tx);
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct ObservationStatusCounts {
     pub fresh: u64,
     pub stale: u64,
@@ -318,6 +449,8 @@ pub struct HostMinuteRollup {
     pub last_partial_reasons: Vec<String>,
     pub statuses: ObservationStatusCounts,
     pub metrics: HostMetricSketches,
+    #[serde(default)]
+    pub traffic: NetworkTrafficRollup,
 }
 
 impl HostMinuteRollup {
@@ -330,6 +463,7 @@ impl HostMinuteRollup {
             last_partial_reasons: Vec::new(),
             statuses: ObservationStatusCounts::default(),
             metrics: HostMetricSketches::default(),
+            traffic: NetworkTrafficRollup::default(),
         }
     }
 
@@ -351,6 +485,7 @@ impl HostMinuteRollup {
         }
         self.statuses.add(sample.status);
         self.metrics.add(sample);
+        self.traffic.add(sample);
     }
 
     fn merge(&mut self, other: &Self) {
@@ -367,6 +502,7 @@ impl HostMinuteRollup {
         }
         self.statuses.merge(&other.statuses);
         self.metrics.merge(&other.metrics);
+        self.traffic.merge(&other.traffic);
     }
 }
 
@@ -795,6 +931,12 @@ fn aggregate_host_window(
             psi_cpu_some_avg10: aggregate.metrics.psi_cpu_some_avg10.quantile(0.5),
             psi_memory_some_avg10: aggregate.metrics.psi_memory_some_avg10.quantile(0.5),
             psi_io_some_avg10: aggregate.metrics.psi_io_some_avg10.quantile(0.5),
+        },
+        totals: HostMetricTotals {
+            network_rx_bytes: aggregate.traffic.rx.total(),
+            network_tx_bytes: aggregate.traffic.tx.total(),
+            network_rx_covered_ms: aggregate.traffic.rx.covered_ms(),
+            network_tx_covered_ms: aggregate.traffic.tx.covered_ms(),
         },
     })
 }
