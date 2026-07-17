@@ -1,8 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderValue, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response, Sse},
@@ -16,7 +16,10 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use crate::{
     authorization::inspect_unverified_action_grant,
     controller::{DurableController, TabLeaseClaim},
-    domain::{DashboardSnapshot, GitCommitId, OperationKind, ProjectId, ReleaseClass},
+    domain::{
+        BlockingReason, DashboardSnapshot, GitCommitId, OperationKind, OperationPhase,
+        OperationRecord, OperationResult, ProjectId, ProjectRepositorySample, ReleaseClass,
+    },
     executor_intent::{
         ExecutorIntentConsequenceV1, ExecutorIntentRequiredRoleV1,
         inspect_unverified_executor_intent,
@@ -25,7 +28,7 @@ use crate::{
     mutation_admission::{
         ExecuteMutationGrantV1, ObserveMutationStatusV1, PrepareMutationIntentV1,
     },
-    store::StoreError,
+    store::{MetricsStore, PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, StoreError},
     unix_time_ms,
 };
 
@@ -63,6 +66,9 @@ pub struct DashboardState {
     pub retention_error: Arc<RwLock<Option<String>>>,
     pub sample_interval: Duration,
     pub mutation_api: Option<Arc<DashboardMutationApiV1>>,
+    pub metrics_store: Option<MetricsStore>,
+    pub operation_history: Option<DurableController>,
+    pub project_repository_errors: Arc<RwLock<BTreeMap<String, String>>>,
 }
 
 impl DashboardState {
@@ -74,12 +80,27 @@ impl DashboardState {
             retention_error: Arc::new(RwLock::new(None)),
             sample_interval,
             mutation_api: None,
+            metrics_store: None,
+            operation_history: None,
+            project_repository_errors: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
     #[must_use]
     pub fn with_mutation_api(mut self, mutation_api: DashboardMutationApiV1) -> Self {
         self.mutation_api = Some(Arc::new(mutation_api));
+        self
+    }
+
+    #[must_use]
+    pub fn with_metrics_store(mut self, metrics_store: MetricsStore) -> Self {
+        self.metrics_store = Some(metrics_store);
+        self
+    }
+
+    #[must_use]
+    pub fn with_operation_history(mut self, controller: DurableController) -> Self {
+        self.operation_history = Some(controller);
         self
     }
 }
@@ -98,6 +119,15 @@ pub fn router_with_access(
         .route("/assets/app.js", get(script))
         .route("/assets/status.js", get(status_script))
         .route("/api/v1/snapshot", get(snapshot))
+        .route("/api/v1/host-history", get(host_history))
+        .route(
+            "/api/v1/projects/{project_id}/operations",
+            get(project_operations),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/repository-history",
+            get(project_repository_history),
+        )
         .route("/api/v1/events", get(events))
         .route("/api/v1/mutations/capabilities", get(mutation_capabilities))
         .route("/api/v1/mutations/lease", post(takeover_mutation_lease))
@@ -222,6 +252,205 @@ async fn snapshot(State(state): State<DashboardState>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "snapshot_unavailable",
             "No complete host snapshot has been collected yet.",
+        )
+        .into_response(),
+    }
+}
+
+async fn host_history(State(state): State<DashboardState>) -> Response {
+    let Some(metrics_store) = state.metrics_store.clone() else {
+        return ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics_history_unavailable",
+            "Historical metrics are not configured.",
+        )
+        .into_response();
+    };
+    let generated_at_ms = match unix_time_ms() {
+        Ok(value) => value,
+        Err(error) => return clock_problem(&error),
+    };
+    match tokio::task::spawn_blocking(move || metrics_store.host_history(generated_at_ms)).await {
+        Ok(Ok(history)) => Json(history).into_response(),
+        Ok(Err(error)) => store_problem(&error),
+        Err(_) => ApiProblem::response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "metrics_history_failed",
+            "Historical metrics could not be calculated.",
+        )
+        .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectOperationsQuery {
+    limit: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectOperationFailureResponse {
+    failing_step: String,
+    code: String,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectOperationResponse {
+    operation_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+    attempt_number: u32,
+    operation_kind: OperationKind,
+    target_commit: Option<GitCommitId>,
+    phase: OperationPhase,
+    result: OperationResult,
+    blocking_reason: BlockingReason,
+    failure: Option<ProjectOperationFailureResponse>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl From<OperationRecord> for ProjectOperationResponse {
+    fn from(operation: OperationRecord) -> Self {
+        let failure = operation
+            .failure_capsule
+            .map(|failure| ProjectOperationFailureResponse {
+                failing_step: failure.failing_step,
+                code: failure.error.code,
+                summary: failure.error.summary,
+            });
+        Self {
+            operation_id: operation.operation_id,
+            attempt_id: operation.attempt_id,
+            attempt_number: operation.attempt_number,
+            operation_kind: operation.operation_kind,
+            target_commit: operation.target_commit,
+            phase: operation.state.phase,
+            result: operation.state.result,
+            blocking_reason: operation.state.blocking_reason,
+            failure,
+            created_at_ms: operation.created_at_ms,
+            updated_at_ms: operation.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectOperationsResponse {
+    schema_version: u16,
+    generated_at_ms: i64,
+    project_id: ProjectId,
+    operations: Vec<ProjectOperationResponse>,
+}
+
+async fn project_operations(
+    State(state): State<DashboardState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Query(query): Query<ProjectOperationsQuery>,
+) -> Response {
+    let Some(controller) = state.operation_history.clone() else {
+        return ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operation_history_unavailable",
+            "Project operation history is not configured.",
+        )
+        .into_response();
+    };
+    let limit = usize::from(query.limit.unwrap_or(10));
+    if !(1..=50).contains(&limit) {
+        return ApiProblem::response(
+            StatusCode::BAD_REQUEST,
+            "invalid_operation_limit",
+            "Operation history limit must be between 1 and 50.",
+        )
+        .into_response();
+    }
+    let generated_at_ms = match unix_time_ms() {
+        Ok(value) => value,
+        Err(error) => return clock_problem(&error),
+    };
+    let response_project = project_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        controller.recent_project_operations(&project_id, limit)
+    })
+    .await
+    {
+        Ok(Ok(operations)) => Json(ProjectOperationsResponse {
+            schema_version: 1,
+            generated_at_ms,
+            project_id: response_project,
+            operations: operations
+                .into_iter()
+                .map(ProjectOperationResponse::from)
+                .collect(),
+        })
+        .into_response(),
+        Ok(Err(error)) => store_problem(&error),
+        Err(_) => ApiProblem::response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "operation_history_failed",
+            "Project operation history could not be loaded.",
+        )
+        .into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectRepositoryHistoryResponse {
+    schema_version: u16,
+    generated_at_ms: i64,
+    project_id: ProjectId,
+    collection_interval_seconds: u64,
+    last_collection_error: Option<String>,
+    samples: Vec<ProjectRepositorySample>,
+}
+
+async fn project_repository_history(
+    State(state): State<DashboardState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Response {
+    let Some(metrics_store) = state.metrics_store.clone() else {
+        return ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository_history_unavailable",
+            "Project repository history is not configured.",
+        )
+        .into_response();
+    };
+    let generated_at_ms = match unix_time_ms() {
+        Ok(value) => value,
+        Err(error) => return clock_problem(&error),
+    };
+    let since_ms = generated_at_ms.saturating_sub(31 * 24 * 60 * 60 * 1_000);
+    let response_project = project_id.clone();
+    let last_collection_error = state
+        .project_repository_errors
+        .read()
+        .await
+        .get(project_id.as_str())
+        .cloned();
+    match tokio::task::spawn_blocking(move || {
+        metrics_store.project_repository_history(&project_id, since_ms)
+    })
+    .await
+    {
+        Ok(Ok(samples)) => Json(ProjectRepositoryHistoryResponse {
+            schema_version: 1,
+            generated_at_ms,
+            project_id: response_project,
+            collection_interval_seconds: u64::try_from(
+                PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS / 1_000,
+            )
+            .unwrap_or(u64::MAX),
+            last_collection_error,
+            samples,
+        })
+        .into_response(),
+        Ok(Err(error)) => store_problem(&error),
+        Err(_) => ApiProblem::response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "repository_history_failed",
+            "Project repository history could not be loaded.",
         )
         .into_response(),
     }

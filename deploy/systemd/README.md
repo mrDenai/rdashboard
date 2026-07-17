@@ -143,8 +143,10 @@ non-root UID assigned to `rdashboardd`. The socket group permits the controller 
 the executor independently requires the configured peer UID on every accepted connection.
 
 Do not add Docker, arbitrary command, writable project-tree or adapter credential access to this
-long-running unit. Admitted backup and bootstrap effects run only in separately constrained
-transient units.
+long-running unit. Its base `rdashboard-source` supplementary group permits only the source
+broker's versioned, root-peer-authenticated snapshot and accepted-tree observation protocol; no
+repository path or Git command is exposed. Admitted backup and bootstrap effects run only in
+separately constrained transient units.
 
 The root executor configuration accepts an optional `mutation_authority` object. Omitting it keeps
 the current read-only behavior and does not require a signing credential. When mutation authority
@@ -160,8 +162,9 @@ Install the executor-intent private seed as exactly 32 raw bytes at
 `executor-intent-seed` service credential; the executor rejects symlinks, wrong ownership or mode,
 size changes, inode replacement and a seed that does not match the configured public key. Do not
 put the private seed in `executor.json` or an environment variable. The same drop-in grants only
-the three read/connect groups needed by bootstrap: `rdashboard-build-readers`, `rdashboard-source`
-and the host's `chrony` group. These groups must exist before the unit is reloaded.
+the two additional read/connect groups needed by bootstrap: `rdashboard-build-readers` and the
+host's `chrony` group. The base unit already carries `rdashboard-source` for read-only accepted-tree
+observation. These groups must exist before the unit is reloaded.
 
 Loading this authority enables the installed backup resolver plus the first-bootstrap deploy
 resolver and their shared sequential worker. The service opens its root-only journal at

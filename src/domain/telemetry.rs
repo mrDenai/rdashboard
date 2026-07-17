@@ -44,6 +44,60 @@ pub struct HostTelemetry {
     pub partial_reasons: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostHistoryWindowKind {
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostMetricMedians {
+    pub cpu_percent: Option<f64>,
+    pub load_1: Option<f64>,
+    pub memory_used_percent: Option<f64>,
+    pub disk_used_percent: Option<f64>,
+    pub network_rx_bytes_per_second: Option<f64>,
+    pub network_tx_bytes_per_second: Option<f64>,
+    pub psi_cpu_some_avg10: Option<f64>,
+    pub psi_memory_some_avg10: Option<f64>,
+    pub psi_io_some_avg10: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostHistoryWindow {
+    pub window: HostHistoryWindowKind,
+    pub starts_at_ms: i64,
+    pub ends_at_ms: i64,
+    pub sample_count: u64,
+    pub covered_minutes: u64,
+    pub expected_minutes: u64,
+    pub complete: bool,
+    pub medians: HostMetricMedians,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostHistorySnapshot {
+    pub schema_version: u16,
+    pub generated_at_ms: i64,
+    pub complete_through_ms: i64,
+    pub windows: Vec<HostHistoryWindow>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectRepositorySample {
+    pub observed_at_ms: i64,
+    pub head: super::GitCommitId,
+    pub file_count: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DashboardSnapshot {

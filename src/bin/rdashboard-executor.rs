@@ -28,6 +28,7 @@ use rdashboard::installed_effects::{
 };
 use rdashboard::installed_intent_resolver::InstalledMutationIntentResolverV1;
 use rdashboard::mutation_admission::RootMutationAdmissionV1;
+use rdashboard::source_socket::SourceBrokerClientV1;
 use rdashboard::store::SecurityStore;
 use tokio::sync::{Notify, watch};
 use tracing::{error, info};
@@ -79,7 +80,9 @@ async fn main() -> Result<(), DynError> {
             None,
         ),
     };
-    let handler = Arc::new(handler);
+    let source_client =
+        SourceBrokerClientV1::installed(Duration::from_millis(config.request_timeout_ms))?;
+    let handler = Arc::new(handler.with_source_client(source_client));
     let mut socket = BoundExecutorSocket::bind(&config.socket_path)?;
     let listener = socket.take_listener();
     info!(

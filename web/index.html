@@ -54,137 +54,72 @@
           </p>
         </div>
 
-        <dl class="metric-strip">
-          <div class="metric-block">
-            <dt>CPU</dt>
-            <dd id="metric-cpu">—</dd>
-            <small id="metric-load">Load —</small>
-          </div>
-          <div class="metric-block">
-            <dt>Память</dt>
-            <dd id="metric-memory">—</dd>
-            <small id="metric-memory-detail">Нет данных</small>
-          </div>
-          <div class="metric-block">
-            <dt>Диск</dt>
-            <dd id="metric-disk">—</dd>
-            <small id="metric-disk-detail">Нет данных</small>
-          </div>
-          <div class="metric-block">
-            <dt>Сеть</dt>
-            <dd id="metric-network">—</dd>
-            <small id="metric-network-detail">Нет данных</small>
-          </div>
-          <div class="metric-block">
-            <dt>PSI CPU / RAM / IO</dt>
-            <dd id="metric-psi">—</dd>
-            <small>avg10, % времени ожидания</small>
-          </div>
-        </dl>
+        <p id="host-history-status" class="history-status" role="status">
+          Загружается история измерений.
+        </p>
+        <div class="table-scroll resource-table-scroll" tabindex="0" aria-label="Ресурсы сервера по периодам">
+          <table class="resource-table">
+            <caption>Текущие ресурсы сервера и медианные значения за завершённые периоды</caption>
+            <thead>
+              <tr>
+                <th scope="col">Ресурс</th>
+                <th scope="col">Сейчас</th>
+                <th scope="col">За час <small id="history-hour-coverage">медиана</small></th>
+                <th scope="col">За день <small id="history-day-coverage">медиана</small></th>
+                <th scope="col">За неделю <small id="history-week-coverage">медиана</small></th>
+                <th scope="col">За месяц <small id="history-month-coverage">медиана</small></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">CPU <small>загрузка</small></th>
+                <td><strong id="metric-cpu">—</strong><small id="metric-load">Load —</small></td>
+                <td data-history-window="hour" data-history-metric="cpu_percent">—</td>
+                <td data-history-window="day" data-history-metric="cpu_percent">—</td>
+                <td data-history-window="week" data-history-metric="cpu_percent">—</td>
+                <td data-history-window="month" data-history-metric="cpu_percent">—</td>
+              </tr>
+              <tr>
+                <th scope="row">Память <small>занято</small></th>
+                <td><strong id="metric-memory">—</strong><small id="metric-memory-detail">Нет данных</small></td>
+                <td data-history-window="hour" data-history-metric="memory_used_percent">—</td>
+                <td data-history-window="day" data-history-metric="memory_used_percent">—</td>
+                <td data-history-window="week" data-history-metric="memory_used_percent">—</td>
+                <td data-history-window="month" data-history-metric="memory_used_percent">—</td>
+              </tr>
+              <tr>
+                <th scope="row">Диск <small>занято</small></th>
+                <td><strong id="metric-disk">—</strong><small id="metric-disk-detail">Нет данных</small></td>
+                <td data-history-window="hour" data-history-metric="disk_used_percent">—</td>
+                <td data-history-window="day" data-history-metric="disk_used_percent">—</td>
+                <td data-history-window="week" data-history-metric="disk_used_percent">—</td>
+                <td data-history-window="month" data-history-metric="disk_used_percent">—</td>
+              </tr>
+              <tr>
+                <th scope="row">Сеть <small>приём / передача</small></th>
+                <td><strong id="metric-network">—</strong><small id="metric-network-detail">Нет данных</small></td>
+                <td data-history-window="hour" data-history-metric="network">—</td>
+                <td data-history-window="day" data-history-metric="network">—</td>
+                <td data-history-window="week" data-history-metric="network">—</td>
+                <td data-history-window="month" data-history-metric="network">—</td>
+              </tr>
+              <tr>
+                <th scope="row">PSI <small>CPU / RAM / IO, avg10</small></th>
+                <td><strong id="metric-psi">—</strong></td>
+                <td data-history-window="hour" data-history-metric="psi">—</td>
+                <td data-history-window="day" data-history-metric="psi">—</td>
+                <td data-history-window="week" data-history-metric="psi">—</td>
+                <td data-history-window="month" data-history-metric="psi">—</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section id="partial-panel" class="partial-panel" aria-labelledby="partial-heading" hidden>
         <h2 id="partial-heading">Неполное наблюдение</h2>
         <p>Некоторые источники недоступны; отсутствующие значения не считаются нулевыми.</p>
         <ul id="partial-reasons"></ul>
-      </section>
-
-      <section class="operation-workspace" aria-labelledby="operations-heading">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">Изменения production</p>
-            <h2 id="operations-heading">Контур операций</h2>
-          </div>
-          <p id="mutation-capability" class="state-label" data-state="unknown">
-            ◌ Проверка конфигурации
-          </p>
-        </div>
-
-        <div class="operation-grid">
-          <section aria-labelledby="new-operation-heading">
-            <h3 id="new-operation-heading">Новая операция</h3>
-            <p class="body-copy">
-              Запуск требует отдельной авторизации и подписанного одноразового разрешения.
-            </p>
-            <div class="operation-actions" aria-describedby="mutation-start-reason">
-              <button class="primary-action" type="button" disabled>Подготовить деплой</button>
-              <button class="secondary-action" type="button" disabled>Создать резервную копию</button>
-            </div>
-            <p id="mutation-start-reason" class="availability-reason">
-              Авторизатор действий не подключён. Запуск операций остаётся заблокированным.
-            </p>
-          </section>
-
-          <section aria-labelledby="operation-status-heading">
-            <h3 id="operation-status-heading">Наблюдение за операцией</h3>
-            <form id="mutation-status-form" novalidate>
-              <div class="identifier-fields">
-                <div class="form-field">
-                  <label for="mutation-intent-id">Intent ID</label>
-                  <input
-                    id="mutation-intent-id"
-                    name="intent_id"
-                    type="text"
-                    inputmode="text"
-                    autocomplete="off"
-                    spellcheck="false"
-                    aria-describedby="mutation-intent-hint mutation-intent-error"
-                    required
-                  >
-                  <small id="mutation-intent-hint">UUID из подготовленной операции</small>
-                  <span id="mutation-intent-error" class="field-error" hidden></span>
-                </div>
-                <div class="form-field">
-                  <label for="mutation-attempt-id">Attempt ID</label>
-                  <input
-                    id="mutation-attempt-id"
-                    name="attempt_id"
-                    type="text"
-                    inputmode="text"
-                    autocomplete="off"
-                    spellcheck="false"
-                    aria-describedby="mutation-attempt-hint mutation-attempt-error"
-                    required
-                  >
-                  <small id="mutation-attempt-hint">UUID конкретной попытки выполнения</small>
-                  <span id="mutation-attempt-error" class="field-error" hidden></span>
-                </div>
-              </div>
-              <button id="mutation-status-submit" class="secondary-action" type="submit" disabled>
-                Показать состояние
-              </button>
-            </form>
-
-            <p id="mutation-status-message" class="body-copy" role="status">
-              Наблюдение станет доступно после подключения root executor.
-            </p>
-            <dl id="mutation-status-detail" class="operation-status-detail" hidden>
-              <div>
-                <dt>Состояние</dt>
-                <dd id="mutation-state" data-state="unknown">—</dd>
-              </div>
-              <div>
-                <dt>Проект / операция</dt>
-                <dd id="mutation-operation">—</dd>
-              </div>
-              <div>
-                <dt>Текущая фаза</dt>
-                <dd id="mutation-phase">—</dd>
-              </div>
-              <div>
-                <dt>Завершённые фазы</dt>
-                <dd id="mutation-completed-phases">—</dd>
-              </div>
-              <div>
-                <dt>Последнее изменение</dt>
-                <dd id="mutation-updated-at">—</dd>
-              </div>
-            </dl>
-            <button id="mutation-status-retry" class="secondary-action" type="button" hidden>
-              Повторить запрос
-            </button>
-          </section>
-        </div>
       </section>
 
       <section class="project-workspace" aria-labelledby="projects-heading">
@@ -195,23 +130,8 @@
           </div>
           <p id="project-count" class="section-meta">0 подключено</p>
         </div>
-        <div class="table-scroll" tabindex="0" aria-label="Прокручиваемая таблица проектов">
-          <table>
-            <caption>Состояние проектов и свежесть наблюдений</caption>
-            <thead>
-              <tr>
-                <th scope="col">Проект</th>
-                <th scope="col">Состояние</th>
-                <th scope="col">Наблюдение</th>
-                <th scope="col">Подробности</th>
-              </tr>
-            </thead>
-            <tbody id="project-rows">
-              <tr>
-                <td colspan="4" class="empty-cell">Проекты ещё не подключены.</td>
-              </tr>
-            </tbody>
-          </table>
+        <div id="project-list" class="project-list">
+          <p class="empty-state">Проекты ещё не подключены.</p>
         </div>
       </section>
 

@@ -34,6 +34,17 @@ const operationKindLabels = Object.freeze({
   backup_only: "резервная копия",
 });
 
+const operationResultLabels = Object.freeze({
+  running: { state: "running", label: "↻ Выполняется" },
+  succeeded: { state: "succeeded", label: "● Завершено" },
+  failed: { state: "error", label: "× Ошибка" },
+  rolled_back: { state: "partial", label: "△ Выполнен откат" },
+  rollback_failed: { state: "error", label: "× Откат не удался" },
+  cancelled: { state: "unknown", label: "◇ Отменено" },
+  superseded: { state: "unknown", label: "◇ Заменено новым" },
+  manual_recovery_required: { state: "error", label: "× Требуется восстановление" },
+});
+
 const operationPhaseLabels = Object.freeze({
   queued: "В очереди",
   syncing_source: "Синхронизация исходников",
@@ -102,6 +113,27 @@ export function formatSampleAge(ageSeconds) {
     : `${Math.floor(ageSeconds / 60)} мин назад`;
 }
 
+export function formatHistoryCoverage(window) {
+  if (
+    !window
+    || !Number.isSafeInteger(window.sample_count)
+    || window.sample_count < 0
+    || !Number.isSafeInteger(window.covered_minutes)
+    || window.covered_minutes < 0
+    || !Number.isSafeInteger(window.expected_minutes)
+    || window.expected_minutes <= 0
+    || window.covered_minutes > window.expected_minutes
+    || typeof window.complete !== "boolean"
+    || window.complete !== (window.covered_minutes === window.expected_minutes)
+  ) {
+    return "история некорректна";
+  }
+  if (window.sample_count === 0) return "нет данных";
+  if (window.complete) return "полная история";
+  const percent = Math.floor((window.covered_minutes / window.expected_minutes) * 100);
+  return `${percent} % истории`;
+}
+
 export function mutationStatePresentation(state) {
   const normalized = Object.hasOwn(mutationStateLabels, state) ? state : "unknown";
   return presentation(normalized, mutationStateLabels[normalized] ?? "? Неизвестно");
@@ -111,8 +143,41 @@ export function operationKindLabel(kind) {
   return operationKindLabels[kind] ?? "неизвестная операция";
 }
 
+export function operationResultPresentation(result) {
+  const value = operationResultLabels[result];
+  return value ? presentation(value.state, value.label) : presentation("unknown", "? Неизвестно");
+}
+
 export function operationPhaseLabel(phase) {
   return operationPhaseLabels[phase] ?? "Неизвестная фаза";
+}
+
+export function repositorySizeChange(samples, periodMs) {
+  if (!Array.isArray(samples) || samples.length < 2 || !Number.isFinite(periodMs) || periodMs <= 0) {
+    return null;
+  }
+  const latest = samples.at(-1);
+  if (!validRepositoryPoint(latest)) return null;
+  const targetMs = latest.observed_at_ms - periodMs;
+  let baseline = null;
+  let previousTime = -1;
+  for (const sample of samples) {
+    if (
+      !validRepositoryPoint(sample)
+      || sample.observed_at_ms <= previousTime
+      || sample.observed_at_ms > latest.observed_at_ms
+    ) return null;
+    if (sample.observed_at_ms <= targetMs) baseline = sample;
+    previousTime = sample.observed_at_ms;
+  }
+  return baseline ? latest.total_bytes - baseline.total_bytes : null;
+}
+
+function validRepositoryPoint(sample) {
+  return Number.isSafeInteger(sample?.observed_at_ms)
+    && sample.observed_at_ms >= 0
+    && Number.isSafeInteger(sample.total_bytes)
+    && sample.total_bytes >= 0;
 }
 
 function observation(status, ageSeconds) {

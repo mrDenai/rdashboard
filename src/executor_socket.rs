@@ -36,6 +36,8 @@ use crate::{
         ControlResponseEnvelope, ControlResponseV1, FrameError, NORMAL_FRAME_MAX_BYTES,
         OBSERVATION_FRAME_MAX_BYTES, ProtocolValidationError, read_frame, write_frame,
     },
+    source::SourceTreeObservationV1,
+    source_socket::SourceBrokerClientV1,
     unix_time_ms,
 };
 
@@ -84,6 +86,38 @@ impl RootExecutorClient {
                 Err(ExecutorClientError::Rejected { code, retryable })
             }
             ControlResponseV1::Negotiated { .. }
+            | ControlResponseV1::ProjectSourceSnapshot { .. }
+            | ControlResponseV1::OperationIntentPrepared { .. }
+            | ControlResponseV1::OperationAccepted { .. }
+            | ControlResponseV1::MutationStatus { .. } => {
+                self.negotiated.store(false, Ordering::Release);
+                Err(ExecutorClientError::UnexpectedResponse)
+            }
+        }
+    }
+
+    pub async fn observe_project_source(
+        &self,
+        project_id: crate::domain::ProjectId,
+    ) -> Result<SourceTreeObservationV1, ExecutorClientError> {
+        self.ensure_negotiated().await?;
+        let response = self
+            .exchange(ControlRequestV1::ObserveProjectSource {
+                project_id: project_id.clone(),
+            })
+            .await?;
+        match response {
+            ControlResponseV1::ProjectSourceSnapshot { snapshot }
+                if snapshot.project_id == project_id =>
+            {
+                Ok(snapshot)
+            }
+            ControlResponseV1::Rejected { code, retryable } => {
+                Err(ExecutorClientError::Rejected { code, retryable })
+            }
+            ControlResponseV1::Negotiated { .. }
+            | ControlResponseV1::HostSnapshot { .. }
+            | ControlResponseV1::ProjectSourceSnapshot { .. }
             | ControlResponseV1::OperationIntentPrepared { .. }
             | ControlResponseV1::OperationAccepted { .. }
             | ControlResponseV1::MutationStatus { .. } => {
@@ -114,6 +148,7 @@ impl RootExecutorClient {
             }
             ControlResponseV1::Negotiated { .. }
             | ControlResponseV1::HostSnapshot { .. }
+            | ControlResponseV1::ProjectSourceSnapshot { .. }
             | ControlResponseV1::OperationAccepted { .. }
             | ControlResponseV1::MutationStatus { .. } => {
                 self.negotiated.store(false, Ordering::Release);
@@ -151,6 +186,7 @@ impl RootExecutorClient {
             }
             ControlResponseV1::Negotiated { .. }
             | ControlResponseV1::HostSnapshot { .. }
+            | ControlResponseV1::ProjectSourceSnapshot { .. }
             | ControlResponseV1::OperationIntentPrepared { .. }
             | ControlResponseV1::OperationAccepted { .. }
             | ControlResponseV1::MutationStatus { .. } => {
@@ -182,6 +218,7 @@ impl RootExecutorClient {
             }
             ControlResponseV1::Negotiated { .. }
             | ControlResponseV1::HostSnapshot { .. }
+            | ControlResponseV1::ProjectSourceSnapshot { .. }
             | ControlResponseV1::OperationIntentPrepared { .. }
             | ControlResponseV1::OperationAccepted { .. }
             | ControlResponseV1::MutationStatus { .. } => {
@@ -212,6 +249,7 @@ impl RootExecutorClient {
             }
             ControlResponseV1::Negotiated { .. }
             | ControlResponseV1::HostSnapshot { .. }
+            | ControlResponseV1::ProjectSourceSnapshot { .. }
             | ControlResponseV1::OperationIntentPrepared { .. }
             | ControlResponseV1::OperationAccepted { .. }
             | ControlResponseV1::MutationStatus { .. } => {
@@ -352,6 +390,7 @@ pub trait ControlRequestHandler: Send + Sync {
 #[derive(Debug)]
 pub struct ReadOnlyExecutorHandler {
     host_collector: Mutex<HostCollector>,
+    source_client: Option<SourceBrokerClientV1>,
     mutation_authority: Option<RootExecutorAuthorityV1>,
     mutation_control: Option<Arc<dyn MutationControlV1>>,
 }
@@ -360,6 +399,7 @@ impl ReadOnlyExecutorHandler {
     pub fn linux(metrics_disk_path: impl Into<PathBuf>) -> Self {
         Self {
             host_collector: Mutex::new(HostCollector::linux(metrics_disk_path)),
+            source_client: None,
             mutation_authority: None,
             mutation_control: None,
         }
@@ -371,6 +411,7 @@ impl ReadOnlyExecutorHandler {
     ) -> Self {
         Self {
             host_collector: Mutex::new(HostCollector::linux(metrics_disk_path)),
+            source_client: None,
             mutation_authority: Some(mutation_authority),
             mutation_control: None,
         }
@@ -382,9 +423,16 @@ impl ReadOnlyExecutorHandler {
     ) -> Self {
         Self {
             host_collector: Mutex::new(HostCollector::linux(metrics_disk_path)),
+            source_client: None,
             mutation_authority: None,
             mutation_control: Some(mutation_control),
         }
+    }
+
+    #[must_use]
+    pub fn with_source_client(mut self, source_client: SourceBrokerClientV1) -> Self {
+        self.source_client = Some(source_client);
+        self
     }
 
     pub const fn mutation_authority_loaded(&self) -> bool {
@@ -488,6 +536,30 @@ impl ReadOnlyExecutorHandler {
             Err(failure) => Self::rejected(envelope, failure.code, failure.retryable),
         }
     }
+
+    fn observe_project_source(
+        &self,
+        envelope: &ControlRequestEnvelope,
+        project_id: &crate::domain::ProjectId,
+    ) -> ControlResponseEnvelope<ControlResponseV1> {
+        let Some(source_client) = self.source_client.as_ref() else {
+            return Self::rejected(
+                envelope,
+                ControlRejectionCodeV1::ProjectObservationNotConfigured,
+                false,
+            );
+        };
+        match source_client.observe_tree(project_id) {
+            Ok(snapshot) => Self::response(
+                envelope,
+                ControlResponseV1::ProjectSourceSnapshot { snapshot },
+            ),
+            Err(error) => {
+                warn!(project_id = %project_id, error = %error, "source tree observation failed");
+                Self::rejected(envelope, ControlRejectionCodeV1::InternalFailure, true)
+            }
+        }
+    }
 }
 
 impl ControlRequestHandler for ReadOnlyExecutorHandler {
@@ -542,6 +614,9 @@ impl ControlRequestHandler for ReadOnlyExecutorHandler {
                 ControlRejectionCodeV1::ProjectObservationNotConfigured,
                 false,
             ),
+            ControlRequestV1::ObserveProjectSource { project_id } => {
+                self.observe_project_source(&request, project_id)
+            }
             ControlRequestV1::PrepareOperationIntent {
                 project_id,
                 operation_kind,

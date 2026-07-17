@@ -7,6 +7,7 @@ Before=rdashboard.service
 Type=simple
 User=root
 Group=rdashboard
+SupplementaryGroups=rdashboard-source
 ExecStart=/usr/libexec/rdashboard/rdashboard-executor
 RuntimeDirectory=rdashboard
 RuntimeDirectoryMode=0750

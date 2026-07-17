@@ -97,6 +97,7 @@ input {
 h1,
 h2,
 h3,
+h4,
 p,
 dl,
 dd {
@@ -140,7 +141,6 @@ h3 {
 
 .connection-summary dt,
 .diagnostic-list dt,
-.metric-block dt,
 .eyebrow {
   color: var(--quiet);
   font-size: 0.72rem;
@@ -233,7 +233,6 @@ main {
 
 .host-overview,
 .project-workspace,
-.operation-workspace,
 .diagnostic-panel,
 .partial-panel {
   border: 1px solid var(--line);
@@ -241,125 +240,8 @@ main {
 }
 
 .host-overview,
-.project-workspace,
-.operation-workspace {
+.project-workspace {
   padding: 1rem;
-}
-
-.operation-grid {
-  display: grid;
-  grid-template-columns: minmax(17rem, 0.8fr) minmax(32rem, 1.4fr);
-  gap: 1rem;
-}
-
-.operation-grid > section {
-  min-width: 0;
-  padding: 0.875rem;
-  border: 1px solid var(--line);
-  background: var(--surface-raised);
-}
-
-.operation-grid h3 + .body-copy,
-.operation-grid h3 + form {
-  margin-block-start: 0.5rem;
-}
-
-.operation-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.625rem;
-  margin-block-start: 1rem;
-}
-
-.availability-reason {
-  margin-block-start: 0.75rem;
-  color: var(--warning);
-}
-
-#mutation-status-form {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 0.75rem;
-}
-
-.identifier-fields {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.75rem;
-}
-
-.form-field {
-  display: grid;
-  gap: 0.25rem;
-  min-width: 0;
-}
-
-.form-field label {
-  font-size: 0.78rem;
-  font-weight: 700;
-}
-
-.form-field input {
-  width: 100%;
-  min-height: 2.5rem;
-  padding: 0.5rem 0.625rem;
-  border: 1px solid var(--line-strong);
-  border-radius: 0.125rem;
-  color: var(--text);
-  background: var(--page);
-  font-family: ui-monospace, "Cascadia Mono", monospace;
-  font-size: 0.76rem;
-}
-
-.form-field input[aria-invalid="true"] {
-  border-color: var(--critical);
-}
-
-.form-field small {
-  color: var(--muted);
-  font-size: 0.72rem;
-}
-
-.field-error {
-  color: var(--critical);
-  font-size: 0.75rem;
-}
-
-#mutation-status-message {
-  margin-block-start: 0.75rem;
-}
-
-.operation-status-detail {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.625rem 1rem;
-  margin-block-start: 0.75rem;
-  padding-block-start: 0.75rem;
-  border-block-start: 1px solid var(--line);
-}
-
-.operation-status-detail[hidden] {
-  display: none;
-}
-
-.operation-status-detail dt {
-  color: var(--quiet);
-  font-size: 0.7rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.operation-status-detail dd {
-  margin-block-start: 0.2rem;
-  overflow-wrap: anywhere;
-  font-family: ui-monospace, "Cascadia Mono", monospace;
-  font-size: 0.77rem;
-}
-
-#mutation-status-retry {
-  margin-block-start: 0.75rem;
 }
 
 .section-heading {
@@ -383,36 +265,55 @@ main {
   font-size: 0.8rem;
 }
 
-.metric-strip {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  border-block: 1px solid var(--line);
-}
-
-.metric-block {
-  min-width: 0;
-  padding: 0.875rem 1rem;
-  border-inline-end: 1px solid var(--line);
-}
-
-.metric-block:last-child {
-  border-inline-end: 0;
-}
-
-.metric-block dd {
-  margin-block: 0.35rem 0.15rem;
-  font-family: ui-monospace, "Cascadia Mono", monospace;
-  font-size: 1.4rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.metric-block small {
-  display: block;
-  overflow: hidden;
+.history-status {
+  margin-block-end: 0.625rem;
   color: var(--muted);
-  font-size: 0.77rem;
-  text-overflow: ellipsis;
+  font-size: 0.78rem;
+}
+
+.resource-table-scroll {
+  max-height: none;
+}
+
+.resource-table {
+  min-width: 64rem;
+}
+
+.resource-table th:not(:first-child),
+.resource-table td {
+  width: 17%;
+}
+
+.resource-table thead small,
+.resource-table tbody small {
+  display: block;
+  margin-block-start: 0.18rem;
+  color: var(--quiet);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.resource-table tbody th {
+  position: static;
+  color: var(--text);
+  background: transparent;
+  font-size: 0.78rem;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.resource-table td {
+  font-family: ui-monospace, "Cascadia Mono", monospace;
+  font-size: 0.82rem;
+  vertical-align: top;
   white-space: nowrap;
+}
+
+.resource-table td strong {
+  font-size: 0.9rem;
+  font-weight: 650;
 }
 
 .partial-panel {
@@ -483,10 +384,178 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
-.empty-cell {
-  height: 5rem;
+.empty-state {
+  min-height: 5rem;
+  display: grid;
+  place-items: center;
   color: var(--muted);
   text-align: center;
+}
+
+.project-list {
+  display: grid;
+  gap: 0.875rem;
+}
+
+.project-overview {
+  border: 1px solid var(--line);
+  background: var(--surface-raised);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 70rem auto 28rem;
+}
+
+.project-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.875rem 1rem;
+  border-block-end: 1px solid var(--line);
+}
+
+.project-header code {
+  display: block;
+  margin-block-start: 0.2rem;
+  color: var(--quiet);
+  font-size: 0.72rem;
+}
+
+.project-health {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.35fr) minmax(20rem, 1fr);
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-block-end: 1px solid var(--line);
+}
+
+.project-health dt {
+  color: var(--quiet);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.project-health dd {
+  margin-block-start: 0.2rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.project-operational-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.operational-section {
+  min-width: 0;
+  min-height: 8rem;
+  padding: 0.75rem 1rem;
+  border-inline-end: 1px solid var(--line);
+  border-block-end: 1px solid var(--line);
+}
+
+.operational-section:nth-child(3n) {
+  border-inline-end: 0;
+}
+
+.operational-section:nth-last-child(-n + 3) {
+  border-block-end: 0;
+}
+
+.operational-section h4 {
+  font-size: 0.78rem;
+}
+
+.integration-unavailable,
+.integration-loading,
+.integration-empty,
+.integration-error {
+  margin-block-start: 0.5rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.integration-unavailable::before {
+  content: "◇ ";
+  color: var(--quiet);
+}
+
+.integration-error {
+  color: var(--critical);
+}
+
+.operation-list {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0.55rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.operation-list li + li {
+  padding-block-start: 0.6rem;
+  border-block-start: 1px solid var(--line);
+}
+
+.operation-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.operation-summary strong,
+.operation-summary span,
+.operation-list p,
+.operation-list code {
+  font-size: 0.72rem;
+}
+
+.operation-list p,
+.operation-list code {
+  display: block;
+  margin-block-start: 0.15rem;
+  color: var(--muted);
+}
+
+.operation-failure {
+  color: var(--critical) !important;
+}
+
+.repository-total {
+  display: block;
+  margin-block-start: 0.45rem;
+  font-family: ui-monospace, "Cascadia Mono", monospace;
+  font-size: 1.15rem;
+}
+
+.repository-detail,
+.repository-section > code {
+  display: block;
+  margin-block-start: 0.15rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.repository-history {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.35rem 0.75rem;
+  margin-block-start: 0.65rem;
+  padding-block-start: 0.55rem;
+  border-block-start: 1px solid var(--line);
+}
+
+.repository-history dt {
+  color: var(--quiet);
+  font-size: 0.68rem;
+}
+
+.repository-history dd {
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-align: end;
 }
 
 .lower-grid {
@@ -536,7 +605,8 @@ tbody tr:last-child td {
 }
 
 @supports not (content-visibility: auto) {
-  .diagnostic-panel {
+  .diagnostic-panel,
+  .project-overview {
     contain: layout style paint;
   }
 }
@@ -552,21 +622,26 @@ tbody tr:last-child td {
     justify-content: space-between;
   }
 
-  .metric-strip {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+  .project-operational-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .metric-block:nth-child(3) {
+  .operational-section:nth-child(3n) {
+    border-inline-end: 1px solid var(--line);
+  }
+
+  .operational-section:nth-child(2n) {
     border-inline-end: 0;
   }
 
-  .metric-block:nth-child(n + 4) {
-    border-block-start: 1px solid var(--line);
+  .operational-section:nth-last-child(-n + 3) {
+    border-block-end: 1px solid var(--line);
   }
 
-  .operation-grid {
-    grid-template-columns: 1fr;
+  .operational-section:nth-last-child(-n + 2) {
+    border-block-end: 0;
   }
+
 }
 
 @media (max-width: 48rem) {
@@ -593,24 +668,30 @@ tbody tr:last-child td {
     flex-direction: column;
   }
 
-  .metric-strip,
-  .identifier-fields,
-  .operation-status-detail,
-  .lower-grid,
-  .diagnostic-list {
+  .project-header {
+    flex-direction: column;
+  }
+
+  .project-health,
+  .project-operational-grid {
     grid-template-columns: 1fr;
   }
 
-  .metric-block,
-  .metric-block:nth-child(3) {
+  .operational-section,
+  .operational-section:nth-child(2n),
+  .operational-section:nth-child(3n),
+  .operational-section:nth-last-child(-n + 2),
+  .operational-section:nth-last-child(-n + 3) {
     border-inline-end: 0;
+    border-block-end: 1px solid var(--line);
   }
 
-  .metric-block:nth-child(n + 2) {
-    border-block-start: 1px solid var(--line);
+  .operational-section:last-child {
+    border-block-end: 0;
   }
 
-  #mutation-status-form {
+  .lower-grid,
+  .diagnostic-list {
     grid-template-columns: 1fr;
   }
 }

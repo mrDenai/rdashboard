@@ -9,12 +9,14 @@ use rdashboard::{
     controller::DurableController,
     domain::{
         ControlSummary, DashboardEvent, DashboardSnapshot, HostTelemetry, ObservationStatus,
-        PsiMeasurement,
+        ProjectId, PsiMeasurement, truncate_utf8,
     },
     executor_socket::{ROOT_EXECUTOR_SOCKET_PATH, RootExecutorClient},
     metrics::HostCollector,
     projects::{RimgConfigError, RimgHealthCollector},
-    store::{ControlStore, MetricsStore},
+    store::{
+        ControlStore, MetricsStore, PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, RepositorySampleWrite,
+    },
     unix_time_ms,
     web::{
         CloudflareAccessConfig, CloudflareAccessConfigError, CloudflareAccessVerifier,
@@ -33,6 +35,9 @@ const PROJECT_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const EXECUTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const RAW_RETENTION: Duration = Duration::from_hours(24);
 const MINUTE_ROLLUP_RETENTION: Duration = Duration::from_hours(720);
+const PROJECT_ID_RIMG: &str = "rimg";
+const PROJECT_REPOSITORY_ERROR_MAX_BYTES: usize = 512;
+const PROJECT_REPOSITORY_FAILURE_RETRY: Duration = Duration::from_mins(5);
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
@@ -54,18 +59,20 @@ async fn main() -> Result<(), DynError> {
         .map(|socket_path| RootExecutorClient::new(socket_path, EXECUTOR_REQUEST_TIMEOUT))
         .transpose()?
         .map(Arc::new);
-    let state = executor_client.as_ref().map_or_else(
-        || DashboardState::new(hub.clone(), SAMPLE_INTERVAL),
-        |client| {
-            DashboardState::new(hub.clone(), SAMPLE_INTERVAL).with_mutation_api(
-                DashboardMutationApiV1::new(
-                    DurableController::new(control_store.clone()),
-                    Arc::clone(client),
-                ),
-            )
-        },
-    );
-    let host_source = executor_client.map_or_else(
+    let durable_controller = DurableController::new(control_store.clone());
+    let state = executor_client
+        .as_ref()
+        .map_or_else(
+            || DashboardState::new(hub.clone(), SAMPLE_INTERVAL),
+            |client| {
+                DashboardState::new(hub.clone(), SAMPLE_INTERVAL).with_mutation_api(
+                    DashboardMutationApiV1::new(durable_controller.clone(), Arc::clone(client)),
+                )
+            },
+        )
+        .with_metrics_store(metrics_store.clone())
+        .with_operation_history(durable_controller);
+    let host_source = executor_client.clone().map_or_else(
         || {
             HostObservationSource::Local(Arc::new(Mutex::new(HostCollector::linux(
                 &config.data_dir,
@@ -110,6 +117,7 @@ async fn main() -> Result<(), DynError> {
     )?;
 
     spawn_collection_loop(state.clone(), metrics_store, host_source, project_collector);
+    spawn_project_repository_collection(state.clone(), executor_client);
 
     let listener = TcpListener::bind(config.listen).await?;
     info!(listen = %config.listen, data_dir = %config.data_dir.display(), "rdashboardd listening");
@@ -238,6 +246,147 @@ fn spawn_collection_loop(
             }
         }
     });
+}
+
+fn spawn_project_repository_collection(
+    state: DashboardState,
+    executor_client: Option<Arc<RootExecutorClient>>,
+) {
+    tokio::spawn(async move {
+        let Some((project_id, metrics_store, executor_client)) =
+            project_repository_collection_context(&state, executor_client).await
+        else {
+            return;
+        };
+
+        loop {
+            let now_ms = match unix_time_ms() {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(error = %error, "repository observation skipped because the host clock is invalid");
+                    set_project_repository_error(
+                        &state,
+                        &project_id,
+                        "Часы сервера недоступны; почасовой снимок репозитория пропущен.",
+                    )
+                    .await;
+                    tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
+                    continue;
+                }
+            };
+            match metrics_store.next_project_repository_observation_at(&project_id) {
+                Ok(Some(next_at_ms)) if next_at_ms > now_ms => {
+                    tokio::time::sleep(duration_until(now_ms, next_at_ms)).await;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(error = %error, "repository observation schedule could not be loaded");
+                    set_project_repository_error(
+                        &state,
+                        &project_id,
+                        "Расписание почасовых снимков репозитория недоступно.",
+                    )
+                    .await;
+                    tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
+                    continue;
+                }
+            }
+
+            match executor_client
+                .observe_project_source(project_id.clone())
+                .await
+            {
+                Ok(observation) => match metrics_store
+                    .record_project_repository_sample(now_ms, &observation)
+                {
+                    Ok(RepositorySampleWrite::Recorded) => {
+                        state
+                            .project_repository_errors
+                            .write()
+                            .await
+                            .remove(project_id.as_str());
+                    }
+                    Ok(RepositorySampleWrite::NotDue {
+                        next_observation_at_ms,
+                    }) => {
+                        tokio::time::sleep(duration_until(now_ms, next_observation_at_ms)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "repository observation could not be persisted");
+                        set_project_repository_error(
+                            &state,
+                            &project_id,
+                            "Почасовой снимок репозитория не удалось сохранить.",
+                        )
+                        .await;
+                        tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    warn!(error = %error, "repository observation unavailable");
+                    set_project_repository_error(&state, &project_id, &error.to_string()).await;
+                    tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
+                    continue;
+                }
+            }
+            tokio::time::sleep(project_repository_interval()).await;
+        }
+    });
+}
+
+async fn project_repository_collection_context(
+    state: &DashboardState,
+    executor_client: Option<Arc<RootExecutorClient>>,
+) -> Option<(ProjectId, MetricsStore, Arc<RootExecutorClient>)> {
+    let project_id: ProjectId = match PROJECT_ID_RIMG.parse() {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            error!(error = %error, "fixed project identifier is invalid");
+            return None;
+        }
+    };
+    let Some(metrics_store) = state.metrics_store.clone() else {
+        set_project_repository_error(
+            state,
+            &project_id,
+            "Хранилище истории репозитория не настроено.",
+        )
+        .await;
+        return None;
+    };
+    let Some(executor_client) = executor_client else {
+        set_project_repository_error(
+            state,
+            &project_id,
+            "Источник принятого Git-дерева не настроен.",
+        )
+        .await;
+        return None;
+    };
+    Some((project_id, metrics_store, executor_client))
+}
+
+fn project_repository_interval() -> Duration {
+    Duration::from_millis(u64::try_from(PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS).unwrap_or(u64::MAX))
+}
+
+fn duration_until(now_ms: i64, target_ms: i64) -> Duration {
+    let delay_ms = target_ms.saturating_sub(now_ms);
+    Duration::from_millis(u64::try_from(delay_ms).unwrap_or(u64::MAX))
+}
+
+async fn set_project_repository_error(
+    state: &DashboardState,
+    project_id: &ProjectId,
+    detail: &str,
+) {
+    state.project_repository_errors.write().await.insert(
+        project_id.to_string(),
+        truncate_utf8(detail, PROJECT_REPOSITORY_ERROR_MAX_BYTES, "…"),
+    );
 }
 
 async fn apply_metric_retention(state: &DashboardState, metrics_store: &MetricsStore) {

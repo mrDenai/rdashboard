@@ -31,11 +31,11 @@ use crate::{
     protocol::{FrameError, decode_single_frame, encode_frame, read_frame, write_frame},
     source::{
         DurableSourceBroker, LiveSourceGate, SourceGateError, SourceGateProof, SourceRepository,
-        SourceSnapshot,
+        SourceSnapshot, SourceTreeObservationV1,
     },
 };
 
-pub const SOURCE_PROTOCOL_VERSION: u16 = 1;
+pub const SOURCE_PROTOCOL_VERSION: u16 = 2;
 pub const SOURCE_SOCKET_PATH: &str = "/run/rdashboard-source/source.sock";
 
 const SOURCE_REQUEST_MAX_BYTES: usize = 512 * 1024;
@@ -59,6 +59,9 @@ pub enum SourceRequestV1 {
         supported_versions: Vec<u16>,
     },
     Snapshot {
+        project_id: ProjectId,
+    },
+    ObserveTree {
         project_id: ProjectId,
     },
     CheckLive {
@@ -89,6 +92,9 @@ pub enum SourceResponseV1 {
     },
     Snapshot {
         snapshot: Box<SourceSnapshot>,
+    },
+    TreeObservation {
+        observation: SourceTreeObservationV1,
     },
     LiveProof {
         proof: SourceGateProof,
@@ -150,12 +156,28 @@ impl<G> BrokerSourceRequestHandlerV1<G> {
 
 pub trait SourceSnapshotReaderV1 {
     fn source_snapshot(&self, project_id: &ProjectId) -> Result<SourceSnapshot, SourceGateError>;
+
+    fn source_tree_observation(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<SourceTreeObservationV1, SourceGateError> {
+        let _ = project_id;
+        Err(SourceGateError::Unavailable)
+    }
 }
 
 impl<R: SourceRepository> SourceSnapshotReaderV1 for DurableSourceBroker<R> {
     fn source_snapshot(&self, project_id: &ProjectId) -> Result<SourceSnapshot, SourceGateError> {
         self.store()
             .snapshot(project_id)
+            .map_err(|_| SourceGateError::Unavailable)
+    }
+
+    fn source_tree_observation(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<SourceTreeObservationV1, SourceGateError> {
+        DurableSourceBroker::source_tree_observation(self, project_id)
             .map_err(|_| SourceGateError::Unavailable)
     }
 }
@@ -195,6 +217,14 @@ where
                             snapshot: Box::new(snapshot),
                         },
                     ),
+                    Err(error) => source_error_response(&request, error),
+                }
+            }
+            SourceRequestV1::ObserveTree { project_id } => {
+                match self.gate.source_tree_observation(project_id) {
+                    Ok(observation) => {
+                        Self::response(&request, SourceResponseV1::TreeObservation { observation })
+                    }
                     Err(error) => source_error_response(&request, error),
                 }
             }
@@ -283,6 +313,26 @@ impl SourceBrokerClientV1 {
         }
     }
 
+    pub fn observe_tree(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<SourceTreeObservationV1, SourceClientError> {
+        self.ensure_negotiated()?;
+        match self.exchange(SourceRequestV1::ObserveTree {
+            project_id: project_id.clone(),
+        })? {
+            SourceResponseV1::TreeObservation { observation }
+                if observation.project_id == *project_id =>
+            {
+                Ok(observation)
+            }
+            SourceResponseV1::Rejected { code, retryable } => {
+                Err(SourceClientError::Rejected { code, retryable })
+            }
+            _ => self.unexpected_response(),
+        }
+    }
+
     fn ensure_negotiated(&self) -> Result<(), SourceClientError> {
         if self.negotiated.load(Ordering::Acquire) {
             return Ok(());
@@ -356,6 +406,14 @@ impl SourceBrokerClientV1 {
 impl SourceSnapshotReaderV1 for SourceBrokerClientV1 {
     fn source_snapshot(&self, project_id: &ProjectId) -> Result<SourceSnapshot, SourceGateError> {
         self.snapshot(project_id)
+            .map_err(|error| source_client_gate_error(&error))
+    }
+
+    fn source_tree_observation(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<SourceTreeObservationV1, SourceGateError> {
+        self.observe_tree(project_id)
             .map_err(|error| source_client_gate_error(&error))
     }
 }
@@ -800,6 +858,25 @@ mod tests {
                 Err(SourceGateError::Unavailable)
             }
         }
+
+        fn source_tree_observation(
+            &self,
+            project_id: &ProjectId,
+        ) -> Result<SourceTreeObservationV1, SourceGateError> {
+            if self.snapshot.project_id != *project_id {
+                return Err(SourceGateError::Unavailable);
+            }
+            Ok(SourceTreeObservationV1 {
+                project_id: project_id.clone(),
+                head: self
+                    .snapshot
+                    .head
+                    .clone()
+                    .ok_or(SourceGateError::Unavailable)?,
+                file_count: 2,
+                total_bytes: 7,
+            })
+        }
     }
 
     impl LiveSourceGate for StaticGate {
@@ -871,13 +948,19 @@ mod tests {
         let project_id = expected.project_id.clone();
         let client_path = socket_path.clone();
         let observed = tokio::task::spawn_blocking(move || {
-            SourceBrokerClientV1::new(client_path, Duration::from_secs(2))
-                .and_then(|client| client.snapshot(&project_id))
+            let client = SourceBrokerClientV1::new(client_path, Duration::from_secs(2))?;
+            let snapshot = client.snapshot(&project_id)?;
+            let tree = client.observe_tree(&project_id)?;
+            Ok::<_, SourceClientError>((snapshot, tree))
         })
         .await
         .expect("client task")
         .expect("source snapshot");
-        assert_eq!(observed, expected);
+        assert_eq!(observed.0, expected);
+        assert_eq!(observed.1.project_id, observed.0.project_id);
+        assert_eq!(observed.1.head, observed.0.head.expect("accepted head"));
+        assert_eq!(observed.1.file_count, 2);
+        assert_eq!(observed.1.total_bytes, 7);
         let _ = shutdown_tx.send(());
         server.await.expect("server task").expect("source server");
     }

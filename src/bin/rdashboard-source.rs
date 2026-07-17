@@ -149,6 +149,16 @@ impl SourceSnapshotReaderV1 for ArcBroker {
     ) -> Result<rdashboard::source::SourceSnapshot, rdashboard::source::SourceGateError> {
         self.0.source_snapshot(project_id)
     }
+
+    fn source_tree_observation(
+        &self,
+        project_id: &rdashboard::domain::ProjectId,
+    ) -> Result<rdashboard::source::SourceTreeObservationV1, rdashboard::source::SourceGateError>
+    {
+        self.0
+            .source_tree_observation(project_id)
+            .map_err(|_| rdashboard::source::SourceGateError::Unavailable)
+    }
 }
 
 async fn run_reconciliation_loop(

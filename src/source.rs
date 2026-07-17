@@ -9,6 +9,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
@@ -350,6 +351,15 @@ pub struct SourceSnapshot {
     pub divergent_candidate: Option<GitCommitId>,
     pub divergence_channel: Option<SourceChannel>,
     pub divergence_evidence_digest: Option<EvidenceDigest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTreeObservationV1 {
+    pub project_id: ProjectId,
+    pub head: GitCommitId,
+    pub file_count: u64,
+    pub total_bytes: u64,
 }
 
 impl SourceSnapshot {
@@ -1468,6 +1478,17 @@ pub trait SourceRepository: Send + Sync + std::fmt::Debug {
         expected: Option<&GitCommitId>,
         candidate: &GitCommitId,
     ) -> Result<bool, SourceError>;
+
+    fn accepted_tree_metrics(
+        &self,
+        project_id: &ProjectId,
+        head: &GitCommitId,
+    ) -> Result<(u64, u64), SourceError> {
+        let _ = (project_id, head);
+        Err(SourceError::Repository(
+            "accepted source tree metrics are unavailable".to_owned(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1802,6 +1823,30 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
 
     pub fn broker_epoch(&self) -> u64 {
         self.broker_lease.epoch
+    }
+
+    pub fn source_tree_observation(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<SourceTreeObservationV1, SourceError> {
+        let _coordination = self.lock_coordination(project_id)?;
+        let snapshot = self.store.snapshot(project_id)?;
+        if snapshot.state != SourceProjectState::Ready {
+            return Err(SourceError::Repository(
+                "accepted source tree is unavailable while source reconciliation needs owner action"
+                    .to_owned(),
+            ));
+        }
+        let head = snapshot.head.ok_or_else(|| {
+            SourceError::Repository("accepted source tree has no canonical head".to_owned())
+        })?;
+        let (file_count, total_bytes) = self.repository.accepted_tree_metrics(project_id, &head)?;
+        Ok(SourceTreeObservationV1 {
+            project_id: project_id.clone(),
+            head,
+            file_count,
+            total_bytes,
+        })
     }
 
     fn require_current_lease(&self) -> Result<(), SourceError> {

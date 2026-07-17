@@ -6,11 +6,17 @@ use axum::{
 };
 use http_body_util::BodyExt as _;
 use rdashboard::{
+    controller::DurableController,
     domain::{
-        ControlSummary, DashboardEvent, DashboardSnapshot, HostTelemetry, ObservationStatus,
-        ProjectCondition, ProjectId, ProjectTelemetry, PsiMeasurement,
+        ControlSummary, DashboardEvent, DashboardSnapshot, GitCommitId, HostHistoryWindowKind,
+        HostTelemetry, ObservationStatus, ProjectCondition, ProjectId, ProjectTelemetry,
+        PsiMeasurement,
     },
-    store::{ControlStore, MINIMUM_SAFE_SQLITE_VERSION_NUMBER, MetricsStore, StoreError},
+    source::SourceTreeObservationV1,
+    store::{
+        ControlStore, MINIMUM_SAFE_SQLITE_VERSION_NUMBER, MetricsStore,
+        PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, RepositorySampleWrite, StoreError,
+    },
     unix_time_ms,
     web::{DashboardState, EventHub, HubError, RequestedAfter, router},
 };
@@ -66,6 +72,17 @@ fn project_sample(observed_at_ms: Option<i64>) -> ProjectTelemetry {
         condition: ProjectCondition::Degraded,
         observed_at_ms,
         detail: "legacy health contract".to_owned(),
+    }
+}
+
+fn repository_observation(total_bytes: u64) -> SourceTreeObservationV1 {
+    SourceTreeObservationV1 {
+        project_id: ProjectId::from_str("rimg")
+            .unwrap_or_else(|error| panic!("project fixture: {error}")),
+        head: GitCommitId::from_str("0123456789abcdef0123456789abcdef01234567")
+            .unwrap_or_else(|error| panic!("commit fixture: {error}")),
+        file_count: 42,
+        total_bytes,
     }
 }
 
@@ -431,6 +448,104 @@ fn metric_retention_streams_multiple_minute_buckets() {
     }
 }
 
+#[test]
+fn host_history_combines_retained_rollups_and_raw_samples_into_named_medians() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
+        .unwrap_or_else(|error| panic!("open metrics: {error}"));
+    for (observed_at_ms, cpu_percent) in [(10_000, 10.0), (70_000, 20.0), (130_000, 30.0)] {
+        let mut sample = host_sample(observed_at_ms);
+        sample.cpu_percent = Some(cpu_percent);
+        metrics
+            .record_host_sample(&sample)
+            .unwrap_or_else(|error| panic!("record history fixture: {error}"));
+    }
+    metrics
+        .apply_retention(120_000, -30_i64 * 24 * 60 * 60 * 1_000)
+        .unwrap_or_else(|error| panic!("roll up history fixture: {error}"));
+    assert_eq!(metrics.host_rollup_count().unwrap_or(0), 2);
+    assert_eq!(metrics.sample_count().unwrap_or(0), 1);
+
+    let history = metrics
+        .host_history(3_600_500)
+        .unwrap_or_else(|error| panic!("calculate host history: {error}"));
+    assert_eq!(history.schema_version, 1);
+    assert_eq!(history.complete_through_ms, 3_600_000);
+    assert_eq!(history.windows.len(), 4);
+    let hour = history
+        .windows
+        .iter()
+        .find(|window| window.window == HostHistoryWindowKind::Hour)
+        .unwrap_or_else(|| panic!("hour history window is missing"));
+    assert_eq!(hour.starts_at_ms, 0);
+    assert_eq!(hour.ends_at_ms, 3_600_000);
+    assert_eq!(hour.sample_count, 3);
+    assert_eq!(hour.covered_minutes, 3);
+    assert_eq!(hour.expected_minutes, 60);
+    assert!(!hour.complete);
+    assert!(
+        hour.medians
+            .cpu_percent
+            .is_some_and(|value| (19.0..=21.0).contains(&value))
+    );
+    assert!(
+        hour.medians
+            .memory_used_percent
+            .is_some_and(|value| (49.0..=51.0).contains(&value))
+    );
+}
+
+#[test]
+fn repository_history_enforces_hourly_sampling_and_preserves_commit_metrics() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
+        .unwrap_or_else(|error| panic!("open metrics: {error}"));
+    let first_at = PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS;
+    assert_eq!(
+        metrics
+            .record_project_repository_sample(first_at, &repository_observation(1_000))
+            .unwrap_or_else(|error| panic!("record first repository sample: {error}")),
+        RepositorySampleWrite::Recorded
+    );
+    assert_eq!(
+        metrics
+            .record_project_repository_sample(
+                first_at + PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS - 1,
+                &repository_observation(2_000),
+            )
+            .unwrap_or_else(|error| panic!("reject early repository sample: {error}")),
+        RepositorySampleWrite::NotDue {
+            next_observation_at_ms: first_at + PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS,
+        }
+    );
+    let second_at = first_at + PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS;
+    assert_eq!(
+        metrics
+            .record_project_repository_sample(second_at, &repository_observation(3_000))
+            .unwrap_or_else(|error| panic!("record second repository sample: {error}")),
+        RepositorySampleWrite::Recorded
+    );
+    let project_id =
+        ProjectId::from_str("rimg").unwrap_or_else(|error| panic!("project fixture: {error}"));
+    assert_eq!(
+        metrics
+            .next_project_repository_observation_at(&project_id)
+            .unwrap_or_else(|error| panic!("load next repository observation: {error}")),
+        Some(second_at + PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS)
+    );
+    let history = metrics
+        .project_repository_history(&project_id, 0)
+        .unwrap_or_else(|error| panic!("load repository history: {error}"));
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].total_bytes, 1_000);
+    assert_eq!(history[1].total_bytes, 3_000);
+    assert_eq!(history[1].file_count, 42);
+    assert_eq!(
+        history[1].head.as_str(),
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+}
+
 #[tokio::test]
 async fn http_surface_is_loopback_slice_with_strict_headers_and_truthful_empty_state() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
@@ -476,8 +591,9 @@ async fn http_surface_is_loopback_slice_with_strict_headers_and_truthful_empty_s
     assert!(html.contains("<main id=\"content\""));
     assert!(html.contains("<caption>"));
     assert!(html.contains("Проекты ещё не подключены"));
-    assert!(html.contains("Контур операций"));
-    assert!(html.contains("Авторизатор действий не подключён"));
+    assert!(html.contains("За месяц"));
+    assert!(html.contains("медианные значения за завершённые периоды"));
+    assert!(!html.contains("Контур операций"));
     assert!(!html.contains("<script>"));
 
     let response = app
@@ -527,6 +643,136 @@ async fn http_surface_is_loopback_slice_with_strict_headers_and_truthful_empty_s
             .and_then(|value| value.parse::<i64>().ok())
             .is_some_and(|value| value > 0)
     );
+}
+
+#[tokio::test]
+async fn host_history_http_surface_returns_all_named_windows() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let control = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control: {error}"));
+    let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
+        .unwrap_or_else(|error| panic!("open metrics: {error}"));
+    metrics
+        .record_host_sample(&host_sample(1_000))
+        .unwrap_or_else(|error| panic!("record HTTP history fixture: {error}"));
+    let app = router(
+        DashboardState::new(EventHub::new(control), Duration::from_secs(5))
+            .with_metrics_store(metrics),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/host-history")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("host history response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let history: serde_json::Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("read host history: {error}"))
+            .to_bytes(),
+    )
+    .unwrap_or_else(|error| panic!("decode host history: {error}"));
+    assert_eq!(history["schema_version"], 1);
+    assert_eq!(history["windows"].as_array().map(Vec::len), Some(4));
+}
+
+#[tokio::test]
+async fn project_operation_history_is_project_scoped_and_bounded() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let control = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control: {error}"));
+    let app = router(
+        DashboardState::new(EventHub::new(control.clone()), Duration::from_secs(5))
+            .with_operation_history(DurableController::new(control)),
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/projects/rimg/operations?limit=10")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("project operations response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let history: serde_json::Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("read project operations: {error}"))
+            .to_bytes(),
+    )
+    .unwrap_or_else(|error| panic!("decode project operations: {error}"));
+    assert_eq!(history["schema_version"], 1);
+    assert_eq!(history["project_id"], "rimg");
+    assert_eq!(history["operations"].as_array().map(Vec::len), Some(0));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/projects/rimg/operations?limit=0")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("invalid operation limit response: {error}"));
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn project_repository_http_surface_retains_last_data_with_collection_error() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let control = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control: {error}"));
+    let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
+        .unwrap_or_else(|error| panic!("open metrics: {error}"));
+    let observed_at_ms = unix_time_ms().unwrap_or_else(|error| panic!("fixture clock: {error}"));
+    metrics
+        .record_project_repository_sample(observed_at_ms, &repository_observation(9_999))
+        .unwrap_or_else(|error| panic!("record repository HTTP fixture: {error}"));
+    let state = DashboardState::new(EventHub::new(control), Duration::from_secs(5))
+        .with_metrics_store(metrics);
+    state.project_repository_errors.write().await.insert(
+        "rimg".to_owned(),
+        "source temporarily unavailable".to_owned(),
+    );
+    let app = router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/projects/rimg/repository-history")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("repository history response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let history: serde_json::Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("read repository history: {error}"))
+            .to_bytes(),
+    )
+    .unwrap_or_else(|error| panic!("decode repository history: {error}"));
+    assert_eq!(history["schema_version"], 1);
+    assert_eq!(history["project_id"], "rimg");
+    assert_eq!(history["collection_interval_seconds"], 3_600);
+    assert_eq!(
+        history["last_collection_error"],
+        "source temporarily unavailable"
+    );
+    assert_eq!(history["samples"][0]["total_bytes"], 9_999);
 }
 
 #[tokio::test]

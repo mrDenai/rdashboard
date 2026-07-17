@@ -46,6 +46,12 @@ const OWNER_ONLY_SHARED_REPOSITORY: &str = "core.sharedRepository=0600";
 type GitVersion = (u64, u64);
 const MINIMUM_DURABLE_FILES_GIT_VERSION: GitVersion = (2, 36);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExportTreeMetrics {
+    file_count: u64,
+    total_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FetchLimits {
     max_file_bytes: u64,
@@ -438,27 +444,28 @@ impl GitSourceRepository {
         &self,
         project: &InstalledGitProject,
         expected_head: &GitCommitId,
-    ) -> Result<(), SourceError> {
+    ) -> Result<ExportTreeMetrics, SourceError> {
         let mut command = Command::new(&self.git_executable);
         configure_git_command(&mut command, project);
         command.args([
             OsString::from("ls-tree"),
             OsString::from("-r"),
             OsString::from("-z"),
+            OsString::from("-l"),
             OsString::from("--full-tree"),
             OsString::from(expected_head.as_str()),
         ]);
-        let entries = run_export_tree_inspection(
+        let metrics = run_export_tree_inspection(
             command,
             "inspect immutable export tree",
             LOCAL_COMMAND_TIMEOUT,
         )?;
-        if entries == 0 {
+        if metrics.file_count == 0 {
             return Err(SourceError::Repository(
                 "immutable export tree is empty".to_owned(),
             ));
         }
-        Ok(())
+        Ok(metrics)
     }
 
     fn read_ref(
@@ -1186,6 +1193,32 @@ impl SourceRepository for GitSourceRepository {
         } else {
             Ok(false)
         }
+    }
+
+    fn accepted_tree_metrics(
+        &self,
+        project_id: &ProjectId,
+        head: &GitCommitId,
+    ) -> Result<(u64, u64), SourceError> {
+        let project = self.project(project_id)?;
+        let _guard = project
+            .command_lock
+            .lock()
+            .map_err(|_| SourceError::LockPoisoned)?;
+        validate_installed_repository(project)?;
+        if self.read_ref(project, ACCEPTED_REF)?.as_ref() != Some(head) {
+            return Err(SourceError::Repository(
+                "accepted source head changed before tree measurement".to_owned(),
+            ));
+        }
+        let metrics = self.validate_exportable_tree(project, head)?;
+        validate_installed_repository(project)?;
+        if self.read_ref(project, ACCEPTED_REF)?.as_ref() != Some(head) {
+            return Err(SourceError::Repository(
+                "accepted source head changed during tree measurement".to_owned(),
+            ));
+        }
+        Ok((metrics.file_count, metrics.total_bytes))
     }
 }
 
@@ -2756,7 +2789,7 @@ fn run_export_tree_inspection(
     mut command: Command,
     operation: &'static str,
     timeout: Duration,
-) -> Result<usize, SourceError> {
+) -> Result<ExportTreeMetrics, SourceError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2800,10 +2833,11 @@ fn run_export_tree_inspection(
     }
 }
 
-fn validate_export_tree_stream(reader: impl Read) -> Result<usize, SourceError> {
+fn validate_export_tree_stream(reader: impl Read) -> Result<ExportTreeMetrics, SourceError> {
     let mut reader = BufReader::new(reader);
     let mut record = Vec::with_capacity(512);
-    let mut entries = 0_usize;
+    let mut file_count = 0_u64;
+    let mut total_bytes = 0_u64;
     while read_bounded_nul_record(&mut reader, &mut record)? {
         let tab = record
             .iter()
@@ -2813,28 +2847,54 @@ fn validate_export_tree_stream(reader: impl Read) -> Result<usize, SourceError> 
             })?;
         let metadata = &record[..tab];
         let path = &record[tab + 1..];
-        let mode = metadata
-            .split(|byte| *byte == b' ')
-            .next()
-            .unwrap_or_default();
+        let fields = metadata
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        if fields.len() != 4
+            || !matches!(fields[2].len(), 40 | 64)
+            || !fields[2]
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(SourceError::Repository(
+                "immutable export tree entry was malformed".to_owned(),
+            ));
+        }
         let has_archive_attributes = path
             .split(|byte| *byte == b'/')
             .any(|component| component == b".gitattributes");
-        if !matches!(mode, b"100644" | b"100755") || path.is_empty() || has_archive_attributes {
+        if fields[1] != b"blob"
+            || !matches!(fields[0], b"100644" | b"100755")
+            || path.is_empty()
+            || has_archive_attributes
+        {
             return Err(SourceError::Repository(
                 "immutable export contains a non-regular entry or archive attributes".to_owned(),
             ));
         }
-        entries = entries.checked_add(1).ok_or_else(|| {
+        let size = std::str::from_utf8(fields[3])
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                SourceError::Repository("immutable export tree entry size was malformed".to_owned())
+            })?;
+        file_count = file_count.checked_add(1).ok_or_else(|| {
             SourceError::Repository("immutable export entry count overflowed".to_owned())
         })?;
-        if entries > MAX_EXPORT_TREE_ENTRIES {
+        total_bytes = total_bytes.checked_add(size).ok_or_else(|| {
+            SourceError::Repository("immutable export logical size overflowed".to_owned())
+        })?;
+        if file_count > u64::try_from(MAX_EXPORT_TREE_ENTRIES).unwrap_or(u64::MAX) {
             return Err(SourceError::Repository(
                 "immutable export exceeds the source file count limit".to_owned(),
             ));
         }
     }
-    Ok(entries)
+    Ok(ExportTreeMetrics {
+        file_count,
+        total_bytes,
+    })
 }
 
 fn read_bounded_nul_record(
@@ -3039,24 +3099,34 @@ mod tests {
         let mut listing = Vec::new();
         for index in 0..2_000 {
             listing.extend_from_slice(
-                format!("100644 blob deadbeef\tdirectory/file-{index:04}.txt\0").as_bytes(),
+                format!(
+                    "100644 blob 0000000000000000000000000000000000000000 {index}\tdirectory/file-{index:04}.txt\0"
+                )
+                .as_bytes(),
             );
         }
-        listing.extend_from_slice(b"100755 blob deadbeef\tdirectory/line\nbreak\0");
+        listing.extend_from_slice(
+            b"100755 blob 0000000000000000000000000000000000000000 7\tdirectory/line\nbreak\0",
+        );
         assert!(listing.len() > CAPTURE_LIMIT);
         assert_eq!(
             validate_export_tree_stream(listing.as_slice())
                 .unwrap_or_else(|error| panic!("validate export tree: {error}")),
-            2_001
+            ExportTreeMetrics {
+                file_count: 2_001,
+                total_bytes: (0_u64..2_000).sum::<u64>() + 7,
+            }
         );
     }
 
     #[test]
     fn export_tree_inspection_rejects_archive_attributes_and_nonregular_entries() {
         for listing in [
-            b"100644 blob deadbeef\tdirectory/.gitattributes\0".as_slice(),
-            b"120000 blob deadbeef\tlinked-source\0".as_slice(),
-            b"160000 commit deadbeef\tnested-repository\0".as_slice(),
+            b"100644 blob 0000000000000000000000000000000000000000 1\tdirectory/.gitattributes\0"
+                .as_slice(),
+            b"120000 blob 0000000000000000000000000000000000000000 1\tlinked-source\0".as_slice(),
+            b"160000 commit 0000000000000000000000000000000000000000 -\tnested-repository\0"
+                .as_slice(),
         ] {
             assert!(matches!(
                 validate_export_tree_stream(listing),
@@ -3207,6 +3277,13 @@ mod tests {
                 .accepted_head(&fixture.project_id)
                 .unwrap_or_else(|error| panic!("accepted head: {error}")),
             Some(second.clone())
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .accepted_tree_metrics(&fixture.project_id, &second)
+                .unwrap_or_else(|error| panic!("measure accepted tree: {error}")),
+            (1, u64::try_from("second".len()).unwrap_or(u64::MAX))
         );
         let project = fixture
             .repository

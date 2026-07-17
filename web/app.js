@@ -2,11 +2,13 @@
 
 import {
   evaluateHostObservation,
+  formatHistoryCoverage,
   formatSampleAge,
-  mutationStatePresentation,
   operationKindLabel,
   operationPhaseLabel,
+  operationResultPresentation,
   projectConditionPresentation,
+  repositorySizeChange,
 } from "./status.js";
 
 const elements = Object.freeze({
@@ -15,6 +17,14 @@ const elements = Object.freeze({
   sequence: document.querySelector("#event-sequence"),
   retry: document.querySelector("#retry-connection"),
   hostStatus: document.querySelector("#host-observation-status"),
+  historyStatus: document.querySelector("#host-history-status"),
+  historyCoverage: Object.freeze({
+    hour: document.querySelector("#history-hour-coverage"),
+    day: document.querySelector("#history-day-coverage"),
+    week: document.querySelector("#history-week-coverage"),
+    month: document.querySelector("#history-month-coverage"),
+  }),
+  historyCells: document.querySelectorAll("[data-history-window][data-history-metric]"),
   cpu: document.querySelector("#metric-cpu"),
   load: document.querySelector("#metric-load"),
   memory: document.querySelector("#metric-memory"),
@@ -27,27 +37,11 @@ const elements = Object.freeze({
   partialPanel: document.querySelector("#partial-panel"),
   partialReasons: document.querySelector("#partial-reasons"),
   projectCount: document.querySelector("#project-count"),
-  projectRows: document.querySelector("#project-rows"),
+  projectList: document.querySelector("#project-list"),
   sqliteVersion: document.querySelector("#sqlite-version"),
   observationOperation: document.querySelector("#observation-operation"),
   sampleInterval: document.querySelector("#sample-interval"),
   streamDetail: document.querySelector("#stream-detail"),
-  mutationCapability: document.querySelector("#mutation-capability"),
-  mutationStartReason: document.querySelector("#mutation-start-reason"),
-  mutationStatusForm: document.querySelector("#mutation-status-form"),
-  mutationIntentId: document.querySelector("#mutation-intent-id"),
-  mutationIntentError: document.querySelector("#mutation-intent-error"),
-  mutationAttemptId: document.querySelector("#mutation-attempt-id"),
-  mutationAttemptError: document.querySelector("#mutation-attempt-error"),
-  mutationStatusSubmit: document.querySelector("#mutation-status-submit"),
-  mutationStatusMessage: document.querySelector("#mutation-status-message"),
-  mutationStatusDetail: document.querySelector("#mutation-status-detail"),
-  mutationState: document.querySelector("#mutation-state"),
-  mutationOperation: document.querySelector("#mutation-operation"),
-  mutationPhase: document.querySelector("#mutation-phase"),
-  mutationCompletedPhases: document.querySelector("#mutation-completed-phases"),
-  mutationUpdatedAt: document.querySelector("#mutation-updated-at"),
-  mutationStatusRetry: document.querySelector("#mutation-status-retry"),
   polite: document.querySelector("#polite-announcer"),
   assertive: document.querySelector("#assertive-announcer"),
 });
@@ -62,15 +56,24 @@ const runtime = {
   snapshotReceivedAtMonotonicMs: null,
   acceptingResyncSnapshot: false,
   initializing: false,
-  mutationCapabilities: null,
-  mutationStatusTimer: null,
-  mutationStatusLoading: false,
-  lastMutationState: null,
+  historyLoading: false,
+  historyFailed: false,
+  projectOperations: new Map(),
+  projectOperationsLoading: new Set(),
+  projectRepositories: new Map(),
+  projectRepositoriesLoading: new Set(),
 };
 
-const MUTATION_STATUS_STORAGE_KEY = "rdashboard.mutation-status.v1";
-const MUTATION_STATUS_POLL_MS = 2_000;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const HOST_HISTORY_REFRESH_MS = 60_000;
+const PROJECT_OPERATIONS_REFRESH_MS = 30_000;
+const PROJECT_REPOSITORY_REFRESH_MS = 5 * 60_000;
+const HOST_HISTORY_WINDOWS = Object.freeze(["hour", "day", "week", "month"]);
+const REPOSITORY_PERIODS = Object.freeze([
+  ["1 ч", 60 * 60_000],
+  ["1 день", 24 * 60 * 60_000],
+  ["7 дней", 7 * 24 * 60 * 60_000],
+  ["30 дней", 30 * 24 * 60 * 60_000],
+]);
 
 const byteFormatter = new Intl.NumberFormat("ru-RU", {
   maximumFractionDigits: 1,
@@ -95,211 +98,107 @@ function announce(message, assertive = false) {
   }, 50);
 }
 
-async function initializeMutationControls() {
-  restoreMutationIdentity();
-  const response = await fetch("/api/v1/mutations/capabilities", {
-    headers: { Accept: "application/json" },
-    cache: "no-store",
-  });
-  if (!response.ok) throw new Error("Конфигурацию контура операций получить не удалось.");
-  const capabilities = await response.json();
-  if (
-    capabilities.schema_version !== 1
-    || typeof capabilities.executor_socket_configured !== "boolean"
-    || typeof capabilities.authorization_handoff_available !== "boolean"
-  ) {
-    throw new Error("Сервер вернул неподдерживаемый контракт контура операций.");
-  }
-  runtime.mutationCapabilities = capabilities;
-  const executorReady = capabilities.executor_socket_configured;
-  elements.mutationStatusSubmit.disabled = !executorReady;
-  if (executorReady) {
-    elements.mutationCapability.dataset.state = "partial";
-    elements.mutationCapability.textContent = "△ Доступно наблюдение";
-    elements.mutationStatusMessage.textContent =
-      "Введите идентификаторы операции; состояние будет обновляться автоматически.";
-  } else {
-    elements.mutationCapability.dataset.state = "error";
-    elements.mutationCapability.textContent = "× Executor не подключён";
-    elements.mutationStatusMessage.textContent =
-      "Наблюдение недоступно: сервер не настроен на root executor.";
-  }
-  if (capabilities.authorization_handoff_available) {
-    elements.mutationStartReason.textContent =
-      "Авторизатор объявлен сервером, но запуск из этого интерфейса ещё не разрешён.";
-  }
-  if (executorReady && restoredMutationIdentityIsComplete()) {
-    await requestMutationStatus(false);
-  }
-}
-
-function renderMutationControlsUnavailable(error) {
-  runtime.mutationCapabilities = null;
-  elements.mutationCapability.dataset.state = "error";
-  elements.mutationCapability.textContent = "× Конфигурация недоступна";
-  elements.mutationStatusSubmit.disabled = true;
-  elements.mutationStatusMessage.textContent = error.message;
-  announce(error.message, true);
-}
-
-function restoreMutationIdentity() {
+async function loadHostHistory(announceFailure = false) {
+  if (runtime.historyLoading) return;
+  runtime.historyLoading = true;
   try {
-    const stored = JSON.parse(window.sessionStorage.getItem(MUTATION_STATUS_STORAGE_KEY));
-    if (stored && normalizeUuid(stored.intent_id) && normalizeUuid(stored.attempt_id)) {
-      elements.mutationIntentId.value = normalizeUuid(stored.intent_id);
-      elements.mutationAttemptId.value = normalizeUuid(stored.attempt_id);
-    }
-  } catch {
-    // Session state is an optional convenience; an unavailable store must not block observation.
-  }
-}
-
-function restoredMutationIdentityIsComplete() {
-  return Boolean(
-    normalizeUuid(elements.mutationIntentId.value)
-    && normalizeUuid(elements.mutationAttemptId.value),
-  );
-}
-
-function persistMutationIdentity(intentId, attemptId) {
-  try {
-    window.sessionStorage.setItem(MUTATION_STATUS_STORAGE_KEY, JSON.stringify({
-      intent_id: intentId,
-      attempt_id: attemptId,
-    }));
-  } catch {
-    // Polling remains functional when storage is disabled or full.
-  }
-}
-
-function normalizeUuid(value) {
-  if (typeof value !== "string") return null;
-  const normalized = value.trim().toLowerCase();
-  if (!UUID_PATTERN.test(normalized) || normalized === "00000000-0000-0000-0000-000000000000") {
-    return null;
-  }
-  return normalized;
-}
-
-function validateMutationIdentity() {
-  clearFieldError(elements.mutationIntentId, elements.mutationIntentError);
-  clearFieldError(elements.mutationAttemptId, elements.mutationAttemptError);
-  const intentId = normalizeUuid(elements.mutationIntentId.value);
-  const attemptId = normalizeUuid(elements.mutationAttemptId.value);
-  let firstInvalid = null;
-  if (!intentId) {
-    showFieldError(
-      elements.mutationIntentId,
-      elements.mutationIntentError,
-      "Укажите ненулевой UUID intent.",
-    );
-    firstInvalid = elements.mutationIntentId;
-  }
-  if (!attemptId) {
-    showFieldError(
-      elements.mutationAttemptId,
-      elements.mutationAttemptError,
-      "Укажите ненулевой UUID попытки.",
-    );
-    firstInvalid ??= elements.mutationAttemptId;
-  }
-  if (firstInvalid) {
-    firstInvalid.focus();
-    announce("Проверьте идентификаторы операции.", true);
-    return null;
-  }
-  elements.mutationIntentId.value = intentId;
-  elements.mutationAttemptId.value = attemptId;
-  return { intentId, attemptId };
-}
-
-function showFieldError(input, errorElement, message) {
-  input.setAttribute("aria-invalid", "true");
-  errorElement.textContent = message;
-  errorElement.hidden = false;
-}
-
-function clearFieldError(input, errorElement) {
-  input.removeAttribute("aria-invalid");
-  errorElement.textContent = "";
-  errorElement.hidden = true;
-}
-
-async function requestMutationStatus(announceFailure = true) {
-  if (runtime.mutationStatusLoading || !runtime.mutationCapabilities?.executor_socket_configured) {
-    return;
-  }
-  const identity = validateMutationIdentity();
-  if (!identity) return;
-  persistMutationIdentity(identity.intentId, identity.attemptId);
-  clearMutationStatusTimer();
-  runtime.mutationStatusLoading = true;
-  elements.mutationStatusSubmit.disabled = true;
-  elements.mutationStatusRetry.hidden = true;
-  elements.mutationStatusMessage.textContent = "Запрашивается состояние операции…";
-  try {
-    const query = new URLSearchParams({
-      intent_id: identity.intentId,
-      attempt_id: identity.attemptId,
-    });
-    const response = await fetch(`/api/v1/mutations/status?${query}`, {
+    const response = await fetch("/api/v1/host-history", {
       headers: { Accept: "application/json" },
       cache: "no-store",
     });
     if (!response.ok) {
       const problem = await response.json().catch(() => ({ detail: response.statusText }));
-      throw new Error(problem.detail || "Состояние операции недоступно.");
+      throw new Error(problem.detail || "История ресурсов недоступна.");
     }
-    const status = await response.json();
-    if (status.intent_id !== identity.intentId || status.attempt_id !== identity.attemptId) {
-      throw new Error("Ответ executor не совпал с запрошенной операцией.");
-    }
-    renderMutationStatus(status);
-    if (status.state !== "succeeded") {
-      runtime.mutationStatusTimer = window.setTimeout(
-        () => requestMutationStatus(false),
-        MUTATION_STATUS_POLL_MS,
-      );
-    }
+    renderHostHistory(await response.json());
+    runtime.historyFailed = false;
   } catch (error) {
-    elements.mutationStatusMessage.textContent = error.message;
-    elements.mutationStatusRetry.hidden = false;
-    if (announceFailure) announce(error.message, true);
+    elements.historyStatus.dataset.state = "error";
+    elements.historyStatus.textContent = error.message;
+    for (const cell of elements.historyCells) {
+      cell.dataset.state = "unknown";
+      cell.textContent = "Недоступно";
+    }
+    if (announceFailure || !runtime.historyFailed) {
+      announce("Историю ресурсов получить не удалось.", true);
+    }
+    runtime.historyFailed = true;
   } finally {
-    runtime.mutationStatusLoading = false;
-    elements.mutationStatusSubmit.disabled = false;
+    runtime.historyLoading = false;
   }
 }
 
-function renderMutationStatus(status) {
-  const state = mutationStatePresentation(status.state);
-  const phase = operationPhaseLabel(status.current_phase);
-  const completed = Array.isArray(status.completed_phases)
-    ? status.completed_phases.map(operationPhaseLabel)
-    : [];
-  elements.mutationStatusDetail.hidden = false;
-  elements.mutationState.dataset.state = state.state;
-  elements.mutationState.textContent = state.label;
-  elements.mutationOperation.textContent = `${status.project_id} · ${operationKindLabel(status.operation_kind)}`;
-  elements.mutationPhase.textContent = phase;
-  elements.mutationCompletedPhases.textContent = completed.length > 0 ? completed.join(" → ") : "Нет";
-  elements.mutationUpdatedAt.textContent = Number.isFinite(status.updated_at_ms)
-    ? new Date(status.updated_at_ms).toLocaleString("ru-RU")
-    : "Некорректное время";
-  elements.mutationStatusMessage.textContent = status.state === "succeeded"
-    ? "Операция завершена; автоматическое обновление остановлено."
-    : "Состояние обновляется автоматически каждые 2 секунды.";
-  if (runtime.lastMutationState !== status.state) {
-    announce(`Состояние операции: ${state.label}. Текущая фаза: ${phase}.`);
-    runtime.lastMutationState = status.state;
+function renderHostHistory(history) {
+  if (
+    history?.schema_version !== 1
+    || !Number.isFinite(history.complete_through_ms)
+    || !Array.isArray(history.windows)
+  ) {
+    throw new Error("Сервер вернул неподдерживаемый контракт истории ресурсов.");
   }
+  const windows = new Map(history.windows.map((window) => [window.window, window]));
+  if (HOST_HISTORY_WINDOWS.some((name) => !validHistoryWindow(windows.get(name), name))) {
+    throw new Error("Сервер вернул неполную историю ресурсов.");
+  }
+  for (const name of HOST_HISTORY_WINDOWS) {
+    const window = windows.get(name);
+    elements.historyCoverage[name].textContent = formatHistoryCoverage(window);
+  }
+  for (const cell of elements.historyCells) {
+    renderHistoryCell(cell, windows.get(cell.dataset.historyWindow));
+  }
+  const partialWindows = HOST_HISTORY_WINDOWS.filter((name) => !windows.get(name).complete);
+  elements.historyStatus.dataset.state = partialWindows.length === 0 ? "fresh" : "partial";
+  elements.historyStatus.textContent = partialWindows.length === 0
+    ? "Медианы рассчитаны по полной истории завершённых минут."
+    : "История ещё накапливается; медианы рассчитаны только по имеющимся завершённым минутам.";
 }
 
-function clearMutationStatusTimer() {
-  if (runtime.mutationStatusTimer !== null) {
-    window.clearTimeout(runtime.mutationStatusTimer);
-    runtime.mutationStatusTimer = null;
+function validHistoryWindow(window, expectedName) {
+  return window?.window === expectedName
+    && Number.isSafeInteger(window.sample_count)
+    && window.sample_count >= 0
+    && Number.isSafeInteger(window.covered_minutes)
+    && window.covered_minutes >= 0
+    && Number.isSafeInteger(window.expected_minutes)
+    && window.expected_minutes > 0
+    && window.covered_minutes <= window.expected_minutes
+    && typeof window.complete === "boolean"
+    && window.complete === (window.covered_minutes === window.expected_minutes)
+    && typeof window.medians === "object"
+    && window.medians !== null;
+}
+
+function renderHistoryCell(cell, window) {
+  cell.replaceChildren();
+  cell.dataset.state = window.complete ? "fresh" : "partial";
+  if (window.sample_count === 0) {
+    cell.dataset.state = "unknown";
+    cell.textContent = "Нет данных";
+    return;
   }
+  const metric = cell.dataset.historyMetric;
+  const primary = document.createElement("strong");
+  const secondary = document.createElement("small");
+  if (metric === "cpu_percent") {
+    primary.textContent = formatPercent(window.medians.cpu_percent);
+    secondary.textContent = Number.isFinite(window.medians.load_1)
+      ? `Load 1: ${window.medians.load_1.toFixed(2)}`
+      : "Load 1: —";
+  } else if (metric === "memory_used_percent" || metric === "disk_used_percent") {
+    primary.textContent = formatPercent(window.medians[metric]);
+  } else if (metric === "network") {
+    primary.textContent = `↓ ${formatRate(window.medians.network_rx_bytes_per_second)}`;
+    secondary.textContent = `↑ ${formatRate(window.medians.network_tx_bytes_per_second)}`;
+  } else if (metric === "psi") {
+    primary.textContent = [
+      window.medians.psi_cpu_some_avg10,
+      window.medians.psi_memory_some_avg10,
+      window.medians.psi_io_some_avg10,
+    ].map((value) => (Number.isFinite(value) ? percentFormatter.format(value) : "—")).join(" / ");
+  }
+  cell.append(primary);
+  if (secondary.textContent) cell.append(secondary);
 }
 
 function formatBytes(value) {
@@ -387,44 +286,343 @@ function renderPartialReasons(reasons) {
 }
 
 function renderProjects(projects) {
-  elements.projectRows.replaceChildren();
-  const count = Array.isArray(projects) ? projects.length : 0;
+  elements.projectList.replaceChildren();
+  const connectedProjects = Array.isArray(projects) ? projects : [];
+  const count = connectedProjects.length;
   elements.projectCount.textContent = `${count} подключено`;
   if (count === 0) {
-    const row = document.createElement("tr");
-    const cell = document.createElement("td");
-    cell.colSpan = 4;
-    cell.className = "empty-cell";
-    cell.textContent = "Проекты ещё не подключены.";
-    row.append(cell);
-    elements.projectRows.append(row);
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = "Проекты ещё не подключены.";
+    elements.projectList.append(empty);
     return;
   }
-  for (const project of projects) {
-    const row = document.createElement("tr");
-    appendCell(row, project.display_name);
-    const condition = String(project.condition);
-    const presentation = projectConditionPresentation(condition, "fresh");
-    const conditionCell = appendCell(row, presentation.label);
-    conditionCell.className = "project-condition";
-    conditionCell.dataset.condition = condition;
-    conditionCell.dataset.state = presentation.state;
-    appendCell(
-      row,
-      Number.isFinite(project.observed_at_ms)
-        ? new Date(project.observed_at_ms).toLocaleString("ru-RU")
-        : "Нет данных",
-    );
-    appendCell(row, project.detail);
-    elements.projectRows.append(row);
+  for (const project of connectedProjects) {
+    elements.projectList.append(createProjectOverview(project, true));
   }
 }
 
-function appendCell(row, value) {
-  const cell = document.createElement("td");
-  cell.textContent = String(value);
-  row.append(cell);
-  return cell;
+function createProjectOverview(project, loadIntegrations) {
+  const projectId = String(project.project_id);
+  const article = document.createElement("article");
+  article.className = "project-overview";
+  article.dataset.projectId = projectId;
+
+  const header = document.createElement("header");
+  header.className = "project-header";
+  const identity = document.createElement("div");
+  const heading = document.createElement("h3");
+  heading.textContent = String(project.display_name);
+  const identifier = document.createElement("code");
+  identifier.textContent = projectId;
+  identity.append(heading, identifier);
+  const condition = String(project.condition);
+  const presentation = projectConditionPresentation(condition, "fresh");
+  const conditionLabel = document.createElement("p");
+  conditionLabel.className = "project-condition";
+  conditionLabel.dataset.condition = condition;
+  conditionLabel.dataset.state = presentation.state;
+  conditionLabel.textContent = presentation.label;
+  header.append(identity, conditionLabel);
+
+  const health = document.createElement("dl");
+  health.className = "project-health";
+  appendDefinition(health, "Последний ответ", Number.isFinite(project.observed_at_ms)
+    ? new Date(project.observed_at_ms).toLocaleString("ru-RU")
+    : "Нет данных");
+  appendDefinition(health, "Проверка", String(project.detail));
+
+  const operations = runtime.projectOperations.get(projectId);
+  const repository = runtime.projectRepositories.get(projectId);
+  const operationalGrid = document.createElement("div");
+  operationalGrid.className = "project-operational-grid";
+  operationalGrid.append(
+    createOperationSection(
+      "Деплои",
+      operations,
+      (operation) => ["deploy", "code_rollback"].includes(operation.operation_kind),
+      "Деплоев через rdashboard ещё не было.",
+    ),
+    createOperationSection(
+      "Резервные копии",
+      operations,
+      (operation) => operation.operation_kind === "backup_only",
+      "Операций резервного копирования через rdashboard ещё не было.",
+    ),
+    createUnavailableSection(
+      "Ресурсы проекта",
+      "Сбор CPU, памяти, диска и сети контейнеров пока не настроен.",
+    ),
+    createRepositorySection(repository),
+    createUnavailableSection(
+      "Обновления",
+      "Источник обновлений зависимостей пока не настроен.",
+    ),
+    createUnavailableSection(
+      "Ошибки",
+      "Интеграция GlitchTip пока не настроена.",
+    ),
+  );
+
+  article.append(header, health, operationalGrid);
+  if (loadIntegrations) {
+    loadProjectOperations(projectId, false);
+    loadProjectRepository(projectId, false);
+  }
+  return article;
+}
+
+function refreshProjectOverview(projectId) {
+  const project = runtime.latestSnapshot?.projects?.find(
+    (candidate) => String(candidate.project_id) === projectId,
+  );
+  if (!project) return;
+  const current = Array.from(elements.projectList.querySelectorAll(".project-overview"))
+    .find((article) => article.dataset.projectId === projectId);
+  if (!current) return;
+  current.replaceWith(createProjectOverview(project, false));
+  updateSampleAge();
+}
+
+function appendDefinition(list, termText, detailText) {
+  const item = document.createElement("div");
+  const term = document.createElement("dt");
+  const detail = document.createElement("dd");
+  term.textContent = termText;
+  detail.textContent = detailText;
+  item.append(term, detail);
+  list.append(item);
+}
+
+function createRepositorySection(cached) {
+  const section = document.createElement("section");
+  section.className = "operational-section repository-section";
+  const heading = document.createElement("h4");
+  heading.textContent = "Репозиторий";
+  section.append(heading);
+  if (!cached) {
+    const loading = document.createElement("p");
+    loading.className = "integration-loading";
+    loading.textContent = "Загружается почасовая история…";
+    section.append(loading);
+    return section;
+  }
+  if (cached.error && cached.samples.length === 0) {
+    const error = document.createElement("p");
+    error.className = "integration-error";
+    error.textContent = cached.error;
+    section.append(error);
+    return section;
+  }
+  if (cached.samples.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "integration-empty";
+    empty.textContent = "Первый почасовой снимок ещё не получен.";
+    section.append(empty);
+    return section;
+  }
+
+  const latest = cached.samples.at(-1);
+  const total = document.createElement("strong");
+  total.className = "repository-total";
+  total.textContent = formatBytes(latest.total_bytes);
+  const detail = document.createElement("p");
+  detail.className = "repository-detail";
+  detail.textContent = `${latest.file_count.toLocaleString("ru-RU")} файлов · ${new Date(latest.observed_at_ms).toLocaleString("ru-RU")}`;
+  const head = document.createElement("code");
+  head.textContent = latest.head.slice(0, 12);
+  section.append(total, detail, head);
+
+  const history = document.createElement("dl");
+  history.className = "repository-history";
+  for (const [label, periodMs] of REPOSITORY_PERIODS) {
+    const change = repositorySizeChange(cached.samples, periodMs);
+    appendDefinition(history, label, formatByteChange(change));
+  }
+  section.append(history);
+  if (cached.error) {
+    const error = document.createElement("p");
+    error.className = "integration-error";
+    error.textContent = `Последние данные сохранены. ${cached.error}`;
+    section.append(error);
+  }
+  return section;
+}
+
+function formatByteChange(value) {
+  if (!Number.isSafeInteger(value)) return "История накапливается";
+  if (value === 0) return "Без изменений";
+  return `${value > 0 ? "+" : "−"}${formatBytes(Math.abs(value))}`;
+}
+
+function createUnavailableSection(titleText, detailText) {
+  const section = document.createElement("section");
+  section.className = "operational-section";
+  const heading = document.createElement("h4");
+  const detail = document.createElement("p");
+  heading.textContent = titleText;
+  detail.className = "integration-unavailable";
+  detail.textContent = detailText;
+  section.append(heading, detail);
+  return section;
+}
+
+function createOperationSection(titleText, cached, predicate, emptyText) {
+  const section = document.createElement("section");
+  section.className = "operational-section";
+  const heading = document.createElement("h4");
+  heading.textContent = titleText;
+  section.append(heading);
+  if (!cached) {
+    const loading = document.createElement("p");
+    loading.className = "integration-loading";
+    loading.textContent = "Загружается история операций…";
+    section.append(loading);
+    return section;
+  }
+  if (cached.error) {
+    const error = document.createElement("p");
+    error.className = "integration-error";
+    error.textContent = cached.error;
+    section.append(error);
+    return section;
+  }
+  const matching = cached.operations.filter(predicate);
+  if (matching.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "integration-empty";
+    empty.textContent = emptyText;
+    section.append(empty);
+    return section;
+  }
+  const list = document.createElement("ol");
+  list.className = "operation-list";
+  for (const operation of matching.slice(0, 5)) {
+    list.append(createOperationItem(operation));
+  }
+  section.append(list);
+  return section;
+}
+
+function createOperationItem(operation) {
+  const item = document.createElement("li");
+  const summary = document.createElement("div");
+  summary.className = "operation-summary";
+  const kind = document.createElement("strong");
+  kind.textContent = operationKindLabel(operation.operation_kind);
+  const result = operationResultPresentation(operation.result);
+  const state = document.createElement("span");
+  state.dataset.state = result.state;
+  state.textContent = result.label;
+  summary.append(kind, state);
+  const detail = document.createElement("p");
+  const updated = Number.isFinite(operation.updated_at_ms)
+    ? new Date(operation.updated_at_ms).toLocaleString("ru-RU")
+    : "время неизвестно";
+  detail.textContent = `${operationPhaseLabel(operation.phase)} · ${updated}`;
+  item.append(summary, detail);
+  if (typeof operation.target_commit === "string") {
+    const target = document.createElement("code");
+    target.textContent = operation.target_commit.slice(0, 12);
+    item.append(target);
+  }
+  if (operation.failure?.summary) {
+    const failure = document.createElement("p");
+    failure.className = "operation-failure";
+    failure.textContent = `${operation.failure.code}: ${operation.failure.summary}`;
+    item.append(failure);
+  }
+  return item;
+}
+
+async function loadProjectOperations(projectId, refresh) {
+  if (runtime.projectOperationsLoading.has(projectId)) return;
+  if (!refresh && runtime.projectOperations.has(projectId)) return;
+  runtime.projectOperationsLoading.add(projectId);
+  try {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/operations?limit=10`,
+      { headers: { Accept: "application/json" }, cache: "no-store" },
+    );
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(problem.detail || "История операций недоступна.");
+    }
+    const payload = await response.json();
+    if (
+      payload?.schema_version !== 1
+      || payload.project_id !== projectId
+      || !Array.isArray(payload.operations)
+    ) {
+      throw new Error("Сервер вернул неподдерживаемую историю операций.");
+    }
+    runtime.projectOperations.set(projectId, { operations: payload.operations });
+  } catch (error) {
+    runtime.projectOperations.set(projectId, { error: error.message, operations: [] });
+  } finally {
+    runtime.projectOperationsLoading.delete(projectId);
+    refreshProjectOverview(projectId);
+  }
+}
+
+async function loadProjectRepository(projectId, refresh) {
+  if (runtime.projectRepositoriesLoading.has(projectId)) return;
+  if (!refresh && runtime.projectRepositories.has(projectId)) return;
+  runtime.projectRepositoriesLoading.add(projectId);
+  try {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/repository-history`,
+      { headers: { Accept: "application/json" }, cache: "no-store" },
+    );
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(problem.detail || "История репозитория недоступна.");
+    }
+    const payload = await response.json();
+    if (!validRepositoryHistory(payload, projectId)) {
+      throw new Error("Сервер вернул неподдерживаемую историю репозитория.");
+    }
+    runtime.projectRepositories.set(projectId, {
+      error: payload.last_collection_error,
+      samples: payload.samples,
+    });
+  } catch (error) {
+    const previous = runtime.projectRepositories.get(projectId);
+    runtime.projectRepositories.set(projectId, {
+      error: error.message,
+      samples: previous?.samples ?? [],
+    });
+  } finally {
+    runtime.projectRepositoriesLoading.delete(projectId);
+    refreshProjectOverview(projectId);
+  }
+}
+
+function validRepositoryHistory(payload, projectId) {
+  if (
+    payload?.schema_version !== 1
+    || payload.project_id !== projectId
+    || payload.collection_interval_seconds !== 3_600
+    || !(payload.last_collection_error === null || typeof payload.last_collection_error === "string")
+    || !Array.isArray(payload.samples)
+    || payload.samples.length > 24 * 31 + 1
+  ) return false;
+  let previousTime = -1;
+  for (const sample of payload.samples) {
+    if (
+      !Number.isSafeInteger(sample?.observed_at_ms)
+      || sample.observed_at_ms < 0
+      || sample.observed_at_ms <= previousTime
+      || typeof sample.head !== "string"
+      || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sample.head)
+      || !Number.isSafeInteger(sample.file_count)
+      || sample.file_count < 0
+      || !Number.isSafeInteger(sample.total_bytes)
+      || sample.total_bytes < 0
+    ) return false;
+    previousTime = sample.observed_at_ms;
+  }
+  return true;
 }
 
 function updateSampleAge() {
@@ -446,7 +644,7 @@ function updateSampleAge() {
 }
 
 function refreshProjectConditions(hostObservationStatus) {
-  for (const cell of elements.projectRows.querySelectorAll(".project-condition")) {
+  for (const cell of elements.projectList.querySelectorAll(".project-condition")) {
     const presentation = projectConditionPresentation(
       cell.dataset.condition,
       hostObservationStatus,
@@ -598,24 +796,9 @@ elements.retry.addEventListener("click", async () => {
     }
   }
   runtime.initializing = false;
+  loadHostHistory(false);
   connect();
 });
-
-elements.mutationStatusForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  requestMutationStatus(true);
-});
-
-elements.mutationStatusRetry.addEventListener("click", () => {
-  requestMutationStatus(true);
-});
-
-for (const [input, errorElement] of [
-  [elements.mutationIntentId, elements.mutationIntentError],
-  [elements.mutationAttemptId, elements.mutationAttemptError],
-]) {
-  input.addEventListener("input", () => clearFieldError(input, errorElement));
-}
 
 window.addEventListener("online", () => {
   runtime.reconnectDelayMs = 1_000;
@@ -627,11 +810,22 @@ window.addEventListener("offline", () => {
   setConnection("disconnected", "× Нет сети", "Браузер находится offline; показан последний снимок.", "Сетевое подключение потеряно.");
 });
 
-window.addEventListener("pagehide", clearMutationStatusTimer);
-
 window.setInterval(updateSampleAge, 1_000);
+window.setInterval(() => loadHostHistory(false), HOST_HISTORY_REFRESH_MS);
+window.setInterval(() => {
+  if (!runtime.latestSnapshot?.projects) return;
+  for (const project of runtime.latestSnapshot.projects) {
+    loadProjectOperations(String(project.project_id), true);
+  }
+}, PROJECT_OPERATIONS_REFRESH_MS);
+window.setInterval(() => {
+  if (!runtime.latestSnapshot?.projects) return;
+  for (const project of runtime.latestSnapshot.projects) {
+    loadProjectRepository(String(project.project_id), true);
+  }
+}, PROJECT_REPOSITORY_REFRESH_MS);
 
-initializeMutationControls().catch(renderMutationControlsUnavailable);
+loadHostHistory(true);
 
 loadInitialSnapshot()
   .then(connect)

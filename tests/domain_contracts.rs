@@ -14,8 +14,8 @@ use rdashboard::{
     },
     policy::{PolicyBundleV1, PolicyError, PolicyVerifier, SignedPolicyBundleV1},
     protocol::{
-        ControlRequestEnvelope, FrameError, NORMAL_FRAME_MAX_BYTES, decode_single_frame,
-        encode_frame,
+        CONTROL_PROTOCOL_VERSION, ControlRequestEnvelope, FrameError, NORMAL_FRAME_MAX_BYTES,
+        decode_single_frame, encode_frame,
     },
 };
 use serde_json::json;
@@ -275,7 +275,7 @@ fn signed_policy_rejects_tampering_unknown_keys_and_rollback() {
 fn framed_protocol_rejects_unknown_duplicate_trailing_and_oversized_input() {
     let request_id = Uuid::new_v4();
     let json = format!(
-        r#"{{"version":1,"request_id":"{request_id}","request":{{"operation":"observe_host_snapshot"}}}}"#
+        r#"{{"version":{CONTROL_PROTOCOL_VERSION},"request_id":"{request_id}","request":{{"operation":"observe_host_snapshot"}}}}"#
     );
     let json_length =
         u32::try_from(json.len()).unwrap_or_else(|error| panic!("fixture length: {error}"));
@@ -288,7 +288,7 @@ fn framed_protocol_rejects_unknown_duplicate_trailing_and_oversized_input() {
         .unwrap_or_else(|error| panic!("validate request: {error}"));
 
     let duplicate = format!(
-        r#"{{"version":1,"version":1,"request_id":"{request_id}","request":{{"operation":"observe_host_snapshot"}}}}"#
+        r#"{{"version":{CONTROL_PROTOCOL_VERSION},"version":{CONTROL_PROTOCOL_VERSION},"request_id":"{request_id}","request":{{"operation":"observe_host_snapshot"}}}}"#
     );
     let duplicate_length =
         u32::try_from(duplicate.len()).unwrap_or_else(|error| panic!("fixture length: {error}"));

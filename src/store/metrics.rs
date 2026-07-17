@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -8,22 +8,51 @@ use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, Transaction
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    HostTelemetry, ObservationStatus, ProjectCondition, ProjectTelemetry, PsiMeasurement,
-    truncate_utf8,
+    HostHistorySnapshot, HostHistoryWindow, HostHistoryWindowKind, HostMetricMedians,
+    HostTelemetry, ObservationStatus, ProjectCondition, ProjectId, ProjectRepositorySample,
+    ProjectTelemetry, PsiMeasurement, truncate_utf8,
 };
+use crate::source::SourceTreeObservationV1;
 
 use super::{StoreError, lock_connection, verify_sqlite_version};
 
-const METRICS_SCHEMA_VERSION: i64 = 3;
+const METRICS_SCHEMA_VERSION: i64 = 4;
 pub const MINUTE_ROLLUP_MS: i64 = 60_000;
 const LOG_SKETCH_RELATIVE_ACCURACY: f64 = 0.01;
 const ROLLUP_DETAIL_MAX_BYTES: usize = 1_024;
 const ROLLUP_REASON_MAX_BYTES: usize = 512;
 const ROLLUP_REASON_LIMIT: usize = 8;
+const HOST_HISTORY_SCHEMA_VERSION: u16 = 1;
+pub const PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS: i64 = 60 * 60 * 1_000;
+pub const PROJECT_REPOSITORY_HISTORY_LIMIT: usize = 24 * 31 + 1;
+const HOST_HISTORY_WINDOWS: [(HostHistoryWindowKind, i64, u64); 4] = [
+    (HostHistoryWindowKind::Hour, 60 * MINUTE_ROLLUP_MS, 60),
+    (
+        HostHistoryWindowKind::Day,
+        24 * 60 * MINUTE_ROLLUP_MS,
+        24 * 60,
+    ),
+    (
+        HostHistoryWindowKind::Week,
+        7 * 24 * 60 * MINUTE_ROLLUP_MS,
+        7 * 24 * 60,
+    ),
+    (
+        HostHistoryWindowKind::Month,
+        30 * 24 * 60 * MINUTE_ROLLUP_MS,
+        30 * 24 * 60,
+    ),
+];
 
 #[derive(Clone, Debug)]
 pub struct MetricsStore {
     connection: Arc<Mutex<Connection>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositorySampleWrite {
+    Recorded,
+    NotDue { next_observation_at_ms: i64 },
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -563,6 +592,211 @@ impl MetricsStore {
         let connection = lock_connection(&self.connection)?;
         load_project_rollup(&connection, bucket_start_ms, project_id)
     }
+
+    pub fn host_history(&self, generated_at_ms: i64) -> Result<HostHistorySnapshot, StoreError> {
+        let complete_through_ms = minute_bucket(generated_at_ms);
+        let connection = lock_connection(&self.connection)?;
+        let mut windows = Vec::with_capacity(HOST_HISTORY_WINDOWS.len());
+        for (window, duration_ms, expected_minutes) in HOST_HISTORY_WINDOWS {
+            let starts_at_ms = complete_through_ms.saturating_sub(duration_ms);
+            windows.push(aggregate_host_window(
+                &connection,
+                window,
+                starts_at_ms,
+                complete_through_ms,
+                expected_minutes,
+            )?);
+        }
+        Ok(HostHistorySnapshot {
+            schema_version: HOST_HISTORY_SCHEMA_VERSION,
+            generated_at_ms,
+            complete_through_ms,
+            windows,
+        })
+    }
+
+    pub fn record_project_repository_sample(
+        &self,
+        observed_at_ms: i64,
+        observation: &SourceTreeObservationV1,
+    ) -> Result<RepositorySampleWrite, StoreError> {
+        if observed_at_ms < 0 {
+            return Err(StoreError::InvalidMetricTimestamp);
+        }
+        let file_count =
+            i64::try_from(observation.file_count).map_err(|_| StoreError::MetricRange {
+                field: "repository_file_count",
+            })?;
+        let total_bytes =
+            i64::try_from(observation.total_bytes).map_err(|_| StoreError::MetricRange {
+                field: "repository_total_bytes",
+            })?;
+        let mut connection = lock_connection(&self.connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest: Option<i64> = transaction.query_row(
+            "SELECT MAX(observed_at_ms)
+                 FROM project_repository_samples
+                 WHERE project_id = ?1",
+            [observation.project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if let Some(latest) = latest {
+            let next_observation_at_ms =
+                latest.saturating_add(PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS);
+            if observed_at_ms < next_observation_at_ms {
+                return Ok(RepositorySampleWrite::NotDue {
+                    next_observation_at_ms,
+                });
+            }
+        }
+        transaction.execute(
+            "INSERT INTO project_repository_samples(
+                project_id, observed_at_ms, head, file_count, total_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                observation.project_id.as_str(),
+                observed_at_ms,
+                observation.head.as_str(),
+                file_count,
+                total_bytes,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(RepositorySampleWrite::Recorded)
+    }
+
+    pub fn next_project_repository_observation_at(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<i64>, StoreError> {
+        let connection = lock_connection(&self.connection)?;
+        let latest: Option<i64> = connection.query_row(
+            "SELECT MAX(observed_at_ms)
+             FROM project_repository_samples
+             WHERE project_id = ?1",
+            [project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(latest.map(|value| value.saturating_add(PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS)))
+    }
+
+    pub fn project_repository_history(
+        &self,
+        project_id: &ProjectId,
+        since_ms: i64,
+    ) -> Result<Vec<ProjectRepositorySample>, StoreError> {
+        if since_ms < 0 {
+            return Err(StoreError::InvalidMetricTimestamp);
+        }
+        let limit = i64::try_from(PROJECT_REPOSITORY_HISTORY_LIMIT).unwrap_or(i64::MAX);
+        let connection = lock_connection(&self.connection)?;
+        let mut statement = connection.prepare(
+            "SELECT observed_at_ms, head, file_count, total_bytes
+             FROM (
+                SELECT observed_at_ms, head, file_count, total_bytes
+                FROM project_repository_samples
+                WHERE project_id = ?1 AND observed_at_ms >= ?2
+                ORDER BY observed_at_ms DESC
+                LIMIT ?3
+             )
+             ORDER BY observed_at_ms",
+        )?;
+        let mut rows = statement.query(params![project_id.as_str(), since_ms, limit])?;
+        let mut samples = Vec::new();
+        while let Some(row) = rows.next()? {
+            let head: String = row.get(1)?;
+            samples.push(ProjectRepositorySample {
+                observed_at_ms: row.get(0)?,
+                head: head.parse().map_err(|_| StoreError::CorruptMetric {
+                    field: "repository_head",
+                })?,
+                file_count: sqlite_required_u64(row, 2, "repository_file_count")?,
+                total_bytes: sqlite_required_u64(row, 3, "repository_total_bytes")?,
+            });
+        }
+        Ok(samples)
+    }
+}
+
+fn aggregate_host_window(
+    connection: &Connection,
+    window: HostHistoryWindowKind,
+    starts_at_ms: i64,
+    ends_at_ms: i64,
+    expected_minutes: u64,
+) -> Result<HostHistoryWindow, StoreError> {
+    let mut aggregate = HostMinuteRollup::new(starts_at_ms);
+    let mut covered_buckets = BTreeSet::new();
+
+    let mut rollup_statement = connection.prepare(
+        "SELECT bucket_start_ms, rollup_json
+         FROM host_minute_rollups
+         WHERE bucket_start_ms >= ?1 AND bucket_start_ms < ?2
+         ORDER BY bucket_start_ms",
+    )?;
+    let mut rollup_rows = rollup_statement.query(params![starts_at_ms, ends_at_ms])?;
+    while let Some(row) = rollup_rows.next()? {
+        let bucket_start_ms: i64 = row.get(0)?;
+        let rollup_json: String = row.get(1)?;
+        let rollup: HostMinuteRollup = serde_json::from_str(&rollup_json)?;
+        if rollup.bucket_start_ms != bucket_start_ms {
+            return Err(StoreError::CorruptRollup {
+                kind: "host",
+                key: bucket_start_ms.to_string(),
+            });
+        }
+        covered_buckets.insert(bucket_start_ms);
+        aggregate.merge(&rollup);
+    }
+    drop(rollup_rows);
+    drop(rollup_statement);
+
+    let mut sample_statement = connection.prepare(
+        "SELECT
+            sample_id, observed_at_ms, status_json, cpu_percent, load_1, load_5, load_15,
+            memory_total_bytes, memory_available_bytes, swap_total_bytes, swap_free_bytes,
+            disk_total_bytes, disk_available_bytes, network_rx_bytes, network_tx_bytes,
+            network_rx_bytes_per_second, network_tx_bytes_per_second,
+            psi_cpu_some_avg10, psi_memory_some_avg10, psi_io_some_avg10,
+            partial_reasons_json
+         FROM host_samples
+         WHERE observed_at_ms >= ?1 AND observed_at_ms < ?2
+         ORDER BY observed_at_ms, sample_id",
+    )?;
+    let mut sample_rows = sample_statement.query(params![starts_at_ms, ends_at_ms])?;
+    while let Some(row) = sample_rows.next()? {
+        let (sample_id, sample) = host_sample_from_row(row)?;
+        covered_buckets.insert(minute_bucket(sample.observed_at_ms));
+        aggregate.add(sample_id, &sample);
+    }
+
+    let covered_minutes = u64::try_from(covered_buckets.len()).unwrap_or(u64::MAX);
+    Ok(HostHistoryWindow {
+        window,
+        starts_at_ms,
+        ends_at_ms,
+        sample_count: aggregate.sample_count,
+        covered_minutes,
+        expected_minutes,
+        complete: covered_minutes == expected_minutes,
+        medians: HostMetricMedians {
+            cpu_percent: aggregate.metrics.cpu_percent.quantile(0.5),
+            load_1: aggregate.metrics.load_1.quantile(0.5),
+            memory_used_percent: aggregate.metrics.memory_used_percent.quantile(0.5),
+            disk_used_percent: aggregate.metrics.disk_used_percent.quantile(0.5),
+            network_rx_bytes_per_second: aggregate
+                .metrics
+                .network_rx_bytes_per_second
+                .quantile(0.5),
+            network_tx_bytes_per_second: aggregate
+                .metrics
+                .network_tx_bytes_per_second
+                .quantile(0.5),
+            psi_cpu_some_avg10: aggregate.metrics.psi_cpu_some_avg10.quantile(0.5),
+            psi_memory_some_avg10: aggregate.metrics.psi_memory_some_avg10.quantile(0.5),
+            psi_io_some_avg10: aggregate.metrics.psi_io_some_avg10.quantile(0.5),
+        },
+    })
 }
 
 fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
@@ -578,6 +812,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
             Ok(())
         }
         2 => migrate_v2_schema(connection),
+        3 => migrate_v3_schema(connection),
         METRICS_SCHEMA_VERSION => create_schema(connection),
         actual => Err(StoreError::UnsupportedMetricsSchemaVersion {
             actual,
@@ -684,6 +919,14 @@ fn migrate_v2_schema(connection: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn migrate_v3_schema(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    create_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", METRICS_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn create_schema(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS host_samples (
@@ -742,7 +985,19 @@ fn create_schema(connection: &Connection) -> Result<(), StoreError> {
          ) STRICT;
 
          CREATE INDEX IF NOT EXISTS project_minute_rollups_project_time
-            ON project_minute_rollups(project_id, bucket_start_ms DESC);",
+            ON project_minute_rollups(project_id, bucket_start_ms DESC);
+
+         CREATE TABLE IF NOT EXISTS project_repository_samples (
+            project_id TEXT NOT NULL,
+            observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms >= 0),
+            head TEXT NOT NULL,
+            file_count INTEGER NOT NULL CHECK(file_count >= 0),
+            total_bytes INTEGER NOT NULL CHECK(total_bytes >= 0),
+            PRIMARY KEY (project_id, observed_at_ms)
+         ) STRICT;
+
+         CREATE INDEX IF NOT EXISTS project_repository_samples_project_time
+            ON project_repository_samples(project_id, observed_at_ms DESC);",
     )?;
     Ok(())
 }
@@ -1030,6 +1285,15 @@ fn sqlite_u64(row: &Row<'_>, index: usize, field: &'static str) -> Result<Option
     value
         .map(|value| u64::try_from(value).map_err(|_| StoreError::CorruptMetric { field }))
         .transpose()
+}
+
+fn sqlite_required_u64(
+    row: &Row<'_>,
+    index: usize,
+    field: &'static str,
+) -> Result<u64, StoreError> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|_| StoreError::CorruptMetric { field })
 }
 
 fn add_usage(

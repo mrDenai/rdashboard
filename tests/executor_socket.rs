@@ -132,6 +132,29 @@ fn root_executor_config_is_fixed_bounded_and_non_root() {
 }
 
 #[test]
+fn installed_executor_keeps_source_group_in_read_only_and_mutation_modes() {
+    let service = include_str!("../deploy/systemd/rdashboard-executor.service");
+    let mutation_drop_in =
+        include_str!("../deploy/systemd/rdashboard-executor-mutation-authority.conf");
+
+    assert!(
+        service
+            .lines()
+            .any(|line| line == "SupplementaryGroups=rdashboard-source")
+    );
+    assert!(
+        mutation_drop_in
+            .lines()
+            .any(|line| line == "SupplementaryGroups=rdashboard-build-readers chrony")
+    );
+    assert!(
+        !mutation_drop_in
+            .lines()
+            .any(|line| line == "SupplementaryGroups=")
+    );
+}
+
+#[test]
 fn read_only_handler_reports_real_host_data_and_fails_mutation_closed() {
     let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
     let handler = ReadOnlyExecutorHandler::linux(temp.path());
@@ -160,9 +183,19 @@ fn read_only_handler_reports_real_host_data_and_fails_mutation_closed() {
     ));
 
     let project_id = ProjectId::from_str("rimg").unwrap_or_else(|error| panic!("project: {error}"));
-    let docker_request = request(ControlRequestV1::ObserveDockerSnapshot { project_id });
+    let docker_request = request(ControlRequestV1::ObserveDockerSnapshot {
+        project_id: project_id.clone(),
+    });
     assert!(matches!(
         handler.handle(docker_request).response,
+        ControlResponseV1::Rejected {
+            code: ControlRejectionCodeV1::ProjectObservationNotConfigured,
+            retryable: false,
+        }
+    ));
+    let source_request = request(ControlRequestV1::ObserveProjectSource { project_id });
+    assert!(matches!(
+        handler.handle(source_request).response,
         ControlResponseV1::Rejected {
             code: ControlRejectionCodeV1::ProjectObservationNotConfigured,
             retryable: false,

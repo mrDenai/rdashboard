@@ -41,6 +41,8 @@ pub enum StoreError {
     SequenceRange,
     #[error("metric {field} is outside SQLite INTEGER range")]
     MetricRange { field: &'static str },
+    #[error("metric observation timestamp must be non-negative")]
+    InvalidMetricTimestamp,
     #[error("persisted metric field {field} is corrupt")]
     CorruptMetric { field: &'static str },
     #[error("persisted {kind} rollup {key} does not match its database key")]

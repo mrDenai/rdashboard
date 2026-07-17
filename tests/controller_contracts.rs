@@ -184,6 +184,28 @@ fn failure_capsule() -> FailureCapsule {
     }
 }
 
+fn assert_project_operation_history(
+    controller: &DurableController,
+    project_id: &ProjectId,
+    expected_latest_attempt: Uuid,
+) {
+    let recent = controller
+        .recent_project_operations(project_id, 1)
+        .unwrap_or_else(|error| panic!("recent project operations: {error}"));
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].attempt_id, expected_latest_attempt);
+    assert!(
+        controller
+            .recent_project_operations(&project("another-project"), 10)
+            .unwrap_or_else(|error| panic!("foreign project operations: {error}"))
+            .is_empty()
+    );
+    assert!(matches!(
+        controller.recent_project_operations(project_id, 0),
+        Err(StoreError::InvalidControllerInput(_))
+    ));
+}
+
 fn recovered_executor(
     security: SecurityStore,
     project_id: &ProjectId,
@@ -487,6 +509,8 @@ fn explicit_retry_creates_a_new_attempt_and_preserves_failed_evidence() {
     assert_eq!(attempts[0].state.result, OperationResult::Failed);
     assert!(attempts[0].failure_capsule.is_some());
     assert_eq!(attempts[1].state.result, OperationResult::Running);
+
+    assert_project_operation_history(&controller, &operation.project_id, second.attempt_id);
 
     let authorization = ExecutorAuthorization {
         authorization_id: retry_grant.nonce,

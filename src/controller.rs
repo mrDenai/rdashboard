@@ -322,6 +322,45 @@ impl DurableController {
         })
     }
 
+    pub fn recent_project_operations(
+        &self,
+        project_id: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<OperationRecord>, StoreError> {
+        if !(1..=50).contains(&limit) {
+            return Err(StoreError::InvalidControllerInput(
+                "project operation limit must be between 1 and 50",
+            ));
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| StoreError::InvalidControllerInput("project operation limit overflow"))?;
+        self.store.read_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT attempt.operation_json
+                 FROM operation_attempts AS attempt
+                 JOIN deployment_requests AS request
+                   ON request.request_id = attempt.request_id
+                 WHERE request.project_id = ?1
+                 ORDER BY attempt.updated_at_ms DESC, attempt.attempt_number DESC
+                 LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![project_id.as_str(), limit], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut operations = Vec::new();
+            for row in rows {
+                let operation = decode_operation(&row?)?;
+                if operation.project_id != *project_id {
+                    return Err(StoreError::CorruptController(
+                        "project operation query returned a foreign project",
+                    ));
+                }
+                operations.push(operation);
+            }
+            Ok(operations)
+        })
+    }
+
     pub fn commit_phase_receipt(
         &self,
         receipt: &PhaseReceipt,

@@ -4,8 +4,8 @@ Low-resource Rust operations dashboard and deployment control plane.
 
 The implementation is being built in gated vertical slices described in
 [PLAN.md](PLAN.md). The browser process remains deliberately bound to loopback: it records real Linux
-host and `rimg` health observations in SQLite, exposes resumable SSE updates and presents the
-installed operation capabilities plus durable mutation status. The controller mutation API can
+host and `rimg` health observations in SQLite, exposes resumable SSE updates and presents current
+host resources beside one-hour, one-day, one-week and 30-day medians. The controller mutation API can
 acquire a tab lease, prepare a root-signed intent, admit an authorizer grant and follow the resulting
 operation; it remains fail-closed when the separate authorizer or executor mutation authority is not
 installed. The durable control plane, bounded Git source adapter and Phase 6A typed backup/deploy
@@ -98,9 +98,15 @@ The controller exposes `POST /api/v1/mutations/lease`,
 `GET /api/v1/mutations/status` and `GET /api/v1/mutations/capabilities` only on the configured
 loopback listener. Preparation never mutates production state. Execution still requires the exact
 one-use grant for the executor-signed intent; the dashboard does not mint or weaken that authority.
-The browser validates operation IDs, persists only the last nonsensitive attempt ID in session
-storage, polls running operations and renders explicit unavailable, retryable, reconciliation and
-terminal states.
+The HTTP mutation surface remains available to the future project-specific deploy journey, but the
+browser does not expose the old manual intent/attempt-ID form. That prototype did not explain an
+operator task and has been removed until the project view can start an admitted operation and follow
+its exact persisted state without manual identifier copying.
+
+The project overview reads bounded, project-scoped operation history from
+`GET /api/v1/projects/{project_id}/operations`. Deploy, rollback and backup entries come from the
+same durable controller journal that drives execution; the browser does not infer success from a
+workflow or container state and retains the recorded failure summary when an attempt fails.
 
 Production source reconciliation uses the fixed `/etc/rdashboard/source.json`, private
 `/var/lib/rdashboard-source` state and `/run/rdashboard-source/source.sock`. The source process
@@ -110,11 +116,25 @@ deadlines. Root-side snapshot verification independently checks signature expiry
 owner-policy identity, target SHA, sequence, attestation digest, blocked-SHA and pause controls.
 See [`deploy/systemd/README.md`](deploy/systemd/README.md) for the installation boundary.
 
+The source broker also exposes a versioned read-only observation of the accepted Git tree to the
+root executor. It counts every regular tracked file and sums its logical blob size at the exact
+accepted commit, rechecking that the accepted ref did not change during measurement. The
+controller never receives a repository path or Git command surface. `metrics.sqlite` records at
+most one such observation per project per hour and
+`GET /api/v1/projects/{project_id}/repository-history` returns the 30-day comparison window plus
+one day for its oldest baseline (up to 745 points), including a last collection error without
+discarding earlier valid samples. The browser shows the latest file count, logical size and commit
+plus covered changes for one hour, one day, one week and 30 days; periods without a complete
+baseline remain explicitly incomplete.
+
 `metrics.sqlite` assigns every collection an independent monotonic sample ID, so an NTP clock step
 cannot collide with an earlier observation. Raw samples are retained for 24 hours and compacted in
 the same SQLite transaction into mergeable one-minute relative-log sketches retained for 30 days;
 raw rows are deleted only after both host and project rollups are durable. Databases created by the
-earlier timestamp-key schema are migrated transactionally on first open.
+earlier timestamp-key schema are migrated transactionally on first open. `GET /api/v1/host-history`
+combines the remaining raw samples and durable rollups into aligned completed-minute windows. It
+returns medians plus explicit covered/expected-minute counts for one hour, one day, one week and 30
+days, so a newly installed or interrupted collector cannot display a partial period as complete.
 
 `RDASHBOARD_RIMG_BASE_URL` is optional and must be a bare internal `http://` origin without
 credentials, path, query or fragment. When it is absent, the `rimg` row remains visible as

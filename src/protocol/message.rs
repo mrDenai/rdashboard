@@ -5,8 +5,9 @@ use uuid::Uuid;
 use crate::domain::{
     GitCommitId, HostTelemetry, MutationStatusV1, OperationKind, ProjectId, ReleaseClass,
 };
+use crate::source::SourceTreeObservationV1;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -40,6 +41,9 @@ pub enum ControlRequestV1 {
         project_id: ProjectId,
     },
     ObserveSystemdUnits {
+        project_id: ProjectId,
+    },
+    ObserveProjectSource {
         project_id: ProjectId,
     },
     PrepareOperationIntent {
@@ -107,7 +111,8 @@ impl ControlRequestV1 {
             }
             Self::ObserveHostSnapshot
             | Self::ObserveDockerSnapshot { .. }
-            | Self::ObserveSystemdUnits { .. } => {}
+            | Self::ObserveSystemdUnits { .. }
+            | Self::ObserveProjectSource { .. } => {}
         }
         Ok(())
     }
@@ -160,6 +165,9 @@ pub enum ControlResponseV1 {
     },
     HostSnapshot {
         snapshot: Box<HostTelemetry>,
+    },
+    ProjectSourceSnapshot {
+        snapshot: SourceTreeObservationV1,
     },
     OperationIntentPrepared {
         signed_intent: String,
