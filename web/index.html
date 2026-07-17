@@ -43,16 +43,9 @@
         <p class="critical-banner">Для потоковых обновлений требуется JavaScript.</p>
       </noscript>
 
-      <section class="host-overview" aria-labelledby="host-heading">
-        <div class="section-heading">
-          <h2 id="host-heading">Ресурсы сервера</h2>
-          <p id="host-observation-status" class="state-label" data-state="unknown">
-            ◌ Ожидание первого измерения
-          </p>
-        </div>
-
+      <section class="host-overview" aria-label="Ресурсы сервера">
         <p id="host-history-status" class="history-status" data-state="loading" hidden></p>
-        <div class="table-scroll resource-table-scroll" tabindex="0" aria-label="Ресурсы сервера по периодам">
+        <div class="table-frame">
           <table class="resource-table">
             <caption>Ресурсы сервера сейчас и за завершённые периоды</caption>
             <thead>
@@ -117,7 +110,7 @@
           </div>
           <p id="project-count" class="section-meta">0 проектов</p>
         </div>
-        <div class="table-scroll project-table-scroll" tabindex="0" aria-label="Сводка по проектам">
+        <div class="table-frame">
           <table class="project-table">
             <caption>Состояние production-проектов и подключённых источников</caption>
             <thead>

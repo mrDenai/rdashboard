@@ -9,8 +9,8 @@ use rdashboard::{
     controller::DurableController,
     domain::{
         ControlSummary, DashboardEvent, DashboardSnapshot, GitCommitId, HostHistoryWindowKind,
-        HostTelemetry, ObservationStatus, ProjectCondition, ProjectId, ProjectTelemetry,
-        PsiMeasurement,
+        HostTelemetry, ObservationStatus, ProjectCondition, ProjectId, ProjectResourceTelemetry,
+        ProjectTelemetry, PsiMeasurement,
     },
     source::SourceTreeObservationV1,
     store::{
@@ -72,6 +72,19 @@ fn project_sample(observed_at_ms: Option<i64>) -> ProjectTelemetry {
         condition: ProjectCondition::Degraded,
         observed_at_ms,
         detail: "legacy health contract".to_owned(),
+        resources: ProjectResourceTelemetry {
+            status: ObservationStatus::Fresh,
+            observed_at_ms,
+            cpu_percent: Some(0.5),
+            memory_used_bytes: Some(20 * 1_024 * 1_024),
+            memory_limit_bytes: Some(16 * 1_024 * 1_024 * 1_024),
+            network_rx_bytes: observed_at_ms.and_then(|value| u64::try_from(value).ok()),
+            network_tx_bytes: observed_at_ms
+                .and_then(|value| u64::try_from(value.saturating_mul(2)).ok()),
+            block_read_bytes: Some(1_000),
+            block_write_bytes: Some(2_000),
+            detail: "fixture resources".to_owned(),
+        },
     }
 }
 
@@ -385,6 +398,63 @@ fn metrics_store_migrates_the_timestamp_key_schema_without_losing_samples() {
 }
 
 #[test]
+fn metrics_store_migrates_v4_project_samples_before_recording_resources() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("metrics.sqlite");
+    {
+        let metrics = MetricsStore::open(&path)
+            .unwrap_or_else(|error| panic!("create current metrics: {error}"));
+        metrics
+            .record_collection(&host_sample(100), &[project_sample(Some(100))])
+            .unwrap_or_else(|error| panic!("record pre-migration sample: {error}"));
+    }
+    let legacy = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("open v4 metrics fixture: {error}"));
+    legacy
+        .execute_batch(
+            "ALTER TABLE project_samples DROP COLUMN resource_detail;
+             ALTER TABLE project_samples DROP COLUMN resource_block_write_bytes;
+             ALTER TABLE project_samples DROP COLUMN resource_block_read_bytes;
+             ALTER TABLE project_samples DROP COLUMN resource_network_tx_bytes;
+             ALTER TABLE project_samples DROP COLUMN resource_network_rx_bytes;
+             ALTER TABLE project_samples DROP COLUMN resource_memory_limit_bytes;
+             ALTER TABLE project_samples DROP COLUMN resource_memory_used_bytes;
+             ALTER TABLE project_samples DROP COLUMN resource_cpu_percent;
+             ALTER TABLE project_samples DROP COLUMN resource_observed_at_ms;
+             ALTER TABLE project_samples DROP COLUMN resource_status_json;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap_or_else(|error| panic!("create v4 metrics fixture: {error}"));
+    drop(legacy);
+
+    let metrics =
+        MetricsStore::open(&path).unwrap_or_else(|error| panic!("migrate v4 metrics: {error}"));
+    assert_eq!(metrics.project_sample_count().unwrap_or(0), 1);
+    metrics
+        .record_collection(&host_sample(200), &[project_sample(Some(200))])
+        .unwrap_or_else(|error| panic!("record post-migration resources: {error}"));
+    let project_id =
+        ProjectId::from_str("rimg").unwrap_or_else(|error| panic!("project fixture: {error}"));
+    let history = metrics
+        .project_resource_history(&project_id, 3_600_500)
+        .unwrap_or_else(|error| panic!("read migrated resources: {error}"));
+    let hour = history
+        .windows
+        .iter()
+        .find(|window| window.window == HostHistoryWindowKind::Hour)
+        .unwrap_or_else(|| panic!("hour resource window is missing"));
+    assert_eq!(hour.sample_count, 1);
+    assert_eq!(hour.covered_minutes, 1);
+    drop(metrics);
+    let inspected = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("inspect migrated metrics: {error}"));
+    let version: i64 = inspected
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap_or_else(|error| panic!("read migrated version: {error}"));
+    assert_eq!(version, 5);
+}
+
+#[test]
 fn metrics_store_rejects_invalid_legacy_project_ids_before_migration() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
     let path = directory.path().join("metrics.sqlite");
@@ -542,6 +612,65 @@ fn host_history_excludes_counter_reset_intervals_from_network_traffic() {
 }
 
 #[test]
+fn project_resource_history_combines_rollups_and_raw_samples_without_recounting_stale_data() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
+        .unwrap_or_else(|error| panic!("open metrics: {error}"));
+    for (observed_at_ms, cpu_percent, memory_used, network_rx, network_tx) in [
+        (10_000, 1.0, 100, 1_000, 2_000),
+        (70_000, 2.0, 200, 1_100, 2_200),
+        (130_000, 3.0, 300, 1_300, 2_500),
+    ] {
+        let mut project = project_sample(Some(observed_at_ms));
+        project.resources.cpu_percent = Some(cpu_percent);
+        project.resources.memory_used_bytes = Some(memory_used);
+        project.resources.memory_limit_bytes = Some(1_000);
+        project.resources.network_rx_bytes = Some(network_rx);
+        project.resources.network_tx_bytes = Some(network_tx);
+        metrics
+            .record_collection(&host_sample(observed_at_ms), &[project])
+            .unwrap_or_else(|error| panic!("record project resources: {error}"));
+    }
+    let mut stale = project_sample(Some(130_000));
+    stale.resources.status = ObservationStatus::Stale;
+    stale.resources.cpu_percent = Some(99.0);
+    metrics
+        .record_collection(&host_sample(140_000), &[stale])
+        .unwrap_or_else(|error| panic!("record stale resources: {error}"));
+    metrics
+        .apply_retention(120_000, -30_i64 * 24 * 60 * 60 * 1_000)
+        .unwrap_or_else(|error| panic!("roll up project resources: {error}"));
+
+    let project_id =
+        ProjectId::from_str("rimg").unwrap_or_else(|error| panic!("project fixture: {error}"));
+    let history = metrics
+        .project_resource_history(&project_id, 3_600_500)
+        .unwrap_or_else(|error| panic!("calculate project resources: {error}"));
+    assert_eq!(history.schema_version, 1);
+    assert_eq!(history.project_id, project_id);
+    let hour = history
+        .windows
+        .iter()
+        .find(|window| window.window == HostHistoryWindowKind::Hour)
+        .unwrap_or_else(|| panic!("hour project resource window is missing"));
+    assert_eq!(hour.sample_count, 3);
+    assert_eq!(hour.covered_minutes, 3);
+    assert!(
+        hour.medians
+            .cpu_percent
+            .is_some_and(|value| (1.9..=2.1).contains(&value))
+    );
+    assert!(
+        hour.medians
+            .memory_used_bytes
+            .is_some_and(|value| (190.0..=210.0).contains(&value))
+    );
+    assert_eq!(hour.totals.network_rx_bytes, Some(300));
+    assert_eq!(hour.totals.network_tx_bytes, Some(500));
+    assert_eq!(hour.totals.network_rx_covered_ms, 120_000);
+}
+
+#[test]
 fn repository_history_enforces_hourly_sampling_and_preserves_commit_metrics() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
     let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
@@ -643,6 +772,9 @@ async fn http_surface_is_loopback_slice_with_strict_headers_and_truthful_empty_s
     assert!(html.contains("Трафик"));
     assert!(!html.contains("Текущий узел"));
     assert!(!html.contains("История ещё накапливается"));
+    assert!(!html.contains("id=\"host-heading\""));
+    assert!(!html.contains("host-observation-status"));
+    assert!(!html.contains("table-scroll"));
     assert!(!html.contains("metric-psi"));
     assert!(!html.contains("Контур операций"));
     assert!(!html.contains("<script>"));
@@ -731,6 +863,45 @@ async fn host_history_http_surface_returns_all_named_windows() {
     )
     .unwrap_or_else(|error| panic!("decode host history: {error}"));
     assert_eq!(history["schema_version"], 2);
+    assert_eq!(history["windows"].as_array().map(Vec::len), Some(4));
+}
+
+#[tokio::test]
+async fn project_resource_history_http_surface_is_project_scoped() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let control = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control: {error}"));
+    let metrics = MetricsStore::open(directory.path().join("metrics.sqlite"))
+        .unwrap_or_else(|error| panic!("open metrics: {error}"));
+    metrics
+        .record_collection(&host_sample(1_000), &[project_sample(Some(1_000))])
+        .unwrap_or_else(|error| panic!("record resource HTTP fixture: {error}"));
+    let app = router(
+        DashboardState::new(EventHub::new(control), Duration::from_secs(5))
+            .with_metrics_store(metrics),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/projects/rimg/resource-history")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("project resource history response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let history: serde_json::Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("read project resource history: {error}"))
+            .to_bytes(),
+    )
+    .unwrap_or_else(|error| panic!("decode project resource history: {error}"));
+    assert_eq!(history["schema_version"], 1);
+    assert_eq!(history["project_id"], "rimg");
     assert_eq!(history["windows"].as_array().map(Vec::len), Some(4));
 }
 

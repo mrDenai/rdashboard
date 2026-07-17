@@ -125,6 +125,10 @@ pub fn router_with_access(
             get(project_operations),
         )
         .route(
+            "/api/v1/projects/{project_id}/resource-history",
+            get(project_resource_history),
+        )
+        .route(
             "/api/v1/projects/{project_id}/repository-history",
             get(project_repository_history),
         )
@@ -277,6 +281,38 @@ async fn host_history(State(state): State<DashboardState>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "metrics_history_failed",
             "Historical metrics could not be calculated.",
+        )
+        .into_response(),
+    }
+}
+
+async fn project_resource_history(
+    State(state): State<DashboardState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Response {
+    let Some(metrics_store) = state.metrics_store.clone() else {
+        return ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_resource_history_unavailable",
+            "Project resource history is not configured.",
+        )
+        .into_response();
+    };
+    let generated_at_ms = match unix_time_ms() {
+        Ok(value) => value,
+        Err(error) => return clock_problem(&error),
+    };
+    match tokio::task::spawn_blocking(move || {
+        metrics_store.project_resource_history(&project_id, generated_at_ms)
+    })
+    .await
+    {
+        Ok(Ok(history)) => Json(history).into_response(),
+        Ok(Err(error)) => store_problem(&error),
+        Err(_) => ApiProblem::response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_resource_history_failed",
+            "Project resource history could not be calculated.",
         )
         .into_response(),
     }

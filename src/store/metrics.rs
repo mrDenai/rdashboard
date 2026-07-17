@@ -10,19 +10,22 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     HostHistorySnapshot, HostHistoryWindow, HostHistoryWindowKind, HostMetricMedians,
     HostMetricTotals, HostTelemetry, ObservationStatus, ProjectCondition, ProjectId,
-    ProjectRepositorySample, ProjectTelemetry, PsiMeasurement, truncate_utf8,
+    ProjectRepositorySample, ProjectResourceHistorySnapshot, ProjectResourceHistoryWindow,
+    ProjectResourceMetricMedians, ProjectResourceMetricTotals, ProjectResourceTelemetry,
+    ProjectTelemetry, PsiMeasurement, truncate_utf8,
 };
 use crate::source::SourceTreeObservationV1;
 
 use super::{StoreError, lock_connection, verify_sqlite_version};
 
-const METRICS_SCHEMA_VERSION: i64 = 4;
+const METRICS_SCHEMA_VERSION: i64 = 5;
 pub const MINUTE_ROLLUP_MS: i64 = 60_000;
 const LOG_SKETCH_RELATIVE_ACCURACY: f64 = 0.01;
 const ROLLUP_DETAIL_MAX_BYTES: usize = 1_024;
 const ROLLUP_REASON_MAX_BYTES: usize = 512;
 const ROLLUP_REASON_LIMIT: usize = 8;
 const HOST_HISTORY_SCHEMA_VERSION: u16 = 2;
+const PROJECT_RESOURCE_HISTORY_SCHEMA_VERSION: u16 = 1;
 pub const PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS: i64 = 60 * 60 * 1_000;
 pub const PROJECT_REPOSITORY_HISTORY_LIMIT: usize = 24 * 31 + 1;
 const HOST_HISTORY_WINDOWS: [(HostHistoryWindowKind, i64, u64); 4] = [
@@ -367,6 +370,68 @@ impl NetworkTrafficRollup {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ProjectResourceMetricSketches {
+    pub cpu_percent: RelativeLogSketch,
+    pub memory_used_bytes: RelativeLogSketch,
+    pub memory_limit_bytes: RelativeLogSketch,
+    pub memory_used_percent: RelativeLogSketch,
+}
+
+impl ProjectResourceMetricSketches {
+    fn add(&mut self, sample: &ProjectResourceTelemetry) {
+        self.cpu_percent.add_optional_f64(sample.cpu_percent);
+        self.memory_used_bytes
+            .add_optional_u64(sample.memory_used_bytes);
+        self.memory_limit_bytes
+            .add_optional_u64(sample.memory_limit_bytes);
+        if let Some((used, limit)) = sample.memory_used_bytes.zip(sample.memory_limit_bytes)
+            && limit > 0
+            && used <= limit
+        {
+            self.memory_used_percent
+                .add(u64_as_f64(used) * 100.0 / u64_as_f64(limit));
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.cpu_percent.merge(&other.cpu_percent);
+        self.memory_used_bytes.merge(&other.memory_used_bytes);
+        self.memory_limit_bytes.merge(&other.memory_limit_bytes);
+        self.memory_used_percent.merge(&other.memory_used_percent);
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ProjectResourceIoRollup {
+    pub network_rx: MonotonicCounterDelta,
+    pub network_tx: MonotonicCounterDelta,
+    pub block_read: MonotonicCounterDelta,
+    pub block_write: MonotonicCounterDelta,
+}
+
+impl ProjectResourceIoRollup {
+    fn add(&mut self, sample: &ProjectResourceTelemetry) {
+        let Some(observed_at_ms) = sample.observed_at_ms else {
+            return;
+        };
+        self.network_rx.add(observed_at_ms, sample.network_rx_bytes);
+        self.network_tx.add(observed_at_ms, sample.network_tx_bytes);
+        self.block_read.add(observed_at_ms, sample.block_read_bytes);
+        self.block_write
+            .add(observed_at_ms, sample.block_write_bytes);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.network_rx.merge(&other.network_rx);
+        self.network_tx.merge(&other.network_tx);
+        self.block_read.merge(&other.block_read);
+        self.block_write.merge(&other.block_write);
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ObservationStatusCounts {
@@ -506,7 +571,7 @@ impl HostMinuteRollup {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ProjectMinuteRollup {
     pub bucket_start_ms: i64,
     pub project_id: String,
@@ -521,6 +586,14 @@ pub struct ProjectMinuteRollup {
     pub last_non_healthy_sample_id: Option<i64>,
     #[serde(default)]
     pub last_non_healthy_detail: Option<String>,
+    #[serde(default)]
+    pub resource_sample_count: u64,
+    #[serde(default)]
+    pub resource_statuses: ObservationStatusCounts,
+    #[serde(default)]
+    pub resource_metrics: ProjectResourceMetricSketches,
+    #[serde(default)]
+    pub resource_io: ProjectResourceIoRollup,
 }
 
 impl ProjectMinuteRollup {
@@ -537,12 +610,17 @@ impl ProjectMinuteRollup {
             last_detail: String::new(),
             last_non_healthy_sample_id: None,
             last_non_healthy_detail: None,
+            resource_sample_count: 0,
+            resource_statuses: ObservationStatusCounts::default(),
+            resource_metrics: ProjectResourceMetricSketches::default(),
+            resource_io: ProjectResourceIoRollup::default(),
         }
     }
 
     fn add(&mut self, sample_id: i64, collected_at_ms: i64, sample: ProjectTelemetry) {
         self.sample_count = self.sample_count.saturating_add(1);
         self.conditions.add(sample.condition);
+        self.add_resources(&sample.resources);
         if sample.condition != ProjectCondition::Healthy
             && self
                 .last_non_healthy_sample_id
@@ -561,9 +639,24 @@ impl ProjectMinuteRollup {
         }
     }
 
+    fn add_resources(&mut self, resources: &ProjectResourceTelemetry) {
+        self.resource_statuses.add(resources.status);
+        if project_resources_have_measurement(resources) {
+            self.resource_sample_count = self.resource_sample_count.saturating_add(1);
+            self.resource_metrics.add(resources);
+            self.resource_io.add(resources);
+        }
+    }
+
     fn merge(&mut self, other: &Self) {
         self.sample_count = self.sample_count.saturating_add(other.sample_count);
         self.conditions.merge(&other.conditions);
+        self.resource_sample_count = self
+            .resource_sample_count
+            .saturating_add(other.resource_sample_count);
+        self.resource_statuses.merge(&other.resource_statuses);
+        self.resource_metrics.merge(&other.resource_metrics);
+        self.resource_io.merge(&other.resource_io);
         if other.last_sample_id >= self.last_sample_id {
             self.last_sample_id = other.last_sample_id;
             self.display_name.clone_from(&other.display_name);
@@ -629,11 +722,42 @@ impl MetricsStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sample_id = insert_host_sample(&transaction, host)?;
         for project in projects {
+            let resource_memory_used = sqlite_integer(
+                project.resources.memory_used_bytes,
+                "project_resource_memory_used_bytes",
+            )?;
+            let resource_memory_limit = sqlite_integer(
+                project.resources.memory_limit_bytes,
+                "project_resource_memory_limit_bytes",
+            )?;
+            let resource_network_rx = sqlite_integer(
+                project.resources.network_rx_bytes,
+                "project_resource_network_rx_bytes",
+            )?;
+            let resource_network_tx = sqlite_integer(
+                project.resources.network_tx_bytes,
+                "project_resource_network_tx_bytes",
+            )?;
+            let resource_block_read = sqlite_integer(
+                project.resources.block_read_bytes,
+                "project_resource_block_read_bytes",
+            )?;
+            let resource_block_write = sqlite_integer(
+                project.resources.block_write_bytes,
+                "project_resource_block_write_bytes",
+            )?;
             transaction.execute(
                 "INSERT INTO project_samples(
                     sample_id, collected_at_ms, project_id, display_name, condition_json,
-                    observed_at_ms, detail
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    observed_at_ms, detail, resource_status_json, resource_observed_at_ms,
+                    resource_cpu_percent, resource_memory_used_bytes,
+                    resource_memory_limit_bytes, resource_network_rx_bytes,
+                    resource_network_tx_bytes, resource_block_read_bytes,
+                    resource_block_write_bytes, resource_detail
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17
+                 )",
                 params![
                     sample_id,
                     host.observed_at_ms,
@@ -642,6 +766,16 @@ impl MetricsStore {
                     serde_json::to_string(&project.condition)?,
                     project.observed_at_ms,
                     project.detail,
+                    serde_json::to_string(&project.resources.status)?,
+                    project.resources.observed_at_ms,
+                    project.resources.cpu_percent,
+                    resource_memory_used,
+                    resource_memory_limit,
+                    resource_network_rx,
+                    resource_network_tx,
+                    resource_block_read,
+                    resource_block_write,
+                    project.resources.detail,
                 ],
             )?;
         }
@@ -747,6 +881,34 @@ impl MetricsStore {
             schema_version: HOST_HISTORY_SCHEMA_VERSION,
             generated_at_ms,
             complete_through_ms,
+            windows,
+        })
+    }
+
+    pub fn project_resource_history(
+        &self,
+        project_id: &ProjectId,
+        generated_at_ms: i64,
+    ) -> Result<ProjectResourceHistorySnapshot, StoreError> {
+        let complete_through_ms = minute_bucket(generated_at_ms);
+        let connection = lock_connection(&self.connection)?;
+        let mut windows = Vec::with_capacity(HOST_HISTORY_WINDOWS.len());
+        for (window, duration_ms, expected_minutes) in HOST_HISTORY_WINDOWS {
+            let starts_at_ms = complete_through_ms.saturating_sub(duration_ms);
+            windows.push(aggregate_project_resource_window(
+                &connection,
+                project_id,
+                window,
+                starts_at_ms,
+                complete_through_ms,
+                expected_minutes,
+            )?);
+        }
+        Ok(ProjectResourceHistorySnapshot {
+            schema_version: PROJECT_RESOURCE_HISTORY_SCHEMA_VERSION,
+            generated_at_ms,
+            complete_through_ms,
+            project_id: project_id.clone(),
             windows,
         })
     }
@@ -941,6 +1103,103 @@ fn aggregate_host_window(
     })
 }
 
+fn aggregate_project_resource_window(
+    connection: &Connection,
+    project_id: &ProjectId,
+    window: HostHistoryWindowKind,
+    starts_at_ms: i64,
+    ends_at_ms: i64,
+    expected_minutes: u64,
+) -> Result<ProjectResourceHistoryWindow, StoreError> {
+    let mut aggregate = ProjectMinuteRollup::new(starts_at_ms, project_id.to_string());
+    let mut covered_buckets = BTreeSet::new();
+
+    let mut rollup_statement = connection.prepare(
+        "SELECT bucket_start_ms, rollup_json
+         FROM project_minute_rollups
+         WHERE project_id = ?1 AND bucket_start_ms >= ?2 AND bucket_start_ms < ?3
+         ORDER BY bucket_start_ms",
+    )?;
+    let mut rollup_rows =
+        rollup_statement.query(params![project_id.as_str(), starts_at_ms, ends_at_ms])?;
+    while let Some(row) = rollup_rows.next()? {
+        let bucket_start_ms: i64 = row.get(0)?;
+        let rollup_json: String = row.get(1)?;
+        let rollup: ProjectMinuteRollup = serde_json::from_str(&rollup_json)?;
+        if rollup.bucket_start_ms != bucket_start_ms || rollup.project_id != project_id.as_str() {
+            return Err(StoreError::CorruptRollup {
+                kind: "project",
+                key: format!("{bucket_start_ms}:{project_id}"),
+            });
+        }
+        if rollup.resource_sample_count > 0 {
+            covered_buckets.insert(bucket_start_ms);
+            aggregate.merge(&rollup);
+        }
+    }
+    drop(rollup_rows);
+    drop(rollup_statement);
+
+    let mut sample_statement = connection.prepare(
+        "SELECT
+            collected_at_ms, resource_status_json, resource_observed_at_ms,
+            resource_cpu_percent, resource_memory_used_bytes, resource_memory_limit_bytes,
+            resource_network_rx_bytes, resource_network_tx_bytes, resource_block_read_bytes,
+            resource_block_write_bytes, resource_detail
+         FROM project_samples
+         WHERE project_id = ?1 AND collected_at_ms >= ?2 AND collected_at_ms < ?3
+         ORDER BY collected_at_ms, sample_id",
+    )?;
+    let mut sample_rows =
+        sample_statement.query(params![project_id.as_str(), starts_at_ms, ends_at_ms])?;
+    while let Some(row) = sample_rows.next()? {
+        let collected_at_ms: i64 = row.get(0)?;
+        let status_json: String = row.get(1)?;
+        let resources = ProjectResourceTelemetry {
+            status: serde_json::from_str(&status_json)?,
+            observed_at_ms: row.get(2)?,
+            cpu_percent: row.get(3)?,
+            memory_used_bytes: sqlite_u64(row, 4, "project_resource_memory_used_bytes")?,
+            memory_limit_bytes: sqlite_u64(row, 5, "project_resource_memory_limit_bytes")?,
+            network_rx_bytes: sqlite_u64(row, 6, "project_resource_network_rx_bytes")?,
+            network_tx_bytes: sqlite_u64(row, 7, "project_resource_network_tx_bytes")?,
+            block_read_bytes: sqlite_u64(row, 8, "project_resource_block_read_bytes")?,
+            block_write_bytes: sqlite_u64(row, 9, "project_resource_block_write_bytes")?,
+            detail: row.get(10)?,
+        };
+        if project_resources_have_measurement(&resources) {
+            covered_buckets.insert(minute_bucket(collected_at_ms));
+            aggregate.add_resources(&resources);
+        }
+    }
+
+    let covered_minutes = u64::try_from(covered_buckets.len()).unwrap_or(u64::MAX);
+    Ok(ProjectResourceHistoryWindow {
+        window,
+        starts_at_ms,
+        ends_at_ms,
+        sample_count: aggregate.resource_sample_count,
+        covered_minutes,
+        expected_minutes,
+        complete: covered_minutes == expected_minutes,
+        medians: ProjectResourceMetricMedians {
+            cpu_percent: aggregate.resource_metrics.cpu_percent.quantile(0.5),
+            memory_used_bytes: aggregate.resource_metrics.memory_used_bytes.quantile(0.5),
+            memory_used_percent: aggregate.resource_metrics.memory_used_percent.quantile(0.5),
+        },
+        totals: ProjectResourceMetricTotals {
+            network_rx_bytes: aggregate.resource_io.network_rx.total(),
+            network_tx_bytes: aggregate.resource_io.network_tx.total(),
+            block_read_bytes: aggregate.resource_io.block_read.total(),
+            block_write_bytes: aggregate.resource_io.block_write.total(),
+            network_rx_covered_ms: aggregate.resource_io.network_rx.covered_ms(),
+            network_tx_covered_ms: aggregate.resource_io.network_tx.covered_ms(),
+            block_read_covered_ms: aggregate.resource_io.block_read.covered_ms(),
+            block_write_covered_ms: aggregate.resource_io.block_write.covered_ms(),
+        },
+    })
+}
+
 fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
@@ -953,8 +1212,15 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
             transaction.commit()?;
             Ok(())
         }
-        2 => migrate_v2_schema(connection),
-        3 => migrate_v3_schema(connection),
+        2 => {
+            migrate_v2_schema(connection)?;
+            migrate_v4_schema(connection)
+        }
+        3 => {
+            migrate_v3_schema(connection)?;
+            migrate_v4_schema(connection)
+        }
+        4 => migrate_v4_schema(connection),
         METRICS_SCHEMA_VERSION => create_schema(connection),
         actual => Err(StoreError::UnsupportedMetricsSchemaVersion {
             actual,
@@ -1056,6 +1322,27 @@ fn migrate_v2_schema(connection: &mut Connection) -> Result<(), StoreError> {
          DROP INDEX IF EXISTS project_samples_time;",
     )?;
     create_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", 4_i64)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v4_schema(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE project_samples
+            ADD COLUMN resource_status_json TEXT NOT NULL DEFAULT '\"unknown\"';
+         ALTER TABLE project_samples ADD COLUMN resource_observed_at_ms INTEGER;
+         ALTER TABLE project_samples ADD COLUMN resource_cpu_percent REAL;
+         ALTER TABLE project_samples ADD COLUMN resource_memory_used_bytes INTEGER;
+         ALTER TABLE project_samples ADD COLUMN resource_memory_limit_bytes INTEGER;
+         ALTER TABLE project_samples ADD COLUMN resource_network_rx_bytes INTEGER;
+         ALTER TABLE project_samples ADD COLUMN resource_network_tx_bytes INTEGER;
+         ALTER TABLE project_samples ADD COLUMN resource_block_read_bytes INTEGER;
+         ALTER TABLE project_samples ADD COLUMN resource_block_write_bytes INTEGER;
+         ALTER TABLE project_samples
+            ADD COLUMN resource_detail TEXT NOT NULL DEFAULT '';",
+    )?;
     transaction.pragma_update(None, "user_version", METRICS_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -1064,7 +1351,7 @@ fn migrate_v2_schema(connection: &mut Connection) -> Result<(), StoreError> {
 fn migrate_v3_schema(connection: &mut Connection) -> Result<(), StoreError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     create_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", METRICS_SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", 4_i64)?;
     transaction.commit()?;
     Ok(())
 }
@@ -1106,6 +1393,16 @@ fn create_schema(connection: &Connection) -> Result<(), StoreError> {
             condition_json TEXT NOT NULL,
             observed_at_ms INTEGER,
             detail TEXT NOT NULL,
+            resource_status_json TEXT NOT NULL DEFAULT '\"unknown\"',
+            resource_observed_at_ms INTEGER,
+            resource_cpu_percent REAL,
+            resource_memory_used_bytes INTEGER,
+            resource_memory_limit_bytes INTEGER,
+            resource_network_rx_bytes INTEGER,
+            resource_network_tx_bytes INTEGER,
+            resource_block_read_bytes INTEGER,
+            resource_block_write_bytes INTEGER,
+            resource_detail TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (sample_id, project_id)
          ) STRICT;
 
@@ -1252,7 +1549,10 @@ fn roll_up_project_samples(
     let mut statement = transaction.prepare(
         "SELECT
             sample_id, collected_at_ms, project_id, display_name, condition_json,
-            observed_at_ms, detail
+            observed_at_ms, detail, resource_status_json, resource_observed_at_ms,
+            resource_cpu_percent, resource_memory_used_bytes, resource_memory_limit_bytes,
+            resource_network_rx_bytes, resource_network_tx_bytes, resource_block_read_bytes,
+            resource_block_write_bytes, resource_detail
          FROM project_samples
          WHERE collected_at_ms < ?1
          ORDER BY collected_at_ms, sample_id, project_id",
@@ -1271,6 +1571,18 @@ fn roll_up_project_samples(
             condition: serde_json::from_str(&condition_json)?,
             observed_at_ms: row.get(5)?,
             detail: row.get(6)?,
+            resources: ProjectResourceTelemetry {
+                status: serde_json::from_str(&row.get::<_, String>(7)?)?,
+                observed_at_ms: row.get(8)?,
+                cpu_percent: row.get(9)?,
+                memory_used_bytes: sqlite_u64(row, 10, "project_resource_memory_used_bytes")?,
+                memory_limit_bytes: sqlite_u64(row, 11, "project_resource_memory_limit_bytes")?,
+                network_rx_bytes: sqlite_u64(row, 12, "project_resource_network_rx_bytes")?,
+                network_tx_bytes: sqlite_u64(row, 13, "project_resource_network_tx_bytes")?,
+                block_read_bytes: sqlite_u64(row, 14, "project_resource_block_read_bytes")?,
+                block_write_bytes: sqlite_u64(row, 15, "project_resource_block_write_bytes")?,
+                detail: row.get(16)?,
+            },
         };
         let bucket = minute_bucket(collected_at_ms);
         if current_bucket.is_some_and(|active| active != bucket) {
@@ -1454,6 +1766,20 @@ fn add_usage(
     if total > 0 {
         percent_sketch.add(u64_as_f64(used) * 100.0 / u64_as_f64(total));
     }
+}
+
+fn project_resources_have_measurement(sample: &ProjectResourceTelemetry) -> bool {
+    matches!(
+        sample.status,
+        ObservationStatus::Fresh | ObservationStatus::Partial
+    ) && sample.observed_at_ms.is_some()
+        && (sample.cpu_percent.is_some()
+            || sample.memory_used_bytes.is_some()
+            || sample.memory_limit_bytes.is_some()
+            || sample.network_rx_bytes.is_some()
+            || sample.network_tx_bytes.is_some()
+            || sample.block_read_bytes.is_some()
+            || sample.block_write_bytes.is_some())
 }
 
 #[allow(clippy::cast_precision_loss)]

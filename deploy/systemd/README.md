@@ -47,7 +47,9 @@ without changing the observation services or their local data.
 
 For private rimg health collection, also install
 `rdashboard-rimg-health.socket`, `rdashboard-rimg-health.service` and the
-`rdashboard-rimg-health-proxy` binary. Install `rdashboard-rimg-health.env` as root-owned mode `0644`
+`rdashboard-rimg-health-proxy` binary. For container resources, also install
+`rdashboard-rimg-resources.socket` and the matching `rdashboard-rimg-resources@.service` template.
+Install `rdashboard-rimg-health.env` as root-owned mode `0644`
 at `/usr/lib/rdashboard/rdashboard-rimg-health.env`; it is deliberately loaded after the optional
 operator environment so the controller's health origin stays fixed. The socket listens only on
 `127.0.0.1:18080`, and the controller never receives Docker access. On each
@@ -63,6 +65,16 @@ limit because the collector deliberately opens three parallel health connections
 seconds: during a rolling gap those expected fail-closed activations must not permanently fail the
 listening socket. Each activation remains deadline- and resource-bounded, and the next collection
 automatically resolves the replacement container once it becomes healthy.
+
+The resource socket is a separate mode-`0600` Unix socket owned by `rdashboard`; it does not expose
+the root helper to other local accounts. One accepted connection starts one bounded template
+instance. The controller sends the fixed `resources-v1` request and closes its write side; the
+helper reuses the same exact label/health selection, runs one fixed `docker stats --no-stream`
+format against only that full container ID, and returns a versioned numeric JSON record. The
+template receives the connection through `StandardInput=socket` and `StandardOutput=socket`, has no
+network address family beyond `AF_UNIX`, and exits after the single response. Missing, malformed,
+oversized or contradictory Docker output fails closed. The controller keeps a last-known sample as
+stale for display but does not roll repeated stale values into resource history.
 
 The dedicated source broker runs as `rdashboard-source` from
 `/usr/libexec/rdashboard/rdashboard-source`. Install `rdashboard-source.service`, create the matching

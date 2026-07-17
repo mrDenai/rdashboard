@@ -108,6 +108,12 @@ The project overview reads bounded, project-scoped operation history from
 same durable controller journal that drives execution; the browser does not infer success from a
 workflow or container state and retains the recorded failure summary when an attempt fails.
 
+`GET /api/v1/projects/{project_id}/resource-history` returns CPU and memory medians plus network
+and block-I/O counter deltas for the same completed hour, day, week and 30-day windows as the host
+overview. Raw per-project observations share the host collection transaction and are compacted into
+the same durable minute buckets. Repeated stale last-known values are not counted as new samples,
+and counter resets omit the unknowable interval instead of fabricating activity.
+
 Production source reconciliation uses the fixed `/etc/rdashboard/source.json`, private
 `/var/lib/rdashboard-source` state and `/run/rdashboard-source/source.sock`. The source process
 validates its installed policy and Ed25519 credential, refuses to serve until its first bounded
@@ -157,6 +163,14 @@ running healthy Kamal container with exact `service=rimg` and `role=web` labels,
 private IPv4 address on the `kamal` network, and forwards only the health connection to port 8080.
 The controller receives neither Docker socket access nor a public rimg route; nginx is not part of
 this path.
+
+The same fixed helper has a separate `--resources` protocol behind the private
+`rdashboard-rimg-resources.socket`. Only the `rdashboard` service account can connect to its
+mode-`0600` Unix socket. Each short-lived activation repeats the exact healthy-label selection and
+executes one bounded `docker stats --no-stream` query, returning only numeric CPU, memory, network
+and block-I/O values. The controller receives neither a Docker command surface nor Docker socket
+access; on a transient failure it marks the last successful values stale rather than recording
+them again as fresh history.
 
 The collector reads the exact versioned `rimg` `/health/status` contract alongside liveness and
 readiness. It renders `Healthy` only when operational mode, worker progress, webhook progress,

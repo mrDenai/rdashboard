@@ -110,6 +110,66 @@ pub struct ProjectRepositorySample {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProjectResourceTelemetry {
+    pub status: ObservationStatus,
+    pub observed_at_ms: Option<i64>,
+    pub cpu_percent: Option<f64>,
+    pub memory_used_bytes: Option<u64>,
+    pub memory_limit_bytes: Option<u64>,
+    pub network_rx_bytes: Option<u64>,
+    pub network_tx_bytes: Option<u64>,
+    pub block_read_bytes: Option<u64>,
+    pub block_write_bytes: Option<u64>,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectResourceMetricMedians {
+    pub cpu_percent: Option<f64>,
+    pub memory_used_bytes: Option<f64>,
+    pub memory_used_percent: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectResourceMetricTotals {
+    pub network_rx_bytes: Option<u64>,
+    pub network_tx_bytes: Option<u64>,
+    pub block_read_bytes: Option<u64>,
+    pub block_write_bytes: Option<u64>,
+    pub network_rx_covered_ms: u64,
+    pub network_tx_covered_ms: u64,
+    pub block_read_covered_ms: u64,
+    pub block_write_covered_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectResourceHistoryWindow {
+    pub window: HostHistoryWindowKind,
+    pub starts_at_ms: i64,
+    pub ends_at_ms: i64,
+    pub sample_count: u64,
+    pub covered_minutes: u64,
+    pub expected_minutes: u64,
+    pub complete: bool,
+    pub medians: ProjectResourceMetricMedians,
+    pub totals: ProjectResourceMetricTotals,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectResourceHistorySnapshot {
+    pub schema_version: u16,
+    pub generated_at_ms: i64,
+    pub complete_through_ms: i64,
+    pub project_id: super::ProjectId,
+    pub windows: Vec<ProjectResourceHistoryWindow>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DashboardSnapshot {
     pub generated_at_ms: i64,
     pub host: HostTelemetry,
@@ -125,6 +185,7 @@ pub struct ProjectTelemetry {
     pub condition: super::ProjectCondition,
     pub observed_at_ms: Option<i64>,
     pub detail: String,
+    pub resources: ProjectResourceTelemetry,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]

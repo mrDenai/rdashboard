@@ -13,7 +13,7 @@ use rdashboard::{
     },
     executor_socket::{ROOT_EXECUTOR_SOCKET_PATH, RootExecutorClient},
     metrics::HostCollector,
-    projects::{RimgConfigError, RimgHealthCollector},
+    projects::{RimgConfigError, RimgHealthCollector, RimgResourceCollector},
     store::{
         ControlStore, MetricsStore, PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, RepositorySampleWrite,
     },
@@ -32,6 +32,8 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:3100";
 const DEFAULT_DATA_DIR: &str = "var";
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 const PROJECT_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+const PROJECT_RESOURCE_TIMEOUT: Duration = Duration::from_secs(2);
+const RIMG_RESOURCE_SOCKET_PATH: &str = "/run/rdashboard/rimg-resources.sock";
 const EXECUTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const RAW_RETENTION: Duration = Duration::from_hours(24);
 const MINUTE_ROLLUP_RETENTION: Duration = Duration::from_hours(720);
@@ -81,6 +83,7 @@ async fn main() -> Result<(), DynError> {
         HostObservationSource::Executor,
     );
     let project_collector = Arc::new(Mutex::new(config.rimg_collector.clone()));
+    let project_resource_collector = Arc::new(Mutex::new(config.rimg_resource_collector.clone()));
 
     let first_started_at = unix_time_ms()?;
     let recovered = control_store.recover_interrupted_observations(first_started_at)?;
@@ -91,13 +94,14 @@ async fn main() -> Result<(), DynError> {
         );
     }
     let first_operation = control_store.start_observation(first_started_at)?;
-    if let Err(collection_error) = collect_and_publish(
+    if let Err(collection_error) = Box::pin(collect_and_publish(
         &state,
         &metrics_store,
         &host_source,
         &project_collector,
+        &project_resource_collector,
         first_operation,
-    )
+    ))
     .await
     {
         let completed_at = unix_time_ms().unwrap_or(first_started_at);
@@ -116,7 +120,13 @@ async fn main() -> Result<(), DynError> {
         None,
     )?;
 
-    spawn_collection_loop(state.clone(), metrics_store, host_source, project_collector);
+    spawn_collection_loop(
+        state.clone(),
+        metrics_store,
+        host_source,
+        project_collector,
+        project_resource_collector,
+    );
     spawn_project_repository_collection(state.clone(), executor_client);
 
     let listener = TcpListener::bind(config.listen).await?;
@@ -132,11 +142,16 @@ async fn collect_and_publish(
     metrics_store: &MetricsStore,
     host_source: &HostObservationSource,
     project_collector: &Mutex<RimgHealthCollector>,
+    project_resource_collector: &Mutex<RimgResourceCollector>,
     observation_operation_id: Uuid,
 ) -> Result<(), DynError> {
     let now = unix_time_ms()?;
-    let host = host_source.collect(now).await;
-    let project = project_collector.lock().await.collect(now).await;
+    let (host, mut project, resources) = tokio::join!(
+        host_source.collect(now),
+        async { project_collector.lock().await.collect(now).await },
+        async { project_resource_collector.lock().await.collect(now).await },
+    );
+    project.resources = resources;
     metrics_store.record_collection(&host, std::slice::from_ref(&project))?;
     let snapshot = DashboardSnapshot {
         generated_at_ms: now,
@@ -205,6 +220,7 @@ fn spawn_collection_loop(
     metrics_store: MetricsStore,
     host_source: HostObservationSource,
     project_collector: Arc<Mutex<RimgHealthCollector>>,
+    project_resource_collector: Arc<Mutex<RimgResourceCollector>>,
 ) {
     tokio::spawn(async move {
         let operation_id = state
@@ -224,13 +240,14 @@ fn spawn_collection_loop(
         let mut cycles = 0_u64;
         loop {
             interval.tick().await;
-            match collect_and_publish(
+            match Box::pin(collect_and_publish(
                 &state,
                 &metrics_store,
                 &host_source,
                 &project_collector,
+                &project_resource_collector,
                 operation_id,
-            )
+            ))
             .await
             {
                 Ok(()) => {}
@@ -418,6 +435,7 @@ struct Config {
     listen: SocketAddr,
     data_dir: PathBuf,
     rimg_collector: RimgHealthCollector,
+    rimg_resource_collector: RimgResourceCollector,
     executor_socket: Option<PathBuf>,
     access: Option<CloudflareAccessConfig>,
 }
@@ -454,6 +472,19 @@ impl Config {
             PROJECT_HEALTH_TIMEOUT,
         )
         .map_err(ConfigError::RimgBaseUrl)?;
+        let rimg_resource_socket = match std::env::var("RDASHBOARD_RIMG_RESOURCE_SOCKET") {
+            Ok(value) if value == RIMG_RESOURCE_SOCKET_PATH => Some(PathBuf::from(value)),
+            Ok(_) => return Err(ConfigError::InvalidRimgResourceSocket),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeRimgResourceSocket);
+            }
+        };
+        let rimg_resource_collector = RimgResourceCollector::from_optional_socket_path(
+            rimg_resource_socket.as_deref(),
+            PROJECT_RESOURCE_TIMEOUT,
+        )
+        .map_err(ConfigError::RimgResourceSocket)?;
         let executor_socket = match std::env::var("RDASHBOARD_EXECUTOR_SOCKET") {
             Ok(value) if value == ROOT_EXECUTOR_SOCKET_PATH => Some(PathBuf::from(value)),
             Ok(_) => return Err(ConfigError::InvalidExecutorSocket),
@@ -467,6 +498,7 @@ impl Config {
             listen,
             data_dir,
             rimg_collector,
+            rimg_resource_collector,
             executor_socket,
             access,
         })
@@ -533,8 +565,14 @@ enum ConfigError {
     NonUnicodeDataDirectory,
     #[error("RDASHBOARD_RIMG_BASE_URL is invalid: {0}")]
     RimgBaseUrl(RimgConfigError),
+    #[error("RDASHBOARD_RIMG_RESOURCE_SOCKET is invalid: {0}")]
+    RimgResourceSocket(RimgConfigError),
     #[error("RDASHBOARD_RIMG_BASE_URL must be valid Unicode")]
     NonUnicodeRimgBaseUrl,
+    #[error("RDASHBOARD_RIMG_RESOURCE_SOCKET must be {RIMG_RESOURCE_SOCKET_PATH}")]
+    InvalidRimgResourceSocket,
+    #[error("RDASHBOARD_RIMG_RESOURCE_SOCKET must be valid Unicode")]
+    NonUnicodeRimgResourceSocket,
     #[error("RDASHBOARD_EXECUTOR_SOCKET must be {ROOT_EXECUTOR_SOCKET_PATH}")]
     InvalidExecutorSocket,
     #[error("RDASHBOARD_EXECUTOR_SOCKET must be valid Unicode")]

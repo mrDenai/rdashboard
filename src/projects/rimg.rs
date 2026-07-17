@@ -1,18 +1,53 @@
-use std::{fmt::Write as _, future::Future, str::FromStr, time::Duration};
+use std::{
+    fmt::Write as _,
+    future::Future,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 use url::{Host, Url};
 
-use crate::domain::{ProjectCondition, ProjectId, ProjectTelemetry};
+use crate::domain::{
+    ObservationStatus, ProjectCondition, ProjectId, ProjectResourceTelemetry, ProjectTelemetry,
+};
 
 const PROJECT_ID: &str = "rimg";
 const DISPLAY_NAME: &str = "rimg";
 const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_STATUS_BODY_BYTES: usize = 64 * 1024;
+const MAX_RESOURCE_RESPONSE_BYTES: usize = 16 * 1024;
+pub const RIMG_RESOURCE_PROTOCOL_V1: &[u8] = b"resources-v1\n";
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RimgResourceSnapshotV1 {
+    pub schema_version: u16,
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub network_rx_bytes: u64,
+    pub network_tx_bytes: u64,
+    pub block_read_bytes: u64,
+    pub block_write_bytes: u64,
+}
+
+impl RimgResourceSnapshotV1 {
+    fn is_valid(&self) -> bool {
+        self.schema_version == 1
+            && self.cpu_percent.is_finite()
+            && self.cpu_percent >= 0.0
+            && self.memory_limit_bytes > 0
+            && self.memory_used_bytes <= self.memory_limit_bytes
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -183,8 +218,141 @@ impl RimgHealthCollector {
             condition,
             observed_at_ms,
             detail: detail.into(),
+            resources: unavailable_resources(
+                ObservationStatus::Unknown,
+                "Resource collector has not run yet.",
+            ),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct RimgResourceCollector {
+    socket_path: Option<PathBuf>,
+    timeout: Duration,
+    last_success: Option<ProjectResourceTelemetry>,
+}
+
+impl RimgResourceCollector {
+    pub fn from_optional_socket_path(
+        socket_path: Option<&Path>,
+        timeout: Duration,
+    ) -> Result<Self, RimgConfigError> {
+        if timeout.is_zero() {
+            return Err(RimgConfigError::ZeroTimeout);
+        }
+        if socket_path.is_some_and(|path| !path.is_absolute()) {
+            return Err(RimgConfigError::ResourceSocketNotAbsolute);
+        }
+        Ok(Self {
+            socket_path: socket_path.map(Path::to_path_buf),
+            timeout,
+            last_success: None,
+        })
+    }
+
+    pub async fn collect(&mut self, now_ms: i64) -> ProjectResourceTelemetry {
+        let Some(socket_path) = self.socket_path.as_deref() else {
+            return unavailable_resources(
+                ObservationStatus::Unknown,
+                "Источник ресурсов контейнера не настроен.",
+            );
+        };
+
+        match bounded_resource_probe(self.timeout, probe_resources(socket_path)).await {
+            Ok(snapshot) => {
+                let telemetry = ProjectResourceTelemetry {
+                    status: ObservationStatus::Fresh,
+                    observed_at_ms: Some(now_ms),
+                    cpu_percent: Some(snapshot.cpu_percent),
+                    memory_used_bytes: Some(snapshot.memory_used_bytes),
+                    memory_limit_bytes: Some(snapshot.memory_limit_bytes),
+                    network_rx_bytes: Some(snapshot.network_rx_bytes),
+                    network_tx_bytes: Some(snapshot.network_tx_bytes),
+                    block_read_bytes: Some(snapshot.block_read_bytes),
+                    block_write_bytes: Some(snapshot.block_write_bytes),
+                    detail: "Текущая статистика контейнера получена.".to_owned(),
+                };
+                self.last_success = Some(telemetry.clone());
+                telemetry
+            }
+            Err(failure) => self.last_success.clone().map_or_else(
+                || {
+                    unavailable_resources(
+                        ObservationStatus::SignalLost,
+                        format!("Статистика контейнера недоступна: {}.", failure.label()),
+                    )
+                },
+                |mut previous| {
+                    previous.status = ObservationStatus::Stale;
+                    previous.detail = format!(
+                        "Показаны последние данные; обновление не удалось: {}.",
+                        failure.label()
+                    );
+                    previous
+                },
+            ),
+        }
+    }
+}
+
+fn unavailable_resources(
+    status: ObservationStatus,
+    detail: impl Into<String>,
+) -> ProjectResourceTelemetry {
+    ProjectResourceTelemetry {
+        status,
+        observed_at_ms: None,
+        cpu_percent: None,
+        memory_used_bytes: None,
+        memory_limit_bytes: None,
+        network_rx_bytes: None,
+        network_tx_bytes: None,
+        block_read_bytes: None,
+        block_write_bytes: None,
+        detail: detail.into(),
+    }
+}
+
+async fn bounded_resource_probe(
+    timeout: Duration,
+    future: impl Future<Output = Result<RimgResourceSnapshotV1, ProbeFailure>>,
+) -> Result<RimgResourceSnapshotV1, ProbeFailure> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .unwrap_or(Err(ProbeFailure::Timeout))
+}
+
+#[cfg(unix)]
+async fn probe_resources(socket_path: &Path) -> Result<RimgResourceSnapshotV1, ProbeFailure> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|_| ProbeFailure::Connect)?;
+    stream
+        .write_all(RIMG_RESOURCE_PROTOCOL_V1)
+        .await
+        .map_err(|_| ProbeFailure::Write)?;
+    stream.shutdown().await.map_err(|_| ProbeFailure::Write)?;
+    let mut response = Vec::with_capacity(1024);
+    stream
+        .take(u64::try_from(MAX_RESOURCE_RESPONSE_BYTES + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut response)
+        .await
+        .map_err(|_| ProbeFailure::Read)?;
+    if response.len() > MAX_RESOURCE_RESPONSE_BYTES {
+        return Err(ProbeFailure::ResponseBodyTooLarge);
+    }
+    let snapshot: RimgResourceSnapshotV1 =
+        serde_json::from_slice(&response).map_err(|_| ProbeFailure::MalformedJson)?;
+    if !snapshot.is_valid() {
+        return Err(ProbeFailure::UnsupportedContract);
+    }
+    Ok(snapshot)
+}
+
+#[cfg(not(unix))]
+async fn probe_resources(_socket_path: &Path) -> Result<RimgResourceSnapshotV1, ProbeFailure> {
+    Err(ProbeFailure::UnsupportedContract)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -596,6 +764,8 @@ pub enum RimgConfigError {
     MissingPort,
     #[error("health timeout must be greater than zero")]
     ZeroTimeout,
+    #[error("resource socket path must be absolute")]
+    ResourceSocketNotAbsolute,
     #[error("internal rimg project identifier is invalid")]
     InvalidInternalProjectId,
 }
@@ -682,6 +852,73 @@ mod tests {
         assert_eq!(telemetry.condition, ProjectCondition::Unknown);
         assert_eq!(telemetry.observed_at_ms, None);
         assert!(telemetry.detail.contains("RDASHBOARD_RIMG_BASE_URL"));
+    }
+
+    #[test]
+    fn resource_collector_rejects_relative_socket_paths() {
+        assert!(matches!(
+            RimgResourceCollector::from_optional_socket_path(
+                Some(Path::new("relative.sock")),
+                Duration::from_secs(2),
+            ),
+            Err(RimgConfigError::ResourceSocketNotAbsolute)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resource_collector_keeps_last_success_as_stale_after_signal_loss() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let socket_path = directory.path().join("resources.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .unwrap_or_else(|error| panic!("bind resource fixture: {error}"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .unwrap_or_else(|error| panic!("accept resource fixture: {error}"));
+            let mut request = Vec::new();
+            stream
+                .read_to_end(&mut request)
+                .await
+                .unwrap_or_else(|error| panic!("read resource fixture: {error}"));
+            assert_eq!(request, RIMG_RESOURCE_PROTOCOL_V1);
+            let response = serde_json::to_vec(&RimgResourceSnapshotV1 {
+                schema_version: 1,
+                cpu_percent: 1.5,
+                memory_used_bytes: 20,
+                memory_limit_bytes: 100,
+                network_rx_bytes: 1_000,
+                network_tx_bytes: 2_000,
+                block_read_bytes: 3_000,
+                block_write_bytes: 4_000,
+            })
+            .unwrap_or_else(|error| panic!("serialize resource fixture: {error}"));
+            stream
+                .write_all(&response)
+                .await
+                .unwrap_or_else(|error| panic!("write resource fixture: {error}"));
+        });
+        let mut collector = RimgResourceCollector::from_optional_socket_path(
+            Some(&socket_path),
+            Duration::from_secs(2),
+        )
+        .unwrap_or_else(|error| panic!("resource collector: {error}"));
+
+        let fresh = collector.collect(100).await;
+        assert_eq!(fresh.status, ObservationStatus::Fresh);
+        assert_eq!(fresh.observed_at_ms, Some(100));
+        assert_eq!(fresh.memory_used_bytes, Some(20));
+        server
+            .await
+            .unwrap_or_else(|error| panic!("resource fixture task: {error}"));
+        std::fs::remove_file(&socket_path)
+            .unwrap_or_else(|error| panic!("remove resource fixture: {error}"));
+
+        let stale = collector.collect(200).await;
+        assert_eq!(stale.status, ObservationStatus::Stale);
+        assert_eq!(stale.observed_at_ms, Some(100));
+        assert_eq!(stale.network_tx_bytes, Some(2_000));
     }
 
     #[tokio::test]

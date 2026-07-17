@@ -1,0 +1,17 @@
+[Unit]
+Description=Private rimg container resource observations for rdashboard
+After=docker.service rdashboard-executor.service
+Requires=docker.service rdashboard-executor.service
+
+[Socket]
+ListenStream=/run/rdashboard/rimg-resources.sock
+SocketUser=rdashboard
+SocketGroup=rdashboard
+SocketMode=0600
+DirectoryMode=0750
+Accept=yes
+MaxConnections=4
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

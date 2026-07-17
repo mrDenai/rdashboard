@@ -15,7 +15,6 @@ const elements = Object.freeze({
   sampleAge: document.querySelector("#sample-age"),
   sequence: document.querySelector("#event-sequence"),
   retry: document.querySelector("#retry-connection"),
-  hostStatus: document.querySelector("#host-observation-status"),
   historyStatus: document.querySelector("#host-history-status"),
   historyCoverage: Object.freeze({
     hour: document.querySelector("#history-hour-coverage"),
@@ -58,12 +57,15 @@ const runtime = {
   historyFailed: false,
   projectOperations: new Map(),
   projectOperationsLoading: new Set(),
+  projectResources: new Map(),
+  projectResourcesLoading: new Set(),
   projectRepositories: new Map(),
   projectRepositoriesLoading: new Set(),
 };
 
 const HOST_HISTORY_REFRESH_MS = 60_000;
 const PROJECT_OPERATIONS_REFRESH_MS = 30_000;
+const PROJECT_RESOURCES_REFRESH_MS = 60_000;
 const PROJECT_REPOSITORY_REFRESH_MS = 5 * 60_000;
 const HOST_HISTORY_WINDOWS = Object.freeze(["hour", "day", "week", "month"]);
 const REPOSITORY_PERIODS = Object.freeze([
@@ -205,7 +207,7 @@ function renderHistoryCell(cell, window) {
 }
 
 function formatBytes(value) {
-  if (!Number.isSafeInteger(value) || value < 0) return "Нет данных";
+  if (!Number.isFinite(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) return "Нет данных";
   const units = ["Б", "КиБ", "МиБ", "ГиБ", "ТиБ"];
   let scaled = value;
   let unit = 0;
@@ -334,11 +336,12 @@ function createProjectRow(project, loadIntegrations) {
   conditionCell.append(conditionLabel);
 
   const operations = runtime.projectOperations.get(projectId);
+  const resources = runtime.projectResources.get(projectId);
   const repository = runtime.projectRepositories.get(projectId);
   row.append(
     identity,
     conditionCell,
-    createUnavailableCell(),
+    createProjectResourceCell(project.resources, resources),
     createOperationCell(
       operations,
       (operation) => ["deploy", "code_rollback"].includes(operation.operation_kind),
@@ -354,9 +357,92 @@ function createProjectRow(project, loadIntegrations) {
 
   if (loadIntegrations) {
     loadProjectOperations(projectId, false);
+    loadProjectResources(projectId, false);
     loadProjectRepository(projectId, false);
   }
   return row;
+}
+
+function createProjectResourceCell(current, history) {
+  if (!validCurrentProjectResources(current)) {
+    return createSummaryCell("Недоступно", "error");
+  }
+  const hasCurrent = Number.isFinite(current.cpu_percent)
+    && Number.isSafeInteger(current.memory_used_bytes)
+    && Number.isSafeInteger(current.memory_limit_bytes);
+  if (!hasCurrent) {
+    const unconfigured = current.status === "unknown" || current.status === "unsupported";
+    return createSummaryCell(unconfigured ? "Не настроено" : "Недоступно", current.status);
+  }
+
+  const cell = createSummaryCell(
+    `${formatPercent(current.cpu_percent)} · ${formatBytes(current.memory_used_bytes)}`,
+    current.status,
+    `RAM из ${formatBytes(current.memory_limit_bytes)}`,
+  );
+  if (!history) {
+    appendProjectCellDetail(cell, "История загружается…");
+    return cell;
+  }
+  if (history.error && history.windows.length === 0) {
+    appendProjectCellDetail(cell, "История недоступна");
+    return cell;
+  }
+
+  const windows = new Map(history.windows.map((window) => [window.window, window]));
+  const labels = { hour: "1ч", day: "1д", week: "7д", month: "30д" };
+  const medians = HOST_HISTORY_WINDOWS.map((name) => {
+    const window = windows.get(name);
+    const cpu = formatPercent(window?.medians?.cpu_percent);
+    const memory = formatBytes(window?.medians?.memory_used_bytes);
+    return `${labels[name]} ${cpu}/${memory}`;
+  });
+  appendProjectCellDetail(cell, medians.join(" · "), "resource-history");
+
+  const hour = windows.get("hour");
+  if (hour?.totals) {
+    appendProjectCellDetail(
+      cell,
+      `трафик 1ч ↓ ${formatBytes(hour.totals.network_rx_bytes)} · ↑ ${formatBytes(hour.totals.network_tx_bytes)}`,
+      "resource-history",
+    );
+  }
+  if (history.error) appendProjectCellDetail(cell, "Последняя сохранённая история");
+  return cell;
+}
+
+function appendProjectCellDetail(cell, text, extraClass = null) {
+  const detail = document.createElement("small");
+  detail.className = "project-cell-detail";
+  if (extraClass) detail.classList.add(extraClass);
+  detail.textContent = text;
+  cell.append(detail);
+}
+
+function validCurrentProjectResources(resources) {
+  if (!resources || typeof resources !== "object") return false;
+  const statuses = ["fresh", "stale", "signal_lost", "partial", "unsupported", "unknown"];
+  const optionalByteValues = [
+    resources.memory_used_bytes,
+    resources.memory_limit_bytes,
+    resources.network_rx_bytes,
+    resources.network_tx_bytes,
+    resources.block_read_bytes,
+    resources.block_write_bytes,
+  ];
+  const memoryIsCoherent = resources.memory_used_bytes === null
+    || resources.memory_limit_bytes === null
+    || (resources.memory_limit_bytes > 0
+      && resources.memory_used_bytes <= resources.memory_limit_bytes);
+  return statuses.includes(resources.status)
+    && typeof resources.detail === "string"
+    && (resources.observed_at_ms === null
+      || (Number.isSafeInteger(resources.observed_at_ms) && resources.observed_at_ms >= 0))
+    && (resources.cpu_percent === null
+      || (Number.isFinite(resources.cpu_percent) && resources.cpu_percent >= 0))
+    && optionalByteValues.every((value) => value === null
+      || (Number.isSafeInteger(value) && value >= 0))
+    && memoryIsCoherent;
 }
 
 function refreshProjectOverview(projectId) {
@@ -486,6 +572,83 @@ async function loadProjectOperations(projectId, refresh) {
   }
 }
 
+async function loadProjectResources(projectId, refresh) {
+  if (runtime.projectResourcesLoading.has(projectId)) return;
+  if (!refresh && runtime.projectResources.has(projectId)) return;
+  runtime.projectResourcesLoading.add(projectId);
+  try {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/resource-history`,
+      { headers: { Accept: "application/json" }, cache: "no-store" },
+    );
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(problem.detail || "История ресурсов проекта недоступна.");
+    }
+    const payload = await response.json();
+    if (!validProjectResourceHistory(payload, projectId)) {
+      throw new Error("Сервер вернул неподдерживаемую историю ресурсов проекта.");
+    }
+    runtime.projectResources.set(projectId, { windows: payload.windows });
+  } catch (error) {
+    const previous = runtime.projectResources.get(projectId);
+    runtime.projectResources.set(projectId, {
+      error: error.message,
+      windows: previous?.windows ?? [],
+    });
+  } finally {
+    runtime.projectResourcesLoading.delete(projectId);
+    refreshProjectOverview(projectId);
+  }
+}
+
+function validProjectResourceHistory(payload, projectId) {
+  if (
+    payload?.schema_version !== 1
+    || payload.project_id !== projectId
+    || !Number.isSafeInteger(payload.complete_through_ms)
+    || !Array.isArray(payload.windows)
+    || payload.windows.length !== HOST_HISTORY_WINDOWS.length
+  ) return false;
+  const windows = new Map(payload.windows.map((window) => [window?.window, window]));
+  return HOST_HISTORY_WINDOWS.every((name) => validProjectResourceWindow(windows.get(name), name));
+}
+
+function validProjectResourceWindow(window, name) {
+  if (
+    window?.window !== name
+    || !Number.isSafeInteger(window.sample_count)
+    || window.sample_count < 0
+    || !Number.isSafeInteger(window.covered_minutes)
+    || window.covered_minutes < 0
+    || !Number.isSafeInteger(window.expected_minutes)
+    || window.expected_minutes <= 0
+    || window.covered_minutes > window.expected_minutes
+    || typeof window.complete !== "boolean"
+    || window.complete !== (window.covered_minutes === window.expected_minutes)
+  ) return false;
+  const medians = [
+    window.medians?.cpu_percent,
+    window.medians?.memory_used_bytes,
+    window.medians?.memory_used_percent,
+  ];
+  const totals = [
+    window.totals?.network_rx_bytes,
+    window.totals?.network_tx_bytes,
+    window.totals?.block_read_bytes,
+    window.totals?.block_write_bytes,
+  ];
+  const coverage = [
+    window.totals?.network_rx_covered_ms,
+    window.totals?.network_tx_covered_ms,
+    window.totals?.block_read_covered_ms,
+    window.totals?.block_write_covered_ms,
+  ];
+  return medians.every((value) => value === null || (Number.isFinite(value) && value >= 0))
+    && totals.every((value) => value === null || (Number.isSafeInteger(value) && value >= 0))
+    && coverage.every((value) => Number.isSafeInteger(value) && value >= 0);
+}
+
 async function loadProjectRepository(projectId, refresh) {
   if (runtime.projectRepositoriesLoading.has(projectId)) return;
   if (!refresh && runtime.projectRepositories.has(projectId)) return;
@@ -549,8 +712,6 @@ function validRepositoryHistory(payload, projectId) {
 function updateSampleAge() {
   if (!runtime.latestSnapshot) {
     elements.sampleAge.textContent = "Нет данных";
-    elements.hostStatus.dataset.state = "unknown";
-    elements.hostStatus.textContent = "? Состояние неизвестно";
     return;
   }
   const elapsedMs = performance.now() - runtime.snapshotReceivedAtMonotonicMs;
@@ -558,8 +719,6 @@ function updateSampleAge() {
     ? runtime.snapshotBaseAgeMs + Math.max(0, elapsedMs)
     : null;
   const observation = evaluateHostObservation(runtime.latestSnapshot, ageMs);
-  elements.hostStatus.dataset.state = observation.status;
-  elements.hostStatus.textContent = observation.label;
   elements.sampleAge.textContent = formatSampleAge(observation.ageSeconds);
   refreshProjectConditions(observation.status);
 }
@@ -739,6 +898,12 @@ window.setInterval(() => {
     loadProjectOperations(String(project.project_id), true);
   }
 }, PROJECT_OPERATIONS_REFRESH_MS);
+window.setInterval(() => {
+  if (!runtime.latestSnapshot?.projects) return;
+  for (const project of runtime.latestSnapshot.projects) {
+    loadProjectResources(String(project.project_id), true);
+  }
+}, PROJECT_RESOURCES_REFRESH_MS);
 window.setInterval(() => {
   if (!runtime.latestSnapshot?.projects) return;
   for (const project of runtime.latestSnapshot.projects) {

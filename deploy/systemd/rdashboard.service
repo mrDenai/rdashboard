@@ -1,7 +1,7 @@
 [Unit]
 Description=rdashboard controller and web dashboard
-After=network-online.target rdashboard-executor.service rdashboard-rimg-health.socket
-Wants=network-online.target rdashboard-rimg-health.socket
+After=network-online.target rdashboard-executor.service rdashboard-rimg-health.socket rdashboard-rimg-resources.socket
+Wants=network-online.target rdashboard-rimg-health.socket rdashboard-rimg-resources.socket
 Requires=rdashboard-executor.service
 
 [Service]

@@ -271,12 +271,8 @@ main {
   font-size: 0.78rem;
 }
 
-.resource-table-scroll {
-  max-height: none;
-}
-
 .resource-table {
-  min-width: 64rem;
+  table-layout: fixed;
 }
 
 .resource-table th:not(:first-child),
@@ -308,12 +304,13 @@ main {
   font-family: ui-monospace, "Cascadia Mono", monospace;
   font-size: 0.82rem;
   vertical-align: top;
-  white-space: nowrap;
 }
 
 .resource-table td strong {
+  display: block;
   font-size: 0.9rem;
   font-weight: 650;
+  white-space: nowrap;
 }
 
 .partial-panel {
@@ -335,10 +332,8 @@ main {
   font-size: 0.78rem;
 }
 
-.table-scroll {
-  max-height: 18rem;
-  overflow: auto;
-  overscroll-behavior: contain;
+.table-frame {
+  min-inline-size: 0;
   border: 1px solid var(--line);
 }
 
@@ -365,9 +360,6 @@ td {
 }
 
 th {
-  position: sticky;
-  z-index: 1;
-  inset-block-start: 0;
   color: var(--muted);
   background: var(--surface-raised);
   font-size: 0.75rem;
@@ -393,34 +385,20 @@ tbody tr:last-child td {
   text-align: center;
 }
 
-.project-table-scroll {
-  max-height: none;
-}
-
 .project-table {
-  min-width: 98rem;
   table-layout: fixed;
 }
 
-.project-table th:nth-child(1) { width: 10rem; }
-.project-table th:nth-child(2) { width: 11rem; }
-.project-table th:nth-child(3) { width: 9rem; }
-.project-table th:nth-child(4) { width: 13rem; }
-.project-table th:nth-child(5) { width: 11rem; }
-.project-table th:nth-child(6) { width: 24rem; }
-.project-table th:nth-child(7) { width: 10rem; }
-.project-table th:nth-child(8) { width: 10rem; }
-
-.project-table thead th:first-child {
-  z-index: 3;
-  inset-inline-start: 0;
-}
+.project-table th:nth-child(1) { width: 8%; }
+.project-table th:nth-child(2) { width: 10%; }
+.project-table th:nth-child(3) { width: 22%; }
+.project-table th:nth-child(4) { width: 10%; }
+.project-table th:nth-child(5) { width: 9%; }
+.project-table th:nth-child(6) { width: 20%; }
+.project-table th:nth-child(7) { width: 10%; }
+.project-table th:nth-child(8) { width: 11%; }
 
 .project-row > th {
-  position: sticky;
-  z-index: 2;
-  inset-block-start: auto;
-  inset-inline-start: 0;
   color: var(--text);
   background: var(--surface-raised);
   font-size: 0.82rem;
@@ -451,6 +429,11 @@ tbody tr:last-child td {
 }
 
 .repository-changes {
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+}
+
+.resource-history {
   font-variant-numeric: tabular-nums;
   line-height: 1.35;
 }
