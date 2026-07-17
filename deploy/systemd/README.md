@@ -170,7 +170,7 @@ Webhook and forced-push ingress are not yet routed by this unit and remain disab
 dedicated HTTP/SSH front doors are installed and tested.
 
 The executor always serves the bounded observation protocol and can optionally enable the admitted
-backup and first-bootstrap mutation paths described below. Install the binary at
+backup and installed-deployment mutation paths described below. Install the binary at
 `/usr/libexec/rdashboard/rdashboard-executor`, create the
 system group `rdashboard`, keep `/etc/rdashboard` root-owned and not group/other writable, and
 install a root-owned `/etc/rdashboard/executor.json` with mode `0640` or stricter:
@@ -193,7 +193,7 @@ the executor independently requires the configured peer UID on every accepted co
 Do not add Docker, arbitrary command, writable project-tree or adapter credential access to this
 long-running unit. Its base `rdashboard-source` supplementary group permits only the source
 broker's versioned, root-peer-authenticated snapshot and accepted-tree observation protocol; no
-repository path or Git command is exposed. Admitted backup and bootstrap effects run only in
+repository path or Git command is exposed. Admitted backup and deployment effects run only in
 separately constrained transient units.
 
 The root executor configuration accepts an optional `mutation_authority` object. Omitting it keeps
@@ -210,11 +210,11 @@ Install the executor-intent private seed as exactly 32 raw bytes at
 `executor-intent-seed` service credential; the executor rejects symlinks, wrong ownership or mode,
 size changes, inode replacement and a seed that does not match the configured public key. Do not
 put the private seed in `executor.json` or an environment variable. The same drop-in grants only
-the two additional read/connect groups needed by bootstrap: `rdashboard-build-readers` and the
+the two additional read/connect groups needed by deployment: `rdashboard-build-readers` and the
 host's `chrony` group. The base unit already carries `rdashboard-source` for read-only accepted-tree
 observation. These groups must exist before the unit is reloaded.
 
-Loading this authority enables the installed backup resolver plus the first-bootstrap deploy
+Loading this authority enables the installed backup resolver plus the installed deploy
 resolver and their shared sequential worker. The service opens its root-only journal at
 `/var/lib/rdashboard-executor/security.sqlite`, acknowledges a grant only after durable
 intent/grant admission, then runs the long operation outside the two-second socket request. Startup
@@ -281,7 +281,7 @@ its canonical state. Upload uses a content-addressed object key and fail-closed 
 detection. A replay after a successful remote write but before local receipt publication
 independently reads and hashes the existing object before accepting it.
 
-## First-bootstrap candidate handoff
+## Candidate handoff and installed deployment
 
 Create a dedicated `rdashboard-build` system user and a separate
 `rdashboard-build-readers` system group. Make `rdashboard-build` the owner of the candidate tree and
@@ -342,11 +342,19 @@ producer that merely signs caller-supplied evidence does not satisfy this contra
 Before the first accepted deploy, install canonical
 `/var/lib/rdashboard-executor/releases/rimg.jcs`, root-owned and mode `0600`, as generation 1 with
 both `current_release_bundle_digest` and `last_known_good_release_bundle_digest` absent and with the
-same installed policy/rimg-policy identities. The bootstrap worker permits only this
-`NeverInstalled` state. After a terminal Soak receipt it promotes the exact bundle to the root store
-and atomically advances release state; restart after either durable boundary replays receipts
-without reapplying Kamal, health or soak effects. Once a current release exists, subsequent deploy
-and rollback requests fail closed until the stable-routing/rollback driver is installed.
+same installed policy/rimg-policy identities. The first deploy permits only this `NeverInstalled`
+state. After a terminal Soak receipt it promotes the exact bundle to the root store and atomically
+advances release state; restart after either durable boundary replays receipts without reapplying
+Kamal, health or soak effects.
+
+Once a current release exists, only an exact `CodeOnlyCompatible` candidate with the installed
+stable-routing and automatic-code-rollback capabilities may proceed. The Deploying authorization
+reuses the latest committed, still-fresh verified base backup for the project; it never treats a
+receipt-less or foreign-project backup as authority. A successful terminal soak atomically moves
+the old current digest into `last_known_good_release_bundle_digest`. A failed candidate health
+check or soak durably takes over the same attempt as a rollback branch, routes back to the exact old
+bundle, verifies rollback health and soak, and leaves release state unchanged. Restart projects both
+the primary and rollback journals before deciding whether any external effect must run again.
 
 The host must run a synchronized local chrony daemon exposing `/run/chrony/chronyd.sock`. The
 executor calls only the policy-pinned `/usr/bin/chronyc` with fixed tracking arguments and rejects a
@@ -362,8 +370,10 @@ The Kamal deploy and rollback profiles additionally require these root-owned ins
   `/usr/bin/skopeo`, all pinned by SHA-256 in
   `/etc/rdashboard/projects/rimg/kamal-adapter-runtime.jcs`;
 - a registry image referenced by an exact digest and its exact local Docker image ID, plus a bounded
-  128 MiB to 16 GiB registry tmpfs budget, in canonical
-  `rdashboard.installed-kamal-adapter-runtime.v2` schema;
+  128 MiB to 16 GiB registry tmpfs budget;
+- a `kamal-proxy` image referenced by an exact digest and its exact local Docker image ID for the
+  private stable router, all in canonical
+  `rdashboard.installed-kamal-adapter-runtime.v3` schema;
 - the immutable release bundle store at `/var/lib/rdashboard-executor/release-bundles`;
 - the private OCI archive store at `/var/lib/rdashboard-executor/oci-archives`;
 - `/etc/rdashboard/credentials/rimg-kamal-secrets.env`, containing exactly the authorized dotenv
@@ -387,7 +397,19 @@ full Git SHA afterward; an already matching
 SHA is treated as crash replay rather than a second deployment. Repository `config/deploy.yml`,
 `.kamal`, hooks, destinations and the managed checkout are never read.
 
-This bootstrap profile is deliberately single-host: the installed Kamal `target_host` must SSH
+Installed updates do not publish a backend port and do not give release containers the `rimg`
+network alias. The sole long-lived alias belongs to the exact owned
+`rdashboard-rimg-router` container on the `kamal` network. Its only persisted state lives in the
+exact labelled `rdashboard-rimg-router-state` Docker volume. Each release runs as
+`rdashboard-rimg-backend-<full-git-sha>` with exact image, bundle and deployment-plan labels. The
+adapter starts and verifies the candidate, asks the private router to health-check
+`/health/ready`, switches and drains through the same `rimg-internal` service, then stops only the
+exact old owned backend. Reconciliation verifies router image, label, network and alias, waits for
+the proxy command endpoint, reads its persisted active target and idempotently reapplies the
+expected route when state is absent or corrupt. A foreign reserved container, volume, backend or
+route fails closed.
+
+This deployment profile is deliberately single-host: the installed Kamal `target_host` must SSH
 back to the same VPS whose executor owns the Docker daemon and loopback registry. In Kamal's
 generated configuration, `localhost:5555` is therefore the registry on that target's own Docker
 host. A remote Docker target or multi-host fleet is unsupported by this milestone and must not be

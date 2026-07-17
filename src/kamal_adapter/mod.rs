@@ -173,6 +173,14 @@ pub enum KamalAdapterError {
     RegistryOwnershipMismatch,
     #[error("the fixed ephemeral registry could not be removed safely")]
     RegistryCleanupFailed,
+    #[error("the stable router name, image, network, or state volume is not owned by rdashboard")]
+    StableRouterOwnershipMismatch,
+    #[error("the stable router did not persist the exact authorized backend target")]
+    StableRouterStateMismatch,
+    #[error("the stable backend name or identity is not owned by the authorized release")]
+    StableBackendOwnershipMismatch,
+    #[error("the exact stable backend did not become Docker-healthy")]
+    StableBackendUnhealthy,
     #[error("fixed Kamal adapter filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("canonical Kamal evidence encoding failed: {0}")]

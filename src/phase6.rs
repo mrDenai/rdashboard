@@ -2424,7 +2424,6 @@ fn resolve_base_backup_chain(
     let verification_completed_at_ms = chain.verification_completed_at_ms()?;
     let snapshot_completed_at_ms = chain.local().completed_at_ms;
     let matches = chain.snapshot_kind() == BackupSnapshotKindV1::Base
-        && spec.attempt_id == intent.attempt_id
         && spec.project_id == intent.project_id
         && spec.installed_policy == *policy.installed_policy()
         && spec.installed_rimg_policy_digest == *policy.digest()

@@ -26,6 +26,7 @@ const mutationStateLabels = Object.freeze({
   running: "↻ Выполняется",
   needs_reconcile: "△ Требует сверки",
   succeeded: "● Завершена",
+  rolled_back: "△ Выполнен откат",
 });
 
 const operationKindLabels = Object.freeze({

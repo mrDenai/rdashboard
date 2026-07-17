@@ -14,7 +14,7 @@ use rdashboard::backup_driver::{
     drive_pending_backup_jobs_until,
 };
 use rdashboard::deploy_driver::{
-    AcceptedDeployJobDriverV1, BootstrapDeployOperationDriverV1, drive_pending_deploy_jobs_until,
+    AcceptedDeployJobDriverV1, InstalledDeployOperationDriverV1, drive_pending_deploy_jobs_until,
 };
 use rdashboard::executor_authority::RootExecutorAuthorityV1;
 use rdashboard::executor_socket::{
@@ -158,7 +158,7 @@ fn configure_mutation_runtime(
         effects.clone(),
     ));
     let deploy_driver: Arc<dyn AcceptedDeployJobDriverV1> =
-        Arc::new(BootstrapDeployOperationDriverV1::new(
+        Arc::new(InstalledDeployOperationDriverV1::new(
             security.clone(),
             InstalledDeployIntentResolverV1::installed()?,
             InstalledBackupDiskProbeV1::installed(),

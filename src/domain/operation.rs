@@ -24,6 +24,7 @@ pub enum MutationExecutionStateV1 {
     Running,
     NeedsReconcile,
     Succeeded,
+    RolledBack,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

@@ -51,6 +51,7 @@ use rdashboard::{
         InstalledRimgPolicyV1, InstalledSchemaTransitionV1, Phase6ContractError,
         ReleaseClassificationAuthorityV1, ReleaseClassificationInputV1,
         RimgDeploymentCapabilitiesV1, RimgProtocolVersionsV1, RimgTimeoutPolicyV1,
+        RuntimeReleaseStateEvidenceInputV1, RuntimeReleaseStateEvidenceV1, RuntimeReleaseStateV1,
         SchemaContractEvaluationEvidenceV1, SchemaContractEvaluationInputV1, SchemaContractKindV1,
         SchemaContractVerdictV1, SchemaInspectionEvidenceInputV1, SchemaInspectionEvidenceV1,
     },
@@ -532,6 +533,74 @@ fn deploy_intent(
         release_class,
         OperationPhase::Deploying,
     )
+}
+
+fn code_only_deploy_intent_with_base(
+    current: &ReleaseBundleV1,
+    candidate: &ReleaseBundleV1,
+    chain: &VerifiedBackupChainV1,
+) -> PhaseIntent {
+    let operation = OperationRecord {
+        operation_id: Uuid::new_v4(),
+        request_id: Uuid::new_v4(),
+        attempt_id: Uuid::new_v4(),
+        attempt_number: 1,
+        project_id: project(),
+        operation_kind: OperationKind::Deploy,
+        target_commit: None,
+        release_class: Some(ReleaseClass::CodeOnlyCompatible),
+        state: OperationState {
+            phase: OperationPhase::Deploying,
+            result: OperationResult::Running,
+            blocking_reason: BlockingReason::None,
+        },
+        actor: OperationActor::Interactive {
+            user_id: Uuid::new_v4(),
+        },
+        evidence: OperationEvidence {
+            installed_policy: Some(installed_policy()),
+            deployment_plan_digest: Some(candidate.deployment_plan_digest().clone()),
+            release_bundle_digest: Some(candidate.digest().clone()),
+            previous_release_bundle_digest: Some(current.digest().clone()),
+            backup_set_id: Some(chain.authorized_spec().backup_set_id),
+            base_backup_id: Some(chain.authorized_spec().backup_id),
+            base_backup_manifest_digest: Some(chain.manifest().manifest_digest.clone()),
+            base_backup_evidence_digest: Some(chain.local().evidence_digest.clone()),
+            base_backup_offsite_evidence_digest: chain
+                .offsite()
+                .map(|offsite| offsite.evidence_digest.clone()),
+            base_backup_verification_digest: Some(chain.chain_digest().clone()),
+            ..OperationEvidence::default()
+        },
+        failure_capsule: None,
+        created_at_ms: 1_000,
+        updated_at_ms: 1_000,
+    };
+    PhaseIntent::from_operation(&operation, digest("historical backup deploy authorization"))
+        .unwrap_or_else(|error| panic!("deploy intent: {error}"))
+}
+
+fn installed_runtime_state(
+    intent: &PhaseIntent,
+    policy: &InstalledRimgPolicyV1,
+    current: &ReleaseBundleV1,
+    clock: &TrustedClockEvidenceV1,
+) -> RuntimeReleaseStateEvidenceV1 {
+    RuntimeReleaseStateEvidenceV1::observe(
+        RuntimeReleaseStateEvidenceInputV1 {
+            attempt_id: intent.attempt_id,
+            project_id: intent.project_id.clone(),
+            installed_policy: policy.installed_policy().clone(),
+            phase_intent_digest: intent.digest.clone(),
+            state: RuntimeReleaseStateV1::Installed {
+                current_release_bundle_digest: current.digest().clone(),
+            },
+            valid_until_ms: clock.observed_at_ms + 30_000,
+            observation_digest: digest("installed runtime state"),
+        },
+        clock,
+    )
+    .unwrap_or_else(|error| panic!("runtime state: {error}"))
 }
 
 fn release_intent(
@@ -1339,6 +1408,56 @@ fn accepted_backup_driver_recovers_from_receipts_without_reapplying_the_effect()
 }
 
 #[test]
+fn latest_committed_base_backup_chain_survives_later_deploy_attempts() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let security = SecurityStore::open(directory.path().join("security.sqlite"))
+        .unwrap_or_else(|error| panic!("security store: {error}"));
+    let (policies, first) = backup_driver_policy_and_acceptance();
+    let effects = VerifiedBackupEffects {
+        security: security.clone(),
+        fence: DeterministicModelEffects::default(),
+        applications: Arc::new(AtomicUsize::new(0)),
+    };
+    let driver = BackupOperationDriverV1::new(
+        security.clone(),
+        policies,
+        FixedBackupDiskProbe {
+            filesystem_identity: digest("historical backup filesystem"),
+        },
+        effects,
+    );
+    driver
+        .drive_accepted(&first, 2_000)
+        .unwrap_or_else(|error| panic!("first backup: {error}"));
+    let first_record = security
+        .latest_committed_base_backup_chain(&first.project_id)
+        .unwrap_or_else(|error| panic!("first historical chain: {error}"))
+        .unwrap_or_else(|| panic!("first historical chain missing"));
+    assert_eq!(first_record.attempt_id, first.attempt_id);
+
+    let second = AcceptedMutationV1 {
+        intent_id: Uuid::new_v4(),
+        intent_digest: digest("second signed backup intent"),
+        attempt_id: Uuid::new_v4(),
+        request_id: Uuid::new_v4(),
+        actor_id: Uuid::new_v4(),
+        action_grant_nonce: Uuid::new_v4(),
+        action_grant_digest: digest("second backup action grant"),
+        lease_id: Uuid::new_v4(),
+        accepted_at_ms: 2_500,
+        ..first
+    };
+    driver
+        .drive_accepted(&second, 3_000)
+        .unwrap_or_else(|error| panic!("second backup: {error}"));
+    let latest = security
+        .latest_committed_base_backup_chain(&second.project_id)
+        .unwrap_or_else(|error| panic!("latest historical chain: {error}"))
+        .unwrap_or_else(|| panic!("latest historical chain missing"));
+    assert_eq!(latest.attempt_id, second.attempt_id);
+}
+
+#[test]
 fn backup_chain_is_policy_bound_canonical_and_fresh() {
     let policy = rimg_policy(complete_protocols());
     let operation = backup_operation(Uuid::new_v4(), Uuid::new_v4());
@@ -1455,6 +1574,92 @@ fn backup_substitution_and_stale_or_untrusted_evidence_fail_closed() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn installed_code_only_deploy_rejects_a_stale_historical_base_backup() {
+    let policy = rimg_policy_with_capabilities(
+        complete_protocols(),
+        Vec::new(),
+        RimgDeploymentCapabilitiesV1 {
+            bootstrap_with_declared_downtime: true,
+            stable_routing: true,
+            automatic_code_rollback: true,
+        },
+    );
+    let current = release_bundle(
+        "1",
+        ReleaseRollbackContractV1::BootstrapUnavailable,
+        "historical current",
+    );
+    let candidate = release_bundle(
+        "1",
+        ReleaseRollbackContractV1::CodeOnlyCompatible,
+        "historical candidate",
+    );
+    let backup_operation = backup_operation(Uuid::new_v4(), Uuid::new_v4());
+    let backup_intent =
+        PhaseIntent::from_operation(&backup_operation, digest("backup authorization"))
+            .unwrap_or_else(|error| panic!("backup intent: {error}"));
+    let backup_spec = base_backup_spec(&policy, &backup_intent);
+    let verified_chain = base_chain(&backup_spec).verified(&backup_spec);
+    let intent = code_only_deploy_intent_with_base(&current, &candidate, &verified_chain);
+    assert_ne!(intent.attempt_id, backup_intent.attempt_id);
+
+    let compatibility = SchemaContractEvaluationEvidenceV1::new(SchemaContractEvaluationInputV1 {
+        intent: &intent,
+        policy: &policy,
+        kind: SchemaContractKindV1::DataCompatibility,
+        current_schema_version: Some("1"),
+        candidate_schema_version: "1",
+        migration_id: None,
+        contract_digest: digest("schema contract"),
+        verdict: SchemaContractVerdictV1::Satisfied,
+        observation_digest: digest("historical compatibility"),
+        evaluated_at_ms: 1_100,
+    })
+    .unwrap_or_else(|error| panic!("compatibility: {error}"));
+    let inspection = SchemaInspectionEvidenceV1::new(SchemaInspectionEvidenceInputV1 {
+        intent: &intent,
+        policy: &policy,
+        current_bundle: Some(&current),
+        candidate_bundle: &candidate,
+        migration_id: None,
+        migration_plan_evidence: None,
+        data_compatibility_evidence: &compatibility,
+        observation_digest: digest("historical inspection"),
+        inspected_at_ms: 1_101,
+    })
+    .unwrap_or_else(|error| panic!("inspection: {error}"));
+    let classification = ReleaseClassificationAuthorityV1::derive(&ReleaseClassificationInputV1 {
+        intent: &intent,
+        policy: &policy,
+        current_bundle: Some(&current),
+        candidate_bundle: &candidate,
+        schema_inspection: &inspection,
+    })
+    .unwrap_or_else(|error| panic!("classification: {error}"));
+    let stale_now = verified_chain.local().completed_at_ms + 24 * 60 * 60 * 1_000 + 1;
+    let clock = TrustedClockEvidenceV1::new(true, 0, stale_now, digest("stale deploy clock"))
+        .unwrap_or_else(|error| panic!("clock: {error}"));
+    let runtime = installed_runtime_state(&intent, &policy, &current, &clock);
+
+    assert!(matches!(
+        AuthorizedPhaseSpecV1::resolve(AuthorizedPhaseSpecInputV1 {
+            intent: &intent,
+            policy: &policy,
+            classification: Some(&classification),
+            backup: None,
+            prerequisites: AuthorizedPhasePrerequisitesV1 {
+                trusted_clock: Some(&clock),
+                boundary_now_ms: Some(stale_now),
+                base_backup_chain: Some(&verified_chain),
+                runtime_release_state: Some(&runtime),
+                ..AuthorizedPhasePrerequisitesV1::default()
+            },
+        }),
+        Err(Phase6ContractError::InvalidVerifiedBackupChain)
+    ));
 }
 
 #[test]

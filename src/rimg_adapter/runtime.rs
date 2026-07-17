@@ -381,6 +381,65 @@ impl InstalledRimgAdminRuntimeV1 {
         }
         Err(last_error.unwrap_or(RimgAdapterError::HealthObservationMismatch))
     }
+
+    fn run_health_command_owned_with_retry(
+        executable: &Path,
+        arguments: &[String],
+    ) -> Result<(), RimgAdapterError> {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        Self::run_health_command_with_retry(executable, &arguments)
+    }
+
+    fn consumer_health_arguments(
+        &self,
+        bundle: &ReleaseBundleV1,
+    ) -> Result<Vec<String>, RimgAdapterError> {
+        let plan = bundle.deployment_plan();
+        if plan.network().as_str() != FIXED_KAMAL_NETWORK_NAME {
+            return Err(RimgAdapterError::RuntimeConfigMismatch);
+        }
+        let (_host_port, container_port) = Self::health_port(bundle)?;
+        let image = format!(
+            "localhost:5555/{}:{}",
+            plan.image().as_str(),
+            plan.source_head().as_str()
+        );
+        let inspected = run_bounded_command(
+            &self.docker_path,
+            &["image", "inspect", "--format={{.Id}}", &image],
+        )?;
+        if !inspected.status.success()
+            || String::from_utf8(inspected.stdout)
+                .ok()
+                .is_none_or(|value| value.trim() != bundle.local_image_id().as_str())
+        {
+            return Err(RimgAdapterError::RuntimeConfigMismatch);
+        }
+        Ok(vec![
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--pull=never".to_owned(),
+            "--read-only".to_owned(),
+            "--cap-drop=ALL".to_owned(),
+            "--security-opt=no-new-privileges".to_owned(),
+            "--pids-limit=64".to_owned(),
+            "--memory=128m".to_owned(),
+            "--cpus=1.0".to_owned(),
+            "--log-driver=none".to_owned(),
+            "--user".to_owned(),
+            format!("{}:{}", plan.run_as().uid, plan.run_as().gid),
+            "--network".to_owned(),
+            FIXED_KAMAL_NETWORK_NAME.to_owned(),
+            "--entrypoint".to_owned(),
+            "rimg".to_owned(),
+            image,
+            "healthcheck".to_owned(),
+            "--host".to_owned(),
+            plan.network_alias().as_str().to_owned(),
+            "--port".to_owned(),
+            container_port.to_string(),
+        ])
+    }
 }
 
 impl RimgAdminRuntimeV1 for InstalledRimgAdminRuntimeV1 {
@@ -440,19 +499,17 @@ impl RimgAdminRuntimeV1 for InstalledRimgAdminRuntimeV1 {
         spec: &AuthorizedPhaseSpecV1,
     ) -> Result<RimgObservedDocumentV1<RimgHealthObservationV1>, RimgAdapterError> {
         let bundle = self.authorized_release_bundle(spec)?;
-        let (host_port, _container_port) = Self::health_port(&bundle)?;
-        let port = host_port.to_string();
-        Self::run_health_command(
-            &self.executable_path,
-            &["healthcheck", "--host", "127.0.0.1", "--port", &port],
-        )?;
+        let plan = bundle.deployment_plan();
+        let (_host_port, container_port) = Self::health_port(&bundle)?;
+        let arguments = self.consumer_health_arguments(&bundle)?;
+        Self::run_health_command_owned_with_retry(&self.docker_path, &arguments)?;
         RimgObservedDocumentV1::from_document(RimgHealthObservationV1 {
             schema_version: 1,
             check: RimgHealthCheckKindV1::DirectReadiness,
-            target_host: "127.0.0.1".to_owned(),
-            target_port: host_port,
-            network: None,
-            image_digest: None,
+            target_host: plan.network_alias().as_str().to_owned(),
+            target_port: container_port,
+            network: Some(FIXED_KAMAL_NETWORK_NAME.to_owned()),
+            image_digest: Some(plan.image_registry_digest().as_str().to_owned()),
             successful_samples: 1,
             minimum_interval_ms: 0,
         })
@@ -467,45 +524,12 @@ impl RimgAdminRuntimeV1 for InstalledRimgAdminRuntimeV1 {
         }
         let bundle = self.authorized_release_bundle(spec)?;
         let plan = bundle.deployment_plan();
-        if plan.network().as_str() != FIXED_KAMAL_NETWORK_NAME {
-            return Err(RimgAdapterError::RuntimeConfigMismatch);
-        }
         let (_host_port, container_port) = Self::health_port(&bundle)?;
-        let image = format!(
-            "localhost:5555/{}@{}",
-            plan.image().as_str(),
-            plan.image_registry_digest().as_str()
-        );
-        let port = container_port.to_string();
-        let user = format!("{}:{}", plan.run_as().uid, plan.run_as().gid);
-        let arguments = [
-            "run",
-            "--rm",
-            "--pull=never",
-            "--read-only",
-            "--cap-drop=ALL",
-            "--security-opt=no-new-privileges",
-            "--pids-limit=64",
-            "--memory=128m",
-            "--cpus=1.0",
-            "--log-driver=none",
-            "--user",
-            user.as_str(),
-            "--network",
-            FIXED_KAMAL_NETWORK_NAME,
-            "--entrypoint",
-            "rimg",
-            image.as_str(),
-            "healthcheck",
-            "--host",
-            plan.network_alias().as_str(),
-            "--port",
-            port.as_str(),
-        ];
-        Self::run_health_command_with_retry(&self.docker_path, &arguments)?;
+        let arguments = self.consumer_health_arguments(&bundle)?;
+        Self::run_health_command_owned_with_retry(&self.docker_path, &arguments)?;
         let interval_started = Instant::now();
         thread::sleep(CONSUMER_SMOKE_INTERVAL);
-        Self::run_health_command_with_retry(&self.docker_path, &arguments)?;
+        Self::run_health_command_owned_with_retry(&self.docker_path, &arguments)?;
         let minimum_interval_ms = u64::try_from(interval_started.elapsed().as_millis())
             .map_err(|_| RimgAdapterError::HealthObservationMismatch)?;
         if minimum_interval_ms

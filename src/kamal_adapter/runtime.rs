@@ -42,12 +42,23 @@ pub const RELEASE_BUNDLE_ROOT: &str = "/var/lib/rdashboard-executor/release-bund
 
 const SYSTEMD_CREDENTIAL_ROOT: &str = "/run/credentials";
 const GENERATED_CONFIG_FILE: &str = "kamal-deploy.json";
+const GENERATED_RUNTIME_ENV_FILE: &str = "stable-backend.env";
 const EXPECTED_KAMAL_VERSION: &str = "2.12.0";
 const EPHEMERAL_REGISTRY_CONTAINER: &str = "rdashboard-registry";
 const EPHEMERAL_REGISTRY_LABEL: &str = "io.rdashboard.role=ephemeral-registry-v1";
+const STABLE_ROUTER_CONTAINER: &str = "rdashboard-rimg-router";
+const STABLE_ROUTER_VOLUME: &str = "rdashboard-rimg-router-state";
+const STABLE_ROUTER_SERVICE: &str = "rimg-internal";
+const STABLE_ROUTER_ROLE: &str = "stable-router-v1";
+const STABLE_ROUTER_VOLUME_ROLE: &str = "stable-router-state-v1";
+const STABLE_BACKEND_ROLE: &str = "stable-backend-v1";
+const STABLE_ROUTER_STATE_PATH: &str = "/home/kamal-proxy/.config/kamal-proxy/kamal-proxy.state";
+const STABLE_ROUTER_HTTP_PORT: u16 = 8080;
 const MIN_REGISTRY_STORAGE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REGISTRY_STORAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const REGISTRY_START_ATTEMPTS: u8 = 10;
+const STABLE_ROUTER_START_ATTEMPTS: u8 = 30;
+const MAX_STABLE_NETWORK_CONTAINERS: usize = 256;
 const MAX_RUNTIME_CONFIG_BYTES: u64 = 32 * 1024;
 const MAX_CREDENTIAL_BYTES: u64 = 256 * 1024;
 const MAX_CONFIG_BYTES: usize = 128 * 1024;
@@ -59,7 +70,7 @@ const VERSION_OBSERVATION_ATTEMPTS: u8 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct InstalledKamalAdapterRuntimeV2 {
+pub struct InstalledKamalAdapterRuntimeV3 {
     pub purpose: String,
     pub schema_version: u16,
     pub project_id: ProjectId,
@@ -73,12 +84,14 @@ pub struct InstalledKamalAdapterRuntimeV2 {
     pub registry_image: String,
     pub registry_local_image_id: OciDigest,
     pub registry_storage_bytes: u64,
+    pub stable_router_image: String,
+    pub stable_router_local_image_id: OciDigest,
     pub secrets_sha256: EvidenceDigest,
     pub ssh_private_key_sha256: EvidenceDigest,
     pub kamal_version: String,
 }
 
-impl InstalledKamalAdapterRuntimeV2 {
+impl InstalledKamalAdapterRuntimeV3 {
     fn load(
         path: &Path,
         kamal_path: &Path,
@@ -91,12 +104,13 @@ impl InstalledKamalAdapterRuntimeV2 {
             .map_err(|_| KamalAdapterError::RuntimeConfigMismatch)?;
         let config: Self = serde_json::from_slice(&bytes)?;
         if serde_jcs::to_vec(&config)? != bytes
-            || config.purpose != "rdashboard.installed-kamal-adapter-runtime.v2"
-            || config.schema_version != 2
+            || config.purpose != "rdashboard.installed-kamal-adapter-runtime.v3"
+            || config.schema_version != 3
             || config.project_id != spec.project_id
             || config.installed_rimg_policy_digest != spec.installed_rimg_policy_digest
             || config.kamal_version != EXPECTED_KAMAL_VERSION
             || !valid_registry_image(&config.registry_image)
+            || !valid_registry_image(&config.stable_router_image)
             || !(MIN_REGISTRY_STORAGE_BYTES..=MAX_REGISTRY_STORAGE_BYTES)
                 .contains(&config.registry_storage_bytes)
         {
@@ -122,7 +136,7 @@ impl InstalledKamalAdapterRuntimeV2 {
 
 #[derive(Debug)]
 pub struct InstalledKamalRuntimeV1 {
-    config: InstalledKamalAdapterRuntimeV2,
+    config: InstalledKamalAdapterRuntimeV3,
     kamal_path: PathBuf,
     docker_path: PathBuf,
     skopeo_path: PathBuf,
@@ -174,7 +188,7 @@ impl InstalledKamalRuntimeV1 {
     ) -> Result<Self, KamalAdapterError> {
         validate_private_directory(job_directory, required_uid)
             .map_err(|_| KamalAdapterError::RuntimeConfigMismatch)?;
-        let config = InstalledKamalAdapterRuntimeV2::load(
+        let config = InstalledKamalAdapterRuntimeV3::load(
             runtime_config_path,
             kamal_path,
             docker_path,
@@ -433,6 +447,621 @@ impl InstalledKamalRuntimeV1 {
         )
     }
 
+    fn stable_backend_name(plan: &KamalDeploymentPlanV1) -> String {
+        format!(
+            "rdashboard-{}-backend-{}",
+            plan.project_id().as_str(),
+            plan.source_head().as_str()
+        )
+    }
+
+    fn stable_backend_port(plan: &KamalDeploymentPlanV1) -> Result<u16, KamalAdapterError> {
+        let mut ports = plan
+            .ports()
+            .iter()
+            .filter(|port| port.protocol == KamalPortProtocolV1::Tcp);
+        let port = ports
+            .next()
+            .ok_or(KamalAdapterError::RuntimeConfigMismatch)?;
+        if ports.next().is_some() {
+            return Err(KamalAdapterError::RuntimeConfigMismatch);
+        }
+        if port.container_port != STABLE_ROUTER_HTTP_PORT {
+            return Err(KamalAdapterError::RuntimeConfigMismatch);
+        }
+        Ok(port.container_port)
+    }
+
+    fn stable_runtime_environment(
+        &self,
+        plan: &KamalDeploymentPlanV1,
+    ) -> Result<PathBuf, KamalAdapterError> {
+        let secret_bytes =
+            read_stable_private_file(&self.secrets_path, self.required_uid, MAX_CREDENTIAL_BYTES)
+                .map_err(|_| KamalAdapterError::RuntimeConfigMismatch)?;
+        let expected = plan
+            .secret_bindings()
+            .iter()
+            .map(|binding| binding.secret_name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let secrets = parse_secret_credential_names(&expected, &secret_bytes)?;
+        let mut environment = BTreeMap::new();
+        for entry in plan.clear_environment() {
+            environment.insert(
+                entry.key.as_str().to_owned(),
+                entry.value.as_str().to_owned(),
+            );
+        }
+        for binding in plan.secret_bindings() {
+            let value = secrets
+                .get(binding.secret_name.as_str())
+                .ok_or(KamalAdapterError::RuntimeConfigMismatch)?;
+            if environment
+                .insert(binding.environment_key.as_str().to_owned(), value.clone())
+                .is_some()
+            {
+                return Err(KamalAdapterError::RuntimeConfigMismatch);
+            }
+        }
+        let mut bytes = Vec::new();
+        for (name, value) in environment {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(b'\n');
+        }
+        let path = self.job_directory.join(GENERATED_RUNTIME_ENV_FILE);
+        materialize_or_verify(&path, self.required_uid, &bytes)?;
+        Ok(path)
+    }
+
+    fn ensure_stable_backend(&self, bundle: &ReleaseBundleV1) -> Result<String, KamalAdapterError> {
+        let plan = bundle.deployment_plan();
+        let name = Self::stable_backend_name(plan);
+        let expected_identity = format!(
+            "{}|{}|{}|{}",
+            bundle.local_image_id().as_str(),
+            STABLE_BACKEND_ROLE,
+            bundle.digest().as_str(),
+            plan.digest().as_str()
+        );
+        let inspected = run_bounded_command(
+            &self.docker_path,
+            &[
+                "container",
+                "inspect",
+                "--format={{.Image}}|{{index .Config.Labels \"io.rdashboard.role\"}}|{{index .Config.Labels \"io.rdashboard.release-bundle\"}}|{{index .Config.Labels \"io.rdashboard.deployment-plan\"}}",
+                &name,
+            ],
+        )?;
+        if inspected.status.success() {
+            let identity = String::from_utf8(inspected.stdout)
+                .map_err(|_| KamalAdapterError::StableBackendOwnershipMismatch)?;
+            if identity.trim() != expected_identity {
+                return Err(KamalAdapterError::StableBackendOwnershipMismatch);
+            }
+            run_status_command(&self.docker_path, &["container", "start", &name])?;
+            self.wait_for_stable_backend_health(&name)?;
+            return Ok(name);
+        }
+
+        let environment = self.stable_runtime_environment(plan)?;
+        let image = format!(
+            "localhost:5555/{}:{}",
+            plan.image().as_str(),
+            plan.source_head().as_str()
+        );
+        if self.inspect_local_image_id(&image)?.as_ref() != Some(bundle.local_image_id()) {
+            return Err(KamalAdapterError::ImageImportMismatch);
+        }
+        let mut arguments = vec![
+            "run".to_owned(),
+            "--detach".to_owned(),
+            "--name".to_owned(),
+            name.clone(),
+            "--label".to_owned(),
+            format!("io.rdashboard.role={STABLE_BACKEND_ROLE}"),
+            "--label".to_owned(),
+            format!("io.rdashboard.release-bundle={}", bundle.digest().as_str()),
+            "--label".to_owned(),
+            format!("io.rdashboard.deployment-plan={}", plan.digest().as_str()),
+            "--network".to_owned(),
+            plan.network().as_str().to_owned(),
+            "--user".to_owned(),
+            format!("{}:{}", plan.run_as().uid, plan.run_as().gid),
+            "--env-file".to_owned(),
+            path_text(&environment)?.to_owned(),
+            "--restart=unless-stopped".to_owned(),
+            "--log-driver=local".to_owned(),
+            "--log-opt".to_owned(),
+            format!("max-size={}", plan.logging().max_size_bytes),
+            "--log-opt".to_owned(),
+            format!("max-file={}", plan.logging().max_files),
+            "--security-opt=no-new-privileges".to_owned(),
+        ];
+        for mount in plan.mounts() {
+            let mut value = format!(
+                "type=bind,source={},target={}",
+                mount.host_path.as_str(),
+                mount.container_path.as_str()
+            );
+            if mount.access == KamalMountAccessV1::ReadOnly {
+                value.push_str(",readonly");
+            }
+            arguments.extend(["--mount".to_owned(), value]);
+        }
+        arguments.push(image);
+        run_status_command_owned(&self.docker_path, &arguments)?;
+        self.wait_for_stable_backend_health(&name)?;
+        Ok(name)
+    }
+
+    fn wait_for_stable_backend_health(&self, name: &str) -> Result<(), KamalAdapterError> {
+        for _ in 0..120 {
+            let output = run_bounded_command(
+                &self.docker_path,
+                &[
+                    "container",
+                    "inspect",
+                    "--format={{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
+                    name,
+                ],
+            )?;
+            if output.status.success() {
+                let status = String::from_utf8(output.stdout)
+                    .map_err(|_| KamalAdapterError::StableBackendUnhealthy)?;
+                if status.trim() == "healthy" {
+                    return Ok(());
+                }
+                if status.trim() == "unhealthy" || status.trim() == "missing" {
+                    return Err(KamalAdapterError::StableBackendUnhealthy);
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(KamalAdapterError::StableBackendUnhealthy)
+    }
+
+    fn ensure_stable_router(&self, network: &str) -> Result<(), KamalAdapterError> {
+        if self
+            .inspect_local_image_id(&self.config.stable_router_image)?
+            .as_ref()
+            != Some(&self.config.stable_router_local_image_id)
+        {
+            return Err(KamalAdapterError::RuntimeConfigMismatch);
+        }
+        self.ensure_stable_router_volume()?;
+        let inspected = run_bounded_command(
+            &self.docker_path,
+            &[
+                "container",
+                "inspect",
+                "--format={{.Image}}|{{index .Config.Labels \"io.rdashboard.role\"}}|{{.HostConfig.NetworkMode}}",
+                STABLE_ROUTER_CONTAINER,
+            ],
+        )?;
+        let expected = format!(
+            "{}|{}|{}",
+            self.config.stable_router_local_image_id.as_str(),
+            STABLE_ROUTER_ROLE,
+            network
+        );
+        if inspected.status.success() {
+            let identity = String::from_utf8(inspected.stdout)
+                .map_err(|_| KamalAdapterError::StableRouterOwnershipMismatch)?;
+            if identity.trim() != expected {
+                return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+            }
+            run_status_command(
+                &self.docker_path,
+                &["container", "start", STABLE_ROUTER_CONTAINER],
+            )?;
+            if self.stable_router_has_network_alias(network)? {
+                return self.wait_for_stable_router();
+            }
+            run_status_command(
+                &self.docker_path,
+                &["container", "rm", "--force", STABLE_ROUTER_CONTAINER],
+            )?;
+        }
+        let state_mount = format!(
+            "type=volume,source={STABLE_ROUTER_VOLUME},target=/home/kamal-proxy/.config/kamal-proxy"
+        );
+        let http_port = format!("--http-port={STABLE_ROUTER_HTTP_PORT}");
+        run_status_command(
+            &self.docker_path,
+            &[
+                "run",
+                "--detach",
+                "--name",
+                STABLE_ROUTER_CONTAINER,
+                "--label",
+                &format!("io.rdashboard.role={STABLE_ROUTER_ROLE}"),
+                "--network",
+                network,
+                "--network-alias",
+                "rimg",
+                "--restart=unless-stopped",
+                "--read-only",
+                "--memory=128m",
+                "--pids-limit=128",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--log-driver=local",
+                "--log-opt",
+                "max-size=16m",
+                "--log-opt",
+                "max-file=2",
+                "--mount",
+                &state_mount,
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777",
+                &self.config.stable_router_image,
+                "kamal-proxy",
+                "run",
+                &http_port,
+                "--https-port=8443",
+            ],
+        )?;
+        if !self.stable_router_has_network_alias(network)? {
+            return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+        }
+        self.wait_for_stable_router()
+    }
+
+    fn stable_router_has_network_alias(&self, network: &str) -> Result<bool, KamalAdapterError> {
+        let output = run_bounded_command(
+            &self.docker_path,
+            &[
+                "container",
+                "inspect",
+                "--format={{json .NetworkSettings.Networks}}",
+                STABLE_ROUTER_CONTAINER,
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+        }
+        stable_router_has_network_alias(&output.stdout, network)
+    }
+
+    fn wait_for_stable_router(&self) -> Result<(), KamalAdapterError> {
+        for attempt in 0..STABLE_ROUTER_START_ATTEMPTS {
+            let output = run_bounded_command(
+                &self.docker_path,
+                &[
+                    "container",
+                    "exec",
+                    STABLE_ROUTER_CONTAINER,
+                    "kamal-proxy",
+                    "version",
+                ],
+            )?;
+            if output.status.success() {
+                return Ok(());
+            }
+            if attempt + 1 < STABLE_ROUTER_START_ATTEMPTS {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+        Err(KamalAdapterError::StableRouterStateMismatch)
+    }
+
+    fn require_exclusive_stable_router_alias(
+        &self,
+        network: &str,
+    ) -> Result<(), KamalAdapterError> {
+        let router = run_bounded_command(
+            &self.docker_path,
+            &[
+                "container",
+                "inspect",
+                "--format={{.Id}}",
+                STABLE_ROUTER_CONTAINER,
+            ],
+        )?;
+        if !router.status.success() {
+            return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+        }
+        let router_id = String::from_utf8(router.stdout)
+            .map_err(|_| KamalAdapterError::StableRouterOwnershipMismatch)?;
+        let router_id = router_id.trim();
+        if !valid_docker_container_id(router_id) {
+            return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+        }
+        let members = run_bounded_command(
+            &self.docker_path,
+            &[
+                "network",
+                "inspect",
+                "--format={{range $id, $_ := .Containers}}{{println $id}}{{end}}",
+                network,
+            ],
+        )?;
+        if !members.status.success() {
+            return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+        }
+        let members = String::from_utf8(members.stdout)
+            .map_err(|_| KamalAdapterError::StableRouterOwnershipMismatch)?;
+        let member_ids = members.lines().collect::<Vec<_>>();
+        if member_ids.is_empty() || member_ids.len() > MAX_STABLE_NETWORK_CONTAINERS {
+            return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+        }
+        let mut found_router = false;
+        for member_id in member_ids {
+            if !valid_docker_container_id(member_id) {
+                return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+            }
+            let inspected = run_bounded_command(
+                &self.docker_path,
+                &[
+                    "container",
+                    "inspect",
+                    "--format={{json .NetworkSettings.Networks}}",
+                    member_id,
+                ],
+            )?;
+            if !inspected.status.success() {
+                return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+            }
+            let has_alias = container_has_network_alias(&inspected.stdout, network, "rimg")?;
+            if member_id == router_id {
+                found_router = has_alias;
+            } else if has_alias {
+                return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+            }
+        }
+        if found_router {
+            Ok(())
+        } else {
+            Err(KamalAdapterError::StableRouterOwnershipMismatch)
+        }
+    }
+
+    fn ensure_stable_router_volume(&self) -> Result<(), KamalAdapterError> {
+        let inspected = run_bounded_command(
+            &self.docker_path,
+            &[
+                "volume",
+                "inspect",
+                "--format={{index .Labels \"io.rdashboard.role\"}}",
+                STABLE_ROUTER_VOLUME,
+            ],
+        )?;
+        if inspected.status.success() {
+            let role = String::from_utf8(inspected.stdout)
+                .map_err(|_| KamalAdapterError::StableRouterOwnershipMismatch)?;
+            return if role.trim() == STABLE_ROUTER_VOLUME_ROLE {
+                Ok(())
+            } else {
+                Err(KamalAdapterError::StableRouterOwnershipMismatch)
+            };
+        }
+        run_status_command(
+            &self.docker_path,
+            &[
+                "volume",
+                "create",
+                "--label",
+                &format!("io.rdashboard.role={STABLE_ROUTER_VOLUME_ROLE}"),
+                STABLE_ROUTER_VOLUME,
+            ],
+        )
+    }
+
+    fn stable_router_target(&self) -> Result<Option<String>, KamalAdapterError> {
+        let output = run_bounded_command(
+            &self.docker_path,
+            &[
+                "container",
+                "exec",
+                STABLE_ROUTER_CONTAINER,
+                "cat",
+                STABLE_ROUTER_STATE_PATH,
+            ],
+        )?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        decode_stable_router_target(&output.stdout)
+    }
+
+    fn switch_stable_router(
+        &self,
+        target: &str,
+        port: u16,
+        spec: &AuthorizedPhaseSpecV1,
+    ) -> Result<(), KamalAdapterError> {
+        let target = format!("{target}:{port}");
+        if self.stable_router_target()?.as_deref() == Some(target.as_str()) {
+            return Ok(());
+        }
+        let deploy_seconds = spec
+            .timeouts
+            .deploy_ms
+            .checked_sub(KAMAL_COMPLETION_MARGIN_MS)
+            .ok_or(KamalAdapterError::RuntimeConfigMismatch)?
+            .div_ceil(1000);
+        let deploy_timeout = format!("--deploy-timeout={deploy_seconds}s");
+        let target_argument = format!("--target={target}");
+        run_status_command(
+            &self.docker_path,
+            &[
+                "container",
+                "exec",
+                STABLE_ROUTER_CONTAINER,
+                "kamal-proxy",
+                "deploy",
+                STABLE_ROUTER_SERVICE,
+                &target_argument,
+                "--health-check-path=/health/ready",
+                "--health-check-interval=1s",
+                "--health-check-timeout=5s",
+                &deploy_timeout,
+                "--drain-timeout=30s",
+                "--target-timeout=30s",
+            ],
+        )?;
+        if self.stable_router_target()?.as_deref() == Some(target.as_str()) {
+            Ok(())
+        } else {
+            Err(KamalAdapterError::StableRouterStateMismatch)
+        }
+    }
+
+    fn stop_owned_stable_backend(&self, bundle: &ReleaseBundleV1) -> Result<(), KamalAdapterError> {
+        let name = Self::stable_backend_name(bundle.deployment_plan());
+        let output = run_bounded_command(
+            &self.docker_path,
+            &[
+                "container",
+                "inspect",
+                "--format={{index .Config.Labels \"io.rdashboard.role\"}}|{{index .Config.Labels \"io.rdashboard.release-bundle\"}}",
+                &name,
+            ],
+        )?;
+        if !output.status.success() {
+            return Ok(());
+        }
+        let expected = format!("{}|{}", STABLE_BACKEND_ROLE, bundle.digest().as_str());
+        let identity = String::from_utf8(output.stdout)
+            .map_err(|_| KamalAdapterError::StableBackendOwnershipMismatch)?;
+        if identity.trim() != expected {
+            return Err(KamalAdapterError::StableBackendOwnershipMismatch);
+        }
+        run_status_command(
+            &self.docker_path,
+            &["container", "stop", "--time=30", &name],
+        )
+    }
+
+    fn remove_adopted_bootstrap_container(
+        &self,
+        bundle: &ReleaseBundleV1,
+    ) -> Result<(), KamalAdapterError> {
+        let plan = bundle.deployment_plan();
+        let expected_name = format!(
+            "{}-web-{}",
+            plan.service().as_str(),
+            plan.source_head().as_str()
+        );
+        let output = run_bounded_command(
+            &self.docker_path,
+            &[
+                "container",
+                "inspect",
+                "--format={{.Image}}|{{index .Config.Labels \"service\"}}|{{index .Config.Labels \"role\"}}|{{index .Config.Labels \"destination\"}}",
+                &expected_name,
+            ],
+        )?;
+        if !output.status.success() {
+            return Ok(());
+        }
+        let expected = format!(
+            "{}|{}|web|",
+            bundle.local_image_id().as_str(),
+            plan.service().as_str()
+        );
+        let identity = String::from_utf8(output.stdout)
+            .map_err(|_| KamalAdapterError::StableBackendOwnershipMismatch)?;
+        if identity.trim() != expected {
+            return Err(KamalAdapterError::StableBackendOwnershipMismatch);
+        }
+        run_status_command(
+            &self.docker_path,
+            &["container", "rm", "--force", &expected_name],
+        )
+    }
+
+    fn apply_stable_release(
+        &self,
+        spec: &AuthorizedPhaseSpecV1,
+        bundle: &ReleaseBundleV1,
+        effect: KamalEffectKindV1,
+    ) -> Result<(), KamalAdapterError> {
+        match effect {
+            KamalEffectKindV1::Deploy => {
+                let Some(crate::phase6::RuntimeReleaseStateV1::Installed {
+                    current_release_bundle_digest: current_digest,
+                }) = spec.runtime_release_state.as_ref()
+                else {
+                    return Err(KamalAdapterError::RuntimeConfigMismatch);
+                };
+                let current = ReleaseBundleReader::open_for_owner(
+                    &self.release_bundle_root,
+                    self.required_uid,
+                )?
+                .load(&spec.project_id, current_digest)?;
+                let _ = self.import_candidate_image(&current)?;
+                self.ensure_stable_router(current.deployment_plan().network().as_str())?;
+                let target_endpoint = format!(
+                    "{}:{}",
+                    Self::stable_backend_name(bundle.deployment_plan()),
+                    Self::stable_backend_port(bundle.deployment_plan())?
+                );
+                if self.stable_router_target()?.as_deref() == Some(target_endpoint.as_str()) {
+                    let _ = self.ensure_stable_backend(bundle)?;
+                    self.remove_adopted_bootstrap_container(&current)?;
+                    self.require_exclusive_stable_router_alias(
+                        current.deployment_plan().network().as_str(),
+                    )?;
+                    if current.digest() != bundle.digest() {
+                        self.stop_owned_stable_backend(&current)?;
+                    }
+                    return Ok(());
+                }
+                let current_name = self.ensure_stable_backend(&current)?;
+                self.switch_stable_router(
+                    &current_name,
+                    Self::stable_backend_port(current.deployment_plan())?,
+                    spec,
+                )?;
+                self.remove_adopted_bootstrap_container(&current)?;
+                self.require_exclusive_stable_router_alias(
+                    current.deployment_plan().network().as_str(),
+                )?;
+
+                let target_name = self.ensure_stable_backend(bundle)?;
+                self.switch_stable_router(
+                    &target_name,
+                    Self::stable_backend_port(bundle.deployment_plan())?,
+                    spec,
+                )?;
+                if current.digest() != bundle.digest() {
+                    self.stop_owned_stable_backend(&current)?;
+                }
+            }
+            KamalEffectKindV1::Rollback => {
+                self.ensure_stable_router(bundle.deployment_plan().network().as_str())?;
+                self.require_exclusive_stable_router_alias(
+                    bundle.deployment_plan().network().as_str(),
+                )?;
+                let target_name = self.ensure_stable_backend(bundle)?;
+                self.switch_stable_router(
+                    &target_name,
+                    Self::stable_backend_port(bundle.deployment_plan())?,
+                    spec,
+                )?;
+                let failed_digest = spec
+                    .release_bundle_digest
+                    .as_ref()
+                    .ok_or(KamalAdapterError::MissingReleaseBundle)?;
+                if failed_digest != bundle.digest() {
+                    let failed = ReleaseBundleReader::open_for_owner(
+                        &self.release_bundle_root,
+                        self.required_uid,
+                    )?
+                    .load(&spec.project_id, failed_digest)?;
+                    self.stop_owned_stable_backend(&failed)?;
+                }
+            }
+            KamalEffectKindV1::Bootstrap => {
+                return Err(KamalAdapterError::RuntimeConfigMismatch);
+            }
+        }
+        Ok(())
+    }
+
     fn observe_version(&self, config_path: &Path) -> Result<Option<String>, KamalAdapterError> {
         let output = run_bounded_command(
             &self.kamal_path,
@@ -538,24 +1167,28 @@ impl KamalRuntimeV1 for InstalledKamalRuntimeV1 {
         self.remove_ephemeral_registry_if_owned()?;
         let (config_path, generated_config_digest) = self.generated_config(spec, plan)?;
         let expected_version = plan.source_head().as_str();
-        let already_deployed = self
-            .observe_version_before_mutation(&config_path, effect)?
-            .is_some_and(|version| version == expected_version);
-        if !already_deployed {
-            self.start_ephemeral_registry(&bundle, &archive_source)?;
-            let mutation = self.mutate(effect, expected_version, &config_path);
-            let cleanup = self.remove_ephemeral_registry_if_owned();
-            match (mutation, cleanup) {
-                (Ok(()), Ok(())) => {}
-                (Err(error), Ok(())) => return Err(error),
-                (_, Err(_)) => return Err(KamalAdapterError::RegistryCleanupFailed),
+        if effect == KamalEffectKindV1::Bootstrap {
+            let already_deployed = self
+                .observe_version_before_mutation(&config_path, effect)?
+                .is_some_and(|version| version == expected_version);
+            if !already_deployed {
+                self.start_ephemeral_registry(&bundle, &archive_source)?;
+                let mutation = self.mutate(effect, expected_version, &config_path);
+                let cleanup = self.remove_ephemeral_registry_if_owned();
+                match (mutation, cleanup) {
+                    (Ok(()), Ok(())) => {}
+                    (Err(error), Ok(())) => return Err(error),
+                    (_, Err(_)) => return Err(KamalAdapterError::RegistryCleanupFailed),
+                }
             }
-        }
-        let deployed_version = self
-            .observe_version(&config_path)?
-            .ok_or(KamalAdapterError::DeploymentObservationMismatch)?;
-        if deployed_version != expected_version {
-            return Err(KamalAdapterError::DeploymentObservationMismatch);
+            let deployed_version = self
+                .observe_version(&config_path)?
+                .ok_or(KamalAdapterError::DeploymentObservationMismatch)?;
+            if deployed_version != expected_version {
+                return Err(KamalAdapterError::DeploymentObservationMismatch);
+            }
+        } else {
+            self.apply_stable_release(spec, &bundle, effect)?;
         }
         Ok(KamalDeploymentObservationV1 {
             schema_version: 1,
@@ -565,9 +1198,63 @@ impl KamalRuntimeV1 for InstalledKamalRuntimeV1 {
             runtime_policy_digest: plan.runtime_policy_digest().clone(),
             generated_config_digest,
             image_registry_digest: plan.image_registry_digest().as_str().to_owned(),
-            deployed_version,
+            deployed_version: expected_version.to_owned(),
         })
     }
+}
+
+#[derive(Deserialize)]
+struct StableRouterStateServiceV1 {
+    name: String,
+    active_targets: Vec<String>,
+}
+
+fn decode_stable_router_target(bytes: &[u8]) -> Result<Option<String>, KamalAdapterError> {
+    let Ok(services) = serde_json::from_slice::<Vec<StableRouterStateServiceV1>>(bytes) else {
+        return Ok(None);
+    };
+    if services.is_empty() {
+        return Ok(None);
+    }
+    if services.len() != 1 || services[0].name != STABLE_ROUTER_SERVICE {
+        return Err(KamalAdapterError::StableRouterOwnershipMismatch);
+    }
+    match services[0].active_targets.as_slice() {
+        [target] => Ok(Some(target.clone())),
+        _ => Err(KamalAdapterError::StableRouterStateMismatch),
+    }
+}
+
+fn stable_router_has_network_alias(bytes: &[u8], network: &str) -> Result<bool, KamalAdapterError> {
+    container_has_network_alias(bytes, network, "rimg")
+}
+
+fn container_has_network_alias(
+    bytes: &[u8],
+    network: &str,
+    alias: &str,
+) -> Result<bool, KamalAdapterError> {
+    let networks: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| KamalAdapterError::StableRouterOwnershipMismatch)?;
+    let aliases = networks
+        .get(network)
+        .and_then(|settings| settings.get("Aliases"))
+        .ok_or(KamalAdapterError::StableRouterOwnershipMismatch)?;
+    let Some(aliases) = aliases.as_array() else {
+        return if aliases.is_null() {
+            Ok(false)
+        } else {
+            Err(KamalAdapterError::StableRouterOwnershipMismatch)
+        };
+    };
+    Ok(aliases.iter().any(|value| value.as_str() == Some(alias)))
+}
+
+fn valid_docker_container_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Serialize)]
@@ -797,6 +1484,13 @@ fn validate_secret_credential_names(
     expected: &std::collections::BTreeSet<&str>,
     bytes: &[u8],
 ) -> Result<(), KamalAdapterError> {
+    parse_secret_credential_names(expected, bytes).map(|_| ())
+}
+
+fn parse_secret_credential_names(
+    expected: &std::collections::BTreeSet<&str>,
+    bytes: &[u8],
+) -> Result<BTreeMap<String, String>, KamalAdapterError> {
     let text = std::str::from_utf8(bytes).map_err(|_| KamalAdapterError::RuntimeConfigMismatch)?;
     let mut actual = BTreeMap::new();
     for line in text.lines() {
@@ -810,20 +1504,20 @@ fn validate_secret_credential_names(
                 byte.is_ascii_alphanumeric()
                     || matches!(byte, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-' | b':')
             })
-            || actual.insert(name, value).is_some()
+            || actual.insert(name.to_owned(), value.to_owned()).is_some()
         {
             return Err(KamalAdapterError::RuntimeConfigMismatch);
         }
     }
     if actual
         .keys()
-        .copied()
+        .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>()
         != *expected
     {
         return Err(KamalAdapterError::RuntimeConfigMismatch);
     }
-    Ok(())
+    Ok(actual)
 }
 
 fn materialize_or_verify(
@@ -920,6 +1614,14 @@ fn run_status_command(executable: &Path, arguments: &[&str]) -> Result<(), Kamal
             "exit status {status}"
         )))
     }
+}
+
+fn run_status_command_owned(
+    executable: &Path,
+    arguments: &[String],
+) -> Result<(), KamalAdapterError> {
+    let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    run_status_command(executable, &arguments)
 }
 
 fn path_text(path: &Path) -> Result<&str, KamalAdapterError> {
@@ -1062,5 +1764,62 @@ mod tests {
                 "docker-daemon:localhost:5555/rimg:abc",
             ]
         );
+    }
+
+    #[test]
+    fn stable_router_state_requires_the_single_owned_service_and_target() {
+        assert_eq!(
+            decode_stable_router_target(
+                br#"[{"name":"rimg-internal","active_targets":["backend:3000"]}]"#,
+            )
+            .unwrap_or_else(|error| panic!("decode router state: {error}")),
+            Some("backend:3000".to_owned())
+        );
+        assert_eq!(
+            decode_stable_router_target(b"not-json")
+                .unwrap_or_else(|error| panic!("malformed state: {error}")),
+            None
+        );
+        assert!(matches!(
+            decode_stable_router_target(
+                br#"[{"name":"foreign","active_targets":["backend:3000"]}]"#,
+            ),
+            Err(KamalAdapterError::StableRouterOwnershipMismatch)
+        ));
+        assert!(matches!(
+            decode_stable_router_target(
+                br#"[{"name":"rimg-internal","active_targets":["one:3000","two:3000"]}]"#,
+            ),
+            Err(KamalAdapterError::StableRouterStateMismatch)
+        ));
+    }
+
+    #[test]
+    fn stable_router_network_requires_the_owned_rimg_alias() {
+        assert!(
+            stable_router_has_network_alias(
+                br#"{"kamal":{"Aliases":["rdashboard-rimg-router","rimg"]}}"#,
+                "kamal",
+            )
+            .unwrap_or_else(|error| panic!("router aliases: {error}"))
+        );
+        assert!(
+            !stable_router_has_network_alias(
+                br#"{"kamal":{"Aliases":["rdashboard-rimg-router"]}}"#,
+                "kamal",
+            )
+            .unwrap_or_else(|error| panic!("router aliases: {error}"))
+        );
+        assert!(matches!(
+            stable_router_has_network_alias(br#"{"other":{"Aliases":["rimg"]}}"#, "kamal"),
+            Err(KamalAdapterError::StableRouterOwnershipMismatch)
+        ));
+        assert!(
+            !container_has_network_alias(br#"{"kamal":{"Aliases":null}}"#, "kamal", "rimg")
+                .unwrap_or_else(|error| panic!("null aliases: {error}"))
+        );
+        assert!(valid_docker_container_id(&"a".repeat(64)));
+        assert!(!valid_docker_container_id(&"A".repeat(64)));
+        assert!(!valid_docker_container_id(&"a".repeat(63)));
     }
 }

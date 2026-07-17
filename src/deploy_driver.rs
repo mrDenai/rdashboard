@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use uuid::Uuid;
 
 use crate::{
-    backup::TrustedClockEvidenceV1,
+    backup::{TrustedClockEvidenceV1, VerifiedBackupChainV1},
     backup_driver::{
         BackupDiskProbeErrorV1, DiskReservationRequirementsV1, InstalledBackupDiskProbeV1,
     },
@@ -12,8 +12,8 @@ use crate::{
     domain::{
         AuthorizedPhaseSpecDigestV1, BlockingReason, EvidenceDigest, ExecutorPhaseBranch,
         OperationActor, OperationEvidence, OperationKind, OperationPhase, OperationRecord,
-        OperationResult, OperationState, OperationTransition, PhaseArtifacts, PhaseReceipt,
-        ReleaseClass,
+        OperationRecoveryMode, OperationResult, OperationState, OperationTransition,
+        PhaseArtifacts, PhaseReceipt, ReleaseClass,
     },
     executor::{
         DurableExecutor, EffectObservation, ExternalEffectError, ExternalEffects,
@@ -40,38 +40,85 @@ use crate::{
 };
 
 #[derive(Clone, Debug)]
-pub struct PreparedBootstrapDeploymentV1 {
+pub struct PreparedInstalledDeploymentV1 {
     pub operation: OperationRecord,
     pub mutation_policy: InstalledDeployMutationPolicyV1,
     pub rimg_policy: InstalledRimgPolicyV1,
     pub release_state: InstalledReleaseStateV1,
     pub attestation: BuildReleaseAttestationV1,
     pub candidate: ReleaseBundleV1,
+    pub current: Option<ReleaseBundleV1>,
+    pub base_backup_chain: Option<VerifiedBackupChainV1>,
     accepted: AcceptedMutationV1,
 }
 
 #[derive(Clone, Debug)]
-pub struct RuntimeBoundBootstrapDeploymentV1 {
-    pub prepared: PreparedBootstrapDeploymentV1,
+pub struct RuntimeBoundInstalledDeploymentV1 {
+    pub prepared: PreparedInstalledDeploymentV1,
     pub authorization: ExecutorAuthorization,
     pub artifacts: RuntimeCandidateArtifactsV1,
 }
 
-impl PreparedBootstrapDeploymentV1 {
+impl PreparedInstalledDeploymentV1 {
     pub fn load<S: DeploySourceSnapshotV1>(
         resolver: &InstalledDeployIntentResolverV1<S>,
         accepted: &AcceptedMutationV1,
+    ) -> Result<Self, DeployDriverError> {
+        Self::load_with_base_backup(resolver, accepted, None)
+    }
+
+    fn load_for_execution<S: DeploySourceSnapshotV1>(
+        resolver: &InstalledDeployIntentResolverV1<S>,
+        security: &SecurityStore,
+        accepted: &AcceptedMutationV1,
+    ) -> Result<Self, DeployDriverError> {
+        let base_backup_chain = if accepted.previous_release_bundle_digest.is_some() {
+            security
+                .latest_committed_base_backup_chain(&accepted.project_id)?
+                .map(|record| VerifiedBackupChainV1::decode_canonical(&record.canonical_json))
+                .transpose()?
+        } else {
+            None
+        };
+        Self::load_with_base_backup(resolver, accepted, base_backup_chain)
+    }
+
+    fn load_with_base_backup<S: DeploySourceSnapshotV1>(
+        resolver: &InstalledDeployIntentResolverV1<S>,
+        accepted: &AcceptedMutationV1,
+        base_backup_chain: Option<VerifiedBackupChainV1>,
     ) -> Result<Self, DeployDriverError> {
         let mutation_policy = resolver.load_policy()?;
         let rimg_policy = resolver.load_rimg_policy()?;
         let release_state = resolver.load_release_state()?;
         validate_policy_state_binding(&mutation_policy, &rimg_policy, &release_state)?;
-        let target = validate_accepted_bootstrap(accepted, &mutation_policy)?;
+        if accepted.previous_release_bundle_digest.is_some()
+            && (!rimg_policy.capabilities().stable_routing
+                || !rimg_policy.capabilities().automatic_code_rollback)
+        {
+            return Err(DeployDriverError::InstalledBinding);
+        }
+        let target = validate_accepted_deploy(accepted, &mutation_policy)?;
         let (attestation, candidate) =
             resolver.load_candidate(&mutation_policy, target, accepted.accepted_at_ms)?;
         validate_candidate_binding(accepted, &attestation, &candidate, &rimg_policy)?;
-        validate_bootstrap_release_shape(&release_state, &candidate)?;
-        let operation = reconstruct_bootstrap_operation(accepted, &mutation_policy, &candidate);
+        let current = accepted
+            .previous_release_bundle_digest
+            .as_ref()
+            .map(|digest| resolver.load_promoted_bundle(&mutation_policy, digest))
+            .transpose()?;
+        validate_release_shape(
+            &release_state,
+            current.as_ref(),
+            &candidate,
+            base_backup_chain.as_ref(),
+        )?;
+        let operation = reconstruct_deploy_operation(
+            accepted,
+            &mutation_policy,
+            &candidate,
+            base_backup_chain.as_ref(),
+        );
         Ok(Self {
             operation,
             mutation_policy,
@@ -79,6 +126,8 @@ impl PreparedBootstrapDeploymentV1 {
             release_state,
             attestation,
             candidate,
+            current,
+            base_backup_chain,
             accepted: accepted.clone(),
         })
     }
@@ -88,7 +137,7 @@ impl PreparedBootstrapDeploymentV1 {
         security: &crate::store::SecurityStore,
         disk: &InstalledBackupDiskProbeV1,
         now_ms: i64,
-    ) -> Result<RuntimeBoundBootstrapDeploymentV1, DeployDriverError> {
+    ) -> Result<RuntimeBoundInstalledDeploymentV1, DeployDriverError> {
         if now_ms < 0 {
             return Err(DeployDriverError::InvalidTime);
         }
@@ -145,7 +194,7 @@ impl PreparedBootstrapDeploymentV1 {
             .attestation
             .bind_runtime_reservation(reservation_digest.clone())?;
         self.operation.evidence.resource_reservation_digest = Some(reservation_digest);
-        Ok(RuntimeBoundBootstrapDeploymentV1 {
+        Ok(RuntimeBoundInstalledDeploymentV1 {
             prepared: self,
             authorization,
             artifacts,
@@ -171,22 +220,30 @@ fn validate_policy_state_binding(
     Ok(())
 }
 
-fn validate_bootstrap_release_shape(
+fn validate_release_shape(
     state: &InstalledReleaseStateV1,
+    current: Option<&ReleaseBundleV1>,
     candidate: &ReleaseBundleV1,
+    base_backup_chain: Option<&VerifiedBackupChainV1>,
 ) -> Result<(), DeployDriverError> {
-    if state.last_known_good_release_bundle_digest.is_some()
-        || state
-            .current_release_bundle_digest
-            .as_ref()
-            .is_some_and(|digest| digest != candidate.digest())
-    {
-        return Err(DeployDriverError::InstalledBinding);
+    match (state.current_release_bundle_digest.as_ref(), current) {
+        (None, None)
+            if state.last_known_good_release_bundle_digest.is_none()
+                && base_backup_chain.is_none() => {}
+        (Some(current_digest), None)
+            if current_digest == candidate.digest()
+                && state.last_known_good_release_bundle_digest.is_none()
+                && base_backup_chain.is_none() => {}
+        (Some(current_digest), Some(current))
+            if (current.digest() == current_digest || candidate.digest() == current_digest)
+                && current.digest() != candidate.digest()
+                && base_backup_chain.is_some() => {}
+        _ => return Err(DeployDriverError::InstalledBinding),
     }
     Ok(())
 }
 
-fn validate_accepted_bootstrap<'a>(
+fn validate_accepted_deploy<'a>(
     accepted: &'a AcceptedMutationV1,
     policy: &InstalledDeployMutationPolicyV1,
 ) -> Result<&'a crate::domain::GitCommitId, DeployDriverError> {
@@ -199,7 +256,6 @@ fn validate_accepted_bootstrap<'a>(
         || accepted.release_bundle_digest.is_none()
         || accepted.build_attestation_digest.is_none()
         || accepted.migration_id.is_some()
-        || accepted.previous_release_bundle_digest.is_some()
     {
         return Err(DeployDriverError::AcceptedMutationBinding);
     }
@@ -229,11 +285,31 @@ fn validate_candidate_binding(
     Ok(())
 }
 
-fn reconstruct_bootstrap_operation(
+fn reconstruct_deploy_operation(
     accepted: &AcceptedMutationV1,
     policy: &InstalledDeployMutationPolicyV1,
     candidate: &ReleaseBundleV1,
+    base_backup_chain: Option<&VerifiedBackupChainV1>,
 ) -> OperationRecord {
+    let mut evidence = OperationEvidence {
+        installed_policy: Some(policy.installed_policy.clone()),
+        source_attestation_digest: accepted.source_attestation_digest.clone(),
+        source_sequence: accepted.source_sequence,
+        deployment_plan_digest: Some(candidate.deployment_plan_digest().clone()),
+        release_bundle_digest: Some(candidate.digest().clone()),
+        previous_release_bundle_digest: accepted.previous_release_bundle_digest.clone(),
+        action_grant_digest: Some(accepted.action_grant_digest.clone()),
+        ..OperationEvidence::default()
+    };
+    if let Some(chain) = base_backup_chain {
+        evidence.backup_set_id = Some(chain.authorized_spec().backup_set_id);
+        evidence.base_backup_id = Some(chain.authorized_spec().backup_id);
+        evidence.base_backup_manifest_digest = Some(chain.manifest().manifest_digest.clone());
+        evidence.base_backup_evidence_digest = Some(chain.local().evidence_digest.clone());
+        evidence.base_backup_offsite_evidence_digest =
+            chain.offsite().map(|value| value.evidence_digest.clone());
+        evidence.base_backup_verification_digest = Some(chain.chain_digest().clone());
+    }
     OperationRecord {
         operation_id: accepted.intent_id,
         request_id: accepted.request_id,
@@ -251,15 +327,7 @@ fn reconstruct_bootstrap_operation(
         actor: OperationActor::Interactive {
             user_id: accepted.actor_id,
         },
-        evidence: OperationEvidence {
-            installed_policy: Some(policy.installed_policy.clone()),
-            source_attestation_digest: accepted.source_attestation_digest.clone(),
-            source_sequence: accepted.source_sequence,
-            deployment_plan_digest: Some(candidate.deployment_plan_digest().clone()),
-            release_bundle_digest: Some(candidate.digest().clone()),
-            action_grant_digest: Some(accepted.action_grant_digest.clone()),
-            ..OperationEvidence::default()
-        },
+        evidence,
         failure_capsule: None,
         created_at_ms: accepted.accepted_at_ms,
         updated_at_ms: accepted.accepted_at_ms,
@@ -308,7 +376,14 @@ where
         }
         let terminal_receipt = security
             .phase_receipt(accepted.attempt_id, OperationPhase::Soaking)?
-            .is_some();
+            .is_some()
+            || security
+                .phase_receipt_in_branch(
+                    accepted.attempt_id,
+                    OperationPhase::Soaking,
+                    ExecutorPhaseBranch::RollbackRecovery,
+                )?
+                .is_some();
         if terminal_receipt {
             match driver.has_committed_terminal(&accepted) {
                 Ok(true) => continue,
@@ -335,12 +410,12 @@ where
 }
 
 #[derive(Clone, Debug)]
-struct BootstrapDeploymentEffectsV1<E> {
+struct InstalledDeployEffectsV1<E> {
     delegate: E,
     candidate: RuntimeCandidateArtifactsV1,
 }
 
-impl<E: ExternalEffects> BootstrapDeploymentEffectsV1<E> {
+impl<E: ExternalEffects> InstalledDeployEffectsV1<E> {
     fn candidate_observation(
         &self,
         intent: &PhaseIntent,
@@ -370,7 +445,7 @@ impl<E: ExternalEffects> BootstrapDeploymentEffectsV1<E> {
     }
 }
 
-impl<E: ExternalEffects> ExternalEffects for BootstrapDeploymentEffectsV1<E> {
+impl<E: ExternalEffects> ExternalEffects for InstalledDeployEffectsV1<E> {
     fn observe_phase(
         &self,
         intent: &PhaseIntent,
@@ -437,7 +512,7 @@ impl<E: ExternalEffects> ExternalEffects for BootstrapDeploymentEffectsV1<E> {
 }
 
 #[derive(Clone, Debug)]
-pub struct BootstrapDeployOperationDriverV1<S, E, C> {
+pub struct InstalledDeployOperationDriverV1<S, E, C> {
     security: SecurityStore,
     resolver: InstalledDeployIntentResolverV1<S>,
     disk: InstalledBackupDiskProbeV1,
@@ -445,7 +520,7 @@ pub struct BootstrapDeployOperationDriverV1<S, E, C> {
     clock: C,
 }
 
-impl<S, E, C> BootstrapDeployOperationDriverV1<S, E, C>
+impl<S, E, C> InstalledDeployOperationDriverV1<S, E, C>
 where
     S: DeploySourceSnapshotV1 + LiveSourceGate + Clone,
     E: ExternalEffects + Clone,
@@ -472,9 +547,13 @@ where
         accepted: &AcceptedMutationV1,
         now_ms: i64,
     ) -> Result<OperationRecord, DeployDriverError> {
-        let prepared = PreparedBootstrapDeploymentV1::load(&self.resolver, accepted)?;
+        let prepared = PreparedInstalledDeploymentV1::load_for_execution(
+            &self.resolver,
+            &self.security,
+            accepted,
+        )?;
         let mut projected = prepared.operation.clone();
-        project_existing_bootstrap_receipts(&self.security, &mut projected)?;
+        project_existing_deploy_receipts(&self.security, &mut projected)?;
         if projected.state.result == OperationResult::Succeeded
             && prepared
                 .release_state
@@ -484,10 +563,17 @@ where
         {
             return Ok(projected);
         }
+        if projected.state.result == OperationResult::RolledBack
+            && prepared.release_state.current_release_bundle_digest
+                == accepted.previous_release_bundle_digest
+        {
+            return Ok(projected);
+        }
         if prepared
             .release_state
             .current_release_bundle_digest
-            .is_some()
+            .as_ref()
+            == Some(prepared.candidate.digest())
         {
             return Err(DeployDriverError::ReleaseStateWithoutTerminalReceipt);
         }
@@ -497,11 +583,11 @@ where
             &runtime.prepared.candidate,
         )?;
         let mut operation = runtime.prepared.operation.clone();
-        project_existing_bootstrap_receipts(&self.security, &mut operation)?;
+        project_existing_deploy_receipts(&self.security, &mut operation)?;
         let authorization_digest = executor_authorization_digest(&operation)?;
         let executor = DurableExecutor::new(
             self.security.clone(),
-            BootstrapDeploymentEffectsV1 {
+            InstalledDeployEffectsV1 {
                 delegate: self.effects.clone(),
                 candidate: runtime.artifacts,
             },
@@ -516,34 +602,78 @@ where
                 OperationPhase::Deploying
                     | OperationPhase::HealthChecking
                     | OperationPhase::Soaking
+                    | OperationPhase::Rollback
             ) {
-                self.ensure_bootstrap_phase_spec(
+                self.ensure_deploy_phase_spec(
                     &operation,
                     &runtime.prepared,
                     &authorization_digest,
                     now_ms,
                 )?;
             }
-            let receipt = executor.execute_phase(&operation, None, now_ms)?;
-            project_bootstrap_receipt(&mut operation, &receipt)?;
+            match executor.execute_phase(&operation, None, now_ms) {
+                Ok(receipt) => {
+                    let rollback =
+                        operation.evidence.recovery_mode == Some(OperationRecoveryMode::Rollback);
+                    project_deploy_receipt(&mut operation, &receipt, rollback)?;
+                }
+                Err(_error)
+                    if runtime.prepared.current.is_some()
+                        && operation.evidence.recovery_mode.is_none()
+                        && matches!(
+                            operation.state.phase,
+                            OperationPhase::HealthChecking | OperationPhase::Soaking
+                        ) =>
+                {
+                    self.security.begin_rollback_takeover(
+                        operation.attempt_id,
+                        &operation.project_id,
+                        &authorization_digest,
+                        now_ms,
+                    )?;
+                    begin_rollback_projection(&mut operation, now_ms)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         executor.cleanup_terminal_resources(&operation, now_ms)?;
-        self.resolver.commit_bootstrap_release(
-            &runtime.prepared.release_state,
-            &runtime.prepared.candidate,
-            now_ms,
-        )?;
+        if operation.state.result == OperationResult::RolledBack {
+            return Ok(operation);
+        }
+        self.commit_succeeded_release(&runtime.prepared, now_ms)?;
         Ok(operation)
     }
 
-    fn ensure_bootstrap_phase_spec(
+    fn commit_succeeded_release(
+        &self,
+        prepared: &PreparedInstalledDeploymentV1,
+        now_ms: i64,
+    ) -> Result<(), DeployDriverError> {
+        if prepared.current.is_some() {
+            self.resolver.commit_installed_release(
+                &prepared.release_state,
+                &prepared.candidate,
+                now_ms,
+            )?;
+        } else {
+            self.resolver.commit_bootstrap_release(
+                &prepared.release_state,
+                &prepared.candidate,
+                now_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_deploy_phase_spec(
         &self,
         operation: &OperationRecord,
-        prepared: &PreparedBootstrapDeploymentV1,
+        prepared: &PreparedInstalledDeploymentV1,
         authorization_digest: &EvidenceDigest,
         now_ms: i64,
     ) -> Result<(), DeployDriverError> {
         let intent = PhaseIntent::from_operation(operation, authorization_digest.clone())?;
+        let branch = intent.branch;
         let phase_plan = operation
             .operation_kind
             .required_phases(operation.release_class)
@@ -552,7 +682,7 @@ where
             attempt_id: operation.attempt_id,
             project_id: &operation.project_id,
             phase: operation.state.phase,
-            branch: ExecutorPhaseBranch::Primary,
+            branch,
             phase_plan: ExecutorPhasePlan::new(phase_plan, true),
             intent_digest: &intent.digest,
             authorization_digest,
@@ -561,32 +691,42 @@ where
         let existing = self.security.authorized_phase_spec_in_branch(
             operation.attempt_id,
             operation.state.phase,
-            ExecutorPhaseBranch::Primary,
+            branch,
         )?;
         if let Some(record) = existing {
             let stored = AuthorizedPhaseSpecV1::decode_canonical(&record.canonical_json)?;
             if stored.attempt_id != operation.attempt_id
                 || stored.project_id != operation.project_id
                 || stored.phase != operation.state.phase
+                || stored.branch != intent.branch
                 || stored.intent_digest != intent.digest
                 || stored.installed_rimg_policy_digest != *prepared.rimg_policy.digest()
                 || stored.release_bundle_digest.as_ref() != Some(prepared.candidate.digest())
                 || stored.deployment_plan_digest.as_ref()
                     != Some(prepared.candidate.deployment_plan_digest())
-                || stored.effective_release_class != Some(ReleaseClass::CodeOnlyCompatible)
+                || stored.effective_release_class
+                    != Some(if intent.branch == ExecutorPhaseBranch::RollbackRecovery {
+                        ReleaseClass::Rollback
+                    } else {
+                        ReleaseClass::CodeOnlyCompatible
+                    })
             {
                 return Err(DeployDriverError::PhaseSpecBinding);
             }
             return Ok(());
         }
-        let expected = bootstrap_phase_spec(&intent, prepared, &self.clock, now_ms)?;
+        let expected = if intent.branch == ExecutorPhaseBranch::RollbackRecovery {
+            rollback_phase_spec(&intent, prepared)?
+        } else {
+            deploy_phase_spec(&intent, prepared, &self.clock, now_ms)?
+        };
         let canonical = expected.canonical_bytes()?;
         self.security
             .bind_authorized_phase_spec(AuthorizedPhaseSpecBinding {
                 attempt_id: operation.attempt_id,
                 project_id: &operation.project_id,
                 phase: operation.state.phase,
-                branch: ExecutorPhaseBranch::Primary,
+                branch,
                 intent_digest: &intent.digest,
                 spec_digest: &expected.spec_digest,
                 canonical_json: &canonical,
@@ -596,7 +736,7 @@ where
     }
 }
 
-impl<S, E, C> AcceptedDeployJobDriverV1 for BootstrapDeployOperationDriverV1<S, E, C>
+impl<S, E, C> AcceptedDeployJobDriverV1 for InstalledDeployOperationDriverV1<S, E, C>
 where
     S: DeploySourceSnapshotV1 + LiveSourceGate + Clone,
     E: ExternalEffects + Clone,
@@ -610,24 +750,31 @@ where
         &self,
         accepted: &AcceptedMutationV1,
     ) -> Result<bool, DeployDriverError> {
-        let prepared = PreparedBootstrapDeploymentV1::load(&self.resolver, accepted)?;
+        let prepared = PreparedInstalledDeploymentV1::load_for_execution(
+            &self.resolver,
+            &self.security,
+            accepted,
+        )?;
         let mut operation = prepared.operation.clone();
-        project_existing_bootstrap_receipts(&self.security, &mut operation)?;
+        project_existing_deploy_receipts(&self.security, &mut operation)?;
         let state_committed = prepared
             .release_state
             .current_release_bundle_digest
             .as_ref()
             == Some(prepared.candidate.digest());
+        let rolled_back = operation.state.result == OperationResult::RolledBack
+            && prepared.release_state.current_release_bundle_digest
+                == accepted.previous_release_bundle_digest;
         if state_committed && operation.state.result != OperationResult::Succeeded {
             return Err(DeployDriverError::ReleaseStateWithoutTerminalReceipt);
         }
-        Ok(state_committed)
+        Ok(state_committed || rolled_back)
     }
 }
 
-fn bootstrap_phase_spec<'a>(
+fn deploy_phase_spec<'a>(
     intent: &'a PhaseIntent,
-    prepared: &'a PreparedBootstrapDeploymentV1,
+    prepared: &'a PreparedInstalledDeploymentV1,
     clock_source: &dyn DeployClockSourceV1,
     boundary_now_ms: i64,
 ) -> Result<AuthorizedPhaseSpecV1, DeployDriverError> {
@@ -636,7 +783,10 @@ fn bootstrap_phase_spec<'a>(
         intent,
         policy,
         kind: SchemaContractKindV1::DataCompatibility,
-        current_schema_version: None,
+        current_schema_version: prepared
+            .current
+            .as_ref()
+            .map(ReleaseBundleV1::application_schema_version),
         candidate_schema_version: prepared.candidate.application_schema_version(),
         migration_id: None,
         contract_digest: policy.schema_contract_digest().clone(),
@@ -650,7 +800,7 @@ fn bootstrap_phase_spec<'a>(
     let inspection = SchemaInspectionEvidenceV1::new(SchemaInspectionEvidenceInputV1 {
         intent,
         policy,
-        current_bundle: None,
+        current_bundle: prepared.current.as_ref(),
         candidate_bundle: &prepared.candidate,
         migration_id: None,
         migration_plan_evidence: None,
@@ -665,36 +815,43 @@ fn bootstrap_phase_spec<'a>(
     let classification = ReleaseClassificationAuthorityV1::derive(&ReleaseClassificationInputV1 {
         intent,
         policy,
-        current_bundle: None,
+        current_bundle: prepared.current.as_ref(),
         candidate_bundle: &prepared.candidate,
         schema_inspection: &inspection,
     })?;
-    let (clock, runtime) = if intent.phase == OperationPhase::Deploying {
-        let clock =
-            clock_source.observe(&prepared.mutation_policy.chronyc_sha256, boundary_now_ms)?;
-        let valid_until_ms = boundary_now_ms
-            .checked_add(30_000)
-            .ok_or(DeployDriverError::InvalidTime)?;
-        let runtime = RuntimeReleaseStateEvidenceV1::observe(
-            RuntimeReleaseStateEvidenceInputV1 {
-                attempt_id: intent.attempt_id,
-                project_id: intent.project_id.clone(),
-                installed_policy: policy.installed_policy().clone(),
-                phase_intent_digest: intent.digest.clone(),
-                state: RuntimeReleaseStateV1::NeverInstalled,
-                valid_until_ms,
-                observation_digest: EvidenceDigest::sha256(serde_jcs::to_vec(&(
-                    "rdashboard.bootstrap-release-state-observation.v1",
-                    &prepared.release_state.document_digest,
-                    &intent.digest,
-                ))?),
-            },
-            &clock,
-        )?;
-        (Some(clock), Some(runtime))
-    } else {
-        (None, None)
-    };
+    let (clock, runtime) =
+        if intent.phase == OperationPhase::Deploying {
+            let clock =
+                clock_source.observe(&prepared.mutation_policy.chronyc_sha256, boundary_now_ms)?;
+            let valid_until_ms = boundary_now_ms
+                .checked_add(30_000)
+                .ok_or(DeployDriverError::InvalidTime)?;
+            let runtime_state = prepared.current.as_ref().map_or(
+                RuntimeReleaseStateV1::NeverInstalled,
+                |current| RuntimeReleaseStateV1::Installed {
+                    current_release_bundle_digest: current.digest().clone(),
+                },
+            );
+            let runtime = RuntimeReleaseStateEvidenceV1::observe(
+                RuntimeReleaseStateEvidenceInputV1 {
+                    attempt_id: intent.attempt_id,
+                    project_id: intent.project_id.clone(),
+                    installed_policy: policy.installed_policy().clone(),
+                    phase_intent_digest: intent.digest.clone(),
+                    state: runtime_state,
+                    valid_until_ms,
+                    observation_digest: EvidenceDigest::sha256(serde_jcs::to_vec(&(
+                        "rdashboard.installed-release-state-observation.v1",
+                        &prepared.release_state.document_digest,
+                        &intent.digest,
+                    ))?),
+                },
+                &clock,
+            )?;
+            (Some(clock), Some(runtime))
+        } else {
+            (None, None)
+        };
     AuthorizedPhaseSpecV1::resolve(AuthorizedPhaseSpecInputV1 {
         intent,
         policy,
@@ -703,6 +860,9 @@ fn bootstrap_phase_spec<'a>(
         prerequisites: AuthorizedPhasePrerequisitesV1 {
             trusted_clock: clock.as_ref(),
             boundary_now_ms: clock.as_ref().map(|_| boundary_now_ms),
+            base_backup_chain: (intent.phase == OperationPhase::Deploying)
+                .then_some(prepared.base_backup_chain.as_ref())
+                .flatten(),
             runtime_release_state: runtime.as_ref(),
             ..AuthorizedPhasePrerequisitesV1::default()
         },
@@ -710,38 +870,177 @@ fn bootstrap_phase_spec<'a>(
     .map_err(Into::into)
 }
 
-fn project_existing_bootstrap_receipts(
+fn rollback_phase_spec(
+    intent: &PhaseIntent,
+    prepared: &PreparedInstalledDeploymentV1,
+) -> Result<AuthorizedPhaseSpecV1, DeployDriverError> {
+    let policy = &prepared.rimg_policy;
+    let rollback_target = prepared
+        .current
+        .as_ref()
+        .ok_or(DeployDriverError::RollbackBinding)?;
+    let compatibility_observation = EvidenceDigest::sha256(serde_jcs::to_vec(&(
+        "rdashboard.rollback-data-compatibility-observation.v1",
+        &intent.digest,
+        prepared.candidate.digest(),
+        rollback_target.digest(),
+        policy.schema_contract_digest(),
+    ))?);
+    let compatibility = SchemaContractEvaluationEvidenceV1::new(SchemaContractEvaluationInputV1 {
+        intent,
+        policy,
+        kind: SchemaContractKindV1::DataCompatibility,
+        current_schema_version: Some(prepared.candidate.application_schema_version()),
+        candidate_schema_version: rollback_target.application_schema_version(),
+        migration_id: None,
+        contract_digest: policy.schema_contract_digest().clone(),
+        verdict: SchemaContractVerdictV1::Satisfied,
+        observation_digest: compatibility_observation,
+        evaluated_at_ms: prepared.accepted.accepted_at_ms,
+    })?;
+    let inspection = SchemaInspectionEvidenceV1::new(SchemaInspectionEvidenceInputV1 {
+        intent,
+        policy,
+        current_bundle: Some(&prepared.candidate),
+        candidate_bundle: rollback_target,
+        migration_id: None,
+        migration_plan_evidence: None,
+        data_compatibility_evidence: &compatibility,
+        observation_digest: EvidenceDigest::sha256(serde_jcs::to_vec(&(
+            "rdashboard.rollback-schema-inspection.v1",
+            &intent.digest,
+            prepared.candidate.digest(),
+            rollback_target.digest(),
+        ))?),
+        inspected_at_ms: prepared.accepted.accepted_at_ms,
+    })?;
+    let classification = ReleaseClassificationAuthorityV1::derive(&ReleaseClassificationInputV1 {
+        intent,
+        policy,
+        current_bundle: Some(&prepared.candidate),
+        candidate_bundle: rollback_target,
+        schema_inspection: &inspection,
+    })?;
+    AuthorizedPhaseSpecV1::resolve(AuthorizedPhaseSpecInputV1 {
+        intent,
+        policy,
+        classification: Some(&classification),
+        backup: None,
+        prerequisites: AuthorizedPhasePrerequisitesV1::default(),
+    })
+    .map_err(Into::into)
+}
+
+fn project_existing_deploy_receipts(
     security: &SecurityStore,
     operation: &mut OperationRecord,
 ) -> Result<(), DeployDriverError> {
     let mut missing = false;
     for phase in OperationKind::Deploy.required_phases(operation.release_class)? {
         match security.phase_receipt(operation.attempt_id, *phase)? {
-            Some(receipt) if !missing => project_bootstrap_receipt(operation, &receipt)?,
+            Some(receipt) if !missing => project_deploy_receipt(operation, &receipt, false)?,
             Some(_) => return Err(DeployDriverError::ReceiptOrder),
             None => missing = true,
+        }
+    }
+    if let Some(takeover) = security.rollback_takeover(operation.attempt_id)? {
+        if operation.evidence.recovery_mode.is_none() {
+            begin_rollback_projection(operation, takeover.created_at_ms)?;
+        }
+        let mut rollback_missing = false;
+        for phase in [
+            OperationPhase::Rollback,
+            OperationPhase::HealthChecking,
+            OperationPhase::Soaking,
+        ] {
+            match security.phase_receipt_in_branch(
+                operation.attempt_id,
+                phase,
+                ExecutorPhaseBranch::RollbackRecovery,
+            )? {
+                Some(receipt) if !rollback_missing => {
+                    project_deploy_receipt(operation, &receipt, true)?;
+                }
+                Some(_) => return Err(DeployDriverError::ReceiptOrder),
+                None => rollback_missing = true,
+            }
         }
     }
     Ok(())
 }
 
-fn project_bootstrap_receipt(
+fn begin_rollback_projection(
+    operation: &mut OperationRecord,
+    occurred_at_ms: i64,
+) -> Result<(), DeployDriverError> {
+    if operation.state.result != OperationResult::Running
+        || !matches!(
+            operation.state.phase,
+            OperationPhase::HealthChecking | OperationPhase::Soaking
+        )
+        || operation.evidence.previous_release_bundle_digest.is_none()
+    {
+        return Err(DeployDriverError::RollbackBinding);
+    }
+    let next = OperationState {
+        phase: OperationPhase::Rollback,
+        result: OperationResult::Running,
+        blocking_reason: BlockingReason::None,
+    };
+    let sequence = u32::try_from(operation.evidence.transitions.len())
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or(DeployDriverError::TransitionOverflow)?;
+    operation.evidence.transitions.push(OperationTransition {
+        sequence,
+        from: operation.state.clone(),
+        to: next.clone(),
+        receipt_digest: None,
+        occurred_at_ms,
+    });
+    operation.evidence.recovery_mode = Some(OperationRecoveryMode::Rollback);
+    operation.state = next;
+    operation.updated_at_ms = occurred_at_ms;
+    Ok(())
+}
+
+fn project_deploy_receipt(
     operation: &mut OperationRecord,
     receipt: &PhaseReceipt,
+    rollback_recovery: bool,
 ) -> Result<(), DeployDriverError> {
     if !receipt.has_valid_digest()?
         || receipt.attempt_id != operation.attempt_id
-        || receipt.branch != ExecutorPhaseBranch::Primary
+        || receipt.branch
+            != if rollback_recovery {
+                ExecutorPhaseBranch::RollbackRecovery
+            } else {
+                ExecutorPhaseBranch::Primary
+            }
         || receipt.phase != operation.state.phase
         || operation.state.result != OperationResult::Running
     {
         return Err(DeployDriverError::ReceiptBinding);
     }
     receipt.artifacts.validate_for_phase(receipt.phase)?;
-    merge_bootstrap_artifacts(&mut operation.evidence, &receipt.artifacts, receipt.phase)?;
-    let phases = operation
-        .operation_kind
-        .required_phases(operation.release_class)?;
+    merge_deploy_artifacts(
+        &mut operation.evidence,
+        &receipt.artifacts,
+        receipt.phase,
+        rollback_recovery,
+    )?;
+    let rollback_phases = [
+        OperationPhase::Rollback,
+        OperationPhase::HealthChecking,
+        OperationPhase::Soaking,
+    ];
+    let phases = if rollback_recovery {
+        rollback_phases.as_slice()
+    } else {
+        operation
+            .operation_kind
+            .required_phases(operation.release_class)?
+    };
     let index = phases
         .iter()
         .position(|phase| *phase == receipt.phase)
@@ -750,7 +1049,11 @@ fn project_bootstrap_receipt(
     let next_state = next.map_or(
         OperationState {
             phase: receipt.phase,
-            result: OperationResult::Succeeded,
+            result: if rollback_recovery {
+                OperationResult::RolledBack
+            } else {
+                OperationResult::Succeeded
+            },
             blocking_reason: BlockingReason::None,
         },
         |phase| OperationState {
@@ -775,21 +1078,26 @@ fn project_bootstrap_receipt(
     Ok(())
 }
 
-fn merge_bootstrap_artifacts(
+fn merge_deploy_artifacts(
     evidence: &mut OperationEvidence,
     artifacts: &PhaseArtifacts,
     phase: OperationPhase,
+    rollback_recovery: bool,
 ) -> Result<(), DeployDriverError> {
     if let Some(spec_digest) = artifacts.authorized_phase_spec_digest.as_ref() {
         let binding = AuthorizedPhaseSpecDigestV1 {
-            branch: ExecutorPhaseBranch::Primary,
+            branch: if rollback_recovery {
+                ExecutorPhaseBranch::RollbackRecovery
+            } else {
+                ExecutorPhaseBranch::Primary
+            },
             phase,
             spec_digest: spec_digest.clone(),
         };
         match evidence
             .authorized_phase_spec_digests
             .iter()
-            .find(|value| value.phase == phase && value.branch == ExecutorPhaseBranch::Primary)
+            .find(|value| value.phase == phase && value.branch == binding.branch)
         {
             Some(existing) if existing == &binding => {}
             Some(_) => return Err(DeployDriverError::ArtifactConflict),
@@ -846,13 +1154,23 @@ fn merge_bootstrap_artifacts(
         &artifacts.base_image_digests,
     )?;
     if phase == OperationPhase::Soaking && artifacts.health_evidence_digest.is_some() {
-        evidence
-            .health_evidence_digest
-            .clone_from(&artifacts.health_evidence_digest);
+        if rollback_recovery {
+            evidence
+                .rollback_health_evidence_digest
+                .clone_from(&artifacts.health_evidence_digest);
+        } else {
+            evidence
+                .health_evidence_digest
+                .clone_from(&artifacts.health_evidence_digest);
+        }
         Ok(())
     } else {
         merge_optional(
-            &mut evidence.health_evidence_digest,
+            if rollback_recovery {
+                &mut evidence.rollback_health_evidence_digest
+            } else {
+                &mut evidence.health_evidence_digest
+            },
             artifacts.health_evidence_digest.as_ref(),
         )
     }
@@ -893,24 +1211,28 @@ pub enum DeployDriverError {
     InvalidTime,
     #[error("installed deploy policy, rimg policy and release state do not match")]
     InstalledBinding,
-    #[error("accepted mutation is not an authorized bootstrap deployment")]
+    #[error("accepted mutation is not an authorized installed deployment")]
     AcceptedMutationBinding,
     #[error("accepted build candidate does not match the signed deploy intent")]
     CandidateBinding,
-    #[error("persisted executor authorization conflicts with the accepted bootstrap")]
+    #[error("persisted executor authorization conflicts with the accepted deployment")]
     AuthorizationBinding,
     #[error("persisted deploy receipts are not an ordered prefix")]
     ReceiptOrder,
-    #[error("deploy receipt does not match the reconstructed bootstrap")]
+    #[error("deploy receipt does not match the reconstructed deployment")]
     ReceiptBinding,
     #[error("deploy receipt evidence conflicts with prior durable evidence")]
     ArtifactConflict,
     #[error("deploy transition sequence overflowed")]
     TransitionOverflow,
-    #[error("authorized bootstrap phase specification is not bound to this operation")]
+    #[error("authorized deploy phase specification is not bound to this operation")]
     PhaseSpecBinding,
-    #[error("the installed bootstrap release state was committed without a terminal soak receipt")]
+    #[error("the installed release state was committed without a terminal soak receipt")]
     ReleaseStateWithoutTerminalReceipt,
+    #[error(
+        "automatic rollback is not bound to the exact installed candidate and previous release"
+    )]
+    RollbackBinding,
     #[error("deploy driver cannot read a valid Unix system clock: {0}")]
     SystemClock(#[from] std::time::SystemTimeError),
     #[error(transparent)]
@@ -1196,12 +1518,12 @@ mod tests {
         fn driver(
             &self,
             security: SecurityStore,
-        ) -> BootstrapDeployOperationDriverV1<
+        ) -> InstalledDeployOperationDriverV1<
             FixedDeploySourceV1,
             BoundDeployEffectsV1,
             FixedDeployClockV1,
         > {
-            BootstrapDeployOperationDriverV1::new(
+            InstalledDeployOperationDriverV1::new(
                 security,
                 self.resolver.clone(),
                 self.disk.clone(),
@@ -1516,7 +1838,7 @@ mod tests {
         let policy = mutation_policy();
         let exact = accepted(&policy);
         assert_eq!(
-            validate_accepted_bootstrap(&exact, &policy)
+            validate_accepted_deploy(&exact, &policy)
                 .unwrap_or_else(|error| panic!("exact accepted binding: {error}")),
             exact
                 .target_commit
@@ -1530,10 +1852,6 @@ mod tests {
                 ..exact.clone()
             },
             AcceptedMutationV1 {
-                previous_release_bundle_digest: Some(digest("previous")),
-                ..exact.clone()
-            },
-            AcceptedMutationV1 {
                 effective_release_class: Some(ReleaseClass::StatefulCompatible),
                 ..exact.clone()
             },
@@ -1543,7 +1861,7 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                validate_accepted_bootstrap(&substituted, &policy),
+                validate_accepted_deploy(&substituted, &policy),
                 Err(DeployDriverError::AcceptedMutationBinding)
             ));
         }
@@ -1612,6 +1930,83 @@ mod tests {
             .drive_accepted(&fixture.accepted, 1_700)
             .unwrap_or_else(|error| panic!("terminal replay: {error}"));
         assert_privileged_application_counts(&fixture, 1);
+    }
+
+    #[test]
+    fn installed_release_commit_advances_current_and_preserves_previous_as_last_known_good() {
+        let fixture = build_bootstrap_fixture();
+        let previous = digest("previous installed release");
+        let expected = InstalledReleaseStateV1::new(InstalledReleaseStateInputV1 {
+            project_id: fixture.initial_state.project_id.clone(),
+            installed_policy: fixture.initial_state.installed_policy.clone(),
+            installed_rimg_policy_digest: fixture
+                .initial_state
+                .installed_rimg_policy_digest
+                .clone(),
+            generation: 7,
+            current_release_bundle_digest: Some(previous.clone()),
+            last_known_good_release_bundle_digest: Some(digest("older release")),
+            updated_at_ms: 2_000,
+        })
+        .unwrap_or_else(|error| panic!("installed release state: {error}"));
+        write_private(
+            &fixture.state_path,
+            &expected
+                .canonical_bytes()
+                .unwrap_or_else(|error| panic!("release state JCS: {error}")),
+        );
+
+        let committed = fixture
+            .resolver
+            .commit_installed_release(&expected, &fixture.candidate, 2_500)
+            .unwrap_or_else(|error| panic!("commit installed release: {error}"));
+
+        assert_eq!(committed.generation, 8);
+        assert_eq!(
+            committed.current_release_bundle_digest.as_ref(),
+            Some(fixture.candidate.digest())
+        );
+        assert_eq!(
+            committed.last_known_good_release_bundle_digest,
+            Some(previous)
+        );
+        assert!(matches!(
+            fixture
+                .resolver
+                .commit_installed_release(&expected, &fixture.candidate, 2_600),
+            Err(crate::installed_deploy::InstalledDeployError::ReleaseStateConflict)
+        ));
+    }
+
+    #[test]
+    fn rollback_recovery_intent_uses_rollback_contract_without_changing_authority() {
+        let policy = mutation_policy();
+        let candidate = crate::build_attestation::tests::release_bundle();
+        let accepted = AcceptedMutationV1 {
+            release_bundle_digest: Some(candidate.digest().clone()),
+            previous_release_bundle_digest: Some(digest("previous release")),
+            ..accepted(&policy)
+        };
+        let mut operation = reconstruct_deploy_operation(&accepted, &policy, &candidate, None);
+        operation.state.phase = OperationPhase::Rollback;
+        operation.evidence.recovery_mode = Some(OperationRecoveryMode::Rollback);
+        let authorization = digest("original deploy authorization");
+
+        let intent = PhaseIntent::from_operation(&operation, authorization.clone())
+            .unwrap_or_else(|error| panic!("rollback phase intent: {error}"));
+
+        assert_eq!(intent.branch, ExecutorPhaseBranch::RollbackRecovery);
+        assert_eq!(intent.payload.operation_kind, OperationKind::CodeRollback);
+        assert_eq!(intent.payload.release_class, Some(ReleaseClass::Rollback));
+        assert_eq!(intent.payload.executor_authorization_digest, authorization);
+        assert_eq!(
+            intent.payload.release_bundle_digest.as_ref(),
+            Some(candidate.digest())
+        );
+        assert_eq!(
+            intent.payload.previous_release_bundle_digest,
+            accepted.previous_release_bundle_digest
+        );
     }
 
     fn assert_privileged_application_counts(fixture: &BootstrapDriverFixtureV1, expected: u32) {

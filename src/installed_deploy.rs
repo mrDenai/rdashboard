@@ -452,6 +452,44 @@ impl<S> InstalledDeployIntentResolverV1<S> {
         )?;
         Ok(next)
     }
+
+    pub fn commit_installed_release(
+        &self,
+        expected: &InstalledReleaseStateV1,
+        candidate: &ReleaseBundleV1,
+        committed_at_ms: i64,
+    ) -> Result<InstalledReleaseStateV1, InstalledDeployError> {
+        let current = expected
+            .current_release_bundle_digest
+            .as_ref()
+            .ok_or(InstalledDeployError::ReleaseStateConflict)?;
+        if committed_at_ms < expected.updated_at_ms
+            || current == candidate.digest()
+            || candidate.project_id() != &expected.project_id
+            || candidate.deployment_plan().installed_policy() != &expected.installed_policy
+        {
+            return Err(InstalledDeployError::ReleaseStateConflict);
+        }
+        let next = InstalledReleaseStateV1::new(InstalledReleaseStateInputV1 {
+            project_id: expected.project_id.clone(),
+            installed_policy: expected.installed_policy.clone(),
+            installed_rimg_policy_digest: expected.installed_rimg_policy_digest.clone(),
+            generation: expected
+                .generation
+                .checked_add(1)
+                .ok_or(InstalledDeployError::ReleaseStateConflict)?,
+            current_release_bundle_digest: Some(candidate.digest().clone()),
+            last_known_good_release_bundle_digest: Some(current.clone()),
+            updated_at_ms: committed_at_ms,
+        })?;
+        persist_release_state(
+            &self.root_release_state_path,
+            self.required_uid,
+            expected,
+            &next,
+        )?;
+        Ok(next)
+    }
 }
 
 impl<S: DeploySourceSnapshotV1> InstalledDeployIntentResolverV1<S> {
@@ -486,9 +524,6 @@ impl<S: DeploySourceSnapshotV1> InstalledDeployIntentResolverV1<S> {
         }
         let state = self.load_release_state()?;
         validate_release_state_binding(&state, &policy)?;
-        if state.current_release_bundle_digest.is_some() {
-            return Err(InstalledDeployError::InstalledUpgradeUnavailable);
-        }
         let current = self.load_current_bundle(&state, &policy)?;
         let (attestation, candidate) = self.load_candidate(&policy, target, now_ms)?;
         if attestation.source_sequence != verified_source.sequence
@@ -500,6 +535,16 @@ impl<S: DeploySourceSnapshotV1> InstalledDeployIntentResolverV1<S> {
         }
         let (effective_release_class, transition) =
             classify_release(&rimg, current.as_ref(), &candidate)?;
+        if let Some(current) = current.as_ref()
+            && (effective_release_class != ReleaseClass::CodeOnlyCompatible
+                || !rimg.capabilities().stable_routing
+                || !rimg.capabilities().automatic_code_rollback
+                || current.digest() == candidate.digest()
+                || candidate.rollback_contract()
+                    != crate::build::ReleaseRollbackContractV1::CodeOnlyCompatible)
+        {
+            return Err(InstalledDeployError::InstalledUpgradeUnavailable);
+        }
         if effective_release_class == ReleaseClass::CodeOnlyCompatible {
             if attestation.migration_plan_observation_digest.is_some() {
                 return Err(InstalledDeployError::CandidateBinding);
@@ -604,15 +649,18 @@ impl<S: DeploySourceSnapshotV1> InstalledDeployIntentResolverV1<S> {
         state
             .current_release_bundle_digest
             .as_ref()
-            .map(|digest| {
-                ReleaseBundleReader::open_for_owner(
-                    &self.root_release_bundle_root,
-                    self.required_uid,
-                )?
-                .load(&policy.project_id, digest)
-                .map_err(InstalledDeployError::from)
-            })
+            .map(|digest| self.load_promoted_bundle(policy, digest))
             .transpose()
+    }
+
+    pub(crate) fn load_promoted_bundle(
+        &self,
+        policy: &InstalledDeployMutationPolicyV1,
+        digest: &EvidenceDigest,
+    ) -> Result<ReleaseBundleV1, InstalledDeployError> {
+        ReleaseBundleReader::open_for_owner(&self.root_release_bundle_root, self.required_uid)?
+            .load(&policy.project_id, digest)
+            .map_err(InstalledDeployError::from)
     }
 }
 
@@ -958,7 +1006,9 @@ pub enum InstalledDeployError {
     ReleaseStateConflict,
     #[error("the deploy request is not supported by the installed resolver")]
     RequestRejected,
-    #[error("installed upgrades remain disabled until the stable-routing driver is installed")]
+    #[error(
+        "the installed upgrade is not code-only compatible or stable rollback capabilities are disabled"
+    )]
     InstalledUpgradeUnavailable,
     #[error("the installed deploy policy, source policy and rimg policy do not match")]
     InstalledBinding,

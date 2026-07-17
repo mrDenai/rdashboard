@@ -181,8 +181,11 @@ impl RimgHealthObservationV1 {
     fn validate(&self, expected: RimgHealthCheckKindV1) -> Result<(), RimgAdapterError> {
         let kind_fields_match = match expected {
             RimgHealthCheckKindV1::DirectReadiness => {
-                self.network.is_none()
-                    && self.image_digest.is_none()
+                self.network.as_ref().is_some_and(|value| !value.is_empty())
+                    && self
+                        .image_digest
+                        .as_ref()
+                        .is_some_and(|value| value.starts_with("sha256:") && value.len() == 71)
                     && self.successful_samples == 1
                     && self.minimum_interval_ms == 0
             }
@@ -915,10 +918,10 @@ mod tests {
         RimgHealthObservationV1 {
             schema_version: 1,
             check: RimgHealthCheckKindV1::DirectReadiness,
-            target_host: "127.0.0.1".to_owned(),
+            target_host: "rimg".to_owned(),
             target_port: 8080,
-            network: None,
-            image_digest: None,
+            network: Some("kamal".to_owned()),
+            image_digest: Some(format!("sha256:{}", "a".repeat(64))),
             successful_samples: 1,
             minimum_interval_ms: 0,
         }

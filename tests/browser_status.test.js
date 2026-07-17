@@ -104,6 +104,10 @@ test("mutation status labels stay explicit for recovery and unknown states", () 
     state: "needs_reconcile",
     label: "△ Требует сверки",
   });
+  assert.deepEqual(mutationStatePresentation("rolled_back"), {
+    state: "rolled_back",
+    label: "△ Выполнен откат",
+  });
   assert.deepEqual(mutationStatePresentation("invented"), {
     state: "unknown",
     label: "? Неизвестно",

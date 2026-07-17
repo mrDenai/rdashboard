@@ -2057,13 +2057,19 @@ fn phase_intent(
     executor_authorization_digest: EvidenceDigest,
 ) -> Result<PhaseIntent, StoreError> {
     let branch = executor_phase_branch(operation);
+    let (operation_kind, release_class) =
+        if operation.evidence.recovery_mode == Some(OperationRecoveryMode::Rollback) {
+            (OperationKind::CodeRollback, Some(ReleaseClass::Rollback))
+        } else {
+            (operation.operation_kind, operation.release_class)
+        };
     let payload = PhaseIntentPayloadV1 {
         purpose: "rdashboard.phase-intent.v1",
         attempt_id: operation.attempt_id,
         request_id: operation.request_id,
         project_id: operation.project_id.clone(),
-        operation_kind: operation.operation_kind,
-        release_class: operation.release_class,
+        operation_kind,
+        release_class,
         target_commit: operation.target_commit.clone(),
         phase: operation.state.phase,
         branch,

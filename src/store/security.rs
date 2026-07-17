@@ -1403,61 +1403,33 @@ impl SecurityStore {
             .operation_kind
             .required_phases(accepted.effective_release_class)?;
         let connection = lock_connection(&self.connection)?;
-        let mut completed_phases = Vec::with_capacity(phases.len());
-        let mut current_phase = phases[0];
-        let mut state = MutationExecutionStateV1::Accepted;
-        let mut updated_at_ms = accepted.accepted_at_ms;
-        let mut found_gap = false;
-        for phase in phases {
-            let storage_phase = ExecutorPhaseBranch::Primary.storage_key(*phase)?;
-            let entry = load_phase_entry(&connection, attempt_id, storage_phase, *phase)?;
-            let receipt = load_phase_receipt(
+        let mut projection = MutationStatusProjectionV1::new(phases[0], accepted.accepted_at_ms);
+        let primary_complete = project_mutation_status_branch(
+            &connection,
+            attempt_id,
+            phases,
+            ExecutorPhaseBranch::Primary,
+            MutationExecutionStateV1::Accepted,
+            &mut projection,
+        )?;
+        if load_rollback_takeover(&connection, attempt_id)?.is_some() {
+            let rollback_complete = project_mutation_status_branch(
                 &connection,
                 attempt_id,
-                storage_phase,
-                *phase,
-                ExecutorPhaseBranch::Primary,
+                &[
+                    OperationPhase::Rollback,
+                    OperationPhase::HealthChecking,
+                    OperationPhase::Soaking,
+                ],
+                ExecutorPhaseBranch::RollbackRecovery,
+                MutationExecutionStateV1::Running,
+                &mut projection,
             )?;
-            if let Some(entry) = entry.as_ref() {
-                updated_at_ms = updated_at_ms.max(entry.updated_at_ms);
+            if rollback_complete {
+                projection.state = MutationExecutionStateV1::RolledBack;
             }
-            if let Some(receipt) = receipt.as_ref() {
-                updated_at_ms = updated_at_ms.max(receipt.committed_at_ms);
-            }
-            match (entry, receipt) {
-                (Some(entry), Some(_))
-                    if !found_gap && entry.status == PhaseJournalStatus::Committed =>
-                {
-                    completed_phases.push(*phase);
-                    current_phase = *phase;
-                    state = MutationExecutionStateV1::Running;
-                }
-                (Some(entry), None)
-                    if !found_gap && entry.status != PhaseJournalStatus::Committed =>
-                {
-                    found_gap = true;
-                    current_phase = *phase;
-                    state = if entry.status == PhaseJournalStatus::NeedsReconcile {
-                        MutationExecutionStateV1::NeedsReconcile
-                    } else {
-                        MutationExecutionStateV1::Running
-                    };
-                }
-                (None, None) if !found_gap => {
-                    found_gap = true;
-                    current_phase = *phase;
-                    state = if completed_phases.is_empty() {
-                        MutationExecutionStateV1::Accepted
-                    } else {
-                        MutationExecutionStateV1::Running
-                    };
-                }
-                (None, None) => {}
-                _ => return Err(StoreError::ExecutorPhaseOrder),
-            }
-        }
-        if !found_gap {
-            state = MutationExecutionStateV1::Succeeded;
+        } else if primary_complete {
+            projection.state = MutationExecutionStateV1::Succeeded;
         }
         Ok(Some(MutationStatusV1 {
             intent_id,
@@ -1466,11 +1438,11 @@ impl SecurityStore {
             operation_kind: accepted.operation_kind,
             target_commit: accepted.target_commit,
             effective_release_class: accepted.effective_release_class,
-            state,
-            current_phase,
-            completed_phases,
+            state: projection.state,
+            current_phase: projection.current_phase,
+            completed_phases: projection.completed_phases,
             accepted_at_ms: accepted.accepted_at_ms,
-            updated_at_ms,
+            updated_at_ms: projection.updated_at_ms,
         }))
     }
 
@@ -1851,6 +1823,14 @@ impl SecurityStore {
         let storage_phase = branch.storage_key(phase)?;
         let connection = lock_connection(&self.connection)?;
         load_verified_backup_chain(&connection, attempt_id, storage_phase, phase, branch)
+    }
+
+    pub fn latest_committed_base_backup_chain(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<VerifiedBackupChainRecord>, StoreError> {
+        let connection = lock_connection(&self.connection)?;
+        load_latest_committed_base_backup_chain(&connection, project_id)
     }
 
     pub fn authorize_bound_phase_spec(
@@ -4827,21 +4807,26 @@ fn require_verified_prerequisite_chain(
     expected_kind: BackupSnapshotKindV1,
     expected_digest: &EvidenceDigest,
 ) -> Result<(), StoreError> {
-    let storage_phase = ExecutorPhaseBranch::Primary.storage_key(phase)?;
-    let record = load_verified_backup_chain(
-        transaction,
-        spec.attempt_id,
-        storage_phase,
-        phase,
-        ExecutorPhaseBranch::Primary,
-    )?
+    let record = if expected_kind == BackupSnapshotKindV1::Base {
+        load_committed_base_backup_chain_by_digest(transaction, &spec.project_id, expected_digest)?
+    } else {
+        let storage_phase = ExecutorPhaseBranch::Primary.storage_key(phase)?;
+        load_verified_backup_chain(
+            transaction,
+            spec.attempt_id,
+            storage_phase,
+            phase,
+            ExecutorPhaseBranch::Primary,
+        )?
+    }
     .ok_or(StoreError::VerifiedBackupChainMissing)?;
     let chain = VerifiedBackupChainV1::decode_canonical(&record.canonical_json)
         .map_err(|_| StoreError::VerifiedBackupChainInvalid)?;
     if record.project_id != spec.project_id
         || record.chain_digest != *expected_digest
         || chain.snapshot_kind() != expected_kind
-        || chain.authorized_spec().attempt_id != spec.attempt_id
+        || expected_kind == BackupSnapshotKindV1::Cutover
+            && chain.authorized_spec().attempt_id != spec.attempt_id
         || chain.authorized_spec().project_id != spec.project_id
         || chain.authorized_spec().installed_policy != spec.installed_policy
         || chain.authorized_spec().installed_rimg_policy_digest != spec.installed_rimg_policy_digest
@@ -4849,6 +4834,43 @@ fn require_verified_prerequisite_chain(
         return Err(StoreError::VerifiedBackupChainBinding);
     }
     Ok(())
+}
+
+fn load_committed_base_backup_chain_by_digest(
+    connection: &Connection,
+    project_id: &ProjectId,
+    chain_digest: &EvidenceDigest,
+) -> Result<Option<VerifiedBackupChainRecord>, StoreError> {
+    let storage_phase = ExecutorPhaseBranch::Primary.storage_key(OperationPhase::BackingUp)?;
+    let attempt_id = connection
+        .query_row(
+            "SELECT chains.attempt_id
+             FROM verified_backup_chains AS chains
+             INNER JOIN executor_phase_journal AS journal
+                ON journal.attempt_id = chains.attempt_id
+               AND journal.phase = chains.phase
+             WHERE chains.project_id = ?1 AND chains.phase = ?2
+               AND chains.chain_digest = ?3 AND journal.status = 'committed'",
+            params![project_id.as_str(), storage_phase, chain_digest.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    attempt_id
+        .map(|attempt_id| {
+            let attempt_id = Uuid::parse_str(&attempt_id)
+                .map_err(|_| StoreError::CorruptSecurityJournal("backup chain attempt"))?;
+            load_verified_backup_chain(
+                connection,
+                attempt_id,
+                storage_phase,
+                OperationPhase::BackingUp,
+                ExecutorPhaseBranch::Primary,
+            )?
+            .ok_or(StoreError::CorruptSecurityJournal(
+                "verified backup chain lookup",
+            ))
+        })
+        .transpose()
 }
 
 fn validate_active_fence_for_spec(
@@ -5292,6 +5314,80 @@ fn load_verified_backup_chain(
         .transpose()
 }
 
+fn load_latest_committed_base_backup_chain(
+    connection: &Connection,
+    project_id: &ProjectId,
+) -> Result<Option<VerifiedBackupChainRecord>, StoreError> {
+    let storage_phase = ExecutorPhaseBranch::Primary.storage_key(OperationPhase::BackingUp)?;
+    connection
+        .query_row(
+            "SELECT chains.attempt_id, chains.authorized_phase_spec_digest,
+                    chains.chain_digest, chains.document_digest, chains.canonical_json,
+                    chains.persisted_at_ms
+             FROM verified_backup_chains AS chains
+             INNER JOIN executor_phase_journal AS journal
+                ON journal.attempt_id = chains.attempt_id
+               AND journal.phase = chains.phase
+             WHERE chains.project_id = ?1 AND chains.phase = ?2
+               AND journal.status = 'committed'
+             ORDER BY journal.updated_at_ms DESC, chains.persisted_at_ms DESC,
+                      chains.attempt_id DESC
+             LIMIT 1",
+            params![project_id.as_str(), storage_phase],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |(
+                attempt_id,
+                authorized_phase_spec_digest,
+                chain_digest,
+                document_digest,
+                canonical_json,
+                persisted_at_ms,
+            )| {
+                let attempt_id = Uuid::parse_str(&attempt_id)
+                    .map_err(|_| StoreError::CorruptSecurityJournal("backup chain attempt"))?;
+                let record = VerifiedBackupChainRecord {
+                    attempt_id,
+                    project_id: project_id.clone(),
+                    phase: OperationPhase::BackingUp,
+                    branch: ExecutorPhaseBranch::Primary,
+                    authorized_phase_spec_digest: parse_digest(&authorized_phase_spec_digest)?,
+                    chain_digest: parse_digest(&chain_digest)?,
+                    document_digest: parse_digest(&document_digest)?,
+                    canonical_json,
+                    persisted_at_ms,
+                };
+                let chain = VerifiedBackupChainV1::decode_canonical(&record.canonical_json)
+                    .map_err(|_| {
+                        StoreError::CorruptSecurityJournal("verified backup chain document")
+                    })?;
+                if chain.snapshot_kind() != BackupSnapshotKindV1::Base
+                    || chain.authorized_spec().attempt_id != record.attempt_id
+                    || chain.authorized_spec().project_id != record.project_id
+                    || chain.chain_digest() != &record.chain_digest
+                    || EvidenceDigest::sha256(&record.canonical_json) != record.document_digest
+                {
+                    return Err(StoreError::CorruptSecurityJournal(
+                        "verified backup chain row binding",
+                    ));
+                }
+                Ok(record)
+            },
+        )
+        .transpose()
+}
+
 fn validate_bound_phase_spec_artifact(
     transaction: &Transaction<'_>,
     attempt_id: Uuid,
@@ -5381,6 +5477,76 @@ fn validate_bound_phase_spec_artifact(
     } else {
         Err(StoreError::VerifiedBackupChainBinding)
     }
+}
+
+struct MutationStatusProjectionV1 {
+    completed_phases: Vec<OperationPhase>,
+    current_phase: OperationPhase,
+    state: MutationExecutionStateV1,
+    updated_at_ms: i64,
+}
+
+impl MutationStatusProjectionV1 {
+    fn new(current_phase: OperationPhase, updated_at_ms: i64) -> Self {
+        Self {
+            completed_phases: Vec::new(),
+            current_phase,
+            state: MutationExecutionStateV1::Accepted,
+            updated_at_ms,
+        }
+    }
+}
+
+fn project_mutation_status_branch(
+    connection: &Connection,
+    attempt_id: Uuid,
+    phases: &[OperationPhase],
+    branch: ExecutorPhaseBranch,
+    empty_state: MutationExecutionStateV1,
+    projection: &mut MutationStatusProjectionV1,
+) -> Result<bool, StoreError> {
+    let mut found_gap = false;
+    for phase in phases {
+        let storage_phase = branch.storage_key(*phase)?;
+        let entry = load_phase_entry(connection, attempt_id, storage_phase, *phase)?;
+        let receipt = load_phase_receipt(connection, attempt_id, storage_phase, *phase, branch)?;
+        if let Some(entry) = entry.as_ref() {
+            projection.updated_at_ms = projection.updated_at_ms.max(entry.updated_at_ms);
+        }
+        if let Some(receipt) = receipt.as_ref() {
+            projection.updated_at_ms = projection.updated_at_ms.max(receipt.committed_at_ms);
+        }
+        match (entry, receipt) {
+            (Some(entry), Some(_))
+                if !found_gap && entry.status == PhaseJournalStatus::Committed =>
+            {
+                projection.completed_phases.push(*phase);
+                projection.current_phase = *phase;
+                projection.state = MutationExecutionStateV1::Running;
+            }
+            (Some(entry), None) if !found_gap && entry.status != PhaseJournalStatus::Committed => {
+                found_gap = true;
+                projection.current_phase = *phase;
+                projection.state = if entry.status == PhaseJournalStatus::NeedsReconcile {
+                    MutationExecutionStateV1::NeedsReconcile
+                } else {
+                    MutationExecutionStateV1::Running
+                };
+            }
+            (None, None) if !found_gap => {
+                found_gap = true;
+                projection.current_phase = *phase;
+                projection.state = if projection.completed_phases.is_empty() {
+                    empty_state
+                } else {
+                    MutationExecutionStateV1::Running
+                };
+            }
+            (None, None) => {}
+            _ => return Err(StoreError::ExecutorPhaseOrder),
+        }
+    }
+    Ok(!found_gap)
 }
 
 fn load_phase_entry(
@@ -6477,6 +6643,7 @@ mod tests {
     use super::*;
     use crate::domain::{InstalledPolicyIdentity, OperationKind, ReleaseClass};
     use crate::phase6::{AUTHORIZED_PHASE_SPEC_SCHEMA_VERSION, RimgTimeoutPolicyV1};
+    use tempfile::tempdir;
 
     fn ledger_spec(grant_id: Uuid, grant_digest: EvidenceDigest) -> AuthorizedPhaseSpecV1 {
         AuthorizedPhaseSpecV1 {
@@ -6688,5 +6855,253 @@ mod tests {
             false,
         )
         .unwrap_or_else(|error| panic!("deploy should carry deploying proof: {error}"));
+    }
+
+    struct MutationStatusFixture {
+        _directory: tempfile::TempDir,
+        store: SecurityStore,
+        intent_id: Uuid,
+        attempt_id: Uuid,
+        project_id: ProjectId,
+    }
+
+    fn mutation_status_fixture() -> MutationStatusFixture {
+        let directory = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let store = SecurityStore::open(directory.path().join("security.sqlite"))
+            .unwrap_or_else(|error| panic!("security store: {error}"));
+        let fixture = MutationStatusFixture {
+            _directory: directory,
+            store,
+            intent_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            project_id: ProjectId::from_str("rollback-status")
+                .unwrap_or_else(|error| panic!("project: {error}")),
+        };
+        insert_status_admission(&fixture);
+        fixture
+    }
+
+    fn insert_status_admission(fixture: &MutationStatusFixture) {
+        let request_id = Uuid::new_v4();
+        let nonce = Uuid::new_v4();
+        let intent_digest = EvidenceDigest::sha256("status intent");
+        let grant_digest = EvidenceDigest::sha256("status grant");
+        let policy_digest = EvidenceDigest::sha256("status policy");
+        let connection = lock_connection(&fixture.store.connection)
+            .unwrap_or_else(|error| panic!("security connection: {error}"));
+        connection
+            .execute(
+                "INSERT INTO executor_action_grants(
+                    nonce, grant_digest, attempt_id, schema_version, issuer,
+                    executor_audience, intent_id, intent_digest, request_id,
+                    actor_id, role, lease_id, lease_generation, key_id, key_epoch,
+                    installed_policy_digest, issued_at_ms, not_before_ms,
+                    expires_at_ms, consumed_at_ms
+                 ) VALUES (?1, ?2, ?3, 1, 'issuer', 'executor', ?4, ?5, ?6,
+                    ?7, 'operator', ?8, 1, 'key', 1, ?9, 1, 1, 10000, 2)",
+                params![
+                    nonce.to_string(),
+                    grant_digest.as_str(),
+                    fixture.attempt_id.to_string(),
+                    fixture.intent_id.to_string(),
+                    intent_digest.as_str(),
+                    request_id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    policy_digest.as_str(),
+                ],
+            )
+            .unwrap_or_else(|error| panic!("insert action grant: {error}"));
+        connection
+            .execute(
+                "INSERT INTO executor_operation_intents(
+                    intent_id, intent_digest, request_id, compact_token,
+                    schema_version, issuer, authorizer_audience, project_id,
+                    operation_kind, target_commit, proposed_release_class,
+                    effective_release_class, installed_policy_digest,
+                    source_attestation_digest, source_sequence,
+                    release_bundle_digest, build_attestation_digest, migration_id,
+                    previous_release_bundle_digest, consequences_json,
+                    minimum_role, key_id, key_epoch, issued_at_ms, not_before_ms,
+                    expires_at_ms, prepared_at_ms, state, attempt_id,
+                    action_grant_nonce, action_grant_digest, consumed_at_ms
+                 ) VALUES (?1, ?2, ?3, 'compact-token', 2, 'issuer', 'authorizer',
+                    ?4, 'deploy', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'code_only_compatible', 'code_only_compatible', ?5, ?6, 1,
+                    ?7, ?8, NULL, ?9, '[]', 'operator', 'key', 1, 1, 1, 10000,
+                    1, 'consumed', ?10, ?11, ?12, 2)",
+                params![
+                    fixture.intent_id.to_string(),
+                    intent_digest.as_str(),
+                    request_id.to_string(),
+                    fixture.project_id.as_str(),
+                    policy_digest.as_str(),
+                    EvidenceDigest::sha256("source").as_str(),
+                    EvidenceDigest::sha256("candidate").as_str(),
+                    EvidenceDigest::sha256("build").as_str(),
+                    EvidenceDigest::sha256("previous").as_str(),
+                    fixture.attempt_id.to_string(),
+                    nonce.to_string(),
+                    grant_digest.as_str(),
+                ],
+            )
+            .unwrap_or_else(|error| panic!("insert accepted intent: {error}"));
+    }
+
+    fn insert_status_rollback_takeover(fixture: &MutationStatusFixture) {
+        let artifacts = serde_json::to_string(&PhaseArtifacts::default())
+            .unwrap_or_else(|error| panic!("artifacts: {error}"));
+        let connection = lock_connection(&fixture.store.connection)
+            .unwrap_or_else(|error| panic!("security connection: {error}"));
+        for (index, phase) in OperationKind::Deploy
+            .required_phases(Some(ReleaseClass::CodeOnlyCompatible))
+            .unwrap_or_else(|error| panic!("deploy phases: {error}"))
+            .iter()
+            .take_while(|phase| **phase != OperationPhase::HealthChecking)
+            .enumerate()
+        {
+            insert_committed_phase_for_status(
+                &connection,
+                fixture.attempt_id,
+                &fixture.project_id,
+                *phase,
+                ExecutorPhaseBranch::Primary,
+                10 + i64::try_from(index).unwrap_or_else(|error| panic!("phase index: {error}")),
+            );
+        }
+        let forward_intent = EvidenceDigest::sha256("forward health intent");
+        connection
+            .execute(
+                "INSERT INTO executor_phase_journal(
+                    attempt_id, phase, project_id, intent_digest,
+                    observation_digest, artifacts_json, status,
+                    started_at_ms, updated_at_ms
+                 ) VALUES (?1, 'health_checking', ?2, ?3, NULL, ?4,
+                    'needs_reconcile', 30, 30)",
+                params![
+                    fixture.attempt_id.to_string(),
+                    fixture.project_id.as_str(),
+                    forward_intent.as_str(),
+                    artifacts,
+                ],
+            )
+            .unwrap_or_else(|error| panic!("insert forward health: {error}"));
+        connection
+            .execute(
+                "INSERT INTO executor_rollback_takeovers(
+                    attempt_id, project_id, forward_phase, forward_status,
+                    forward_intent_digest, created_at_ms
+                 ) VALUES (?1, ?2, 'health_checking', 'needs_reconcile', ?3, 31)",
+                params![
+                    fixture.attempt_id.to_string(),
+                    fixture.project_id.as_str(),
+                    forward_intent.as_str(),
+                ],
+            )
+            .unwrap_or_else(|error| panic!("insert rollback takeover: {error}"));
+    }
+
+    #[test]
+    fn mutation_status_projects_rollback_recovery_until_its_terminal_soak() {
+        let fixture = mutation_status_fixture();
+        insert_status_rollback_takeover(&fixture);
+
+        let started = fixture
+            .store
+            .mutation_status(fixture.intent_id, fixture.attempt_id)
+            .unwrap_or_else(|error| panic!("started rollback status: {error}"))
+            .unwrap_or_else(|| panic!("started rollback status missing"));
+        assert_eq!(started.state, MutationExecutionStateV1::Running);
+        assert_eq!(started.current_phase, OperationPhase::Rollback);
+
+        let connection = lock_connection(&fixture.store.connection)
+            .unwrap_or_else(|error| panic!("security connection: {error}"));
+        for (index, phase) in [
+            OperationPhase::Rollback,
+            OperationPhase::HealthChecking,
+            OperationPhase::Soaking,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert_committed_phase_for_status(
+                &connection,
+                fixture.attempt_id,
+                &fixture.project_id,
+                phase,
+                ExecutorPhaseBranch::RollbackRecovery,
+                40 + i64::try_from(index).unwrap_or_else(|error| panic!("phase index: {error}")),
+            );
+        }
+        drop(connection);
+
+        let completed = fixture
+            .store
+            .mutation_status(fixture.intent_id, fixture.attempt_id)
+            .unwrap_or_else(|error| panic!("completed rollback status: {error}"))
+            .unwrap_or_else(|| panic!("completed rollback status missing"));
+        assert_eq!(completed.state, MutationExecutionStateV1::RolledBack);
+        assert_eq!(completed.current_phase, OperationPhase::Soaking);
+        assert_eq!(completed.updated_at_ms, 42);
+    }
+
+    fn insert_committed_phase_for_status(
+        connection: &Connection,
+        attempt_id: Uuid,
+        project_id: &ProjectId,
+        phase: OperationPhase,
+        branch: ExecutorPhaseBranch,
+        timestamp: i64,
+    ) {
+        let storage_phase = branch
+            .storage_key(phase)
+            .unwrap_or_else(|error| panic!("storage phase: {error}"));
+        let intent = EvidenceDigest::sha256(format!("{storage_phase} intent"));
+        let observation = EvidenceDigest::sha256(format!("{storage_phase} observation"));
+        let artifacts = PhaseArtifacts::default();
+        let receipt = PhaseReceipt::new(
+            attempt_id,
+            phase,
+            branch,
+            intent.clone(),
+            observation.clone(),
+            artifacts.clone(),
+            timestamp,
+        )
+        .unwrap_or_else(|error| panic!("phase receipt: {error}"));
+        connection
+            .execute(
+                "INSERT INTO executor_phase_journal(
+                    attempt_id, phase, project_id, intent_digest,
+                    observation_digest, artifacts_json, status,
+                    started_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'committed', ?7, ?7)",
+                params![
+                    attempt_id.to_string(),
+                    storage_phase,
+                    project_id.as_str(),
+                    intent.as_str(),
+                    observation.as_str(),
+                    serde_json::to_string(&artifacts)
+                        .unwrap_or_else(|error| panic!("artifacts JSON: {error}")),
+                    timestamp,
+                ],
+            )
+            .unwrap_or_else(|error| panic!("insert {storage_phase} journal: {error}"));
+        connection
+            .execute(
+                "INSERT INTO executor_phase_receipts(
+                    attempt_id, phase, receipt_digest, receipt_json, committed_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    attempt_id.to_string(),
+                    storage_phase,
+                    receipt.receipt_digest.as_str(),
+                    serde_json::to_string(&receipt)
+                        .unwrap_or_else(|error| panic!("receipt JSON: {error}")),
+                    timestamp,
+                ],
+            )
+            .unwrap_or_else(|error| panic!("insert {storage_phase} receipt: {error}"));
     }
 }
