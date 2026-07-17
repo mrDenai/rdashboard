@@ -1,7 +1,7 @@
 [Unit]
 Description=rdashboard controller and web dashboard
-After=network-online.target rdashboard-executor.service
-Wants=network-online.target
+After=network-online.target rdashboard-executor.service rdashboard-rimg-health.socket
+Wants=network-online.target rdashboard-rimg-health.socket
 Requires=rdashboard-executor.service
 
 [Service]
@@ -14,6 +14,7 @@ Environment=RDASHBOARD_DATA_DIR=/var/lib/rdashboard
 Environment=RDASHBOARD_EXECUTOR_SOCKET=/run/rdashboard/executor.sock
 Environment=RDASHBOARD_ACCESS_REQUIRED=true
 EnvironmentFile=-/etc/rdashboard/controller.env
+EnvironmentFile=/usr/lib/rdashboard/rdashboard-rimg-health.env
 StateDirectory=rdashboard
 StateDirectoryMode=0750
 UMask=0027

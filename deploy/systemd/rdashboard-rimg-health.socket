@@ -1,0 +1,11 @@
+[Unit]
+Description=Loopback rimg health endpoint for rdashboard
+After=network-online.target
+Wants=network-online.target
+
+[Socket]
+ListenStream=127.0.0.1:18080
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

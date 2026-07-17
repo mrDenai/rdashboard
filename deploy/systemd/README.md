@@ -45,6 +45,21 @@ Activation order is fail-closed:
 Removing the Kamal Proxy host route and disabling the bridge socket closes external reachability
 without changing the observation services or their local data.
 
+For private rimg health collection, also install
+`rdashboard-rimg-health.socket`, `rdashboard-rimg-health.service` and the
+`rdashboard-rimg-health-proxy` binary. Install `rdashboard-rimg-health.env` as root-owned mode `0644`
+at `/usr/lib/rdashboard/rdashboard-rimg-health.env`; it is deliberately loaded after the optional
+operator environment so the controller's health origin stays fixed. The socket listens only on
+`127.0.0.1:18080`, and the controller never receives Docker access. On each
+socket-activated burst the short-lived root helper queries only the fixed local Docker socket,
+requires exact Kamal labels `service=rimg` and `role=web`, revalidates `running` plus Docker
+`healthy`, selects the newest eligible container, and accepts only its private IPv4 address from
+the named `kamal` network. It then replaces itself with the fixed systemd socket proxy to that
+address on rimg port 8080 and exits after one idle second, forcing the next collection burst to
+resolve a post-deploy container again. No rimg port is published on the host or through Kamal
+Proxy. A missing, starting, unhealthy, non-private or ambiguously encoded target fails closed and
+is recorded by the controller as health signal loss.
+
 The dedicated source broker runs as `rdashboard-source` from
 `/usr/libexec/rdashboard/rdashboard-source`. Install `rdashboard-source.service`, create the matching
 system user/group plus the `rdashboard-build-readers` group, and apply `rdashboard-tmpfiles.conf`.
@@ -325,11 +340,6 @@ installed until it has a separately authenticated registry transport and rollout
 
 `rdashboard.service` enables the fixed executor socket. It starts and remains available if an
 individual executor observation fails; that sample is persisted as `signal_lost` with no invented
-metric values. Put only the internal rimg health origin in the root-owned controller environment:
-
-```text
-RDASHBOARD_RIMG_BASE_URL=http://127.0.0.1:8080
-```
-
-The controller unit has no Docker socket, production credentials, project checkout write access or
-privileged capabilities.
+metric values. Its rimg origin is the source-controlled loopback health socket described above,
+not an operator-supplied container address. The controller unit has no Docker socket, production
+credentials, project checkout write access or privileged capabilities.

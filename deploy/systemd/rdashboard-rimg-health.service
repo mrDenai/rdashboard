@@ -1,0 +1,35 @@
+[Unit]
+Description=Resolve the current private rimg container for rdashboard health collection
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/libexec/rdashboard/rdashboard-rimg-health-proxy
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+TasksMax=32
+LimitNOFILE=256
+MemoryMax=32M
+TimeoutStartSec=5s
+TimeoutStopSec=5s

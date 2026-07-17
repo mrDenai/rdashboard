@@ -122,6 +122,13 @@ credentials, path, query or fragment. When it is absent, the `rimg` row remains 
 distinct states. The collector requests fixed `/health/live` and `/health/ready` paths in parallel
 with a two-second bound and never follows redirects.
 
+The production unit fixes that origin to the loopback-only
+`rdashboard-rimg-health.socket` at `127.0.0.1:18080`. Its short-lived companion resolves the newest
+running healthy Kamal container with exact `service=rimg` and `role=web` labels, revalidates its
+private IPv4 address on the `kamal` network, and forwards only the health connection to port 8080.
+The controller receives neither Docker socket access nor a public rimg route; nginx is not part of
+this path.
+
 The collector reads the exact versioned `rimg` `/health/status` contract alongside liveness and
 readiness. It renders `Healthy` only when operational mode, worker progress, webhook progress,
 writable database/storage probes and the readiness endpoint agree. Legacy endpoints remain
