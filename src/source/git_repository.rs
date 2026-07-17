@@ -17,6 +17,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 
 use crate::domain::{EvidenceDigest, GIB, GitCommitId, ProjectId, RemoteUrl};
+use url::Url;
 
 use super::{CommitRelationship, SourceError, SourceRepository};
 
@@ -43,6 +44,7 @@ const DEFAULT_FETCH_MAX_STAGING_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_FETCH_EMERGENCY_BYTES: u64 = 8 * GIB;
 const DEFAULT_FETCH_EMERGENCY_PERCENT: u64 = 15;
 const OWNER_ONLY_SHARED_REPOSITORY: &str = "core.sharedRepository=0600";
+const SOURCE_CREDENTIAL_DIRECTORY: &str = "/run/credentials/rdashboard-source.service";
 type GitVersion = (u64, u64);
 const MINIMUM_DURABLE_FILES_GIT_VERSION: GitVersion = (2, 36);
 
@@ -117,11 +119,58 @@ impl FetchLimits {
 pub struct GitSourceProjectConfig {
     pub project_id: ProjectId,
     pub remote_url: RemoteUrl,
+    pub ssh_transport: Option<GitSshTransportConfig>,
 }
 
 impl GitSourceProjectConfig {
     pub fn repository_identity(&self) -> EvidenceDigest {
         network_repository_identity(&self.remote_url)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GitSshTransportConfig {
+    pub private_key_path: PathBuf,
+    pub known_hosts_path: PathBuf,
+}
+
+impl GitSshTransportConfig {
+    fn validate(&self) -> Result<(), SourceError> {
+        for path in [&self.private_key_path, &self.known_hosts_path] {
+            if path.parent() != Some(Path::new(SOURCE_CREDENTIAL_DIRECTORY))
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| {
+                        name.is_empty()
+                            || name.len() > 96
+                            || !name.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                            })
+                    })
+            {
+                return Err(SourceError::InvalidInstalledPolicy);
+            }
+        }
+        if self.private_key_path == self.known_hosts_path {
+            return Err(SourceError::InvalidInstalledPolicy);
+        }
+        Ok(())
+    }
+
+    fn command(&self) -> Result<String, SourceError> {
+        self.validate()?;
+        let private_key = self
+            .private_key_path
+            .to_str()
+            .ok_or(SourceError::InvalidInstalledPolicy)?;
+        let known_hosts = self
+            .known_hosts_path
+            .to_str()
+            .ok_or(SourceError::InvalidInstalledPolicy)?;
+        Ok(format!(
+            "/usr/bin/ssh -i {private_key} -oIdentitiesOnly=yes -oIdentityAgent=none -oBatchMode=yes -oStrictHostKeyChecking=yes -oUserKnownHostsFile={known_hosts} -oGlobalKnownHostsFile=/dev/null -oUpdateHostKeys=no -oCheckHostIP=no -oPreferredAuthentications=publickey -oPasswordAuthentication=no -oKbdInteractiveAuthentication=no -oConnectTimeout=15 -oConnectionAttempts=1 -oServerAliveInterval=10"
+        ))
     }
 }
 
@@ -139,6 +188,7 @@ struct InstalledGitProject {
     repository_root: PathBuf,
     repository_path: PathBuf,
     remote: GitRemote,
+    ssh_command: Option<String>,
     repository_identity: EvidenceDigest,
     command_lock: Arc<Mutex<()>>,
     #[cfg(unix)]
@@ -219,11 +269,18 @@ impl GitSourceRepository {
     ) -> Result<Self, SourceError> {
         let projects = projects
             .into_iter()
-            .map(|project| (project.project_id, GitRemote::Network(project.remote_url)))
+            .map(|project| {
+                (
+                    project.project_id,
+                    GitRemote::Network(project.remote_url),
+                    project.ssh_transport,
+                )
+            })
             .collect::<Vec<_>>();
-        Self::open_with_remotes(repository_root.as_ref(), projects)
+        Self::open_with_transport(repository_root.as_ref(), projects, FetchLimits::PRODUCTION)
     }
 
+    #[cfg(test)]
     fn open_with_remotes(
         repository_root: &Path,
         projects: Vec<(ProjectId, GitRemote)>,
@@ -231,9 +288,25 @@ impl GitSourceRepository {
         Self::open_with_remotes_and_limits(repository_root, projects, FetchLimits::PRODUCTION)
     }
 
+    #[cfg(test)]
     fn open_with_remotes_and_limits(
         repository_root: &Path,
         projects: Vec<(ProjectId, GitRemote)>,
+        fetch_limits: FetchLimits,
+    ) -> Result<Self, SourceError> {
+        Self::open_with_transport(
+            repository_root,
+            projects
+                .into_iter()
+                .map(|(project_id, remote)| (project_id, remote, None))
+                .collect(),
+            fetch_limits,
+        )
+    }
+
+    fn open_with_transport(
+        repository_root: &Path,
+        projects: Vec<(ProjectId, GitRemote, Option<GitSshTransportConfig>)>,
         fetch_limits: FetchLimits,
     ) -> Result<Self, SourceError> {
         let root = validate_repository_root(repository_root)?;
@@ -242,7 +315,24 @@ impl GitSourceRepository {
         #[cfg(unix)]
         validate_process_kill_executable()?;
         let mut installed = BTreeMap::new();
-        for (project_id, remote) in projects {
+        for (project_id, remote, ssh_transport) in projects {
+            let remote_uses_ssh = match &remote {
+                GitRemote::Network(remote) => {
+                    Url::parse(remote.as_str()).is_ok_and(|url| url.scheme() == "ssh")
+                }
+                #[cfg(test)]
+                GitRemote::Local(_) => false,
+            };
+            if remote_uses_ssh != ssh_transport.is_some() {
+                return Err(SourceError::InvalidInstalledPolicy);
+            }
+            if let Some(transport) = &ssh_transport {
+                transport.validate()?;
+            }
+            let ssh_command = ssh_transport
+                .as_ref()
+                .map(GitSshTransportConfig::command)
+                .transpose()?;
             let key = project_id.to_string();
             let repository_path = validate_project_repository(&root, &project_id)?;
             #[cfg(unix)]
@@ -260,6 +350,7 @@ impl GitSourceRepository {
                         repository_root: root.clone(),
                         repository_path,
                         remote,
+                        ssh_command,
                         repository_identity,
                         command_lock: Arc::new(Mutex::new(())),
                         #[cfg(unix)]
@@ -578,6 +669,7 @@ impl GitSourceRepository {
             &mut command,
             git_directory,
             project.remote.allows_file_protocol(),
+            project.ssh_command.as_deref(),
         );
         configure_staging_object_directories(&mut command, project, git_directory)?;
         command.args(arguments);
@@ -674,7 +766,7 @@ impl GitSourceRepository {
     ) -> Result<(), SourceError> {
         create_private_directory(staging_path)?;
         let mut command = Command::new(&self.git_executable);
-        configure_git_environment(&mut command);
+        configure_git_environment(&mut command, project.ssh_command.as_deref());
         command.env("GIT_DEFAULT_REF_FORMAT", "files");
         command.args([
             OsString::from("--no-pager"),
@@ -774,6 +866,7 @@ impl GitSourceRepository {
                 &mut command,
                 staging_path,
                 project.remote.allows_file_protocol(),
+                project.ssh_command.as_deref(),
             );
             configure_staging_object_directories(&mut command, project, staging_path)?;
             command.args(os_args(&["cat-file", "--batch-check=%(objecttype)"]));
@@ -1231,7 +1324,7 @@ fn validate_git_executable() -> Result<(PathBuf, GitVersion), SourceError> {
         ));
     }
     let mut command = Command::new(&executable);
-    configure_git_environment(&mut command);
+    configure_git_environment(&mut command, None);
     let output = command
         .arg("--version")
         .stdin(Stdio::null())
@@ -2573,6 +2666,7 @@ fn configure_git_command(command: &mut Command, project: &InstalledGitProject) {
         command,
         &project.repository_path,
         project.remote.allows_file_protocol(),
+        project.ssh_command.as_deref(),
     );
 }
 
@@ -2580,6 +2674,7 @@ fn configure_git_command_for_directory(
     command: &mut Command,
     git_directory: &Path,
     allow_file_protocol: bool,
+    ssh_command: Option<&str>,
 ) {
     command
         .arg("--no-pager")
@@ -2594,7 +2689,7 @@ fn configure_git_command_for_directory(
     if allow_file_protocol {
         command.args(["-c", "protocol.file.allow=always"]);
     }
-    configure_git_environment(command);
+    configure_git_environment(command, ssh_command);
 }
 
 fn configure_staging_object_directories(
@@ -2633,7 +2728,7 @@ fn configure_staging_object_directories(
     Ok(())
 }
 
-fn configure_git_environment(command: &mut Command) {
+fn configure_git_environment(command: &mut Command, ssh_command: Option<&str>) {
     command
         .env_clear()
         .env("HOME", "/nonexistent")
@@ -2642,11 +2737,12 @@ fn configure_git_environment(command: &mut Command) {
         .env("LC_ALL", "C")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env(
-            "GIT_SSH_COMMAND",
-            "/usr/bin/ssh -oBatchMode=yes -oConnectTimeout=15 -oServerAliveInterval=10",
-        );
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(ssh_command) = ssh_command {
+        command
+            .env("GIT_SSH_VARIANT", "ssh")
+            .env("GIT_SSH_COMMAND", ssh_command);
+    }
 }
 
 #[derive(Debug)]
@@ -3076,6 +3172,7 @@ fn os_args(values: &[&str]) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         fs::OpenOptions,
         io::{Read as _, Seek as _, SeekFrom},
         process::Command,
@@ -3093,6 +3190,77 @@ mod tests {
     use super::*;
 
     const MAX_SMALL_FETCH_STORAGE_GROWTH: u64 = 64 * 1024;
+
+    #[test]
+    fn source_git_ssh_environment_is_fixed_identity_only_and_host_pinned() {
+        let mut command = Command::new(SYSTEM_GIT);
+        let ssh_command = GitSshTransportConfig {
+            private_key_path: PathBuf::from(
+                "/run/credentials/rdashboard-source.service/source-git-rimg-private-key",
+            ),
+            known_hosts_path: PathBuf::from(
+                "/run/credentials/rdashboard-source.service/source-git-rimg-known-hosts",
+            ),
+        }
+        .command()
+        .expect("fixed SSH command");
+        configure_git_environment(&mut command, Some(&ssh_command));
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get("HOME"),
+            Some(&Some("/nonexistent".to_owned()))
+        );
+        assert_eq!(
+            environment.get("GIT_TERMINAL_PROMPT"),
+            Some(&Some("0".to_owned()))
+        );
+        assert_eq!(
+            environment.get("GIT_SSH_VARIANT"),
+            Some(&Some("ssh".to_owned()))
+        );
+        assert!(!environment.contains_key("SSH_AUTH_SOCK"));
+
+        let ssh = environment
+            .get("GIT_SSH_COMMAND")
+            .and_then(Option::as_deref)
+            .expect("fixed SSH command");
+        for required in [
+            "-i /run/credentials/rdashboard-source.service/source-git-rimg-private-key",
+            "-oIdentitiesOnly=yes",
+            "-oIdentityAgent=none",
+            "-oBatchMode=yes",
+            "-oStrictHostKeyChecking=yes",
+            "-oUserKnownHostsFile=/run/credentials/rdashboard-source.service/source-git-rimg-known-hosts",
+            "-oGlobalKnownHostsFile=/dev/null",
+            "-oUpdateHostKeys=no",
+            "-oCheckHostIP=no",
+            "-oPreferredAuthentications=publickey",
+            "-oPasswordAuthentication=no",
+            "-oKbdInteractiveAuthentication=no",
+        ] {
+            assert!(
+                ssh.contains(required),
+                "missing SSH restriction: {required}"
+            );
+        }
+
+        let mut https_command = Command::new(SYSTEM_GIT);
+        configure_git_environment(&mut https_command, None);
+        let https_environment = https_command
+            .get_envs()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(!https_environment.contains("GIT_SSH_COMMAND"));
+        assert!(!https_environment.contains("GIT_SSH_VARIANT"));
+    }
 
     #[test]
     fn export_tree_inspection_streams_large_and_unusual_path_sets() {

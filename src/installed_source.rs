@@ -10,6 +10,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use url::Url;
 use zeroize::Zeroize as _;
 
 use crate::{
@@ -18,8 +19,8 @@ use crate::{
         EvidenceDigest, GitCommitId, InstalledPolicyIdentity, ProjectId, ReleaseClass, RemoteUrl,
     },
     source::{
-        GitSourceProjectConfig, InstalledSourceProjectPolicy, SourceAttestationError,
-        SourceAttestationVerifier, SourceProjectState, SourceSnapshot,
+        GitSourceProjectConfig, GitSshTransportConfig, InstalledSourceProjectPolicy,
+        SourceAttestationError, SourceAttestationVerifier, SourceProjectState, SourceSnapshot,
     },
     source_socket::{SOURCE_SOCKET_PATH, SourceServerConfigV1},
 };
@@ -30,9 +31,11 @@ pub const SOURCE_REPOSITORY_ROOT: &str = "/var/lib/rdashboard-source/repositorie
 pub const SOURCE_DATABASE_PATH: &str = "/var/lib/rdashboard-source/source.sqlite";
 pub const SOURCE_ATTESTATION_CREDENTIAL_PATH: &str =
     "/run/credentials/rdashboard-source.service/source-attestation-seed";
+pub const SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY: &str = "/run/credentials/rdashboard-source.service";
 
-const SOURCE_CONFIG_SCHEMA_VERSION: u16 = 2;
+const SOURCE_CONFIG_SCHEMA_VERSION: u16 = 3;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_GIT_SSH_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MIN_RECONCILE_INTERVAL_MS: u64 = 10_000;
 const MAX_RECONCILE_INTERVAL_MS: u64 = 10 * 60 * 1_000;
 const MIN_ATTESTATION_TTL_MS: u64 = 10_000;
@@ -40,10 +43,53 @@ const MAX_ATTESTATION_TTL_MS: u64 = 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct InstalledSourceGitSshV1 {
+    pub private_key_credential: String,
+    pub private_key_sha256: EvidenceDigest,
+    pub known_hosts_credential: String,
+    pub known_hosts_sha256: EvidenceDigest,
+}
+
+impl InstalledSourceGitSshV1 {
+    pub fn new(
+        project_id: &ProjectId,
+        private_key_sha256: EvidenceDigest,
+        known_hosts_sha256: EvidenceDigest,
+    ) -> Self {
+        Self {
+            private_key_credential: format!("source-git-{project_id}-private-key"),
+            private_key_sha256,
+            known_hosts_credential: format!("source-git-{project_id}-known-hosts"),
+            known_hosts_sha256,
+        }
+    }
+
+    fn validate(&self, project_id: &ProjectId) -> Result<(), InstalledSourceError> {
+        if self.private_key_credential != format!("source-git-{project_id}-private-key")
+            || self.known_hosts_credential != format!("source-git-{project_id}-known-hosts")
+        {
+            return Err(InstalledSourceError::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    fn transport(&self) -> GitSshTransportConfig {
+        GitSshTransportConfig {
+            private_key_path: Path::new(SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY)
+                .join(&self.private_key_credential),
+            known_hosts_path: Path::new(SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY)
+                .join(&self.known_hosts_credential),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstalledSourceProjectV1 {
     pub project_id: ProjectId,
     pub remote_url: RemoteUrl,
     pub repository_identity: EvidenceDigest,
+    pub git_ssh: Option<InstalledSourceGitSshV1>,
     pub installed_policy: InstalledPolicyIdentity,
     pub auto_deploy: bool,
     pub maximum_attempts: u32,
@@ -54,6 +100,7 @@ impl InstalledSourceProjectV1 {
     pub fn new(
         project_id: ProjectId,
         remote_url: RemoteUrl,
+        git_ssh: Option<InstalledSourceGitSshV1>,
         installed_policy: InstalledPolicyIdentity,
         auto_deploy: bool,
         maximum_attempts: u32,
@@ -62,12 +109,14 @@ impl InstalledSourceProjectV1 {
         let repository_identity = GitSourceProjectConfig {
             project_id: project_id.clone(),
             remote_url: remote_url.clone(),
+            ssh_transport: None,
         }
         .repository_identity();
         let project = Self {
             project_id,
             remote_url,
             repository_identity,
+            git_ssh,
             installed_policy,
             auto_deploy,
             maximum_attempts,
@@ -81,8 +130,14 @@ impl InstalledSourceProjectV1 {
         let repository = GitSourceProjectConfig {
             project_id: self.project_id.clone(),
             remote_url: self.remote_url.clone(),
+            ssh_transport: None,
         };
         if self.repository_identity != repository.repository_identity()
+            || remote_uses_ssh(&self.remote_url) != self.git_ssh.is_some()
+            || self
+                .git_ssh
+                .as_ref()
+                .is_some_and(|git_ssh| git_ssh.validate(&self.project_id).is_err())
             || self.installed_policy.version == 0
             || !(1..=10).contains(&self.maximum_attempts)
             || self.release_class == ReleaseClass::Rollback
@@ -96,6 +151,10 @@ impl InstalledSourceProjectV1 {
         GitSourceProjectConfig {
             project_id: self.project_id.clone(),
             remote_url: self.remote_url.clone(),
+            ssh_transport: self
+                .git_ssh
+                .as_ref()
+                .map(InstalledSourceGitSshV1::transport),
         }
     }
 
@@ -183,7 +242,7 @@ struct InstalledSourceConfigPayload<'a> {
 impl InstalledSourceConfigV1 {
     pub fn new(input: InstalledSourceConfigInputV1) -> Result<Self, InstalledSourceError> {
         let mut config = Self {
-            purpose: "rdashboard.installed-source-config.v2".to_owned(),
+            purpose: "rdashboard.installed-source-config.v3".to_owned(),
             schema_version: SOURCE_CONFIG_SCHEMA_VERSION,
             source_uid: input.source_uid,
             build_reader_gid: input.build_reader_gid,
@@ -208,7 +267,7 @@ impl InstalledSourceConfigV1 {
     }
 
     pub fn validate(&self) -> Result<(), InstalledSourceError> {
-        if self.purpose != "rdashboard.installed-source-config.v2"
+        if self.purpose != "rdashboard.installed-source-config.v3"
             || self.schema_version != SOURCE_CONFIG_SCHEMA_VERSION
             || self.source_uid == 0
             || self.source_uid == u32::MAX
@@ -245,7 +304,7 @@ impl InstalledSourceConfigV1 {
     fn calculate_digest(&self) -> Result<EvidenceDigest, InstalledSourceError> {
         Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
             &InstalledSourceConfigPayload {
-                purpose: "rdashboard.installed-source-config.v2",
+                purpose: "rdashboard.installed-source-config.v3",
                 schema_version: SOURCE_CONFIG_SCHEMA_VERSION,
                 source_uid: self.source_uid,
                 build_reader_gid: self.build_reader_gid,
@@ -438,6 +497,147 @@ pub(crate) fn load_source_signing_key_from(
     Ok(signing_key)
 }
 
+pub fn validate_source_git_ssh_credentials(
+    config: &InstalledSourceConfigV1,
+) -> Result<(), InstalledSourceError> {
+    validate_source_git_ssh_credentials_from(config, Path::new(SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY))
+}
+
+fn validate_source_git_ssh_credentials_from(
+    config: &InstalledSourceConfigV1,
+    credential_directory: &Path,
+) -> Result<(), InstalledSourceError> {
+    config.validate()?;
+    for project in &config.projects {
+        let Some(git_ssh) = &project.git_ssh else {
+            continue;
+        };
+        let expected_hosts = BTreeSet::from([ssh_known_host(&project.remote_url)?]);
+        let private_key_path = credential_directory.join(&git_ssh.private_key_credential);
+        let known_hosts_path = credential_directory.join(&git_ssh.known_hosts_credential);
+        let mut private_key = read_stable_git_credential(&private_key_path, config.source_uid)?;
+        let known_hosts = read_stable_git_credential(&known_hosts_path, config.source_uid)?;
+        let valid = EvidenceDigest::sha256(&private_key) == git_ssh.private_key_sha256
+            && EvidenceDigest::sha256(&known_hosts) == git_ssh.known_hosts_sha256
+            && valid_openssh_private_key(&private_key)
+            && valid_known_hosts(&known_hosts, &expected_hosts);
+        private_key.zeroize();
+        if !valid {
+            return Err(InstalledSourceError::GitCredentialMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn read_stable_git_credential(
+    path: &Path,
+    source_uid: u32,
+) -> Result<Vec<u8>, InstalledSourceError> {
+    let path_metadata = fs::symlink_metadata(path)?;
+    let credential_uid = path_metadata.uid();
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.file_type().is_file()
+        || credential_uid != 0 && credential_uid != source_uid
+        || path_metadata.permissions().mode() & 0o077 != 0
+        || path_metadata.len() == 0
+        || path_metadata.len() > MAX_GIT_SSH_CREDENTIAL_BYTES
+    {
+        return Err(InstalledSourceError::UnsafeGitCredential);
+    }
+    let file = File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    if opened_metadata.dev() != path_metadata.dev()
+        || opened_metadata.ino() != path_metadata.ino()
+        || opened_metadata.len() != path_metadata.len()
+    {
+        return Err(InstalledSourceError::UnsafeGitCredential);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(opened_metadata.len()).unwrap_or(0));
+    file.take(MAX_GIT_SSH_CREDENTIAL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let final_metadata = fs::symlink_metadata(path)?;
+    if final_metadata.dev() != opened_metadata.dev()
+        || final_metadata.ino() != opened_metadata.ino()
+        || final_metadata.len() != opened_metadata.len()
+        || bytes.len() != usize::try_from(opened_metadata.len()).unwrap_or(usize::MAX)
+    {
+        bytes.zeroize();
+        return Err(InstalledSourceError::UnsafeGitCredential);
+    }
+    Ok(bytes)
+}
+
+fn valid_openssh_private_key(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if text.contains('\r') || !text.ends_with('\n') {
+        return false;
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() < 3
+        || lines.first() != Some(&"-----BEGIN OPENSSH PRIVATE KEY-----")
+        || lines.last() != Some(&"-----END OPENSSH PRIVATE KEY-----")
+        || lines[1..lines.len() - 1]
+            .iter()
+            .any(|line| line.is_empty() || line.len() > 80)
+    {
+        return false;
+    }
+    let encoded = lines[1..lines.len() - 1].concat();
+    let Ok(mut decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let valid = decoded.starts_with(b"openssh-key-v1\0");
+    decoded.zeroize();
+    valid
+}
+
+fn valid_known_hosts(bytes: &[u8], expected_hosts: &BTreeSet<String>) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if text.contains(['\0', '\r']) || !text.ends_with('\n') {
+        return false;
+    }
+    let mut present_hosts = BTreeSet::new();
+    for line in text.lines() {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3
+            || fields[0].starts_with(['@', '|'])
+            || fields[0]
+                .bytes()
+                .any(|byte| matches!(byte, b'!' | b'*' | b'?'))
+            || !matches!(fields[1], "ssh-ed25519" | "ecdsa-sha2-nistp256" | "ssh-rsa")
+            || base64::engine::general_purpose::STANDARD
+                .decode(fields[2])
+                .is_err()
+        {
+            return false;
+        }
+        present_hosts.extend(fields[0].split(',').map(str::to_owned));
+    }
+    !present_hosts.is_empty() && expected_hosts.is_subset(&present_hosts)
+}
+
+fn remote_uses_ssh(remote: &RemoteUrl) -> bool {
+    Url::parse(remote.as_str()).is_ok_and(|url| url.scheme() == "ssh")
+}
+
+fn ssh_known_host(remote: &RemoteUrl) -> Result<String, InstalledSourceError> {
+    let url = Url::parse(remote.as_str()).map_err(|_| InstalledSourceError::InvalidConfig)?;
+    if url.scheme() != "ssh" {
+        return Err(InstalledSourceError::InvalidConfig);
+    }
+    let host = url.host_str().ok_or(InstalledSourceError::InvalidConfig)?;
+    let port = url.port().unwrap_or(22);
+    if port == 22 && !host.contains(':') {
+        Ok(host.to_owned())
+    } else {
+        Ok(format!("[{host}]:{port}"))
+    }
+}
+
 fn read_stable_config(path: &Path, required_uid: u32) -> Result<Vec<u8>, InstalledSourceError> {
     let parent = path.parent().ok_or(InstalledSourceError::UnsafeConfig)?;
     let parent_metadata = fs::symlink_metadata(parent)?;
@@ -510,6 +710,10 @@ pub enum InstalledSourceError {
     UnsafeCredential,
     #[error("source attestation seed does not match the installed public key")]
     CredentialKeyMismatch,
+    #[error("source Git SSH credential is not a safe exact private file")]
+    UnsafeGitCredential,
+    #[error("source Git SSH key or pinned host file does not match installed configuration")]
+    GitCredentialMismatch,
     #[error("source snapshot is not a current installed-policy-bound accepted head")]
     InvalidSourceSnapshot,
     #[error(transparent)]
@@ -536,10 +740,17 @@ mod tests {
     use super::*;
     use crate::source::{DeterministicSourceRepository, DurableSourceBroker, SourceStore};
 
-    fn config(source_uid: u32, signing_key: &SigningKey) -> InstalledSourceConfigV1 {
+    fn config_with_remote(
+        source_uid: u32,
+        signing_key: &SigningKey,
+        remote_url: &str,
+        git_ssh: Option<InstalledSourceGitSshV1>,
+    ) -> InstalledSourceConfigV1 {
+        let project_id = ProjectId::from_str("rimg").expect("project");
         let project = InstalledSourceProjectV1::new(
-            ProjectId::from_str("rimg").expect("project"),
-            RemoteUrl::from_str("https://github.com/example/rimg.git").expect("remote"),
+            project_id,
+            RemoteUrl::from_str(remote_url).expect("remote"),
+            git_ssh,
             InstalledPolicyIdentity {
                 digest: EvidenceDigest::sha256("owner policy"),
                 version: 7,
@@ -561,6 +772,23 @@ mod tests {
             projects: vec![project],
         })
         .expect("source config")
+    }
+
+    fn config(source_uid: u32, signing_key: &SigningKey) -> InstalledSourceConfigV1 {
+        config_with_remote(
+            source_uid,
+            signing_key,
+            "https://github.com/example/rimg.git",
+            None,
+        )
+    }
+
+    fn fake_openssh_private_key() -> Vec<u8> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"openssh-key-v1\0fixture");
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{encoded}\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+        .into_bytes()
     }
 
     #[test]
@@ -620,6 +848,102 @@ mod tests {
     }
 
     #[test]
+    fn source_git_ssh_credentials_are_exact_private_and_host_pinned() {
+        let directory = tempdir().expect("tempdir");
+        let uid = fs::metadata(directory.path()).expect("metadata").uid();
+        let signing_key = SigningKey::from_bytes(&[37_u8; 32]);
+        let private_key = fake_openssh_private_key();
+        let known_hosts = b"github.com ssh-ed25519 aG9zdGtleQ==\n";
+        let installed = config_with_remote(
+            uid,
+            &signing_key,
+            "ssh://git@github.com/mrDenai/rimg.git",
+            Some(InstalledSourceGitSshV1::new(
+                &ProjectId::from_str("rimg").expect("project"),
+                EvidenceDigest::sha256(&private_key),
+                EvidenceDigest::sha256(known_hosts),
+            )),
+        );
+        let private_key_path = directory.path().join("source-git-rimg-private-key");
+        let known_hosts_path = directory.path().join("source-git-rimg-known-hosts");
+        fs::write(&private_key_path, &private_key).expect("write private key");
+        fs::write(&known_hosts_path, known_hosts).expect("write known hosts");
+        fs::set_permissions(&private_key_path, fs::Permissions::from_mode(0o600))
+            .expect("private key permissions");
+        fs::set_permissions(&known_hosts_path, fs::Permissions::from_mode(0o600))
+            .expect("known hosts permissions");
+
+        validate_source_git_ssh_credentials_from(&installed, directory.path())
+            .expect("validate Git SSH credentials");
+
+        fs::write(
+            &known_hosts_path,
+            b"attacker.example ssh-ed25519 aG9zdGtleQ==\n",
+        )
+        .expect("replace known hosts");
+        assert!(matches!(
+            validate_source_git_ssh_credentials_from(&installed, directory.path()),
+            Err(InstalledSourceError::GitCredentialMismatch)
+        ));
+
+        fs::set_permissions(&private_key_path, fs::Permissions::from_mode(0o640))
+            .expect("make private key unsafe");
+        assert!(matches!(
+            validate_source_git_ssh_credentials_from(&installed, directory.path()),
+            Err(InstalledSourceError::UnsafeGitCredential)
+        ));
+    }
+
+    #[test]
+    fn source_git_ssh_configuration_cannot_be_partial_or_attached_to_https() {
+        let directory = tempdir().expect("tempdir");
+        let uid = fs::metadata(directory.path()).expect("metadata").uid();
+        let signing_key = SigningKey::from_bytes(&[41_u8; 32]);
+        let project_id = ProjectId::from_str("rimg").expect("project");
+        let git_ssh = InstalledSourceGitSshV1::new(
+            &project_id,
+            EvidenceDigest::sha256("private key"),
+            EvidenceDigest::sha256("known hosts"),
+        );
+        for (remote, transport) in [
+            ("ssh://git@github.com/mrDenai/rimg.git", None),
+            ("https://github.com/mrDenai/rimg.git", Some(git_ssh.clone())),
+        ] {
+            assert!(matches!(
+                InstalledSourceProjectV1::new(
+                    project_id.clone(),
+                    RemoteUrl::from_str(remote).expect("remote"),
+                    transport,
+                    InstalledPolicyIdentity {
+                        digest: EvidenceDigest::sha256("owner policy"),
+                        version: 7,
+                    },
+                    true,
+                    3,
+                    ReleaseClass::StatefulCompatible,
+                ),
+                Err(InstalledSourceError::InvalidConfig)
+            ));
+        }
+
+        let mut valid = config_with_remote(
+            uid,
+            &signing_key,
+            "ssh://git@github.com/mrDenai/rimg.git",
+            Some(git_ssh),
+        );
+        valid.projects[0]
+            .git_ssh
+            .as_mut()
+            .expect("SSH transport")
+            .private_key_credential = "source-git-other-private-key".to_owned();
+        assert!(matches!(
+            valid.validate(),
+            Err(InstalledSourceError::InvalidConfig)
+        ));
+    }
+
+    #[test]
     fn source_service_can_write_only_its_external_export_store() {
         let unit = include_str!("../deploy/systemd/rdashboard-source.service");
         assert!(unit.lines().any(|line| line == "ProtectSystem=strict"));
@@ -628,6 +952,25 @@ mod tests {
                 .filter(|line| line.starts_with("ReadWritePaths="))
                 .collect::<Vec<_>>(),
             ["ReadWritePaths=/var/lib/rdashboard-build/source-exports"]
+        );
+        assert_eq!(
+            unit.lines()
+                .filter(|line| line.starts_with("LoadCredential="))
+                .collect::<Vec<_>>(),
+            [
+                "LoadCredential=source-attestation-seed:/etc/rdashboard/credentials/source-attestation-seed"
+            ]
+        );
+        let git_ssh_drop_in = include_str!("../deploy/systemd/rdashboard-source-git-ssh.conf");
+        assert_eq!(
+            git_ssh_drop_in
+                .lines()
+                .filter(|line| line.starts_with("LoadCredential="))
+                .collect::<Vec<_>>(),
+            [
+                "LoadCredential=source-git-rimg-private-key:/etc/rdashboard/credentials/source-git-rimg-private-key",
+                "LoadCredential=source-git-rimg-known-hosts:/etc/rdashboard/credentials/source-git-rimg-known-hosts",
+            ]
         );
     }
 

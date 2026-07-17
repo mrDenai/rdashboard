@@ -95,19 +95,55 @@ still authenticates every connection as peer UID 0, so group membership grants t
 not source authority. The controller must not be a member of `rdashboard-source`.
 
 Install one canonical-JCS `/etc/rdashboard/source.json`, root-owned and not group/other writable.
-`InstalledSourceConfigV1` schema v2 binds the fixed socket, database, repository and build-source
+`InstalledSourceConfigV1` schema v3 binds the fixed socket, database, repository and build-source
 export paths, the numeric source UID and build-reader GID, root executor peer UID, connection/time
 limits, reconcile interval, attestation key identity and public key, and each project's exact
 remote-derived repository identity and owner-policy identity. Its `document_digest` covers the
-complete document. The service refuses path overrides, duplicate projects, mutable policy
-versions, rollback release classes, key substitution and a remote URL whose derived repository
-identity differs from the installed value.
+complete document. Each project using an `ssh://` remote also requires its own exact installed
+credential names and SHA-256 identities for a read-only SSH private key and pinned known-hosts file.
+HTTPS projects forbid an SSH credential binding. The service refuses path overrides, incomplete Git SSH
+credentials, duplicate projects, mutable policy versions, rollback release classes, key
+substitution and a remote URL whose derived repository identity differs from the installed value.
 
 Install the corresponding 32-byte Ed25519 seed at
 `/etc/rdashboard/credentials/source-attestation-seed`; systemd exposes it only as the fixed
 `source-attestation-seed` service credential. The broker checks file type, ownership, mode, inode,
 exact size and derived non-weak Ed25519 public key, and zeroizes the raw seed buffer after
 constructing the signer.
+
+For a private SSH remote, install an unencrypted, repository-read-only OpenSSH key at
+`/etc/rdashboard/credentials/source-git-<project>-private-key` and the provider's reviewed host key
+lines at `/etc/rdashboard/credentials/source-git-<project>-known-hosts`; both must be root-owned mode
+`0600`. Record their exact credential names and SHA-256 digests in that project's `source.json`
+entry, then add the same two credential names to
+`rdashboard-source-git-ssh.conf` as the service's `git-ssh.conf` systemd drop-in. The base source
+unit does not request Git credentials, so an HTTPS-only installation does not depend on absent SSH
+files. The drop-in exposes only credential copies at the two fixed
+`/run/credentials/rdashboard-source.service/` paths. Startup rejects symlinks, wrong
+owners/modes, oversized files, non-OpenSSH private-key framing, malformed host-key lines, a missing
+pin for any configured SSH hostname or any digest change. Git runs with no ambient environment,
+HOME, credential helper, agent, password, keyboard-interactive prompt, mutable host-key update or
+global known-hosts fallback; each SSH project uses only its own exact identity and pinned file.
+Adding a future repository requires its own deploy key plus an explicit installed unit/config
+change rather than silently borrowing an operator account or reusing another project's authority.
+
+Install `rdashboard-source-config` at `/usr/libexec/rdashboard/rdashboard-source-config`. After the
+three rimg credential files exist, generate the canonical document without placing any secret in
+argv or stdout:
+
+```sh
+/usr/libexec/rdashboard/rdashboard-source-config \
+  SOURCE_UID BUILD_READER_GID INSTALLED_POLICY_SHA256 INSTALLED_POLICY_VERSION \
+  > /etc/rdashboard/source.json.new
+```
+
+The tool has a fixed `rimg` project/remote and fixed root credential paths. It derives the
+attestation public key, project-specific credential digests and key ID, emits only canonical JCS,
+sets `auto_deploy=false`, and never serializes private bytes. Validate and atomically install the
+new document as root-owned mode `0600`; do not generate it until the exact installed owner-policy
+identity is known. Future multi-project generation should extend this typed builder rather than
+hand-editing digest-covered JSON.
+
 Initialize each canonical bare repository below
 `/var/lib/rdashboard-source/repositories/<project>.git` as the `rdashboard-source` account using the
 reviewed `files` ref backend and owner-only modes before starting the service. Startup validates the

@@ -118,7 +118,10 @@ Production source reconciliation uses the fixed `/etc/rdashboard/source.json`, p
 `/var/lib/rdashboard-source` state and `/run/rdashboard-source/source.sock`. The source process
 validates its installed policy and Ed25519 credential, refuses to serve until its first bounded
 remote reconciliation succeeds, and enforces exact peer UID, framing, response binding and request
-deadlines. Root-side snapshot verification independently checks signature expiry, repository and
+deadlines. Private SSH remotes additionally require a fixed systemd-loaded read-only key and pinned
+known-hosts file whose SHA-256 identities are part of the canonical installed source document; Git
+cannot inherit an operator key, SSH agent, password prompt or global host configuration. Root-side
+snapshot verification independently checks signature expiry, repository and
 owner-policy identity, target SHA, sequence, attestation digest, blocked-SHA and pause controls.
 See [`deploy/systemd/README.md`](deploy/systemd/README.md) for the installation boundary.
 

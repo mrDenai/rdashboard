@@ -29,7 +29,7 @@ use crate::{
 
 mod git_repository;
 
-pub use git_repository::{GitSourceProjectConfig, GitSourceRepository};
+pub use git_repository::{GitSourceProjectConfig, GitSourceRepository, GitSshTransportConfig};
 
 pub const ACCEPTED_HEAD_SCHEMA_VERSION: u16 = 1;
 const SOURCE_SCHEMA_VERSION: i64 = 2;

@@ -10,6 +10,7 @@ use rdashboard::{
     build_source::{SourceArchiveInputV1, SourceArchivePublisherV1},
     installed_source::{
         InstalledSourceConfigV1, load_installed_source_config, load_source_signing_key,
+        validate_source_git_ssh_credentials,
     },
     source::{DurableSourceBroker, GitSourceRepository, SourceProjectState, SourceStore},
     source_socket::{
@@ -39,6 +40,7 @@ async fn main() -> Result<(), DynError> {
     }
 
     let signing_key = load_source_signing_key(&config)?;
+    validate_source_git_ssh_credentials(&config)?;
     let repository =
         GitSourceRepository::open(&config.repository_root, config.repository_configs())?;
     let export_repository = repository.clone();
