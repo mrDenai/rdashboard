@@ -2,6 +2,7 @@
 Description=Resolve the current private rimg container for rdashboard health collection
 Requires=docker.service
 After=docker.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec

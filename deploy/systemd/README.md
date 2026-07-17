@@ -58,7 +58,11 @@ the named `kamal` network. It then replaces itself with the fixed systemd socket
 address on rimg port 8080 and exits after one idle second, forcing the next collection burst to
 resolve a post-deploy container again. No rimg port is published on the host or through Kamal
 Proxy. A missing, starting, unhealthy, non-private or ambiguously encoded target fails closed and
-is recorded by the controller as health signal loss.
+is recorded by the controller as health signal loss. The helper unit disables systemd's start-rate
+limit because the collector deliberately opens three parallel health connections every five
+seconds: during a rolling gap those expected fail-closed activations must not permanently fail the
+listening socket. Each activation remains deadline- and resource-bounded, and the next collection
+automatically resolves the replacement container once it becomes healthy.
 
 The dedicated source broker runs as `rdashboard-source` from
 `/usr/libexec/rdashboard/rdashboard-source`. Install `rdashboard-source.service`, create the matching

@@ -523,6 +523,11 @@ mod unix {
             assert!(
                 service.contains("ExecStart=/usr/libexec/rdashboard/rdashboard-rimg-health-proxy")
             );
+            assert!(
+                service
+                    .lines()
+                    .any(|line| line == "StartLimitIntervalSec=0")
+            );
             assert!(service.lines().any(|line| line == "CapabilityBoundingSet="));
             assert!(
                 socket
