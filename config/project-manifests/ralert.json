@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "project_id": "ralert",
+  "display_name": "Ralert image renderer",
+  "source": {
+    "remote_url": "https://github.com/mrDenai/ralert.git",
+    "branch": "main"
+  },
+  "ci": "bin_ci",
+  "build": {
+    "context": "repository_root",
+    "dockerfile": "Dockerfile"
+  },
+  "health_checks": [
+    {
+      "name": "liveness",
+      "endpoint": "http://ralert:8080/health/live",
+      "expected_status": 200,
+      "timeout_seconds": 5
+    },
+    {
+      "name": "readiness",
+      "endpoint": "http://ralert:8080/health/ready",
+      "expected_status": 200,
+      "timeout_seconds": 5
+    }
+  ],
+  "data_volumes": [
+    {
+      "path": "/data/templates",
+      "class": "stateful",
+      "backup_required": true
+    },
+    {
+      "path": "/data/images",
+      "class": "derived",
+      "backup_required": false
+    }
+  ],
+  "migration": {
+    "entrypoint": "none",
+    "write_fence": "unsupported"
+  },
+  "rollback": {
+    "code_rollback": true,
+    "soak_seconds": 60
+  },
+  "notifications": {
+    "route": "telegram_default",
+    "maintenance_suppression": true
+  }
+}
