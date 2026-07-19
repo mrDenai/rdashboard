@@ -28,7 +28,10 @@ use crate::{
     mutation_admission::{
         ExecuteMutationGrantV1, ObserveMutationStatusV1, PrepareMutationIntentV1,
     },
-    store::{MetricsStore, PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, StoreError},
+    store::{
+        IntegrationStore, IntegrationStoreError, MetricsStore,
+        PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, StoreError,
+    },
     unix_time_ms,
 };
 
@@ -67,6 +70,7 @@ pub struct DashboardState {
     pub sample_interval: Duration,
     pub mutation_api: Option<Arc<DashboardMutationApiV1>>,
     pub metrics_store: Option<MetricsStore>,
+    pub integration_store: Option<IntegrationStore>,
     pub operation_history: Option<DurableController>,
     pub project_repository_errors: Arc<RwLock<BTreeMap<String, String>>>,
 }
@@ -81,6 +85,7 @@ impl DashboardState {
             sample_interval,
             mutation_api: None,
             metrics_store: None,
+            integration_store: None,
             operation_history: None,
             project_repository_errors: Arc::new(RwLock::new(BTreeMap::new())),
         }
@@ -95,6 +100,12 @@ impl DashboardState {
     #[must_use]
     pub fn with_metrics_store(mut self, metrics_store: MetricsStore) -> Self {
         self.metrics_store = Some(metrics_store);
+        self
+    }
+
+    #[must_use]
+    pub fn with_integration_store(mut self, integration_store: IntegrationStore) -> Self {
+        self.integration_store = Some(integration_store);
         self
     }
 
@@ -131,6 +142,11 @@ pub fn router_with_access(
         .route(
             "/api/v1/projects/{project_id}/repository-history",
             get(project_repository_history),
+        )
+        .route("/api/v1/projects/{project_id}/errors", get(project_errors))
+        .route(
+            "/api/v1/projects/{project_id}/updates",
+            get(project_updates),
         )
         .route("/api/v1/events", get(events))
         .route("/api/v1/mutations/capabilities", get(mutation_capabilities))
@@ -487,6 +503,66 @@ async fn project_repository_history(
             StatusCode::INTERNAL_SERVER_ERROR,
             "repository_history_failed",
             "Project repository history could not be loaded.",
+        )
+        .into_response(),
+    }
+}
+
+async fn project_errors(
+    State(state): State<DashboardState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Response {
+    let Some(store) = state.integration_store.clone() else {
+        return ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_errors_unavailable",
+            "Project error integration storage is not configured.",
+        )
+        .into_response();
+    };
+    match tokio::task::spawn_blocking(move || store.project_errors(&project_id)).await {
+        Ok(Ok(Some(record))) => Json(record).into_response(),
+        Ok(Ok(None)) => ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_errors_not_collected",
+            "Project errors have not been collected yet.",
+        )
+        .into_response(),
+        Ok(Err(error)) => integration_store_problem(&error),
+        Err(_) => ApiProblem::response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_errors_failed",
+            "Project errors could not be loaded.",
+        )
+        .into_response(),
+    }
+}
+
+async fn project_updates(
+    State(state): State<DashboardState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Response {
+    let Some(store) = state.integration_store.clone() else {
+        return ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_updates_unavailable",
+            "Project dependency update storage is not configured.",
+        )
+        .into_response();
+    };
+    match tokio::task::spawn_blocking(move || store.project_updates(&project_id)).await {
+        Ok(Ok(Some(record))) => Json(record).into_response(),
+        Ok(Ok(None)) => ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_updates_not_collected",
+            "Project dependency updates have not been collected yet.",
+        )
+        .into_response(),
+        Ok(Err(error)) => integration_store_problem(&error),
+        Err(_) => ApiProblem::response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_updates_failed",
+            "Project dependency updates could not be loaded.",
         )
         .into_response(),
     }
@@ -863,6 +939,16 @@ fn store_problem(error: &StoreError) -> Response {
         StatusCode::BAD_REQUEST,
         "invalid_mutation_request",
         &error.to_string(),
+    )
+    .into_response()
+}
+
+fn integration_store_problem(error: &IntegrationStoreError) -> Response {
+    tracing::error!(error = %error, "integration record could not be loaded");
+    ApiProblem::response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "integration_store_failed",
+        "Stored project integration data is unavailable.",
     )
     .into_response()
 }

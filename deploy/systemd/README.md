@@ -45,6 +45,37 @@ Activation order is fail-closed:
 Removing the Kamal Proxy host route and disabling the bridge socket closes external reachability
 without changing the observation services or their local data.
 
+## GlitchTip, DeepSeek and GitHub metadata
+
+The base controller unit intentionally starts without external integration credentials. After each
+dedicated least-privilege identity has been provisioned, install its matching
+`rdashboard-glitchtip.conf`, `rdashboard-opencode.conf` or `rdashboard-github-metadata.conf` as a
+systemd drop-in for `rdashboard.service`, together with the corresponding root-owned mode-`0600`
+regular file:
+
+- `/etc/rdashboard/credentials/glitchtip-read-token`, a token for a dedicated GlitchTip user with
+  read-only scopes and access limited to the required project;
+- `/etc/rdashboard/credentials/opencode-api-key`, the OpenCode Zen key used only for anonymous
+  aggregate error facts;
+- `/etc/rdashboard/credentials/github-metadata-token`, a GitHub App or fine-grained token limited to
+  pull-request and check-run metadata for `mrDenai/rimg`.
+
+Do not install an operator-wide GlitchTip token, reuse the source deploy key for GitHub API access or
+put any token in `controller.env`. systemd copies only the named files into the service credential
+directory. Missing credentials remain a visible `not_configured` record; a present malformed file
+fails startup. Provider responses are time/body/count bounded, redirects are refused, and a failure
+preserves the last successful integration record. The OpenCode route receives no issue title,
+culprit, path, event body, stack trace, issue ID or deep link. The free provider is therefore not an
+incident authority and never gates collection, backup or deployment.
+
+Telegram delivery is a separate activation boundary. The repository contains a durable idempotent
+outbox and the exact `telegram-gateway` request contract, but `rdashboard.service` neither opens that
+outbox nor receives a gateway API secret. Before enabling delivery, register a dedicated gateway
+project, choose the exact chat and optional thread, install a separate notifier user/service with its
+own credential, and grant it only the narrow outbox transport needed for claiming and completing
+messages. Until those values exist, do not enqueue notifications: an accumulating undeliverable queue
+would be a false success state rather than useful monitoring.
+
 For private rimg health collection, also install
 `rdashboard-rimg-health.socket`, `rdashboard-rimg-health.service` and the
 `rdashboard-rimg-health-proxy` binary. For container resources, also install

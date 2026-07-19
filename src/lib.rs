@@ -44,11 +44,14 @@ pub mod installed_intent_resolver;
 pub mod installed_policy;
 #[cfg(unix)]
 pub mod installed_source;
+pub mod integration_collectors;
+pub mod integrations;
 #[cfg(unix)]
 pub mod kamal_adapter;
 pub mod metrics;
 #[cfg(unix)]
 pub mod mutation_admission;
+pub mod notifications;
 #[cfg(unix)]
 pub mod oci_handoff;
 pub mod phase6;

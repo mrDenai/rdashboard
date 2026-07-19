@@ -1,9 +1,13 @@
 mod control;
+mod integrations;
 mod metrics;
+mod notifications;
 mod security;
 
 pub use control::*;
+pub use integrations::*;
 pub use metrics::*;
+pub use notifications::*;
 pub use security::*;
 
 use std::sync::{Mutex, MutexGuard};

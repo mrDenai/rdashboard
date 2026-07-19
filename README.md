@@ -154,6 +154,29 @@ state, resources, deploys, backups, repository, dependency updates and errors as
 contracts and executor/source diagnostics stay out of that summary; unavailable integrations use a
 bounded operator-facing state.
 
+Project integration snapshots live in a separate `integrations.sqlite` journal. The controller
+collects unresolved GlitchTip groups for the fixed organization `4u` and numeric project `4`, stores
+only bounded aggregate metadata, and preserves the last successful snapshot when a provider fails.
+For a non-empty set, the OpenCode Zen request is structurally restricted to counts, levels and opaque
+ranks; issue titles, culprit strings, paths, event bodies, stack traces, issue IDs and links never
+enter the model packet. An empty set is resolved locally without calling a model. A strict bounded
+DeepSeek JSON result is advisory: malformed or unavailable analysis leaves the deterministic facts
+visible as a partial state. The dependency-update collector separately reads only Renovate/dependency
+pull requests and observed check-run conclusions from `mrDenai/rimg`; it does not claim review,
+approval or mergeability.
+
+The authenticated browser APIs are `GET /api/v1/projects/{project_id}/errors` and
+`GET /api/v1/projects/{project_id}/updates`. Their records expose the latest attempt, last successful
+collection, safe data and a bounded collection/analysis failure. The browser distinguishes loading,
+unconfigured, empty, fresh, partial, stale and failed states rather than erasing last-known data.
+
+The notification boundary is deliberately separate from provider collection. Typed events derive a
+deterministic deduplication key, and `NotificationStore` provides durable enqueue, bounded delivery
+leases, exact replay after ambiguous transport and terminal delivery/failure states. Its outbound
+`TelegramGatewayMessageV1` matches the gateway's project/chat/event-key/dedup-key contract. The
+controller does not open this outbox or possess a Telegram secret until a dedicated notifier identity,
+gateway project and destination are installed; consequently the unconfigured build queues no messages.
+
 `RDASHBOARD_RIMG_BASE_URL` is optional and must be a bare internal `http://` origin without
 credentials, path, query or fragment. When it is absent, the `rimg` row remains visible as
 `Unknown`; transport loss, HTTP failure and contradictory liveness/readiness results remain

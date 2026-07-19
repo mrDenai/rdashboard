@@ -12,10 +12,12 @@ use rdashboard::{
         ProjectId, PsiMeasurement, truncate_utf8,
     },
     executor_socket::{ROOT_EXECUTOR_SOCKET_PATH, RootExecutorClient},
+    integration_collectors::ProjectIntegrationCollectors,
     metrics::HostCollector,
     projects::{RimgConfigError, RimgHealthCollector, RimgResourceCollector},
     store::{
-        ControlStore, MetricsStore, PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, RepositorySampleWrite,
+        ControlStore, IntegrationStore, MetricsStore, PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS,
+        RepositorySampleWrite,
     },
     unix_time_ms,
     web::{
@@ -40,6 +42,8 @@ const MINUTE_ROLLUP_RETENTION: Duration = Duration::from_hours(720);
 const PROJECT_ID_RIMG: &str = "rimg";
 const PROJECT_REPOSITORY_ERROR_MAX_BYTES: usize = 512;
 const PROJECT_REPOSITORY_FAILURE_RETRY: Duration = Duration::from_mins(5);
+const PROJECT_INTEGRATION_INTERVAL: Duration = Duration::from_mins(5);
+const PROJECT_INTEGRATION_TIMEOUT: Duration = Duration::from_secs(20);
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
@@ -54,6 +58,11 @@ async fn main() -> Result<(), DynError> {
 
     let control_store = ControlStore::open(config.data_dir.join("control.sqlite"))?;
     let metrics_store = MetricsStore::open(config.data_dir.join("metrics.sqlite"))?;
+    let integration_store = IntegrationStore::open(config.data_dir.join("integrations.sqlite"))?;
+    let integration_collectors = ProjectIntegrationCollectors::from_credential_directory(
+        config.credential_directory.as_deref(),
+        PROJECT_INTEGRATION_TIMEOUT,
+    )?;
     let hub = EventHub::new(control_store.clone());
     let executor_client = config
         .executor_socket
@@ -73,6 +82,7 @@ async fn main() -> Result<(), DynError> {
             },
         )
         .with_metrics_store(metrics_store.clone())
+        .with_integration_store(integration_store.clone())
         .with_operation_history(durable_controller);
     let host_source = executor_client.clone().map_or_else(
         || {
@@ -128,6 +138,7 @@ async fn main() -> Result<(), DynError> {
         project_resource_collector,
     );
     spawn_project_repository_collection(state.clone(), executor_client);
+    spawn_project_integration_collection(integration_store, integration_collectors);
 
     let listener = TcpListener::bind(config.listen).await?;
     info!(listen = %config.listen, data_dir = %config.data_dir.display(), "rdashboardd listening");
@@ -354,6 +365,68 @@ fn spawn_project_repository_collection(
     });
 }
 
+fn spawn_project_integration_collection(
+    store: IntegrationStore,
+    collectors: ProjectIntegrationCollectors,
+) {
+    tokio::spawn(async move {
+        let project_id: ProjectId = match PROJECT_ID_RIMG.parse() {
+            Ok(project_id) => project_id,
+            Err(error) => {
+                error!(error = %error, "fixed integration project identifier is invalid");
+                return;
+            }
+        };
+        let mut interval = tokio::time::interval(PROJECT_INTEGRATION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let now_ms = match unix_time_ms() {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(error = %error, "project integration collection skipped because the host clock is invalid");
+                    continue;
+                }
+            };
+            let (errors, updates) = tokio::join!(
+                collectors.collect_errors(now_ms),
+                collectors.collect_updates(now_ms),
+            );
+            let cycle_store = store.clone();
+            let cycle_project = project_id.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                let errors_result = match errors {
+                    Ok(data) => cycle_store.record_errors_success(now_ms, data).map(|_| ()),
+                    Err(error) => cycle_store
+                        .record_errors_failure(&cycle_project, now_ms, error.into_failure())
+                        .map(|_| ()),
+                };
+                let updates_result = match updates {
+                    Ok(data) => cycle_store.record_updates_success(now_ms, data).map(|_| ()),
+                    Err(error) => cycle_store
+                        .record_updates_failure(&cycle_project, now_ms, error.into_failure())
+                        .map(|_| ()),
+                };
+                (errors_result, updates_result)
+            })
+            .await;
+            match persisted {
+                Ok((errors_result, updates_result)) => {
+                    if let Err(error) = errors_result {
+                        error!(error = %error, integration = "errors", "project integration record could not be persisted");
+                    }
+                    if let Err(error) = updates_result {
+                        error!(error = %error, integration = "updates", "project integration record could not be persisted");
+                    }
+                }
+                Err(error) => {
+                    error!(error = %error, "project integration persistence task failed");
+                }
+            }
+        }
+    });
+}
+
 async fn project_repository_collection_context(
     state: &DashboardState,
     executor_client: Option<Arc<RootExecutorClient>>,
@@ -438,6 +511,7 @@ struct Config {
     rimg_resource_collector: RimgResourceCollector,
     executor_socket: Option<PathBuf>,
     access: Option<CloudflareAccessConfig>,
+    credential_directory: Option<PathBuf>,
 }
 
 impl Config {
@@ -494,6 +568,13 @@ impl Config {
             }
         };
         let access = CloudflareAccessConfig::from_env()?;
+        let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+        if credential_directory
+            .as_deref()
+            .is_some_and(|path| validate_configured_data_dir(path).is_err())
+        {
+            return Err(ConfigError::InvalidCredentialDirectory);
+        }
         Ok(Self {
             listen,
             data_dir,
@@ -501,6 +582,7 @@ impl Config {
             rimg_resource_collector,
             executor_socket,
             access,
+            credential_directory,
         })
     }
 }
@@ -563,6 +645,8 @@ enum ConfigError {
     EmptyDataDirectory,
     #[error("RDASHBOARD_DATA_DIR must be valid Unicode")]
     NonUnicodeDataDirectory,
+    #[error("CREDENTIALS_DIRECTORY must be absolute, normalized and bounded")]
+    InvalidCredentialDirectory,
     #[error("RDASHBOARD_RIMG_BASE_URL is invalid: {0}")]
     RimgBaseUrl(RimgConfigError),
     #[error("RDASHBOARD_RIMG_RESOURCE_SOCKET is invalid: {0}")]

@@ -8,13 +8,17 @@ use http_body_util::BodyExt as _;
 use rdashboard::{
     controller::DurableController,
     domain::{
-        ControlSummary, DashboardEvent, DashboardSnapshot, GitCommitId, HostHistoryWindowKind,
-        HostTelemetry, ObservationStatus, ProjectCondition, ProjectId, ProjectResourceTelemetry,
-        ProjectTelemetry, PsiMeasurement,
+        ControlSummary, DashboardEvent, DashboardSnapshot, EvidenceDigest, GitCommitId,
+        HostHistoryWindowKind, HostTelemetry, ObservationStatus, ProjectCondition, ProjectId,
+        ProjectResourceTelemetry, ProjectTelemetry, PsiMeasurement,
+    },
+    integrations::{
+        ErrorInsightV1, ErrorLevelV1, InsightPriorityV1, InsightSourceV1, IntegrationFailureV1,
+        PROJECT_INTEGRATION_SCHEMA_VERSION, ProjectErrorsDataV1, ProjectUpdatesDataV1,
     },
     source::SourceTreeObservationV1,
     store::{
-        ControlStore, MINIMUM_SAFE_SQLITE_VERSION_NUMBER, MetricsStore,
+        ControlStore, IntegrationStore, MINIMUM_SAFE_SQLITE_VERSION_NUMBER, MetricsStore,
         PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, RepositorySampleWrite, StoreError,
     },
     unix_time_ms,
@@ -995,6 +999,128 @@ async fn project_repository_http_surface_retains_last_data_with_collection_error
         "source temporarily unavailable"
     );
     assert_eq!(history["samples"][0]["total_bytes"], 9_999);
+}
+
+fn integration_store_with_last_known_success(path: &Path) -> IntegrationStore {
+    let integrations = IntegrationStore::open(path.join("integrations.sqlite"))
+        .unwrap_or_else(|error| panic!("open integrations: {error}"));
+    let project_id =
+        ProjectId::from_str("rimg").unwrap_or_else(|error| panic!("project fixture: {error}"));
+    integrations
+        .record_errors_success(
+            10,
+            ProjectErrorsDataV1 {
+                schema_version: PROJECT_INTEGRATION_SCHEMA_VERSION,
+                project_id: project_id.clone(),
+                unresolved_groups: 0,
+                truncated: false,
+                total_events: 0,
+                affected_users: 0,
+                highest_level: ErrorLevelV1::Unknown,
+                groups: Vec::new(),
+                insight: ErrorInsightV1 {
+                    source: InsightSourceV1::Deterministic,
+                    priority: InsightPriorityV1::None,
+                    summary: "Открытых ошибок нет.".to_owned(),
+                    actions: Vec::new(),
+                    generated_at_ms: 10,
+                    input_digest: EvidenceDigest::sha256("empty"),
+                },
+                analysis_error: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("record errors: {error}"));
+    integrations
+        .record_errors_failure(
+            &project_id,
+            20,
+            IntegrationFailureV1::new("timeout", "GlitchTip временно недоступен.")
+                .unwrap_or_else(|error| panic!("failure: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("record error failure: {error}"));
+    integrations
+        .record_updates_success(
+            20,
+            ProjectUpdatesDataV1 {
+                schema_version: PROJECT_INTEGRATION_SCHEMA_VERSION,
+                project_id: project_id.clone(),
+                truncated: false,
+                updates: Vec::new(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("record updates: {error}"));
+    integrations
+}
+
+#[tokio::test]
+async fn project_integration_http_surface_is_scoped_and_preserves_last_success() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let control = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control: {error}"));
+    let integrations = integration_store_with_last_known_success(directory.path());
+    let app = router(
+        DashboardState::new(EventHub::new(control), Duration::from_secs(5))
+            .with_integration_store(integrations),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/projects/rimg/errors")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("errors response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let errors: serde_json::Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("read errors: {error}"))
+            .to_bytes(),
+    )
+    .unwrap_or_else(|error| panic!("decode errors: {error}"));
+    assert_eq!(errors["project_id"], "rimg");
+    assert_eq!(errors["successful_at_ms"], 10);
+    assert_eq!(errors["attempted_at_ms"], 20);
+    assert_eq!(errors["collection_error"]["code"], "timeout");
+    assert_eq!(errors["data"]["unresolved_groups"], 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/projects/rimg/updates")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("updates response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let updates: serde_json::Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("read updates: {error}"))
+            .to_bytes(),
+    )
+    .unwrap_or_else(|error| panic!("decode updates: {error}"));
+    assert_eq!(updates["data"]["updates"].as_array().map(Vec::len), Some(0));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/projects/other/errors")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("foreign errors response: {error}"));
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

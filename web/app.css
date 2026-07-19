@@ -428,6 +428,17 @@ tbody tr:last-child td {
   font-weight: 650;
 }
 
+.project-cell-link {
+  color: inherit;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.16em;
+}
+
+.project-cell-link:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
 .repository-changes {
   font-variant-numeric: tabular-nums;
   line-height: 1.35;

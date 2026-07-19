@@ -61,12 +61,18 @@ const runtime = {
   projectResourcesLoading: new Set(),
   projectRepositories: new Map(),
   projectRepositoriesLoading: new Set(),
+  projectUpdates: new Map(),
+  projectUpdatesLoading: new Set(),
+  projectErrors: new Map(),
+  projectErrorsLoading: new Set(),
 };
 
 const HOST_HISTORY_REFRESH_MS = 60_000;
 const PROJECT_OPERATIONS_REFRESH_MS = 30_000;
 const PROJECT_RESOURCES_REFRESH_MS = 60_000;
 const PROJECT_REPOSITORY_REFRESH_MS = 5 * 60_000;
+const PROJECT_INTEGRATIONS_REFRESH_MS = 60_000;
+const PROJECT_INTEGRATIONS_STALE_MS = 15 * 60_000;
 const HOST_HISTORY_WINDOWS = Object.freeze(["hour", "day", "week", "month"]);
 const REPOSITORY_PERIODS = Object.freeze([
   ["1 ч", 60 * 60_000],
@@ -338,6 +344,8 @@ function createProjectRow(project, loadIntegrations) {
   const operations = runtime.projectOperations.get(projectId);
   const resources = runtime.projectResources.get(projectId);
   const repository = runtime.projectRepositories.get(projectId);
+  const updates = runtime.projectUpdates.get(projectId);
+  const errors = runtime.projectErrors.get(projectId);
   row.append(
     identity,
     conditionCell,
@@ -351,14 +359,16 @@ function createProjectRow(project, loadIntegrations) {
       (operation) => operation.operation_kind === "backup_only",
     ),
     createRepositoryCell(repository),
-    createUnavailableCell(),
-    createUnavailableCell(),
+    createUpdatesCell(updates),
+    createErrorsCell(errors),
   );
 
   if (loadIntegrations) {
     loadProjectOperations(projectId, false);
     loadProjectResources(projectId, false);
     loadProjectRepository(projectId, false);
+    loadProjectUpdates(projectId, false);
+    loadProjectErrors(projectId, false);
   }
   return row;
 }
@@ -498,8 +508,120 @@ function formatByteChange(value) {
   return `${value > 0 ? "+" : "−"}${formatBytes(Math.abs(value))}`;
 }
 
-function createUnavailableCell() {
-  return createSummaryCell("Не настроено", "unknown");
+function createUpdatesCell(cached) {
+  if (!cached) return createSummaryCell("Загрузка…", "loading");
+  if (!cached.record) {
+    return createSummaryCell("Недоступно", "error", cached.fetchError || "Нет данных");
+  }
+  const { record } = cached;
+  if (record.data === null) {
+    const unconfigured = record.collection_error?.code === "github_not_configured";
+    return createSummaryCell(
+      unconfigured ? "Не настроено" : "Недоступно",
+      unconfigured ? "unknown" : "error",
+      record.collection_error?.detail || "Данные ещё не собраны",
+    );
+  }
+  const updates = record.data.updates;
+  const counts = { passing: 0, pending: 0, failing: 0, unknown: 0 };
+  for (const update of updates) counts[update.check_state] += 1;
+  let state = "fresh";
+  if (counts.failing > 0) state = "error";
+  else if (counts.pending > 0) state = "partial";
+  else if (counts.unknown > 0) state = "unknown";
+  if (record.collection_error || integrationRecordIsStale(record)) state = "stale";
+  const suffix = record.data.truncated ? "+" : "";
+  const cell = createSummaryCell(`${updates.length}${suffix} обновлений`, state);
+  const checkParts = [];
+  if (counts.passing) checkParts.push(`✓ ${counts.passing}`);
+  if (counts.pending) checkParts.push(`… ${counts.pending}`);
+  if (counts.failing) checkParts.push(`× ${counts.failing}`);
+  if (counts.unknown) checkParts.push(`? ${counts.unknown}`);
+  appendProjectCellDetail(cell, checkParts.length > 0 ? checkParts.join(" · ") : "Открытых нет");
+  if (updates.length > 0) {
+    appendProjectCellLink(cell, `#${updates[0].number} ${updates[0].title}`, updates[0].deep_link);
+  }
+  appendIntegrationFreshness(cell, record);
+  if (record.collection_error) appendProjectCellDetail(cell, record.collection_error.detail);
+  if (cached.fetchError) appendProjectCellDetail(cell, "API дашборда временно недоступен");
+  return cell;
+}
+
+function createErrorsCell(cached) {
+  if (!cached) return createSummaryCell("Загрузка…", "loading");
+  if (!cached.record) {
+    return createSummaryCell("Недоступно", "error", cached.fetchError || "Нет данных");
+  }
+  const { record } = cached;
+  if (record.data === null) {
+    const unconfigured = record.collection_error?.code === "glitchtip_not_configured";
+    return createSummaryCell(
+      unconfigured ? "Не настроено" : "Недоступно",
+      unconfigured ? "unknown" : "error",
+      record.collection_error?.detail || "Данные ещё не собраны",
+    );
+  }
+  const data = record.data;
+  if (data.unresolved_groups === 0) {
+    const state = record.collection_error || integrationRecordIsStale(record) ? "stale" : "fresh";
+    const cell = createSummaryCell("Нет открытых", state, "Проверено без вызова модели");
+    appendIntegrationFreshness(cell, record);
+    if (record.collection_error) appendProjectCellDetail(cell, record.collection_error.detail);
+    return cell;
+  }
+  let state = {
+    none: "fresh",
+    low: "fresh",
+    medium: "partial",
+    high: "error",
+    critical: "error",
+  }[data.insight.priority] || "unknown";
+  if (record.collection_error || integrationRecordIsStale(record)) state = "stale";
+  if (data.analysis_error && state === "fresh") state = "partial";
+  const suffix = data.truncated ? "+" : "";
+  const cell = createSummaryCell(
+    `${data.unresolved_groups}${suffix} групп · ${data.total_events} событий`,
+    state,
+    data.insight.summary,
+  );
+  const model = data.insight.source === "deepseek_v4_flash_free"
+    ? "DeepSeek Free"
+    : "Локальная сводка";
+  appendProjectCellDetail(cell, `${model} · приоритет ${data.insight.priority}`);
+  if (data.groups.length > 0) {
+    appendProjectCellLink(cell, data.groups[0].safe_label, data.groups[0].deep_link);
+  }
+  appendIntegrationFreshness(cell, record);
+  if (data.analysis_error) appendProjectCellDetail(cell, data.analysis_error.detail);
+  if (record.collection_error) appendProjectCellDetail(cell, record.collection_error.detail);
+  if (cached.fetchError) appendProjectCellDetail(cell, "API дашборда временно недоступен");
+  return cell;
+}
+
+function appendProjectCellLink(cell, text, href) {
+  const link = document.createElement("a");
+  link.className = "project-cell-detail project-cell-link";
+  link.href = href;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.referrerPolicy = "no-referrer";
+  link.textContent = text;
+  cell.append(link);
+}
+
+function appendIntegrationFreshness(cell, record) {
+  if (!Number.isSafeInteger(record.successful_at_ms)) return;
+  const label = record.collection_error || integrationRecordIsStale(record)
+    ? "Последние данные"
+    : "Обновлено";
+  appendProjectCellDetail(cell, `${label}: ${new Date(record.successful_at_ms).toLocaleString("ru-RU")}`);
+}
+
+function integrationRecordIsStale(record) {
+  const serverReferenceMs = currentServerReferenceMs();
+  return Number.isSafeInteger(record.successful_at_ms)
+    && Number.isFinite(serverReferenceMs)
+    && serverReferenceMs - record.successful_at_ms > PROJECT_INTEGRATIONS_STALE_MS;
 }
 
 function createOperationCell(cached, predicate) {
@@ -709,18 +831,291 @@ function validRepositoryHistory(payload, projectId) {
   return true;
 }
 
+async function loadProjectUpdates(projectId, refresh) {
+  await loadProjectIntegration(
+    projectId,
+    refresh,
+    "updates",
+    runtime.projectUpdates,
+    runtime.projectUpdatesLoading,
+    validProjectUpdatesRecord,
+  );
+}
+
+async function loadProjectErrors(projectId, refresh) {
+  await loadProjectIntegration(
+    projectId,
+    refresh,
+    "errors",
+    runtime.projectErrors,
+    runtime.projectErrorsLoading,
+    validProjectErrorsRecord,
+  );
+}
+
+async function loadProjectIntegration(projectId, refresh, route, cache, loading, validator) {
+  if (loading.has(projectId)) return;
+  if (!refresh && cache.has(projectId)) return;
+  loading.add(projectId);
+  try {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/${route}`,
+      { headers: { Accept: "application/json" }, cache: "no-store" },
+    );
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(problem.detail || "Интеграция проекта недоступна.");
+    }
+    const record = await response.json();
+    if (!validator(record, projectId)) {
+      throw new Error("Сервер вернул неподдерживаемый контракт интеграции.");
+    }
+    cache.set(projectId, { record });
+  } catch (error) {
+    const previous = cache.get(projectId);
+    cache.set(projectId, {
+      record: previous?.record ?? null,
+      fetchError: error.message,
+    });
+  } finally {
+    loading.delete(projectId);
+    refreshProjectOverview(projectId);
+  }
+}
+
+function validProjectErrorsRecord(record, projectId) {
+  if (!validIntegrationRecord(record, projectId, validProjectErrorsData)) return false;
+  return record.data === null || record.data.project_id === projectId;
+}
+
+function validProjectUpdatesRecord(record, projectId) {
+  if (!validIntegrationRecord(record, projectId, validProjectUpdatesData)) return false;
+  return record.data === null || record.data.project_id === projectId;
+}
+
+function validIntegrationRecord(record, projectId, validateData) {
+  if (!exactKeys(record, [
+    "schema_version",
+    "project_id",
+    "attempted_at_ms",
+    "successful_at_ms",
+    "collection_error",
+    "data",
+  ])) return false;
+  if (
+    record.schema_version !== 1
+    || record.project_id !== projectId
+    || !safeNonnegativeInteger(record.attempted_at_ms)
+    || !(record.successful_at_ms === null || safeNonnegativeInteger(record.successful_at_ms))
+    || (Number.isSafeInteger(record.successful_at_ms)
+      && record.successful_at_ms > record.attempted_at_ms)
+    || !(record.collection_error === null || validIntegrationFailure(record.collection_error))
+    || !(record.data === null || validateData(record.data, projectId))
+    || (record.successful_at_ms !== null) !== (record.data !== null)
+    || (record.collection_error === null && record.successful_at_ms !== record.attempted_at_ms)
+  ) return false;
+  return true;
+}
+
+function validProjectErrorsData(data, projectId) {
+  if (!exactKeys(data, [
+    "schema_version",
+    "project_id",
+    "unresolved_groups",
+    "truncated",
+    "total_events",
+    "affected_users",
+    "highest_level",
+    "groups",
+    "insight",
+    "analysis_error",
+  ])) return false;
+  if (
+    data.schema_version !== 1
+    || data.project_id !== projectId
+    || !safeNonnegativeInteger(data.unresolved_groups)
+    || typeof data.truncated !== "boolean"
+    || !safeNonnegativeInteger(data.total_events)
+    || !safeNonnegativeInteger(data.affected_users)
+    || !["debug", "info", "warning", "error", "fatal", "unknown"].includes(data.highest_level)
+    || !Array.isArray(data.groups)
+    || data.groups.length > 20
+    || data.unresolved_groups !== data.groups.length
+    || !data.groups.every(validErrorGroup)
+    || !validErrorInsight(data.insight)
+    || !(data.analysis_error === null || validIntegrationFailure(data.analysis_error))
+  ) return false;
+  const eventTotal = safeSum(data.groups.map((group) => group.event_count));
+  const userTotal = safeSum(data.groups.map((group) => group.affected_users));
+  if (eventTotal !== data.total_events || userTotal !== data.affected_users) return false;
+  if (data.unresolved_groups === 0) {
+    return data.truncated === false
+      && data.total_events === 0
+      && data.affected_users === 0
+      && data.highest_level === "unknown"
+      && data.insight.source === "deterministic"
+      && data.insight.priority === "none"
+      && data.analysis_error === null;
+  }
+  return true;
+}
+
+function validErrorGroup(group) {
+  return exactKeys(group, [
+    "safe_label",
+    "level",
+    "event_count",
+    "affected_users",
+    "first_seen",
+    "last_seen",
+    "deep_link",
+  ])
+    && typeof group.safe_label === "string"
+    && /^[A-Za-z0-9:_.$#]{1,96}$/.test(group.safe_label)
+    && ["debug", "info", "warning", "error", "fatal", "unknown"].includes(group.level)
+    && Number.isSafeInteger(group.event_count)
+    && group.event_count > 0
+    && safeNonnegativeInteger(group.affected_users)
+    && validProviderTimestamp(group.first_seen)
+    && validProviderTimestamp(group.last_seen)
+    && validHttpsLink(group.deep_link, "glitchtip.4u.ge");
+}
+
+function validErrorInsight(insight) {
+  return exactKeys(insight, [
+    "source",
+    "priority",
+    "summary",
+    "actions",
+    "generated_at_ms",
+    "input_digest",
+  ])
+    && ["deterministic", "deepseek_v4_flash_free"].includes(insight.source)
+    && ["none", "low", "medium", "high", "critical"].includes(insight.priority)
+    && boundedDisplayText(insight.summary, 512)
+    && Array.isArray(insight.actions)
+    && insight.actions.length <= 3
+    && insight.actions.every((action) => boundedDisplayText(action, 240))
+    && safeNonnegativeInteger(insight.generated_at_ms)
+    && typeof insight.input_digest === "string"
+    && /^[0-9a-f]{64}$/.test(insight.input_digest);
+}
+
+function validProjectUpdatesData(data, projectId) {
+  return exactKeys(data, ["schema_version", "project_id", "truncated", "updates"])
+    && data.schema_version === 1
+    && data.project_id === projectId
+    && typeof data.truncated === "boolean"
+    && Array.isArray(data.updates)
+    && data.updates.length <= 50
+    && data.updates.every(validDependencyUpdate);
+}
+
+function validDependencyUpdate(update) {
+  return exactKeys(update, [
+    "number",
+    "title",
+    "head_ref",
+    "head",
+    "updated_at",
+    "deep_link",
+    "check_state",
+  ])
+    && Number.isSafeInteger(update.number)
+    && update.number > 0
+    && boundedDisplayText(update.title, 240)
+    && typeof update.head_ref === "string"
+    && /^(?!\/)(?!.*\.\.)(?!.*\/$)[A-Za-z0-9/_.-]{1,160}$/.test(update.head_ref)
+    && typeof update.head === "string"
+    && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(update.head)
+    && validProviderTimestamp(update.updated_at)
+    && validHttpsLink(update.deep_link, "github.com")
+    && ["passing", "pending", "failing", "unknown"].includes(update.check_state);
+}
+
+function validIntegrationFailure(failure) {
+  return exactKeys(failure, ["code", "detail"])
+    && typeof failure.code === "string"
+    && /^[a-z0-9_]{1,64}$/.test(failure.code)
+    && boundedDisplayText(failure.detail, 240);
+}
+
+function validProviderTimestamp(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 48
+    && value.includes("T")
+    && (value.endsWith("Z") || value.includes("+"));
+}
+
+function validHttpsLink(value, requiredHost) {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && url.hostname === requiredHost
+      && url.username === ""
+      && url.password === ""
+      && url.hash === "";
+  } catch (_error) {
+    return false;
+  }
+}
+
+function exactKeys(value, expected) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function safeNonnegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function safeSum(values) {
+  let total = 0;
+  for (const value of values) {
+    if (!safeNonnegativeInteger(value) || !Number.isSafeInteger(total + value)) return null;
+    total += value;
+  }
+  return total;
+}
+
+function boundedDisplayText(value, maximumBytes) {
+  return typeof value === "string"
+    && value.length > 0
+    && value === value.trim()
+    && new TextEncoder().encode(value).length <= maximumBytes
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 function updateSampleAge() {
   if (!runtime.latestSnapshot) {
     elements.sampleAge.textContent = "Нет данных";
     return;
   }
-  const elapsedMs = performance.now() - runtime.snapshotReceivedAtMonotonicMs;
-  const ageMs = Number.isFinite(runtime.snapshotBaseAgeMs) && Number.isFinite(elapsedMs)
-    ? runtime.snapshotBaseAgeMs + Math.max(0, elapsedMs)
-    : null;
+  const ageMs = currentSnapshotAgeMs();
   const observation = evaluateHostObservation(runtime.latestSnapshot, ageMs);
   elements.sampleAge.textContent = formatSampleAge(observation.ageSeconds);
   refreshProjectConditions(observation.status);
+}
+
+function currentSnapshotAgeMs() {
+  const elapsedMs = performance.now() - runtime.snapshotReceivedAtMonotonicMs;
+  return Number.isFinite(runtime.snapshotBaseAgeMs) && Number.isFinite(elapsedMs)
+    ? runtime.snapshotBaseAgeMs + Math.max(0, elapsedMs)
+    : null;
+}
+
+function currentServerReferenceMs() {
+  const generatedAtMs = runtime.latestSnapshot?.generated_at_ms;
+  const ageMs = currentSnapshotAgeMs();
+  if (!Number.isSafeInteger(generatedAtMs) || !Number.isFinite(ageMs)) return null;
+  const serverReferenceMs = generatedAtMs + ageMs;
+  return Number.isFinite(serverReferenceMs) && serverReferenceMs <= Number.MAX_SAFE_INTEGER
+    ? serverReferenceMs
+    : null;
 }
 
 function refreshProjectConditions(hostObservationStatus) {
@@ -910,6 +1305,14 @@ window.setInterval(() => {
     loadProjectRepository(String(project.project_id), true);
   }
 }, PROJECT_REPOSITORY_REFRESH_MS);
+window.setInterval(() => {
+  if (!runtime.latestSnapshot?.projects) return;
+  for (const project of runtime.latestSnapshot.projects) {
+    const projectId = String(project.project_id);
+    loadProjectUpdates(projectId, true);
+    loadProjectErrors(projectId, true);
+  }
+}, PROJECT_INTEGRATIONS_REFRESH_MS);
 
 loadHostHistory(true);
 
