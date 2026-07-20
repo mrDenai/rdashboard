@@ -1,11 +1,12 @@
 # GitHub-independent delivery implementation review
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
-- Status: slices 1a and 1b complete locally; authorized live baseline remains pending
+- Status: slices 1a, 1b and 2a complete locally; step 2 runtime integration and the authorized live baseline remain pending
 - Review date: 2026-07-20
 - Baseline HEAD: `d20cf342dac204c51d30a32009eeb9c58097c8aa`
-- Local implementation commit: `64e64f2` (`Add persistent resource observer`)
-- Final staged diff SHA-256: `ca9712b8517e0a7c42c6672d81abed2e8c74165337306dca0ded2bc5c36e6432`
+- Local implementation commits: `64e64f2` (`Add persistent resource observer`), `581a432`
+  (`Add adapter execution receipts`)
+- Slice 1a staged diff SHA-256: `ca9712b8517e0a7c42c6672d81abed2e8c74165337306dca0ded2bc5c36e6432`
 
 ## Reviewed scope
 
@@ -162,3 +163,119 @@ Slice 1b is production-worthy as a local, inactive implementation and may be com
 install the helper, restart systemd, run against the live VPS, activate deployment authority or complete
 the one-hour baseline/comparison. Step 1 therefore remains open only for that separately authorized live
 evidence; Step 2 remains the next local implementation dependency.
+
+## Slice 2a: installed workflow contract and durable scheduler journal
+
+### Reviewed scope
+
+Slice 2a adds the inactive repository-agnostic scheduling core without installing a worker or duplicating
+the existing privileged effect journal:
+
+- `ProjectManifestV2` and the generated V2 schema add a strict finite workflow DAG while preserving the
+  V1 manifest and schema. The root-installed loader accepts only stable owner-private canonical `.jcs`
+  files and binds the complete manifest to its workflow-policy digest.
+- The workflow domain names only fixed node kinds, adapters, worker pools, network/cache classes,
+  timeouts, resource envelopes and artifact contracts. Canonical leases bind the complete execution
+  profile, exact source/policy/preparation/input identity, worker, host, generation and deadline.
+- Control schema version 2 atomically adds strict request, trigger, head, attempt, node/dependency,
+  lease, receipt, reduction, mutation-lock, transition and fairness-cursor tables, with a tested V1
+  reopen migration.
+- The scheduler implements stable cross-channel admission identity, source high-water checks,
+  pre-mutation supersession, project mutation single-flight, weighted cross-project claims,
+  generation-bound lease expiry, late/conflicting receipt rejection and deterministic reduction.
+- Required preparation and release builds stay in the VPS-required pool. Optional i9-style compute can
+  claim verification only and therefore cannot own a required preparation or deployment artifact.
+- Two different project fixtures exercise the same catalog, queue and protocol model. The `ralert`
+  source manifest is upgraded to inactive V2, but no installed canonical mirror, worker runtime or
+  deployment is enabled.
+
+The exact staged code/config/test diff contains 17 paths, 6,025 insertions and 38 deletions. Shared dirty
+`src/lib.rs` and `tests/store_and_web.rs` were staged by hunk; notification implementation and its
+workflow artifacts remain outside this review.
+
+### First independent consultation and self-review disposition
+
+- Route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`.
+- Status: `ANSWERED`, one attempt, CLI `1.18.3`, 270 seconds.
+- Reviewed state fingerprint:
+  `2421725e8399f541d2e00044f48a3b502bb1868d96200a65026bb099da856884`.
+- Brief SHA-256: `b5e6bd86b9cc8a6ae406b7854cf6cd074bb3ac09188102ed0026ad3b109f336c`.
+- Response: `consult-slice2a-deepseek/response.md`; verdict `SAFE`, no P0-P2 finding.
+
+The first response reviewed staged hash
+`d749fd30d8fe1df1d129cddf62816b8f9f0f8bcbf892c504634851ed0e4ee9c8`. Independent self-review did
+not stop at that verdict and found hardening gaps the consultation had missed:
+
+1. Canonical leases named a profile but did not carry its full runtime envelope. They now digest-bind
+   network, cache, timeout, resources and input/output artifact contracts and reject a controller-managed
+   or kind-inconsistent worker lease.
+2. The optional build-compute pool could own the only host-preparation node. Authoritative preparation
+   now remains VPS-required; optional compute can claim verification but neither preparation nor release.
+3. A previously persisted reduction replayed its cached receipt without re-reading source receipts.
+   Replay now reconstructs the complete evidence set, validates row/document/node bindings and rejects a
+   reduction timestamp earlier than its latest committed input.
+4. Several conditionally updated rows were assumed rather than counted. Lease, node, attempt, request and
+   mutation-lock transitions now require the exact affected-row count; terminal success fails atomically
+   when the held project lock is missing.
+
+The hardening changed the reviewed source. Its exact staged code/config/test diff SHA-256 is now
+`ce07e41ae6aba45c499900fdded60b2eecb5bd8a4e5be56ba6707807e4da862e`; therefore a fresh final
+consultation was started rather than reusing the first `SAFE` response.
+
+### Verification after hardening
+
+- Bare `bin/ci`: **passed**, exit code 0.
+- Covered formatting, Clippy with warnings denied, 184 library tests with 2 credentialed live-provider
+  tests ignored, all binary/integration suites, the V1-to-V2 migration, 10 scheduler contract tests,
+  schema drift checks, 8 browser tests and the optimized release build.
+- The final optimized release build completed in 2 minutes 55 seconds.
+- New regression evidence covers optional accelerator placement, non-monotonic reduction rejection and
+  source-receipt tamper detection on persisted reduction replay after restart. Two end-to-end tests also
+  prove terminal success releases the mutation lock and wakes the newer head, while a missing held lock
+  rolls the entire terminal-receipt transaction back and leaves the observation node leased.
+- `git diff --cached --check`: passed.
+
+### Final consultation, findings and closure
+
+Full post-hardening round:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 177 seconds;
+- state fingerprint: `3d2955ae9c1bc1bb1e2f88679771bf509b1a39ae9e02e68eb2ef2e7398d901f7`;
+- brief SHA-256: `d73d0a228457e22b98a118371cce4e286a0a673966b7fa4da9ffb001a664400a`;
+- response: `consult-slice2a-deepseek-final/response.md`;
+- verdict: `SAFE`, no P0/P1, with one actionable low-confidence P2.
+
+Finding dispositions:
+
+1. **Accepted P2 — non-mutation expiry did not count the guarded node update.** The active lease,
+   `leased -> ready` node and attempt timestamp updates now each require exactly one affected row.
+2. **Partially accepted latency suggestion — combine expiry with its following operation.** `claim_next`
+   now expires and claims inside one immediate transaction. The same change for receipt submission was
+   tested and rejected: the expected late-receipt error rolled back the expiry and left the node leased.
+   `commit_node_receipt` therefore intentionally commits expiry first, then validates the receipt in a
+   second transaction; a regression test proves the expired node remains ready after rejection.
+3. **Verified no-finding — terminal receipt replay.** Exact receipt replay exits through the persisted
+   receipt branch and does not rerun lock release; no idempotency defect exists.
+4. **Verified no-findings — reduction ordering and lease generation.** Both are canonical and monotonic
+   by construction and persisted checks.
+
+Exact closure round:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 67 seconds;
+- state fingerprint: `61a57a32bb45af11165c4ea96f4119fbd16b1924f6ea22fb945c20fcef3496a1`;
+- brief SHA-256: `92e1f67ba173ff10ff8bfbba823134b5deb2a69410be4f07c131348af25bc934`;
+- response: `consult-slice2a-deepseek-closure/response.md`;
+- verdict: `SAFE`; the P2 is fixed, the deliberate receipt transaction boundary is correct, and no
+  P0-P2 regression remains.
+
+The final exact staged code/config/test diff SHA-256 (workflow artifacts excluded) is
+`cf105882140ff6d8b57806823ee6e27cbda9497fc9ee806099bc0df3a204b2df`.
+
+### Verdict
+
+Slice 2a is production-worthy as an inactive local foundation and may be committed. It does not expose
+an unauthenticated scheduling surface or activate a deploy: the worker protocol/runtime, cleanup
+reconciliation, controller/web projection and source ingress remain explicit subsequent work. No VPS
+installation, GitHub/provider mutation, push, service restart or deployment was performed.

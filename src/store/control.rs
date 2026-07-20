@@ -11,7 +11,7 @@ use crate::domain::{DashboardEvent, EVENT_PROTOCOL_VERSION, EventEnvelope};
 use super::{StoreError, lock_connection, verify_sqlite_version};
 
 const EVENT_HISTORY_LIMIT: i64 = 512;
-const CONTROL_SCHEMA_VERSION: i64 = 1;
+const CONTROL_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Debug)]
 pub struct ControlStore {
@@ -26,6 +26,10 @@ pub struct EventHistoryWindow {
 }
 
 impl ControlStore {
+    // Keeping the complete STRICT schema in one immediate transaction makes a partially installed
+    // control journal impossible; splitting the declarative DDL only to satisfy a line counter would
+    // obscure that atomic boundary.
+    #[allow(clippy::too_many_lines)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         verify_sqlite_version()?;
         let mut connection = Connection::open(path)?;
@@ -119,6 +123,181 @@ impl ControlStore {
                 occurred_at_ms INTEGER NOT NULL,
                 PRIMARY KEY(attempt_id, sequence)
             ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_requests (
+                request_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                workflow_policy_digest TEXT NOT NULL,
+                source_sha TEXT NOT NULL,
+                operation_kind TEXT NOT NULL CHECK(operation_kind IN ('deploy')),
+                source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+                source_attestation_digest TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 3),
+                state TEXT NOT NULL CHECK(state IN ('active', 'superseded', 'terminal')),
+                superseded_by_request_id TEXT REFERENCES workflow_requests(request_id),
+                created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+                updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+                UNIQUE(project_id, workflow_policy_digest, source_sha, operation_kind),
+                CHECK((state = 'superseded') = (superseded_by_request_id IS NOT NULL))
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS workflow_requests_project_state
+                ON workflow_requests(project_id, state, created_at_ms);
+
+            CREATE TABLE IF NOT EXISTS workflow_project_heads (
+                project_id TEXT PRIMARY KEY,
+                source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+                source_sha TEXT NOT NULL,
+                request_id TEXT NOT NULL REFERENCES workflow_requests(request_id),
+                updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_triggers (
+                channel TEXT NOT NULL CHECK(channel IN (
+                    'github_webhook', 'source_reconciliation', 'direct_push'
+                )),
+                delivery_id TEXT NOT NULL,
+                payload_digest TEXT NOT NULL,
+                request_id TEXT NOT NULL REFERENCES workflow_requests(request_id),
+                received_at_ms INTEGER NOT NULL CHECK(received_at_ms >= 0),
+                PRIMARY KEY(channel, delivery_id)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL REFERENCES workflow_requests(request_id),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+                preparation_key TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'queued', 'waiting_for_mutation', 'running', 'succeeded', 'failed',
+                    'superseded', 'needs_reconcile'
+                )),
+                mutation_state TEXT NOT NULL CHECK(mutation_state IN (
+                    'not_started', 'owned', 'needs_reconcile', 'complete'
+                )),
+                cleanup_state TEXT NOT NULL CHECK(cleanup_state IN ('complete', 'pending')),
+                created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+                updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+                terminal_at_ms INTEGER,
+                UNIQUE(request_id, attempt_number),
+                CHECK((state IN ('succeeded', 'failed', 'superseded')) =
+                    (terminal_at_ms IS NOT NULL))
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS workflow_attempts_state
+                ON workflow_attempts(state, created_at_ms);
+
+            CREATE TABLE IF NOT EXISTS workflow_nodes (
+                attempt_id TEXT NOT NULL REFERENCES workflow_attempts(attempt_id),
+                node_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                node_kind TEXT NOT NULL,
+                activation TEXT NOT NULL CHECK(activation IN ('always', 'on_mutation_failure')),
+                profile_id TEXT NOT NULL,
+                worker_pool TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'dormant', 'blocked', 'ready', 'leased', 'succeeded', 'failed',
+                    'cancelled', 'needs_reconcile'
+                )),
+                lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),
+                output_digest TEXT,
+                receipt_digest TEXT,
+                completed_at_ms INTEGER,
+                PRIMARY KEY(attempt_id, node_id),
+                UNIQUE(attempt_id, ordinal),
+                CHECK((state = 'succeeded') = (output_digest IS NOT NULL)),
+                CHECK((state IN ('succeeded', 'failed', 'cancelled', 'needs_reconcile')) =
+                    (completed_at_ms IS NOT NULL))
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS workflow_nodes_ready
+                ON workflow_nodes(state, worker_pool, ordinal);
+
+            CREATE TABLE IF NOT EXISTS workflow_node_dependencies (
+                attempt_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                dependency_node_id TEXT NOT NULL,
+                PRIMARY KEY(attempt_id, node_id, dependency_node_id),
+                FOREIGN KEY(attempt_id, node_id)
+                    REFERENCES workflow_nodes(attempt_id, node_id),
+                FOREIGN KEY(attempt_id, dependency_node_id)
+                    REFERENCES workflow_nodes(attempt_id, node_id)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_lease_journal (
+                lease_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                worker_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                expected_input_digest TEXT NOT NULL,
+                lease_digest TEXT NOT NULL UNIQUE,
+                lease_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'active', 'expired', 'committed', 'revoked'
+                )),
+                leased_at_ms INTEGER NOT NULL CHECK(leased_at_ms >= 0),
+                expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms > leased_at_ms),
+                closed_at_ms INTEGER,
+                receipt_digest TEXT,
+                UNIQUE(attempt_id, node_id, generation),
+                FOREIGN KEY(attempt_id, node_id)
+                    REFERENCES workflow_nodes(attempt_id, node_id),
+                CHECK((state = 'active') = (closed_at_ms IS NULL))
+            ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS workflow_active_node_lease
+                ON workflow_lease_journal(attempt_id, node_id) WHERE state = 'active';
+
+            CREATE TABLE IF NOT EXISTS workflow_node_receipts (
+                receipt_digest TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                lease_id TEXT NOT NULL UNIQUE REFERENCES workflow_lease_journal(lease_id),
+                receipt_json TEXT NOT NULL,
+                committed_at_ms INTEGER NOT NULL CHECK(committed_at_ms >= 0),
+                UNIQUE(attempt_id, node_id),
+                FOREIGN KEY(attempt_id, node_id)
+                    REFERENCES workflow_nodes(attempt_id, node_id)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_reductions (
+                attempt_id TEXT PRIMARY KEY REFERENCES workflow_attempts(attempt_id),
+                reduce_node_id TEXT NOT NULL,
+                receipt_digest TEXT NOT NULL UNIQUE,
+                receipt_json TEXT NOT NULL,
+                committed_at_ms INTEGER NOT NULL CHECK(committed_at_ms >= 0),
+                FOREIGN KEY(attempt_id, reduce_node_id)
+                    REFERENCES workflow_nodes(attempt_id, node_id)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_mutation_locks (
+                project_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL UNIQUE REFERENCES workflow_attempts(attempt_id),
+                state TEXT NOT NULL CHECK(state IN ('held', 'needs_reconcile')),
+                acquired_at_ms INTEGER NOT NULL CHECK(acquired_at_ms >= 0),
+                updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= acquired_at_ms)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_transitions (
+                attempt_id TEXT NOT NULL REFERENCES workflow_attempts(attempt_id),
+                sequence INTEGER NOT NULL CHECK(sequence > 0),
+                subject_kind TEXT NOT NULL CHECK(subject_kind IN ('attempt', 'node', 'lease')),
+                subject_id TEXT NOT NULL,
+                from_state TEXT,
+                to_state TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                evidence_digest TEXT,
+                occurred_at_ms INTEGER NOT NULL CHECK(occurred_at_ms >= 0),
+                PRIMARY KEY(attempt_id, sequence)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_scheduler_cursor (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                last_project_id TEXT,
+                remaining_weight INTEGER NOT NULL DEFAULT 0 CHECK(remaining_weight >= 0)
+            ) STRICT;
+            INSERT OR IGNORE INTO workflow_scheduler_cursor(
+                singleton, last_project_id, remaining_weight
+            ) VALUES (1, NULL, 0);
             ",
         )?;
         initialize_control_schema_version(&transaction)?;
@@ -406,6 +585,13 @@ fn initialize_control_schema_version(transaction: &Transaction<'_>) -> Result<()
         .optional()?;
     match version {
         Some(CONTROL_SCHEMA_VERSION) => Ok(()),
+        Some(1) => {
+            transaction.execute(
+                "UPDATE controller_meta SET integer_value = ?1 WHERE key = 'schema_version'",
+                [CONTROL_SCHEMA_VERSION],
+            )?;
+            Ok(())
+        }
         Some(actual) => Err(StoreError::UnsupportedControlSchemaVersion {
             actual,
             supported: CONTROL_SCHEMA_VERSION,
@@ -432,6 +618,18 @@ fn validate_control_schema(transaction: &Transaction<'_>) -> Result<(), StoreErr
         "controller_action_grants",
         "transport_deliveries",
         "operation_transitions",
+        "workflow_requests",
+        "workflow_project_heads",
+        "workflow_triggers",
+        "workflow_attempts",
+        "workflow_nodes",
+        "workflow_node_dependencies",
+        "workflow_lease_journal",
+        "workflow_node_receipts",
+        "workflow_reductions",
+        "workflow_mutation_locks",
+        "workflow_transitions",
+        "workflow_scheduler_cursor",
     ];
     for table in required_tables {
         if !control_table_exists(transaction, table)? {
@@ -447,6 +645,19 @@ fn validate_control_schema(transaction: &Transaction<'_>) -> Result<(), StoreErr
         ("controller_action_grants", "grant_digest"),
         ("transport_deliveries", "payload_digest"),
         ("operation_transitions", "transition_json"),
+        ("workflow_requests", "manifest_json"),
+        ("workflow_project_heads", "source_sequence"),
+        ("workflow_triggers", "payload_digest"),
+        ("workflow_attempts", "preparation_key"),
+        ("workflow_nodes", "worker_pool"),
+        ("workflow_node_dependencies", "dependency_node_id"),
+        ("workflow_lease_journal", "lease_json"),
+        ("workflow_node_receipts", "receipt_json"),
+        ("workflow_reductions", "receipt_json"),
+        ("workflow_mutation_locks", "state"),
+        ("workflow_transitions", "reason"),
+        ("workflow_scheduler_cursor", "last_project_id"),
+        ("workflow_scheduler_cursor", "remaining_weight"),
     ] {
         if !control_column_exists(transaction, table, column)? {
             return Err(StoreError::CorruptControlSchema(column));

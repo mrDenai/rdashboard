@@ -101,7 +101,8 @@ Implementation progress:
 | Step | Status | Current evidence |
 | --- | --- | --- |
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
-| 2-12 | Pending | Dependency-ordered behind step 1; external activation gates remain unchanged. |
+| 2. Installed workflow and scheduler journal | In progress | Slice 2a locally implements the strict V2 installed DAG, atomic control-schema migration, stable admission identity, fair durable claims, pre-mutation supersession, deploy single-flight, generation-bound leases, mutation reconciliation, deterministic reduction and two-project contracts. The authenticated worker socket/runtime, cleanup reconciliation and controller/web projection remain before step 2 can close. |
+| 3-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
 
@@ -142,6 +143,33 @@ Implementation ledger:
   reserve from a real reserve deficit. Both were implemented and tested. The final exact-manifest
   review found no P0-P2 issue and approved the staged slice for a local commit; its P3 observations
   were verified as non-blocking contract/test hygiene.
+- Slice 2a preserves the legacy V1 manifest/schema and adds a strict canonical V2 manifest whose
+  workflow policy is a finite typed DAG. Profiles name only fixed adapters, worker pools, network and
+  cache classes, bounded timeouts/resources and typed artifact contracts. The committed `ralert`
+  catalog fixture is upgraded to V2 without enabling a deploy; production installation requires a
+  separately generated canonical `.jcs` mirror and later authorization.
+- The new scheduler tables live in `control.sqlite` under schema version 2 and do not replace the
+  existing privileged security/effect journal. They persist stable request identity, trigger replay,
+  source high-water state, attempts, nodes/dependencies, preparation keys, fair claims, leases,
+  receipts, reductions, mutation locks and transitions in immediate transactions. Newer heads cancel
+  only pre-mutation work; a failed or expired mutation lease retains ownership as `needs_reconcile`.
+- Self-review after the first independent `SAFE` response strengthened the exact contract further:
+  leases now carry and digest-bind the complete network/cache/timeout/resource/artifact profile;
+  authoritative preparation and release remain VPS-required while optional i9 compute may claim only
+  verification; persisted reductions revalidate every source lease/receipt after restart and enforce a
+  monotonic evidence time; and success cannot discard a missing mutation lock or a failed conditional
+  journal update. These corrections are covered by the scheduler contract suite.
+- The final bare `bin/ci` passed with 184 library tests (2 credentialed live-provider tests ignored),
+  every binary/integration suite, strict V1-to-V2 migration and schema checks, 10 scheduler contracts,
+  8 browser tests and the optimized release build. End-to-end scheduler evidence now covers both the
+  successful lock-release/new-head handoff and atomic terminal-receipt rollback when the held mutation
+  lock is missing.
+- Three `deepseek-free` rounds were used because each material correction changed the exact staged
+  manifest. The closing review verified the one actionable P2 was fixed: expiry now counts every
+  guarded row. `claim_next` combines expiry and claim in one immediate transaction; receipt submission
+  deliberately retains a preceding expiry transaction because the gate proved a late-receipt error
+  otherwise rolls the expiry back. The final exact staged code/config/test hash is
+  `cf105882140ff6d8b57806823ee6e27cbda9497fc9ee806099bc0df3a204b2df`, with no open P0-P2 finding.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

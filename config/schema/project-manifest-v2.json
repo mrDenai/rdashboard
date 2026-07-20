@@ -1,0 +1,501 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProjectManifestV2",
+  "type": "object",
+  "properties": {
+    "build": {
+      "$ref": "#/$defs/BuildPolicy"
+    },
+    "ci": {
+      "$ref": "#/$defs/CiPolicy"
+    },
+    "data_volumes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DataVolumePolicy"
+      }
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "health_checks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/HealthCheckPolicy"
+      }
+    },
+    "migration": {
+      "$ref": "#/$defs/MigrationPolicy"
+    },
+    "notifications": {
+      "$ref": "#/$defs/NotificationPolicy"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "rollback": {
+      "$ref": "#/$defs/RollbackPolicy"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "source": {
+      "$ref": "#/$defs/SourcePolicy"
+    },
+    "workflow": {
+      "$ref": "#/$defs/WorkflowPolicyV1"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_id",
+    "display_name",
+    "source",
+    "ci",
+    "build",
+    "workflow",
+    "health_checks",
+    "data_volumes",
+    "migration",
+    "rollback",
+    "notifications"
+  ],
+  "$defs": {
+    "BuildContext": {
+      "type": "string",
+      "enum": [
+        "repository_root"
+      ]
+    },
+    "BuildPolicy": {
+      "type": "object",
+      "properties": {
+        "context": {
+          "$ref": "#/$defs/BuildContext"
+        },
+        "dockerfile": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "context",
+        "dockerfile"
+      ]
+    },
+    "CanonicalBranch": {
+      "type": "string",
+      "enum": [
+        "main"
+      ]
+    },
+    "CiPolicy": {
+      "type": "string",
+      "enum": [
+        "bin_ci"
+      ]
+    },
+    "DataClass": {
+      "type": "string",
+      "enum": [
+        "stateful",
+        "derived",
+        "ephemeral"
+      ]
+    },
+    "DataVolumePolicy": {
+      "type": "object",
+      "properties": {
+        "backup_required": {
+          "type": "boolean"
+        },
+        "class": {
+          "$ref": "#/$defs/DataClass"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "class",
+        "backup_required"
+      ]
+    },
+    "HealthCheckPolicy": {
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "type": "string"
+        },
+        "expected_status": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "name": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "endpoint",
+        "expected_status",
+        "timeout_seconds"
+      ]
+    },
+    "MigrationEntrypoint": {
+      "type": "string",
+      "enum": [
+        "none",
+        "application_migrate"
+      ]
+    },
+    "MigrationPolicy": {
+      "type": "object",
+      "properties": {
+        "entrypoint": {
+          "$ref": "#/$defs/MigrationEntrypoint"
+        },
+        "write_fence": {
+          "$ref": "#/$defs/WriteFencePolicy"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "entrypoint",
+        "write_fence"
+      ]
+    },
+    "NotificationPolicy": {
+      "type": "object",
+      "properties": {
+        "maintenance_suppression": {
+          "type": "boolean"
+        },
+        "route": {
+          "$ref": "#/$defs/NotificationRoute"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "route",
+        "maintenance_suppression"
+      ]
+    },
+    "NotificationRoute": {
+      "type": "string",
+      "enum": [
+        "telegram_default"
+      ]
+    },
+    "RollbackPolicy": {
+      "type": "object",
+      "properties": {
+        "code_rollback": {
+          "type": "boolean"
+        },
+        "soak_seconds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code_rollback",
+        "soak_seconds"
+      ]
+    },
+    "SourcePolicy": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "$ref": "#/$defs/CanonicalBranch"
+        },
+        "remote_url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "remote_url",
+        "branch"
+      ]
+    },
+    "WorkflowAdapterIdV1": {
+      "type": "string",
+      "enum": [
+        "controller_source_admission_v1",
+        "worker_host_prepare_v1",
+        "worker_bare_bin_ci_v1",
+        "worker_native_release_build_v1",
+        "worker_oci_release_build_v1",
+        "controller_reduce_v1",
+        "executor_resource_reserve_v1",
+        "executor_backup_v1",
+        "executor_migration_v1",
+        "executor_candidate_health_v1",
+        "executor_cutover_v1",
+        "executor_released_observe_v1",
+        "executor_rollback_v1"
+      ]
+    },
+    "WorkflowArtifactKindV1": {
+      "type": "string",
+      "enum": [
+        "source_snapshot",
+        "prepared_run",
+        "verification_receipt",
+        "release_bundle",
+        "reduction_receipt",
+        "resource_reservation",
+        "backup_receipt",
+        "migration_receipt",
+        "candidate_health_receipt",
+        "cutover_receipt",
+        "released_observation_receipt",
+        "rollback_receipt"
+      ]
+    },
+    "WorkflowCacheClassV1": {
+      "type": "string",
+      "enum": [
+        "none",
+        "dependency",
+        "prepared_run"
+      ]
+    },
+    "WorkflowExecutionProfileV1": {
+      "type": "object",
+      "properties": {
+        "adapter_id": {
+          "$ref": "#/$defs/WorkflowAdapterIdV1"
+        },
+        "cache_class": {
+          "$ref": "#/$defs/WorkflowCacheClassV1"
+        },
+        "network_class": {
+          "$ref": "#/$defs/WorkflowNetworkClassV1"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "resources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowResourceEnvelopeV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "worker_pool": {
+          "$ref": "#/$defs/WorkflowWorkerPoolV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "adapter_id",
+        "worker_pool",
+        "network_class",
+        "cache_class",
+        "timeout_ms"
+      ]
+    },
+    "WorkflowNetworkClassV1": {
+      "type": "string",
+      "enum": [
+        "offline",
+        "dependency_egress",
+        "local_health_only"
+      ]
+    },
+    "WorkflowNodeActivationV1": {
+      "type": "string",
+      "enum": [
+        "always",
+        "on_mutation_failure"
+      ]
+    },
+    "WorkflowNodeKindV1": {
+      "type": "string",
+      "enum": [
+        "source_admission",
+        "host_prepare",
+        "verification",
+        "release_build",
+        "deterministic_reduce",
+        "resource_reservation",
+        "backup",
+        "migration",
+        "candidate_health",
+        "cutover",
+        "released_observation",
+        "rollback"
+      ]
+    },
+    "WorkflowNodeV1": {
+      "type": "object",
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/WorkflowNodeActivationV1"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "input_contracts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkflowArtifactKindV1"
+          }
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkflowNodeKindV1"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "output_contract": {
+          "$ref": "#/$defs/WorkflowArtifactKindV1"
+        },
+        "profile_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "node_id",
+        "display_name",
+        "kind",
+        "activation",
+        "profile_id",
+        "depends_on",
+        "input_contracts",
+        "output_contract"
+      ]
+    },
+    "WorkflowPolicyV1": {
+      "type": "object",
+      "properties": {
+        "execution_profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkflowExecutionProfileV1"
+          }
+        },
+        "fairness_weight": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkflowNodeV1"
+          }
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "fairness_weight",
+        "execution_profiles",
+        "nodes"
+      ]
+    },
+    "WorkflowResourceEnvelopeV1": {
+      "type": "object",
+      "properties": {
+        "cpu_millicores": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "memory_max_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_max_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "scratch_max_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "scratch_max_inodes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tasks_max": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cpu_millicores",
+        "memory_max_bytes",
+        "tasks_max",
+        "scratch_max_bytes",
+        "scratch_max_inodes",
+        "output_max_bytes"
+      ]
+    },
+    "WorkflowWorkerPoolV1": {
+      "type": "string",
+      "enum": [
+        "controller",
+        "vps_required",
+        "build_compute",
+        "privileged_executor"
+      ]
+    },
+    "WriteFencePolicy": {
+      "type": "string",
+      "enum": [
+        "unsupported",
+        "application_protocol_v1"
+      ]
+    }
+  }
+}

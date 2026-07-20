@@ -9,9 +9,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use url::Url;
 
-use super::ProjectId;
+use super::{EvidenceDigest, ProjectId, WorkflowNodeKindV1, WorkflowPolicyV1};
 
 pub const PROJECT_MANIFEST_SCHEMA_VERSION: u16 = 1;
+pub const PROJECT_MANIFEST_V2_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -34,39 +35,148 @@ impl ProjectManifestV1 {
         if self.schema_version != PROJECT_MANIFEST_SCHEMA_VERSION {
             return Err(ManifestError::UnsupportedSchemaVersion(self.schema_version));
         }
-        let display_name = self.display_name.trim();
-        if display_name.is_empty() || display_name.len() > 96 {
-            return Err(ManifestError::InvalidDisplayName);
-        }
-        self.source.validate()?;
-        self.build.validate()?;
-        if self.health_checks.is_empty() {
-            return Err(ManifestError::MissingHealthCheck);
-        }
+        validate_common_manifest(
+            &self.display_name,
+            &self.source,
+            &self.build,
+            &self.health_checks,
+            &self.data_volumes,
+            &self.rollback,
+        )
+    }
+}
 
-        let mut health_names = HashSet::new();
-        for check in &self.health_checks {
-            check.validate()?;
-            if !health_names.insert(check.name.as_str()) {
-                return Err(ManifestError::DuplicateHealthCheck(check.name.clone()));
-            }
-        }
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectManifestV2 {
+    pub schema_version: u16,
+    pub project_id: ProjectId,
+    pub display_name: String,
+    pub source: SourcePolicy,
+    pub ci: CiPolicy,
+    pub build: BuildPolicy,
+    pub workflow: WorkflowPolicyV1,
+    pub health_checks: Vec<HealthCheckPolicy>,
+    pub data_volumes: Vec<DataVolumePolicy>,
+    pub migration: MigrationPolicy,
+    pub rollback: RollbackPolicy,
+    pub notifications: NotificationPolicy,
+}
 
-        let mut volume_paths = HashSet::new();
-        for volume in &self.data_volumes {
-            if volume.path.as_str() == "/" {
-                return Err(ManifestError::UnsafeDataPath(volume.path.to_string()));
-            }
-            if !volume_paths.insert(volume.path.as_str()) {
-                return Err(ManifestError::DuplicateDataPath(volume.path.to_string()));
-            }
-        }
+#[derive(Serialize)]
+struct ProjectManifestV2DigestPayload<'a> {
+    purpose: &'static str,
+    manifest: &'a ProjectManifestV2,
+}
 
-        if !(10..=86_400).contains(&self.rollback.soak_seconds) {
-            return Err(ManifestError::InvalidSoakDuration);
+impl ProjectManifestV2 {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.schema_version != PROJECT_MANIFEST_V2_SCHEMA_VERSION {
+            return Err(ManifestError::UnsupportedSchemaVersion(self.schema_version));
+        }
+        validate_common_manifest(
+            &self.display_name,
+            &self.source,
+            &self.build,
+            &self.health_checks,
+            &self.data_volumes,
+            &self.rollback,
+        )?;
+        self.workflow
+            .validate()
+            .map_err(|_| ManifestError::WorkflowInvalid)?;
+
+        let has_backup = self
+            .workflow
+            .nodes
+            .iter()
+            .any(|node| node.kind == WorkflowNodeKindV1::Backup);
+        let backup_required = self
+            .data_volumes
+            .iter()
+            .any(|volume| volume.backup_required);
+        if has_backup != backup_required {
+            return Err(ManifestError::WorkflowBackupMismatch);
+        }
+        let has_migration = self
+            .workflow
+            .nodes
+            .iter()
+            .any(|node| node.kind == WorkflowNodeKindV1::Migration);
+        let migration_required = self.migration.entrypoint != MigrationEntrypoint::None;
+        if has_migration != migration_required {
+            return Err(ManifestError::WorkflowMigrationMismatch);
         }
         Ok(())
     }
+
+    pub fn workflow_policy_digest(&self) -> Result<EvidenceDigest, ManifestError> {
+        self.validate()?;
+        Ok(EvidenceDigest::sha256(
+            serde_jcs::to_vec(&ProjectManifestV2DigestPayload {
+                purpose: "rdashboard.project-workflow-policy.v2",
+                manifest: self,
+            })
+            .map_err(|_| ManifestError::CanonicalEncoding)?,
+        ))
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ManifestError> {
+        self.validate()?;
+        serde_jcs::to_vec(self).map_err(|_| ManifestError::CanonicalEncoding)
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ManifestError> {
+        let manifest: Self =
+            serde_json::from_slice(bytes).map_err(|_| ManifestError::InvalidManifestJson)?;
+        if serde_jcs::to_vec(&manifest).map_err(|_| ManifestError::CanonicalEncoding)? != bytes {
+            return Err(ManifestError::NoncanonicalManifest);
+        }
+        manifest.validate()?;
+        Ok(manifest)
+    }
+}
+
+fn validate_common_manifest(
+    display_name: &str,
+    source: &SourcePolicy,
+    build: &BuildPolicy,
+    health_checks: &[HealthCheckPolicy],
+    data_volumes: &[DataVolumePolicy],
+    rollback: &RollbackPolicy,
+) -> Result<(), ManifestError> {
+    let display_name = display_name.trim();
+    if display_name.is_empty() || display_name.len() > 96 {
+        return Err(ManifestError::InvalidDisplayName);
+    }
+    source.validate()?;
+    build.validate()?;
+    if health_checks.is_empty() {
+        return Err(ManifestError::MissingHealthCheck);
+    }
+
+    let mut health_names = HashSet::new();
+    for check in health_checks {
+        check.validate()?;
+        if !health_names.insert(check.name.as_str()) {
+            return Err(ManifestError::DuplicateHealthCheck(check.name.clone()));
+        }
+    }
+
+    let mut volume_paths = HashSet::new();
+    for volume in data_volumes {
+        if volume.path.as_str() == "/" {
+            return Err(ManifestError::UnsafeDataPath(volume.path.to_string()));
+        }
+        if !volume_paths.insert(volume.path.as_str()) {
+            return Err(ManifestError::DuplicateDataPath(volume.path.to_string()));
+        }
+    }
+
+    if !(10..=86_400).contains(&rollback.soak_seconds) {
+        return Err(ManifestError::InvalidSoakDuration);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -375,4 +485,16 @@ pub enum ManifestError {
     InvalidDockerfilePath,
     #[error("soak duration must be between 10 seconds and 24 hours")]
     InvalidSoakDuration,
+    #[error("workflow backup node does not match backup-required data")]
+    WorkflowBackupMismatch,
+    #[error("workflow migration node does not match the declared migration entrypoint")]
+    WorkflowMigrationMismatch,
+    #[error("project manifest is not canonical JCS")]
+    NoncanonicalManifest,
+    #[error("workflow contract is invalid")]
+    WorkflowInvalid,
+    #[error("project manifest JSON is invalid")]
+    InvalidManifestJson,
+    #[error("project manifest canonical encoding failed")]
+    CanonicalEncoding,
 }

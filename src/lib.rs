@@ -46,6 +46,8 @@ pub mod installed_intent_resolver;
 pub mod installed_policy;
 #[cfg(unix)]
 pub mod installed_source;
+#[cfg(unix)]
+pub mod installed_workflow;
 pub mod integration_collectors;
 pub mod integrations;
 #[cfg(unix)]
@@ -68,6 +70,7 @@ pub mod rimg_adapter;
 pub mod root_adapter_runtime;
 #[cfg(unix)]
 pub mod root_fence_runtime;
+pub mod scheduler;
 pub mod source;
 #[cfg(unix)]
 pub mod source_socket;

@@ -1,12 +1,15 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
-use rdashboard::domain::{DataClass, MigrationEntrypoint, ProjectManifestV1, WriteFencePolicy};
+use rdashboard::domain::{
+    DataClass, MigrationEntrypoint, ProjectManifestV2, WorkflowAdapterIdV1, WorkflowNodeKindV1,
+    WorkflowWorkerPoolV1, WriteFencePolicy,
+};
 
 fn catalog_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/project-manifests")
 }
 
-fn catalog() -> Vec<(String, ProjectManifestV1)> {
+fn catalog() -> Vec<(String, ProjectManifestV2)> {
     let root = catalog_root();
     let mut files = fs::read_dir(&root)
         .unwrap_or_else(|error| panic!("read project manifest catalog {}: {error}", root.display()))
@@ -28,7 +31,7 @@ fn catalog() -> Vec<(String, ProjectManifestV1)> {
         .map(|path| {
             let bytes = fs::read(&path)
                 .unwrap_or_else(|error| panic!("read manifest {}: {error}", path.display()));
-            let manifest: ProjectManifestV1 =
+            let manifest: ProjectManifestV2 =
                 serde_json::from_slice(&bytes).unwrap_or_else(|error| {
                     panic!("decode strict manifest {}: {error}", path.display())
                 });
@@ -99,5 +102,49 @@ fn ralert_contract_separates_stateful_templates_from_disposable_images() {
             "http://ralert:8080/health/live",
             "http://ralert:8080/health/ready",
         ])
+    );
+
+    let verification = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::Verification)
+        .unwrap_or_else(|| panic!("ralert verification node is required"));
+    let verification_profile = manifest
+        .workflow
+        .profile(&verification.profile_id)
+        .unwrap_or_else(|| panic!("ralert verification profile is required"));
+    assert_eq!(
+        verification_profile.adapter_id,
+        WorkflowAdapterIdV1::WorkerBareBinCiV1
+    );
+    assert_eq!(
+        verification_profile.worker_pool,
+        WorkflowWorkerPoolV1::BuildCompute
+    );
+    assert_eq!(
+        manifest
+            .workflow
+            .nodes
+            .iter()
+            .filter(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+            .count(),
+        1,
+        "preparation is one first-class node, not a shard preamble"
+    );
+    let preparation = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+        .unwrap_or_else(|| panic!("ralert preparation node is required"));
+    assert_eq!(
+        manifest
+            .workflow
+            .profile(&preparation.profile_id)
+            .unwrap_or_else(|| panic!("ralert preparation profile is required"))
+            .worker_pool,
+        WorkflowWorkerPoolV1::VpsRequired,
+        "the authoritative preparation cannot be owned only by optional compute"
     );
 }

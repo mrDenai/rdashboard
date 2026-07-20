@@ -8,6 +8,7 @@ mod operation;
 mod redaction;
 mod states;
 mod telemetry;
+mod workflow;
 
 pub use budget::*;
 pub use events::*;
@@ -19,3 +20,4 @@ pub use operation::*;
 pub use redaction::*;
 pub use states::*;
 pub use telemetry::*;
+pub use workflow::*;

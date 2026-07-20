@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "project_id": "ralert",
   "display_name": "Ralert image renderer",
   "source": {
@@ -10,6 +10,286 @@
   "build": {
     "context": "repository_root",
     "dockerfile": "Dockerfile"
+  },
+  "workflow": {
+    "schema_version": 1,
+    "fairness_weight": 1,
+    "execution_profiles": [
+      {
+        "profile_id": "source-controller",
+        "adapter_id": "controller_source_admission_v1",
+        "worker_pool": "controller",
+        "network_class": "offline",
+        "cache_class": "none",
+        "timeout_ms": 1000,
+        "resources": null
+      },
+      {
+        "profile_id": "host-prepare",
+        "adapter_id": "worker_host_prepare_v1",
+      "worker_pool": "vps_required",
+        "network_class": "dependency_egress",
+        "cache_class": "dependency",
+        "timeout_ms": 900000,
+        "resources": {
+          "cpu_millicores": 3000,
+          "memory_max_bytes": 4294967296,
+          "tasks_max": 1024,
+          "scratch_max_bytes": 8589934592,
+          "scratch_max_inodes": 1000000,
+          "output_max_bytes": 1073741824
+        }
+      },
+      {
+        "profile_id": "bare-bin-ci",
+        "adapter_id": "worker_bare_bin_ci_v1",
+        "worker_pool": "build_compute",
+        "network_class": "offline",
+        "cache_class": "prepared_run",
+        "timeout_ms": 900000,
+        "resources": {
+          "cpu_millicores": 3000,
+          "memory_max_bytes": 4294967296,
+          "tasks_max": 1024,
+          "scratch_max_bytes": 8589934592,
+          "scratch_max_inodes": 1000000,
+          "output_max_bytes": 1073741824
+        }
+      },
+      {
+        "profile_id": "oci-release-build",
+        "adapter_id": "worker_oci_release_build_v1",
+        "worker_pool": "vps_required",
+        "network_class": "offline",
+        "cache_class": "prepared_run",
+        "timeout_ms": 900000,
+        "resources": {
+          "cpu_millicores": 3000,
+          "memory_max_bytes": 4294967296,
+          "tasks_max": 1024,
+          "scratch_max_bytes": 8589934592,
+          "scratch_max_inodes": 1000000,
+          "output_max_bytes": 4294967296
+        }
+      },
+      {
+        "profile_id": "reduce-controller",
+        "adapter_id": "controller_reduce_v1",
+        "worker_pool": "controller",
+        "network_class": "offline",
+        "cache_class": "none",
+        "timeout_ms": 1000,
+        "resources": null
+      },
+      {
+        "profile_id": "resource-reserve",
+        "adapter_id": "executor_resource_reserve_v1",
+        "worker_pool": "privileged_executor",
+        "network_class": "offline",
+        "cache_class": "none",
+        "timeout_ms": 10000,
+        "resources": {
+          "cpu_millicores": 500,
+          "memory_max_bytes": 268435456,
+          "tasks_max": 64,
+          "scratch_max_bytes": 67108864,
+          "scratch_max_inodes": 4096,
+          "output_max_bytes": 1048576
+        }
+      },
+      {
+        "profile_id": "backup",
+        "adapter_id": "executor_backup_v1",
+        "worker_pool": "privileged_executor",
+        "network_class": "offline",
+        "cache_class": "none",
+        "timeout_ms": 600000,
+        "resources": {
+          "cpu_millicores": 1000,
+          "memory_max_bytes": 1073741824,
+          "tasks_max": 128,
+          "scratch_max_bytes": 4294967296,
+          "scratch_max_inodes": 100000,
+          "output_max_bytes": 4294967296
+        }
+      },
+      {
+        "profile_id": "candidate-health",
+        "adapter_id": "executor_candidate_health_v1",
+        "worker_pool": "privileged_executor",
+        "network_class": "local_health_only",
+        "cache_class": "none",
+        "timeout_ms": 30000,
+        "resources": {
+          "cpu_millicores": 500,
+          "memory_max_bytes": 268435456,
+          "tasks_max": 64,
+          "scratch_max_bytes": 67108864,
+          "scratch_max_inodes": 4096,
+          "output_max_bytes": 1048576
+        }
+      },
+      {
+        "profile_id": "cutover",
+        "adapter_id": "executor_cutover_v1",
+        "worker_pool": "privileged_executor",
+        "network_class": "offline",
+        "cache_class": "none",
+        "timeout_ms": 30000,
+        "resources": {
+          "cpu_millicores": 500,
+          "memory_max_bytes": 268435456,
+          "tasks_max": 64,
+          "scratch_max_bytes": 67108864,
+          "scratch_max_inodes": 4096,
+          "output_max_bytes": 1048576
+        }
+      },
+      {
+        "profile_id": "released-observe",
+        "adapter_id": "executor_released_observe_v1",
+        "worker_pool": "privileged_executor",
+        "network_class": "local_health_only",
+        "cache_class": "none",
+        "timeout_ms": 60000,
+        "resources": {
+          "cpu_millicores": 500,
+          "memory_max_bytes": 268435456,
+          "tasks_max": 64,
+          "scratch_max_bytes": 67108864,
+          "scratch_max_inodes": 4096,
+          "output_max_bytes": 1048576
+        }
+      },
+      {
+        "profile_id": "rollback",
+        "adapter_id": "executor_rollback_v1",
+        "worker_pool": "privileged_executor",
+        "network_class": "offline",
+        "cache_class": "none",
+        "timeout_ms": 120000,
+        "resources": {
+          "cpu_millicores": 1000,
+          "memory_max_bytes": 1073741824,
+          "tasks_max": 128,
+          "scratch_max_bytes": 1073741824,
+          "scratch_max_inodes": 100000,
+          "output_max_bytes": 1073741824
+        }
+      }
+    ],
+    "nodes": [
+      {
+        "node_id": "source",
+        "display_name": "Accept exact source",
+        "kind": "source_admission",
+        "activation": "always",
+        "profile_id": "source-controller",
+        "depends_on": [],
+        "input_contracts": [],
+        "output_contract": "source_snapshot"
+      },
+      {
+        "node_id": "prepare",
+        "display_name": "Prepare immutable host inputs",
+        "kind": "host_prepare",
+        "activation": "always",
+        "profile_id": "host-prepare",
+        "depends_on": ["source"],
+        "input_contracts": ["source_snapshot"],
+        "output_contract": "prepared_run"
+      },
+      {
+        "node_id": "verify",
+        "display_name": "Run the exact bare bin/ci gate",
+        "kind": "verification",
+        "activation": "always",
+        "profile_id": "bare-bin-ci",
+        "depends_on": ["prepare"],
+        "input_contracts": ["prepared_run"],
+        "output_contract": "verification_receipt"
+      },
+      {
+        "node_id": "release-build",
+        "display_name": "Build the local OCI release",
+        "kind": "release_build",
+        "activation": "always",
+        "profile_id": "oci-release-build",
+        "depends_on": ["prepare"],
+        "input_contracts": ["prepared_run"],
+        "output_contract": "release_bundle"
+      },
+      {
+        "node_id": "reduce",
+        "display_name": "Reduce required verification evidence",
+        "kind": "deterministic_reduce",
+        "activation": "always",
+        "profile_id": "reduce-controller",
+        "depends_on": ["release-build", "verify"],
+        "input_contracts": ["verification_receipt", "release_bundle"],
+        "output_contract": "reduction_receipt"
+      },
+      {
+        "node_id": "reserve",
+        "display_name": "Reserve deployment resources",
+        "kind": "resource_reservation",
+        "activation": "always",
+        "profile_id": "resource-reserve",
+        "depends_on": ["reduce"],
+        "input_contracts": ["reduction_receipt"],
+        "output_contract": "resource_reservation"
+      },
+      {
+        "node_id": "backup",
+        "display_name": "Back up required state",
+        "kind": "backup",
+        "activation": "always",
+        "profile_id": "backup",
+        "depends_on": ["reserve"],
+        "input_contracts": ["resource_reservation"],
+        "output_contract": "backup_receipt"
+      },
+      {
+        "node_id": "candidate-health",
+        "display_name": "Prove candidate health",
+        "kind": "candidate_health",
+        "activation": "always",
+        "profile_id": "candidate-health",
+        "depends_on": ["backup"],
+        "input_contracts": ["backup_receipt"],
+        "output_contract": "candidate_health_receipt"
+      },
+      {
+        "node_id": "cutover",
+        "display_name": "Cut over the stable route",
+        "kind": "cutover",
+        "activation": "always",
+        "profile_id": "cutover",
+        "depends_on": ["candidate-health"],
+        "input_contracts": ["candidate_health_receipt"],
+        "output_contract": "cutover_receipt"
+      },
+      {
+        "node_id": "released-observe",
+        "display_name": "Observe the released candidate",
+        "kind": "released_observation",
+        "activation": "always",
+        "profile_id": "released-observe",
+        "depends_on": ["cutover"],
+        "input_contracts": ["cutover_receipt"],
+        "output_contract": "released_observation_receipt"
+      },
+      {
+        "node_id": "rollback",
+        "display_name": "Restore the last known good release",
+        "kind": "rollback",
+        "activation": "on_mutation_failure",
+        "profile_id": "rollback",
+        "depends_on": ["cutover"],
+        "input_contracts": ["cutover_receipt"],
+        "output_contract": "rollback_receipt"
+      }
+    ]
   },
   "health_checks": [
     {

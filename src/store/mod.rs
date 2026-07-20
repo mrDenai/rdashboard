@@ -107,6 +107,28 @@ pub enum StoreError {
     UnsupportedControlSchemaVersion { actual: i64, supported: i64 },
     #[error("control schema is missing required table or column {0}")]
     CorruptControlSchema(&'static str),
+    #[error("invalid workflow scheduler input: {0}")]
+    InvalidWorkflowSchedulerInput(&'static str),
+    #[error("workflow trigger identity was reused with different content")]
+    WorkflowDeliveryConflict,
+    #[error("workflow source admission is older than the persisted project head")]
+    WorkflowStaleSource,
+    #[error("workflow source sequence identifies two different accepted heads")]
+    WorkflowSourceConflict,
+    #[error("workflow request or installed policy does not match its durable identity")]
+    WorkflowPolicyMismatch,
+    #[error("workflow attempt {0} does not exist")]
+    WorkflowAttemptNotFound(uuid::Uuid),
+    #[error("workflow scheduler state does not permit this transition")]
+    WorkflowStateConflict,
+    #[error("workflow lease is missing, expired, revoked, or owned by another worker")]
+    WorkflowLeaseConflict,
+    #[error("workflow node receipt conflicts with durable lease or prior receipt evidence")]
+    WorkflowReceiptConflict,
+    #[error("workflow reduction is incomplete or conflicts with required step evidence")]
+    WorkflowReductionConflict,
+    #[error("persisted workflow scheduler journal is corrupt: {0}")]
+    CorruptWorkflowJournal(&'static str),
     #[error("persisted security journal is corrupt: {0}")]
     CorruptSecurityJournal(&'static str),
     #[error("security schema version {actual} is unsupported; this build supports {supported}")]
@@ -221,6 +243,10 @@ pub enum StoreError {
     OperationState(#[from] crate::domain::OperationStateError),
     #[error(transparent)]
     ArtifactContract(#[from] crate::domain::ArtifactContractError),
+    #[error(transparent)]
+    WorkflowContract(#[from] crate::domain::WorkflowContractError),
+    #[error(transparent)]
+    ManifestContract(#[from] crate::domain::ManifestError),
     #[error("bundled SQLite {actual} is below safe version number {minimum_number}")]
     UnsafeSqliteVersion { actual: String, minimum_number: i32 },
 }

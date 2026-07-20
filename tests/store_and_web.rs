@@ -247,9 +247,67 @@ fn control_store_rejects_unknown_schema_versions_at_open() {
         ControlStore::open(&path),
         Err(StoreError::UnsupportedControlSchemaVersion {
             actual: 99,
-            supported: 1
+            supported: 2
         })
     ));
+}
+
+#[test]
+fn control_store_migrates_v1_to_the_durable_workflow_journal() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("v1-control.sqlite");
+    let store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("create control store: {error}"));
+    drop(store);
+
+    let legacy = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("open simulated v1 store: {error}"));
+    legacy
+        .execute_batch(
+            "DROP TABLE workflow_reductions;
+             DROP TABLE workflow_node_receipts;
+             DROP TABLE workflow_lease_journal;
+             DROP TABLE workflow_node_dependencies;
+             DROP TABLE workflow_nodes;
+             DROP TABLE workflow_mutation_locks;
+             DROP TABLE workflow_transitions;
+             DROP TABLE workflow_attempts;
+             DROP TABLE workflow_triggers;
+             DROP TABLE workflow_project_heads;
+             DROP TABLE workflow_requests;
+             DROP TABLE workflow_scheduler_cursor;
+             UPDATE controller_meta SET integer_value = 1 WHERE key = 'schema_version';",
+        )
+        .unwrap_or_else(|error| panic!("downgrade fixture to v1: {error}"));
+    drop(legacy);
+
+    let migrated =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("migrate v1 store: {error}"));
+    drop(migrated);
+    let inspected = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("inspect migrated store: {error}"));
+    let version: i64 = inspected
+        .query_row(
+            "SELECT integer_value FROM controller_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("read migrated version: {error}"));
+    assert_eq!(version, 2);
+    let scheduler_tables: i64 = inspected
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN (
+                'workflow_requests', 'workflow_attempts', 'workflow_nodes',
+                'workflow_lease_journal', 'workflow_node_receipts',
+                'workflow_reductions', 'workflow_mutation_locks',
+                'workflow_transitions', 'workflow_scheduler_cursor'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("count migrated scheduler tables: {error}"));
+    assert_eq!(scheduler_tables, 9);
 }
 
 #[test]

@@ -23,6 +23,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v1.json
+cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v2.json
 node --check web/app.js
 node --test tests/browser_status.test.js
 cargo build --workspace --all-targets --all-features --release --locked

