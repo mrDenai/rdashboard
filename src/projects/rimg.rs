@@ -1,14 +1,6 @@
-use std::{
-    fmt::Write as _,
-    future::Future,
-    path::{Path, PathBuf},
-    str::FromStr,
-    time::Duration,
-};
+use std::{fmt::Write as _, future::Future, path::Path, str::FromStr, time::Duration};
 
-use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -18,37 +10,15 @@ use url::{Host, Url};
 use crate::domain::{
     ObservationStatus, ProjectCondition, ProjectId, ProjectResourceTelemetry, ProjectTelemetry,
 };
+#[cfg(all(unix, test))]
+use crate::observer::ProjectResourceSnapshotV1;
+#[cfg(unix)]
+use crate::observer::{ObserverClientError, ObserverClientV1, ObserverRejectionCodeV1};
 
 const PROJECT_ID: &str = "rimg";
 const DISPLAY_NAME: &str = "rimg";
 const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_STATUS_BODY_BYTES: usize = 64 * 1024;
-const MAX_RESOURCE_RESPONSE_BYTES: usize = 16 * 1024;
-pub const RIMG_RESOURCE_PROTOCOL_V1: &[u8] = b"resources-v1\n";
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RimgResourceSnapshotV1 {
-    pub schema_version: u16,
-    pub cpu_percent: f64,
-    pub memory_used_bytes: u64,
-    pub memory_limit_bytes: u64,
-    pub network_rx_bytes: u64,
-    pub network_tx_bytes: u64,
-    pub block_read_bytes: u64,
-    pub block_write_bytes: u64,
-}
-
-impl RimgResourceSnapshotV1 {
-    fn is_valid(&self) -> bool {
-        self.schema_version == 1
-            && self.cpu_percent.is_finite()
-            && self.cpu_percent >= 0.0
-            && self.memory_limit_bytes > 0
-            && self.memory_used_bytes <= self.memory_limit_bytes
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum RimgOperationalModeV1 {
@@ -228,8 +198,9 @@ impl RimgHealthCollector {
 
 #[derive(Clone, Debug)]
 pub struct RimgResourceCollector {
-    socket_path: Option<PathBuf>,
-    timeout: Duration,
+    project_id: ProjectId,
+    #[cfg(unix)]
+    client: Option<ObserverClientV1>,
     last_success: Option<ProjectResourceTelemetry>,
 }
 
@@ -244,26 +215,43 @@ impl RimgResourceCollector {
         if socket_path.is_some_and(|path| !path.is_absolute()) {
             return Err(RimgConfigError::ResourceSocketNotAbsolute);
         }
+        #[cfg(unix)]
+        let client = socket_path
+            .map(|path| ObserverClientV1::new(path, timeout))
+            .transpose()
+            .map_err(|_| RimgConfigError::InvalidResourceObserverClient)?;
         Ok(Self {
-            socket_path: socket_path.map(Path::to_path_buf),
-            timeout,
+            project_id: ProjectId::from_str(PROJECT_ID)
+                .map_err(|_| RimgConfigError::InvalidInternalProjectId)?,
+            #[cfg(unix)]
+            client,
             last_success: None,
         })
     }
 
-    pub async fn collect(&mut self, now_ms: i64) -> ProjectResourceTelemetry {
-        let Some(socket_path) = self.socket_path.as_deref() else {
+    pub async fn collect(&mut self, _now_ms: i64) -> ProjectResourceTelemetry {
+        #[cfg(not(unix))]
+        return unavailable_resources(
+            ObservationStatus::Unsupported,
+            "Resource observer is supported only on Unix.",
+        );
+        #[cfg(unix)]
+        let Some(client) = self.client.as_ref() else {
             return unavailable_resources(
                 ObservationStatus::Unknown,
                 "Источник ресурсов контейнера не настроен.",
             );
         };
 
-        match bounded_resource_probe(self.timeout, probe_resources(socket_path)).await {
+        #[cfg(unix)]
+        match client
+            .observe_project_resources(self.project_id.clone())
+            .await
+        {
             Ok(snapshot) => {
                 let telemetry = ProjectResourceTelemetry {
                     status: ObservationStatus::Fresh,
-                    observed_at_ms: Some(now_ms),
+                    observed_at_ms: Some(snapshot.observed_at_ms),
                     cpu_percent: Some(snapshot.cpu_percent),
                     memory_used_bytes: Some(snapshot.memory_used_bytes),
                     memory_limit_bytes: Some(snapshot.memory_limit_bytes),
@@ -280,14 +268,17 @@ impl RimgResourceCollector {
                 || {
                     unavailable_resources(
                         ObservationStatus::SignalLost,
-                        format!("Статистика контейнера недоступна: {}.", failure.label()),
+                        format!(
+                            "Статистика контейнера недоступна: {}.",
+                            observer_failure_label(&failure)
+                        ),
                     )
                 },
                 |mut previous| {
                     previous.status = ObservationStatus::Stale;
                     previous.detail = format!(
                         "Показаны последние данные; обновление не удалось: {}.",
-                        failure.label()
+                        observer_failure_label(&failure)
                     );
                     previous
                 },
@@ -314,45 +305,26 @@ fn unavailable_resources(
     }
 }
 
-async fn bounded_resource_probe(
-    timeout: Duration,
-    future: impl Future<Output = Result<RimgResourceSnapshotV1, ProbeFailure>>,
-) -> Result<RimgResourceSnapshotV1, ProbeFailure> {
-    tokio::time::timeout(timeout, future)
-        .await
-        .unwrap_or(Err(ProbeFailure::Timeout))
-}
-
 #[cfg(unix)]
-async fn probe_resources(socket_path: &Path) -> Result<RimgResourceSnapshotV1, ProbeFailure> {
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .map_err(|_| ProbeFailure::Connect)?;
-    stream
-        .write_all(RIMG_RESOURCE_PROTOCOL_V1)
-        .await
-        .map_err(|_| ProbeFailure::Write)?;
-    stream.shutdown().await.map_err(|_| ProbeFailure::Write)?;
-    let mut response = Vec::with_capacity(1024);
-    stream
-        .take(u64::try_from(MAX_RESOURCE_RESPONSE_BYTES + 1).unwrap_or(u64::MAX))
-        .read_to_end(&mut response)
-        .await
-        .map_err(|_| ProbeFailure::Read)?;
-    if response.len() > MAX_RESOURCE_RESPONSE_BYTES {
-        return Err(ProbeFailure::ResponseBodyTooLarge);
+const fn observer_failure_label(error: &ObserverClientError) -> &'static str {
+    match error {
+        ObserverClientError::DeadlineExceeded => "timeout",
+        ObserverClientError::Io(_) => "connect_failed",
+        ObserverClientError::Rejected {
+            code: ObserverRejectionCodeV1::ProjectNotConfigured,
+            ..
+        } => "project_not_configured",
+        ObserverClientError::Rejected {
+            code: ObserverRejectionCodeV1::CollectionUnavailable,
+            ..
+        } => "collection_unavailable",
+        ObserverClientError::Rejected { .. } => "observer_rejected",
+        ObserverClientError::InvalidConfig
+        | ObserverClientError::Frame(_)
+        | ObserverClientError::TrailingResponse
+        | ObserverClientError::RequestBinding
+        | ObserverClientError::WrongResponse => "unsupported_contract",
     }
-    let snapshot: RimgResourceSnapshotV1 =
-        serde_json::from_slice(&response).map_err(|_| ProbeFailure::MalformedJson)?;
-    if !snapshot.is_valid() {
-        return Err(ProbeFailure::UnsupportedContract);
-    }
-    Ok(snapshot)
-}
-
-#[cfg(not(unix))]
-async fn probe_resources(_socket_path: &Path) -> Result<RimgResourceSnapshotV1, ProbeFailure> {
-    Err(ProbeFailure::UnsupportedContract)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -766,6 +738,8 @@ pub enum RimgConfigError {
     ZeroTimeout,
     #[error("resource socket path must be absolute")]
     ResourceSocketNotAbsolute,
+    #[error("resource observer client configuration is invalid")]
+    InvalidResourceObserverClient,
     #[error("internal rimg project identifier is invalid")]
     InvalidInternalProjectId,
 }
@@ -877,27 +851,39 @@ mod tests {
                 .accept()
                 .await
                 .unwrap_or_else(|error| panic!("accept resource fixture: {error}"));
-            let mut request = Vec::new();
+            let request: crate::observer::ObserverRequestV1 =
+                crate::protocol::read_frame(&mut stream, crate::protocol::NORMAL_FRAME_MAX_BYTES)
+                    .await
+                    .unwrap_or_else(|error| panic!("read resource fixture: {error}"));
+            let crate::observer::ObserverQueryV1::ProjectResources { project_id } = request.query;
+            assert_eq!(project_id.as_str(), PROJECT_ID);
+            let response = crate::observer::ObserverResponseV1::ProjectResources {
+                schema_version: crate::observer::OBSERVER_PROTOCOL_VERSION,
+                request_id: request.request_id,
+                project_id,
+                snapshot: ProjectResourceSnapshotV1 {
+                    schema_version: crate::observer::PROJECT_RESOURCE_SNAPSHOT_SCHEMA_VERSION,
+                    observed_at_ms: 100,
+                    cpu_percent: 1.5,
+                    memory_used_bytes: 20,
+                    memory_limit_bytes: 100,
+                    network_rx_bytes: 1_000,
+                    network_tx_bytes: 2_000,
+                    block_read_bytes: 3_000,
+                    block_write_bytes: 4_000,
+                },
+            };
+            crate::protocol::write_frame(
+                &mut stream,
+                &response,
+                crate::protocol::NORMAL_FRAME_MAX_BYTES,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("write resource fixture: {error}"));
             stream
-                .read_to_end(&mut request)
+                .shutdown()
                 .await
-                .unwrap_or_else(|error| panic!("read resource fixture: {error}"));
-            assert_eq!(request, RIMG_RESOURCE_PROTOCOL_V1);
-            let response = serde_json::to_vec(&RimgResourceSnapshotV1 {
-                schema_version: 1,
-                cpu_percent: 1.5,
-                memory_used_bytes: 20,
-                memory_limit_bytes: 100,
-                network_rx_bytes: 1_000,
-                network_tx_bytes: 2_000,
-                block_read_bytes: 3_000,
-                block_write_bytes: 4_000,
-            })
-            .unwrap_or_else(|error| panic!("serialize resource fixture: {error}"));
-            stream
-                .write_all(&response)
-                .await
-                .unwrap_or_else(|error| panic!("write resource fixture: {error}"));
+                .unwrap_or_else(|error| panic!("close resource fixture: {error}"));
         });
         let mut collector = RimgResourceCollector::from_optional_socket_path(
             Some(&socket_path),

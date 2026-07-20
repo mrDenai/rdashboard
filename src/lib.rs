@@ -53,6 +53,8 @@ pub mod metrics;
 pub mod mutation_admission;
 pub mod notifications;
 #[cfg(unix)]
+pub mod observer;
+#[cfg(unix)]
 pub mod oci_handoff;
 pub mod phase6;
 pub mod policy;

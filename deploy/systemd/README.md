@@ -78,8 +78,8 @@ would be a false success state rather than useful monitoring.
 
 For private rimg health collection, also install
 `rdashboard-rimg-health.socket`, `rdashboard-rimg-health.service` and the
-`rdashboard-rimg-health-proxy` binary. For container resources, also install
-`rdashboard-rimg-resources.socket` and the matching `rdashboard-rimg-resources@.service` template.
+`rdashboard-rimg-health-proxy` binary. For container resources, install the separate persistent
+`rdashboard-observer` binary and `rdashboard-observer.service`.
 Install `rdashboard-rimg-health.env` as root-owned mode `0644`
 at `/usr/lib/rdashboard/rdashboard-rimg-health.env`; it is deliberately loaded after the optional
 operator environment so the controller's health origin stays fixed. The socket listens only on
@@ -97,15 +97,24 @@ seconds: during a rolling gap those expected fail-closed activations must not pe
 listening socket. Each activation remains deadline- and resource-bounded, and the next collection
 automatically resolves the replacement container once it becomes healthy.
 
-The resource socket is a separate mode-`0600` Unix socket owned by `rdashboard`; it does not expose
-the root helper to other local accounts. One accepted connection starts one bounded template
-instance. The controller sends the fixed `resources-v1` request and closes its write side; the
-helper reuses the same exact label/health selection, runs one fixed `docker stats --no-stream`
-format against only that full container ID, and returns a versioned numeric JSON record. The
-template receives the connection through `StandardInput=socket` and `StandardOutput=socket`, has no
-network address family beyond `AF_UNIX`, and exits after the single response. Missing, malformed,
-oversized or contradictory Docker output fails closed. The controller keeps a last-known sample as
-stale for display but does not roll repeated stale values into resource history.
+Before starting the observer, write the controller's actual non-root numeric UID as
+`RDASHBOARD_OBSERVER_ALLOWED_UID=<uid>` in root-owned `/etc/rdashboard/observer.env`; no other value
+belongs in that file. The persistent root observer creates
+`/run/rdashboard-observer/observer.sock` as `root:rdashboard` mode `0660`, verifies every connecting
+peer UID, and accepts only the versioned `project_resources` request for an installed project. The
+current installed handler recognizes only `rimg`; the request cannot select a container, Docker
+command, label, socket or host path. The observer performs fixed, one-second-bounded Docker queries,
+requires exact Kamal labels `service=rimg` and `role=web`, revalidates running/healthy state and a
+private `kamal` address, then returns only a bounded numeric resource record. Its service has fixed
+CPU, memory, task and descriptor limits and no network namespace. A stale socket left by a crash is
+reconciled only when its protected owner/group/mode/inode contract still matches; a live socket or
+changed path fails closed.
+
+This persistent process replaces `rdashboard-rimg-resources.socket` and
+`rdashboard-rimg-resources@.service`; those legacy units must be stopped and removed only during a
+separately authorized installation. Missing, malformed, oversized, timed-out or contradictory Docker
+output fails closed. The controller keeps a last-known sample as stale for display but does not roll
+repeated stale values into resource history. It never receives Docker socket access.
 
 The dedicated source broker runs as `rdashboard-source` from
 `/usr/libexec/rdashboard/rdashboard-source`. Install `rdashboard-source.service`, create the matching

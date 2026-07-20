@@ -190,13 +190,13 @@ private IPv4 address on the `kamal` network, and forwards only the health connec
 The controller receives neither Docker socket access nor a public rimg route; nginx is not part of
 this path.
 
-The same fixed helper has a separate `--resources` protocol behind the private
-`rdashboard-rimg-resources.socket`. Only the `rdashboard` service account can connect to its
-mode-`0600` Unix socket. Each short-lived activation repeats the exact healthy-label selection and
-executes one bounded `docker stats --no-stream` query, returning only numeric CPU, memory, network
-and block-I/O values. The controller receives neither a Docker command surface nor Docker socket
-access; on a transient failure it marks the last successful values stale rather than recording
-them again as fresh history.
+A separate persistent `rdashboard-observer` root service owns the Docker observation boundary. It
+authenticates the controller through Unix peer credentials, accepts only the typed allowlisted
+`project_resources` request, performs fixed deadline-bounded discovery and `docker stats` calls, and
+returns only numeric CPU, memory, network and block-I/O evidence. The controller receives neither a
+Docker command surface nor Docker socket access; on a transient failure it marks the last successful
+values stale rather than recording them again as fresh history. This replaces the previous
+five-second `rdashboard-rimg-resources@.service` activation lifecycle.
 
 The collector reads the exact versioned `rimg` `/health/status` contract alongside liveness and
 readiness. It renders `Healthy` only when operational mode, worker progress, webhook progress,
