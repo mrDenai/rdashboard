@@ -1011,6 +1011,226 @@ async fn project_resource_history_http_surface_is_project_scoped() {
     assert_eq!(history["windows"].as_array().map(Vec::len), Some(4));
 }
 
+fn workflow_web_fixture() -> (
+    rdashboard::domain::ProjectManifestV2,
+    rdashboard::scheduler::WorkflowAdmissionV1,
+) {
+    let manifest: rdashboard::domain::ProjectManifestV2 =
+        serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
+            .unwrap_or_else(|error| panic!("decode workflow manifest: {error}"));
+    let admission = rdashboard::scheduler::WorkflowAdmissionV1 {
+        project_id: manifest.project_id.clone(),
+        workflow_policy_digest: manifest
+            .workflow_policy_digest()
+            .unwrap_or_else(|error| panic!("workflow policy digest: {error}")),
+        source_sha: GitCommitId::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap_or_else(|error| panic!("source SHA: {error}")),
+        operation_kind: rdashboard::domain::OperationKind::Deploy,
+        source_sequence: 1,
+        source_attestation_digest: EvidenceDigest::sha256("workflow web attestation"),
+        trigger_channel: rdashboard::scheduler::WorkflowTriggerChannelV1::GithubWebhook,
+        delivery_id: "workflow-web-1".to_owned(),
+        payload_digest: EvidenceDigest::sha256("workflow web payload"),
+        priority: 2,
+    };
+    (manifest, admission)
+}
+
+async fn json_response(response: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("read JSON response: {error}"))
+            .to_bytes(),
+    )
+    .unwrap_or_else(|error| panic!("decode JSON response: {error}"))
+}
+
+#[tokio::test]
+async fn workflow_overview_http_surface_is_empty_bounded_and_read_only() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let control = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control: {error}"));
+    let app = router(DashboardState::new(
+        EventHub::new(control),
+        Duration::from_secs(5),
+    ));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/workflows?limit=20")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("workflow response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = json_response(response).await;
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["truncated"], false);
+    assert_eq!(payload["attempts"].as_array().map(Vec::len), Some(0));
+    assert!(
+        payload["generated_at_ms"]
+            .as_i64()
+            .is_some_and(|time| time >= 0)
+    );
+
+    let invalid = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/workflows?limit=0")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("invalid request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("invalid workflow response: {error}"));
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn workflow_overview_serializes_the_exact_browser_contract() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let control = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control: {error}"));
+    let scheduler = rdashboard::scheduler::DurableWorkflowScheduler::new(control.clone());
+    let app = router(DashboardState::new(
+        EventHub::new(control),
+        Duration::from_secs(5),
+    ));
+    let (manifest, admission) = workflow_web_fixture();
+    scheduler
+        .admit(&manifest, &admission, 1)
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    let populated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/workflows?limit=1")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("populated request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("populated workflow response: {error}"));
+    assert_eq!(populated.status(), StatusCode::OK);
+    let populated = json_response(populated).await;
+    assert_eq!(populated["truncated"], false);
+    let attempt = &populated["attempts"][0];
+    assert_eq!(attempt["project_id"], "ralert");
+    assert_eq!(attempt["source_sha"], admission.source_sha.as_str());
+    assert_eq!(attempt["priority"], 2);
+    assert!(attempt["attempt_id"].as_str().is_some());
+    assert!(
+        populated["generated_at_ms"]
+            .as_i64()
+            .zip(attempt["updated_at_ms"].as_i64())
+            .is_some_and(|(generated, updated)| generated >= updated)
+    );
+    assert_eq!(
+        attempt
+            .as_object()
+            .unwrap_or_else(|| panic!("workflow attempt is an object"))
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "attempt_id",
+            "attempt_number",
+            "cleanup_state",
+            "created_at_ms",
+            "mutation_state",
+            "nodes",
+            "preparation_key",
+            "priority",
+            "project_id",
+            "request_id",
+            "source_attestation_digest",
+            "source_sequence",
+            "source_sha",
+            "state",
+            "terminal_at_ms",
+            "updated_at_ms",
+            "workflow_policy_digest",
+        ])
+    );
+    assert!(
+        attempt["workflow_policy_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64)
+    );
+    assert!(
+        attempt["nodes"]
+            .as_array()
+            .is_some_and(|nodes| !nodes.is_empty())
+    );
+    let node = &attempt["nodes"][0];
+    assert_eq!(
+        node.as_object()
+            .unwrap_or_else(|| panic!("workflow node is an object"))
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "completed_at_ms",
+            "kind",
+            "lease_generation",
+            "node_id",
+            "output_digest",
+            "profile_id",
+            "receipt_digest",
+            "state",
+            "worker_pool",
+        ])
+    );
+}
+
+#[tokio::test]
+async fn workflow_overview_sanitizes_corrupt_journal_failures() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("corrupt-workflow-control.sqlite");
+    let control = ControlStore::open(&path).unwrap_or_else(|error| panic!("open control: {error}"));
+    let scheduler = rdashboard::scheduler::DurableWorkflowScheduler::new(control.clone());
+    let (manifest, admission) = workflow_web_fixture();
+    scheduler
+        .admit(&manifest, &admission, 1)
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    drop(scheduler);
+    drop(control);
+
+    let corrupt = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("open corrupt workflow fixture: {error}"));
+    corrupt
+        .execute(
+            "UPDATE workflow_requests SET project_id = 'internal-secret-marker!'",
+            [],
+        )
+        .unwrap_or_else(|error| panic!("corrupt workflow fixture: {error}"));
+    drop(corrupt);
+
+    let control =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control: {error}"));
+    let response = router(DashboardState::new(
+        EventHub::new(control),
+        Duration::from_secs(5),
+    ))
+    .oneshot(
+        Request::builder()
+            .uri("/api/v1/workflows")
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("request: {error}")),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("corrupt workflow response: {error}"));
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let problem = json_response(response).await;
+    assert_eq!(problem["code"], "workflow_overview_failed");
+    assert_eq!(problem["detail"], "Workflow overview could not be loaded.");
+    assert!(!problem.to_string().contains("internal-secret-marker"));
+    assert!(!problem.to_string().contains("project ID"));
+}
+
 #[tokio::test]
 async fn project_operation_history_is_project_scoped_and_bounded() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
@@ -1502,10 +1722,16 @@ fn browser_assets_use_safe_dom_updates_and_central_live_regions() {
     assert!(javascript.contains("envelope.delivered_at_ms"));
     assert!(javascript.contains("performance.now()"));
     assert!(!javascript.contains("Date.now()"));
+    assert!(html.contains("id=\"workflow-heading\">Workflow и деплои</h2>"));
+    assert!(html.contains("Последние попытки workflow для всех установленных проектов"));
+    assert!(javascript.contains("validWorkflowOverview"));
+    assert!(javascript.contains("/api/v1/workflows?limit=20"));
     assert!(status_javascript.contains("projectConditionLabels"));
+    assert!(status_javascript.contains("workflowAttemptLabels"));
     assert!(status_javascript.contains("signal_lost: \"× Сигнал потерян\""));
     assert!(status_javascript.contains("intervalMs * 2"));
     assert!(status_javascript.contains("intervalMs * 3"));
     assert!(css.contains("prefers-reduced-motion: reduce"));
     assert!(css.contains("@supports not (content-visibility: auto)"));
+    assert!(css.contains("overflow-x: auto"));
 }

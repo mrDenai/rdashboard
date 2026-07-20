@@ -1,11 +1,12 @@
 # GitHub-independent delivery implementation review
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
-- Status: slices 1a, 1b, 2a and 2b complete locally; step 2 controller/web projection and the authorized live baseline remain pending
+- Status: slices 1a, 1b, 2a, 2b and 2c complete locally; the separately authorized live baseline remains pending
 - Review date: 2026-07-20
 - Baseline HEAD: `d20cf342dac204c51d30a32009eeb9c58097c8aa`
 - Local implementation commits: `64e64f2` (`Add persistent resource observer`), `581a432`
-  (`Add adapter execution receipts`), `25dff26` (`Add durable workflow scheduler`)
+  (`Add adapter execution receipts`), `25dff26` (`Add durable workflow scheduler`), `8b72141`
+  (`Add authenticated workflow gateway`)
 - Slice 1a staged diff SHA-256: `ca9712b8517e0a7c42c6672d81abed2e8c74165337306dca0ded2bc5c36e6432`
 
 ## Reviewed scope
@@ -347,3 +348,89 @@ Slice 2b is production-worthy as an inactive local gateway contract and may be c
 install or enable the service, run generic worker jobs, grant Docker/root mutation authority, project
 workflow state into the controller/web UI, complete source ingress or deploy anything. No VPS,
 GitHub/provider or other external system was mutated.
+
+## Slice 2c: read-only workflow journal projection
+
+### Reviewed scope
+
+Slice 2c closes the local controller/dashboard projection for implementation-plan step 2 without
+adding workflow mutation authority:
+
+- `WorkflowJournalReaderV1` exposes one bounded read-only journal capability. It reads attempts and
+  nodes through a deferred SQLite transaction, validates the exact persisted snapshots, accepts limits
+  1 through 50, reads one extra attempt for truthful truncation and orders newest-first with stable
+  tie-breakers.
+- GET `/api/v1/workflows` defaults to 20 attempts, validates the bound, moves blocking SQLite work off
+  the async runtime and captures its response time after the consistent read. Every server-side failure
+  logs its exact value and returns one fixed generic HTTP 500 problem.
+- The browser polls every five seconds without overlap, strictly validates the exact V1 response,
+  preserves the last valid snapshot on refresh failure and renders loading, empty, truncated, success,
+  recovery, cleanup-required and stale/error states. Failed or reconciliation-required nodes take
+  priority over merely ready work.
+- The dashboard uses a native refresh button, semantic caption/headers/row headers, centralized live
+  announcements, `textContent` insertion and keyboard-focusable real overflow scrolling. It introduces
+  no experimental browser API, credentials, raw logs, mutation tokens or repository-specific path.
+
+The exact staged product/test diff contains 11 paths, 969 insertions and 2 deletions. Shared dirty web,
+route and test files were staged by hunk; notification implementation and its workflow artifacts remain
+unstaged and outside this review.
+
+### Self-review and first consultation
+
+Self-review corrected two concurrency/presentation defects before consultation: `generated_at_ms` is
+now captured after the journal read so a concurrent newer row cannot invalidate an otherwise successful
+response, and failed nodes now take current-step priority over ready nodes. Both have regression
+assertions.
+
+The first exact-staged consultation returned `SAFE` with two actionable P2 findings:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 211 seconds;
+- state fingerprint: `feaa4ea4c7c8db46788f23f4eba6de8f41530d45cfdd76a208d129c9b1b901a0`;
+- brief SHA-256: `c90f8ee1dc5fb2b6f745f739e4228653e0b9fa4f02919f92dd63dae862663e83`;
+- response: `consult-slice2c-deepseek/response.md`.
+
+Finding dispositions:
+
+1. **Accepted P2 — journal errors leaked internal SQLite/validation detail and returned mutation-style
+   HTTP 400.** A dedicated `workflow_overview_problem` logs the real store error and returns HTTP 500,
+   code `workflow_overview_failed` and the fixed detail `Workflow overview could not be loaded.`
+2. **Accepted P2 — the clock failure exposed `SystemTimeError::Display`.** Clock and blocking-task join
+   failures now use the same sanitized mapper. A corrupt persisted project ID containing an internal
+   marker proves the response contains neither that marker nor an internal validation fragment.
+
+### Exact verification and final consultation
+
+- A refreshed exact `git checkout-index` staged export passed bare `bin/ci`, exit code 0, after both
+  accepted fixes.
+- It covered formatting, Clippy with warnings denied, 167 library tests with 2 credentialed live tests
+  ignored, every binary/integration suite, 29 store/web contracts, 14 scheduler contracts, 8 browser
+  contracts, schema checks and the optimized release build.
+- The final optimized release build completed in 2 minutes 49 seconds.
+- `git diff --cached --check`: passed.
+- Exact staged product/test diff SHA-256 (workflow artifacts excluded):
+  `c33ee2422411e306b023cb12f2f69ed5f5b3a907a72260237b1ebd7d52d261df`.
+- Modern web guidance was applied for table semantics, error announcements, native controls and real
+  overflow behavior. The in-app browser-control surface was unavailable, so no visual browser QA is
+  claimed; executable JavaScript contracts and static semantic assertions passed.
+
+Final post-fix consultation:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 251 seconds;
+- state fingerprint: `4061e3dc96bd80922fbd087ce191914d96efa18e26e8845595b9121dcf8214c4`;
+- brief SHA-256: `210bc7370be221b263984ec1d880c13da0120de547cbcde8f6d0f5193981e17f`;
+- response: `consult-slice2c-deepseek-final/response.md`;
+- verdict: `SAFE`, no actionable finding and no open question.
+
+The reviewer independently verified the sanitized store/clock/join failure boundary, bounded consistent
+snapshot, deterministic ordering, post-read response time, strict browser schema/cardinality/order,
+non-overlapping stale-preserving polling, recovery-state priority and semantic DOM behavior.
+
+### Verdict
+
+Slice 2c is production-worthy as an inactive local read-only projection and may be committed. It closes
+implementation-plan step 2 locally, but does not install or restart services, expose source ingress,
+execute worker jobs, activate deployment authority, write to GitHub or deploy anything. The authorized
+live resource baseline remains a separate activation gate; the generic worker and sealed preparation
+store remain step 4 after source-ingress work.

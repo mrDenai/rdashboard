@@ -43,6 +43,10 @@ impl EventHub {
         Ok(envelope)
     }
 
+    pub(crate) const fn control_store(&self) -> &ControlStore {
+        &self.store
+    }
+
     pub fn subscribe(&self, requested_after: RequestedAfter) -> Result<EventStream, HubError> {
         let permit = self
             .permits

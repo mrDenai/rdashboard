@@ -102,6 +102,49 @@
         <ul id="partial-reasons"></ul>
       </section>
 
+      <section class="workflow-workspace" aria-labelledby="workflow-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Durable journal</p>
+            <h2 id="workflow-heading">Workflow и деплои</h2>
+          </div>
+          <div class="section-actions">
+            <p id="workflow-summary" class="section-meta">Загрузка…</p>
+            <button id="workflow-refresh" class="secondary-action" type="button">Обновить</button>
+          </div>
+        </div>
+        <p id="workflow-status" class="history-status" data-state="loading">
+          Загружается журнал workflow…
+        </p>
+        <div
+          class="table-frame workflow-table-frame"
+          role="group"
+          aria-labelledby="workflow-heading"
+          tabindex="0"
+        >
+          <table class="workflow-table">
+            <caption>Последние попытки workflow для всех установленных проектов</caption>
+            <thead>
+              <tr>
+                <th scope="col">Проект</th>
+                <th scope="col">Попытка</th>
+                <th scope="col">Состояние</th>
+                <th scope="col">Текущий этап</th>
+                <th scope="col">Мутация</th>
+                <th scope="col">Cleanup</th>
+                <th scope="col">Приоритет</th>
+                <th scope="col">Обновлено</th>
+              </tr>
+            </thead>
+            <tbody id="workflow-list">
+              <tr>
+                <td class="empty-state" colspan="8">Загружается журнал workflow…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="project-workspace" aria-labelledby="projects-heading">
         <div class="section-heading">
           <div>

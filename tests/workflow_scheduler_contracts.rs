@@ -10,8 +10,9 @@ use rdashboard::{
     installed_workflow::InstalledWorkflowCatalogV1,
     scheduler::{
         DurableWorkflowScheduler, WorkflowAdmissionV1, WorkflowAttemptStateV1,
-        WorkflowCleanupReasonV1, WorkflowCleanupStateV1, WorkflowMutationStateV1,
-        WorkflowNodeStateV1, WorkflowTriggerChannelV1, WorkflowWorkerRegistrationV1,
+        WorkflowCleanupReasonV1, WorkflowCleanupStateV1, WorkflowJournalReaderV1,
+        WorkflowMutationStateV1, WorkflowNodeStateV1, WorkflowTriggerChannelV1,
+        WorkflowWorkerRegistrationV1,
     },
     store::{ControlStore, StoreError},
 };
@@ -1061,4 +1062,72 @@ fn terminal_and_revoked_cleanup_obligations_bind_their_exact_evidence() {
             && obligation.reason == WorkflowCleanupReasonV1::LeaseRevoked
             && obligation.terminal_receipt.is_none()
     }));
+}
+
+#[test]
+fn workflow_overview_is_bounded_ordered_and_consistent_after_reopen() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("overview-control.sqlite");
+    let store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store.clone());
+    let first_manifest = manifest("ralert", 1);
+    let second_manifest = manifest("second", 1);
+    let first = scheduler
+        .admit(
+            &first_manifest,
+            &admission(
+                &first_manifest,
+                'a',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "overview-first",
+            ),
+            10,
+        )
+        .unwrap_or_else(|error| panic!("admit first workflow: {error}"));
+    let second = scheduler
+        .admit(
+            &second_manifest,
+            &admission(
+                &second_manifest,
+                'b',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "overview-second",
+            ),
+            20,
+        )
+        .unwrap_or_else(|error| panic!("admit second workflow: {error}"));
+    let reader = WorkflowJournalReaderV1::new(store.clone());
+    let page = reader
+        .recent_attempts(1)
+        .unwrap_or_else(|error| panic!("read bounded overview: {error}"));
+    assert!(page.truncated);
+    assert_eq!(page.attempts.len(), 1);
+    assert_eq!(page.attempts[0], second.attempt().clone());
+    assert!(matches!(
+        reader.recent_attempts(0),
+        Err(StoreError::InvalidWorkflowSchedulerInput(
+            "workflow overview limit"
+        ))
+    ));
+    drop(reader);
+    drop(scheduler);
+    drop(store);
+
+    let reopened_store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}"));
+    let reopened = WorkflowJournalReaderV1::new(reopened_store);
+    let page = reopened
+        .recent_attempts(2)
+        .unwrap_or_else(|error| panic!("read overview after reopen: {error}"));
+    assert!(!page.truncated);
+    assert_eq!(
+        page.attempts
+            .iter()
+            .map(|attempt| attempt.attempt_id)
+            .collect::<Vec<_>>(),
+        vec![second.attempt().attempt_id, first.attempt().attempt_id]
+    );
 }

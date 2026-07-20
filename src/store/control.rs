@@ -330,6 +330,17 @@ impl ControlStore {
         Ok(output)
     }
 
+    pub(crate) fn read_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut connection = lock_connection(&self.connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let output = operation(&transaction)?;
+        transaction.commit()?;
+        Ok(output)
+    }
+
     pub(crate) fn read_connection<T>(
         &self,
         operation: impl FnOnce(&Connection) -> Result<T, StoreError>,

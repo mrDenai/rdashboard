@@ -289,6 +289,57 @@ pub struct DurableWorkflowScheduler {
     store: ControlStore,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowAttemptPageV1 {
+    pub truncated: bool,
+    pub attempts: Vec<WorkflowAttemptSnapshotV1>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkflowJournalReaderV1 {
+    store: ControlStore,
+}
+
+impl WorkflowJournalReaderV1 {
+    pub const fn new(store: ControlStore) -> Self {
+        Self { store }
+    }
+
+    pub fn recent_attempts(&self, limit: usize) -> Result<WorkflowAttemptPageV1, StoreError> {
+        if !(1..=50).contains(&limit) {
+            return Err(StoreError::InvalidWorkflowSchedulerInput(
+                "workflow overview limit",
+            ));
+        }
+        let query_limit = i64::try_from(limit.saturating_add(1))
+            .map_err(|_| StoreError::InvalidWorkflowSchedulerInput("workflow overview limit"))?;
+        self.store.read_transaction(|transaction| {
+            let mut statement = transaction.prepare(
+                "SELECT attempt_id FROM workflow_attempts
+                 ORDER BY updated_at_ms DESC, created_at_ms DESC, attempt_id ASC
+                 LIMIT ?1",
+            )?;
+            let mut attempt_ids = statement
+                .query_map([query_limit], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            let truncated = attempt_ids.len() > limit;
+            attempt_ids.truncate(limit);
+            let attempts = attempt_ids
+                .into_iter()
+                .map(|attempt_id| {
+                    let attempt_id = parse_uuid(&attempt_id, "workflow overview attempt ID")?;
+                    load_attempt_snapshot(transaction, attempt_id)
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            Ok(WorkflowAttemptPageV1 {
+                truncated,
+                attempts,
+            })
+        })
+    }
+}
+
 impl DurableWorkflowScheduler {
     pub const fn new(store: ControlStore) -> Self {
         Self { store }

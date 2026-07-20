@@ -232,6 +232,7 @@ main {
 }
 
 .host-overview,
+.workflow-workspace,
 .project-workspace,
 .diagnostic-panel,
 .partial-panel {
@@ -240,6 +241,7 @@ main {
 }
 
 .host-overview,
+.workflow-workspace,
 .project-workspace {
   padding: 1rem;
 }
@@ -334,7 +336,13 @@ main {
 
 .table-frame {
   min-inline-size: 0;
+  overflow-x: auto;
   border: 1px solid var(--line);
+}
+
+.table-frame:focus-visible {
+  outline: 0.1875rem solid var(--focus);
+  outline-offset: 0.1875rem;
 }
 
 table {
@@ -387,6 +395,50 @@ tbody tr:last-child td {
 
 .project-table {
   table-layout: fixed;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.workflow-table {
+  min-width: 68rem;
+  table-layout: fixed;
+}
+
+.workflow-table th:nth-child(1) { width: 11%; }
+.workflow-table th:nth-child(2) { width: 9%; }
+.workflow-table th:nth-child(3) { width: 12%; }
+.workflow-table th:nth-child(4) { width: 23%; }
+.workflow-table th:nth-child(5) { width: 12%; }
+.workflow-table th:nth-child(6) { width: 10%; }
+.workflow-table th:nth-child(7) { width: 8%; }
+.workflow-table th:nth-child(8) { width: 15%; }
+
+.workflow-row > th {
+  color: var(--text);
+  background: var(--surface-raised);
+  font-size: 0.82rem;
+  letter-spacing: normal;
+  text-transform: none;
+  vertical-align: top;
+}
+
+.workflow-row > td {
+  color: var(--muted);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.workflow-row > td > strong {
+  color: var(--text);
+}
+
+.workflow-table .empty-state {
+  display: table-cell;
+  height: 5rem;
 }
 
 .project-table th:nth-child(1) { width: 8%; }
@@ -545,6 +597,11 @@ tbody tr:last-child td {
   .section-heading {
     align-items: start;
     flex-direction: column;
+  }
+
+  .section-actions {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .lower-grid,

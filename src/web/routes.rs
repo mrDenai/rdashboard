@@ -28,6 +28,7 @@ use crate::{
     mutation_admission::{
         ExecuteMutationGrantV1, ObserveMutationStatusV1, PrepareMutationIntentV1,
     },
+    scheduler::{WorkflowAttemptPageV1, WorkflowJournalReaderV1},
     store::{
         IntegrationStore, IntegrationStoreError, MetricsStore,
         PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, StoreError,
@@ -72,11 +73,13 @@ pub struct DashboardState {
     pub metrics_store: Option<MetricsStore>,
     pub integration_store: Option<IntegrationStore>,
     pub operation_history: Option<DurableController>,
+    pub workflow_reader: WorkflowJournalReaderV1,
     pub project_repository_errors: Arc<RwLock<BTreeMap<String, String>>>,
 }
 
 impl DashboardState {
     pub fn new(hub: EventHub, sample_interval: Duration) -> Self {
+        let workflow_reader = WorkflowJournalReaderV1::new(hub.control_store().clone());
         Self {
             hub,
             latest_snapshot: Arc::new(RwLock::new(None)),
@@ -87,6 +90,7 @@ impl DashboardState {
             metrics_store: None,
             integration_store: None,
             operation_history: None,
+            workflow_reader,
             project_repository_errors: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -148,6 +152,7 @@ pub fn router_with_access(
             "/api/v1/projects/{project_id}/updates",
             get(project_updates),
         )
+        .route("/api/v1/workflows", get(workflow_overview))
         .route("/api/v1/events", get(events))
         .route("/api/v1/mutations/capabilities", get(mutation_capabilities))
         .route("/api/v1/mutations/lease", post(takeover_mutation_lease))
@@ -445,6 +450,66 @@ async fn project_operations(
         )
         .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowOverviewQuery {
+    limit: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowOverviewResponse {
+    schema_version: u16,
+    generated_at_ms: i64,
+    truncated: bool,
+    attempts: Vec<crate::scheduler::WorkflowAttemptSnapshotV1>,
+}
+
+impl WorkflowOverviewResponse {
+    fn from_page(generated_at_ms: i64, page: WorkflowAttemptPageV1) -> Self {
+        Self {
+            schema_version: 1,
+            generated_at_ms,
+            truncated: page.truncated,
+            attempts: page.attempts,
+        }
+    }
+}
+
+async fn workflow_overview(
+    State(state): State<DashboardState>,
+    Query(query): Query<WorkflowOverviewQuery>,
+) -> Response {
+    let limit = usize::from(query.limit.unwrap_or(20));
+    if !(1..=50).contains(&limit) {
+        return ApiProblem::response(
+            StatusCode::BAD_REQUEST,
+            "invalid_workflow_limit",
+            "Workflow overview limit must be between 1 and 50.",
+        )
+        .into_response();
+    }
+    match tokio::task::spawn_blocking(move || state.workflow_reader.recent_attempts(limit)).await {
+        Ok(Ok(page)) => match unix_time_ms() {
+            Ok(generated_at_ms) => {
+                Json(WorkflowOverviewResponse::from_page(generated_at_ms, page)).into_response()
+            }
+            Err(error) => workflow_overview_problem(&error),
+        },
+        Ok(Err(error)) => workflow_overview_problem(&error),
+        Err(error) => workflow_overview_problem(&error),
+    }
+}
+
+fn workflow_overview_problem(error: &impl std::fmt::Display) -> Response {
+    tracing::error!(error = %error, "workflow overview could not be loaded");
+    ApiProblem::response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "workflow_overview_failed",
+        "Workflow overview could not be loaded.",
+    )
+    .into_response()
 }
 
 #[derive(Debug, Serialize)]

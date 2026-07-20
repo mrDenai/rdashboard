@@ -1,0 +1,1425 @@
+[0m
+> plan · deepseek-v4-flash-free
+[0m
+[0m$ [0mgit diff --cached --stat
+.../2026-07-20-github-independent-delivery/plan.md |  17 +-
+ src/scheduler.rs                                   |  51 +++++
+ src/store/control.rs                               |  11 +
+ src/web/hub.rs                                     |   4 +
+ src/web/routes.rs                                  |  65 ++++++
+ tests/browser_status.test.js                       |  76 +++++++
+ tests/store_and_web.rs                             | 226 +++++++++++++++++++++
+ tests/workflow_scheduler_contracts.rs              |  73 ++++++-
+ web/app.css                                        |  57 ++++++
+ web/app.js                                         | 159 +++++++++++++++
+ web/index.html                                     |  43 ++++
+ web/status.js                                      | 206 +++++++++++++++++++
+ 12 files changed, 985 insertions(+), 3 deletions(-)
+[0m
+[0m$ [0mgit diff --cached --check
+(no output)
+[0m
+[0m$ [0mgit log --oneline -5
+8b72141 Add authenticated workflow gateway
+25dff26 Add durable workflow scheduler
+581a432 Add adapter execution receipts
+64e64f2 Add persistent resource observer
+d20cf34 Add dashboard integration automation
+[0m
+[0m$ [0mgit diff --cached
+diff --git a/.agent/workflows/2026-07-20-github-independent-delivery/plan.md b/.agent/workflows/2026-07-20-github-independent-delivery/plan.md
+index a6a87cf..2143ac2 100644
+--- a/.agent/workflows/2026-07-20-github-independent-delivery/plan.md
++++ b/.agent/workflows/2026-07-20-github-independent-delivery/plan.md
+@@ -101,7 +101,7 @@ Implementation progress:
+ | Step | Status | Current evidence |
+ | --- | --- | --- |
+ | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
+-| 2. Installed workflow and scheduler journal | In progress | Slice 2a locally implements the strict V2 installed DAG and durable scheduler. Slice 2b adds the single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, canonical cleanup receipts, cleanup-before-reuse and V1/V2-to-V3 migration. Only controller/web projection remains before step 2 can close; the actual generic worker and sealed preparation store are step 4. |
++| 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker and sealed preparation store remain step 4. |
+ | 3-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
+
+ Implementation ledger:
+@@ -187,6 +187,21 @@ Implementation ledger:
+   in 2 minutes 50 seconds. A fresh exact-manifest `deepseek-free` review returned `SAFE` with no open
+   P0-P2 finding for staged hash
+   `6f34022a5bd8ec926e14183c713d7a6151f1cba18171c66aefec09aa280d48bb`.
++- Slice 2c adds a narrow read-only scheduler journal reader over a consistent SQLite transaction and
++  exposes at most 50 newest attempts through the authenticated controller surface. Ordering and
++  truncation are deterministic, the response timestamp is captured after the snapshot read, and the
++  HTTP surface has no workflow mutation authority.
++- The dashboard polls 20 attempts every five seconds without overlapping requests, validates an exact
++  versioned wire contract and preserves the last valid snapshot on failure. It renders loading, empty,
++  bounded, success, recovery, cleanup and stale-error states in a semantic table with a native refresh
++  button, keyboard-scrollable overflow and centralized announcements. Modern web guidance was applied
++  for semantics, error announcements and real overflow scrolling; no experimental browser dependency
++  or polyfill was introduced.
++- The post-correction bare `bin/ci` passed with 184 library tests (2 credentialed live tests ignored),
++  every binary/integration suite, 29 store/web contracts, 14 scheduler contracts, 9 browser contracts
++  and the optimized release build in 2 minutes 51 seconds. The in-app browser-control surface was not
++  available in this session, so visual browser QA remains explicitly unperformed; static semantic,
++  Rust wire-contract and JavaScript state-contract checks passed.
+
+ ### 1. Establish trustworthy lifecycle, resource and failure evidence
+
+diff --git a/src/scheduler.rs b/src/scheduler.rs
+index a5338d3..bc20519 100644
+--- a/src/scheduler.rs
++++ b/src/scheduler.rs
+@@ -289,6 +289,57 @@ pub struct DurableWorkflowScheduler {
+     store: ControlStore,
+ }
+
++#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
++pub struct WorkflowAttemptPageV1 {
++    pub truncated: bool,
++    pub attempts: Vec<WorkflowAttemptSnapshotV1>,
++}
++
++#[derive(Clone, Debug)]
++pub struct WorkflowJournalReaderV1 {
++    store: ControlStore,
++}
++
++impl WorkflowJournalReaderV1 {
++    pub const fn new(store: ControlStore) -> Self {
++        Self { store }
++    }
++
++    pub fn recent_attempts(&self, limit: usize) -> Result<WorkflowAttemptPageV1, StoreError> {
++        if !(1..=50).contains(&limit) {
++            return Err(StoreError::InvalidWorkflowSchedulerInput(
++                "workflow overview limit",
++            ));
++        }
++        let query_limit = i64::try_from(limit.saturating_add(1))
++            .map_err(|_| StoreError::InvalidWorkflowSchedulerInput("workflow overview limit"))?;
++        self.store.read_transaction(|transaction| {
++            let mut statement = transaction.prepare(
++                "SELECT attempt_id FROM workflow_attempts
++                 ORDER BY updated_at_ms DESC, created_at_ms DESC, attempt_id ASC
++                 LIMIT ?1",
++            )?;
++            let mut attempt_ids = statement
++                .query_map([query_limit], |row| row.get::<_, String>(0))?
++                .collect::<Result<Vec<_>, _>>()?;
++            drop(statement);
++            let truncated = attempt_ids.len() > limit;
++            attempt_ids.truncate(limit);
++            let attempts = attempt_ids
++                .into_iter()
++                .map(|attempt_id| {
++                    let attempt_id = parse_uuid(&attempt_id, "workflow overview attempt ID")?;
++                    load_attempt_snapshot(transaction, attempt_id)
++                })
++                .collect::<Result<Vec<_>, StoreError>>()?;
++            Ok(WorkflowAttemptPageV1 {
++                truncated,
++                attempts,
++            })
++        })
++    }
++}
++
+ impl DurableWorkflowScheduler {
+     pub const fn new(store: ControlStore) -> Self {
+         Self { store }
+diff --git a/src/store/control.rs b/src/store/control.rs
+index 09587a2..5392e70 100644
+--- a/src/store/control.rs
++++ b/src/store/control.rs
+@@ -330,6 +330,17 @@ impl ControlStore {
+         Ok(output)
+     }
+
++    pub(crate) fn read_transaction<T>(
++        &self,
++        operation: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
++    ) -> Result<T, StoreError> {
++        let mut connection = lock_connection(&self.connection)?;
++        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
++        let output = operation(&transaction)?;
++        transaction.commit()?;
++        Ok(output)
++    }
++
+     pub(crate) fn read_connection<T>(
+         &self,
+         operation: impl FnOnce(&Connection) -> Result<T, StoreError>,
+diff --git a/src/web/hub.rs b/src/web/hub.rs
+index a5478cf..575366d 100644
+--- a/src/web/hub.rs
++++ b/src/web/hub.rs
+@@ -43,6 +43,10 @@ impl EventHub {
+         Ok(envelope)
+     }
+
++    pub(crate) const fn control_store(&self) -> &ControlStore {
++        &self.store
++    }
++
+     pub fn subscribe(&self, requested_after: RequestedAfter) -> Result<EventStream, HubError> {
+         let permit = self
+             .permits
+diff --git a/src/web/routes.rs b/src/web/routes.rs
+index ccbd90c..bcda514 100644
+--- a/src/web/routes.rs
++++ b/src/web/routes.rs
+@@ -28,6 +28,7 @@ use crate::{
+     mutation_admission::{
+         ExecuteMutationGrantV1, ObserveMutationStatusV1, PrepareMutationIntentV1,
+     },
++    scheduler::{WorkflowAttemptPageV1, WorkflowJournalReaderV1},
+     store::{
+         IntegrationStore, IntegrationStoreError, MetricsStore,
+         PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, StoreError,
+@@ -72,11 +73,13 @@ pub struct DashboardState {
+     pub metrics_store: Option<MetricsStore>,
+     pub integration_store: Option<IntegrationStore>,
+     pub operation_history: Option<DurableController>,
++    pub workflow_reader: WorkflowJournalReaderV1,
+     pub project_repository_errors: Arc<RwLock<BTreeMap<String, String>>>,
+ }
+
+ impl DashboardState {
+     pub fn new(hub: EventHub, sample_interval: Duration) -> Self {
++        let workflow_reader = WorkflowJournalReaderV1::new(hub.control_store().clone());
+         Self {
+             hub,
+             latest_snapshot: Arc::new(RwLock::new(None)),
+@@ -87,6 +90,7 @@ impl DashboardState {
+             metrics_store: None,
+             integration_store: None,
+             operation_history: None,
++            workflow_reader,
+             project_repository_errors: Arc::new(RwLock::new(BTreeMap::new())),
+         }
+     }
+@@ -148,6 +152,7 @@ pub fn router_with_access(
+             "/api/v1/projects/{project_id}/updates",
+             get(project_updates),
+         )
++        .route("/api/v1/workflows", get(workflow_overview))
+         .route("/api/v1/events", get(events))
+         .route("/api/v1/mutations/capabilities", get(mutation_capabilities))
+         .route("/api/v1/mutations/lease", post(takeover_mutation_lease))
+@@ -447,6 +452,66 @@ async fn project_operations(
+     }
+ }
+
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct WorkflowOverviewQuery {
++    limit: Option<u8>,
++}
++
++#[derive(Debug, Serialize)]
++struct WorkflowOverviewResponse {
++    schema_version: u16,
++    generated_at_ms: i64,
++    truncated: bool,
++    attempts: Vec<crate::scheduler::WorkflowAttemptSnapshotV1>,
++}
++
++impl WorkflowOverviewResponse {
++    fn from_page(generated_at_ms: i64, page: WorkflowAttemptPageV1) -> Self {
++        Self {
++            schema_version: 1,
++            generated_at_ms,
++            truncated: page.truncated,
++            attempts: page.attempts,
++        }
++    }
++}
++
++async fn workflow_overview(
++    State(state): State<DashboardState>,
++    Query(query): Query<WorkflowOverviewQuery>,
++) -> Response {
++    let limit = usize::from(query.limit.unwrap_or(20));
++    if !(1..=50).contains(&limit) {
++        return ApiProblem::response(
++            StatusCode::BAD_REQUEST,
++            "invalid_workflow_limit",
++            "Workflow overview limit must be between 1 and 50.",
++        )
++        .into_response();
++    }
++    match tokio::task::spawn_blocking(move || state.workflow_reader.recent_attempts(limit)).await {
++        Ok(Ok(page)) => match unix_time_ms() {
++            Ok(generated_at_ms) => {
++                Json(WorkflowOverviewResponse::from_page(generated_at_ms, page)).into_response()
++            }
++            Err(error) => workflow_overview_problem(&error),
++        },
++        Ok(Err(error)) => workflow_overview_problem(&error),
++        Err(error) => workflow_overview_problem(&error),
++    }
++}
++
++fn workflow_overview_problem(error: &impl std::fmt::Display) -> Response {
++    tracing::error!(error = %error, "workflow overview could not be loaded");
++    ApiProblem::response(
++        StatusCode::INTERNAL_SERVER_ERROR,
++        "workflow_overview_failed",
++        "Workflow overview could not be loaded.",
++    )
++    .into_response()
++}
++
+ #[derive(Debug, Serialize)]
+ struct ProjectRepositoryHistoryResponse {
+     schema_version: u16,
+diff --git a/tests/browser_status.test.js b/tests/browser_status.test.js
+index 49c071b..f04707c 100644
+--- a/tests/browser_status.test.js
++++ b/tests/browser_status.test.js
+@@ -11,6 +11,11 @@ import {
+   operationResultPresentation,
+   projectConditionPresentation,
+   repositorySizeChange,
++  validWorkflowOverview,
++  workflowAttemptPresentation,
++  workflowCleanupPresentation,
++  workflowCurrentStepLabel,
++  workflowMutationPresentation,
+ } from "../web/status.js";
+
+ function snapshot(status = "fresh") {
+@@ -139,3 +144,74 @@ test("repository history reports only fully covered size changes", () => {
+   assert.equal(repositorySizeChange([{ observed_at_ms: 0, total_bytes: -1 }], hour), null);
+   assert.equal(repositorySizeChange([samples[1], samples[0], samples[2]], hour), null);
+ });
++
++test("workflow overview is strict and keeps recovery and cleanup visible", () => {
++  const attempt = {
++    request_id: "11111111-1111-4111-8111-111111111111",
++    attempt_id: "22222222-2222-4222-8222-222222222222",
++    attempt_number: 1,
++    project_id: "rimg",
++    source_sha: "a".repeat(40),
++    source_sequence: 1,
++    workflow_policy_digest: "b".repeat(64),
++    source_attestation_digest: "c".repeat(64),
++    preparation_key: "d".repeat(64),
++    priority: 2,
++    state: "needs_reconcile",
++    mutation_state: "needs_reconcile",
++    cleanup_state: "pending",
++    created_at_ms: 10,
++    updated_at_ms: 20,
++    terminal_at_ms: null,
++    nodes: [{
++      node_id: "cutover",
++      kind: "cutover",
++      profile_id: "cutover-v1",
++      worker_pool: "privileged_executor",
++      state: "needs_reconcile",
++      lease_generation: 1,
++      output_digest: null,
++      receipt_digest: null,
++      completed_at_ms: null,
++    }],
++  };
++  const overview = {
++    schema_version: 1,
++    generated_at_ms: 30,
++    truncated: false,
++    attempts: [attempt],
++  };
++  assert.equal(validWorkflowOverview(overview), true);
++  assert.deepEqual(workflowAttemptPresentation("needs_reconcile"), {
++    state: "needs_reconcile",
++    label: "△ Требует сверки",
++  });
++  assert.deepEqual(workflowMutationPresentation("needs_reconcile"), {
++    state: "needs_reconcile",
++    label: "Требует сверки",
++  });
++  assert.deepEqual(workflowCleanupPresentation("pending"), {
++    state: "error",
++    label: "Требуется",
++  });
++  assert.equal(workflowCurrentStepLabel(attempt), "Переключение трафика");
++  assert.equal(workflowCurrentStepLabel({
++    ...attempt,
++    state: "failed",
++    nodes: [
++      { ...attempt.nodes[0], state: "ready", kind: "rollback", node_id: "rollback" },
++      { ...attempt.nodes[0], state: "failed", kind: "candidate_health", node_id: "health" },
++    ],
++  }), "Проверка кандидата");
++
++  assert.equal(validWorkflowOverview({ ...overview, unexpected: true }), false);
++  assert.equal(validWorkflowOverview({ ...overview, generated_at_ms: 19 }), false);
++  assert.equal(validWorkflowOverview({
++    ...overview,
++    attempts: [attempt, { ...attempt }],
++  }), false);
++  assert.deepEqual(workflowAttemptPresentation("invented"), {
++    state: "unknown",
++    label: "? Неизвестно",
++  });
++});
+diff --git a/tests/store_and_web.rs b/tests/store_and_web.rs
+index 20b285f..1d3401c 100644
+--- a/tests/store_and_web.rs
++++ b/tests/store_and_web.rs
+@@ -1011,6 +1011,226 @@ async fn project_resource_history_http_surface_is_project_scoped() {
+     assert_eq!(history["windows"].as_array().map(Vec::len), Some(4));
+ }
+
++fn workflow_web_fixture() -> (
++    rdashboard::domain::ProjectManifestV2,
++    rdashboard::scheduler::WorkflowAdmissionV1,
++) {
++    let manifest: rdashboard::domain::ProjectManifestV2 =
++        serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
++            .unwrap_or_else(|error| panic!("decode workflow manifest: {error}"));
++    let admission = rdashboard::scheduler::WorkflowAdmissionV1 {
++        project_id: manifest.project_id.clone(),
++        workflow_policy_digest: manifest
++            .workflow_policy_digest()
++            .unwrap_or_else(|error| panic!("workflow policy digest: {error}")),
++        source_sha: GitCommitId::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
++            .unwrap_or_else(|error| panic!("source SHA: {error}")),
++        operation_kind: rdashboard::domain::OperationKind::Deploy,
++        source_sequence: 1,
++        source_attestation_digest: EvidenceDigest::sha256("workflow web attestation"),
++        trigger_channel: rdashboard::scheduler::WorkflowTriggerChannelV1::GithubWebhook,
++        delivery_id: "workflow-web-1".to_owned(),
++        payload_digest: EvidenceDigest::sha256("workflow web payload"),
++        priority: 2,
++    };
++    (manifest, admission)
++}
++
++async fn json_response(response: axum::response::Response) -> serde_json::Value {
++    serde_json::from_slice(
++        &response
++            .into_body()
++            .collect()
++            .await
++            .unwrap_or_else(|error| panic!("read JSON response: {error}"))
++            .to_bytes(),
++    )
++    .unwrap_or_else(|error| panic!("decode JSON response: {error}"))
++}
++
++#[tokio::test]
++async fn workflow_overview_http_surface_is_empty_bounded_and_read_only() {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let control = ControlStore::open(directory.path().join("control.sqlite"))
++        .unwrap_or_else(|error| panic!("open control: {error}"));
++    let app = router(DashboardState::new(
++        EventHub::new(control),
++        Duration::from_secs(5),
++    ));
++    let response = app
++        .clone()
++        .oneshot(
++            Request::builder()
++                .uri("/api/v1/workflows?limit=20")
++                .body(Body::empty())
++                .unwrap_or_else(|error| panic!("request: {error}")),
++        )
++        .await
++        .unwrap_or_else(|error| panic!("workflow response: {error}"));
++    assert_eq!(response.status(), StatusCode::OK);
++    let payload = json_response(response).await;
++    assert_eq!(payload["schema_version"], 1);
++    assert_eq!(payload["truncated"], false);
++    assert_eq!(payload["attempts"].as_array().map(Vec::len), Some(0));
++    assert!(
++        payload["generated_at_ms"]
++            .as_i64()
++            .is_some_and(|time| time >= 0)
++    );
++
++    let invalid = app
++        .oneshot(
++            Request::builder()
++                .uri("/api/v1/workflows?limit=0")
++                .body(Body::empty())
++                .unwrap_or_else(|error| panic!("invalid request: {error}")),
++        )
++        .await
++        .unwrap_or_else(|error| panic!("invalid workflow response: {error}"));
++    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
++}
++
++#[tokio::test]
++async fn workflow_overview_serializes_the_exact_browser_contract() {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let control = ControlStore::open(directory.path().join("control.sqlite"))
++        .unwrap_or_else(|error| panic!("open control: {error}"));
++    let scheduler = rdashboard::scheduler::DurableWorkflowScheduler::new(control.clone());
++    let app = router(DashboardState::new(
++        EventHub::new(control),
++        Duration::from_secs(5),
++    ));
++    let (manifest, admission) = workflow_web_fixture();
++    scheduler
++        .admit(&manifest, &admission, 1)
++        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
++    let populated = app
++        .clone()
++        .oneshot(
++            Request::builder()
++                .uri("/api/v1/workflows?limit=1")
++                .body(Body::empty())
++                .unwrap_or_else(|error| panic!("populated request: {error}")),
++        )
++        .await
++        .unwrap_or_else(|error| panic!("populated workflow response: {error}"));
++    assert_eq!(populated.status(), StatusCode::OK);
++    let populated = json_response(populated).await;
++    assert_eq!(populated["truncated"], false);
++    let attempt = &populated["attempts"][0];
++    assert_eq!(attempt["project_id"], "ralert");
++    assert_eq!(attempt["source_sha"], admission.source_sha.as_str());
++    assert_eq!(attempt["priority"], 2);
++    assert!(attempt["attempt_id"].as_str().is_some());
++    assert!(
++        populated["generated_at_ms"]
++            .as_i64()
++            .zip(attempt["updated_at_ms"].as_i64())
++            .is_some_and(|(generated, updated)| generated >= updated)
++    );
++    assert_eq!(
++        attempt
++            .as_object()
++            .unwrap_or_else(|| panic!("workflow attempt is an object"))
++            .keys()
++            .map(String::as_str)
++            .collect::<std::collections::BTreeSet<_>>(),
++        std::collections::BTreeSet::from([
++            "attempt_id",
++            "attempt_number",
++            "cleanup_state",
++            "created_at_ms",
++            "mutation_state",
++            "nodes",
++            "preparation_key",
++            "priority",
++            "project_id",
++            "request_id",
++            "source_attestation_digest",
++            "source_sequence",
++            "source_sha",
++            "state",
++            "terminal_at_ms",
++            "updated_at_ms",
++            "workflow_policy_digest",
++        ])
++    );
++    assert!(
++        attempt["workflow_policy_digest"]
++            .as_str()
++            .is_some_and(|digest| digest.len() == 64)
++    );
++    assert!(
++        attempt["nodes"]
++            .as_array()
++            .is_some_and(|nodes| !nodes.is_empty())
++    );
++    let node = &attempt["nodes"][0];
++    assert_eq!(
++        node.as_object()
++            .unwrap_or_else(|| panic!("workflow node is an object"))
++            .keys()
++            .map(String::as_str)
++            .collect::<std::collections::BTreeSet<_>>(),
++        std::collections::BTreeSet::from([
++            "completed_at_ms",
++            "kind",
++            "lease_generation",
++            "node_id",
++            "output_digest",
++            "profile_id",
++            "receipt_digest",
++            "state",
++            "worker_pool",
++        ])
++    );
++}
++
++#[tokio::test]
++async fn workflow_overview_sanitizes_corrupt_journal_failures() {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let path = directory.path().join("corrupt-workflow-control.sqlite");
++    let control = ControlStore::open(&path).unwrap_or_else(|error| panic!("open control: {error}"));
++    let scheduler = rdashboard::scheduler::DurableWorkflowScheduler::new(control.clone());
++    let (manifest, admission) = workflow_web_fixture();
++    scheduler
++        .admit(&manifest, &admission, 1)
++        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
++    drop(scheduler);
++    drop(control);
++
++    let corrupt = rusqlite::Connection::open(&path)
++        .unwrap_or_else(|error| panic!("open corrupt workflow fixture: {error}"));
++    corrupt
++        .execute(
++            "UPDATE workflow_requests SET project_id = 'internal-secret-marker!'",
++            [],
++        )
++        .unwrap_or_else(|error| panic!("corrupt workflow fixture: {error}"));
++    drop(corrupt);
++
++    let control =
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control: {error}"));
++    let response = router(DashboardState::new(
++        EventHub::new(control),
++        Duration::from_secs(5),
++    ))
++    .oneshot(
++        Request::builder()
++            .uri("/api/v1/workflows")
++            .body(Body::empty())
++            .unwrap_or_else(|error| panic!("request: {error}")),
++    )
++    .await
++    .unwrap_or_else(|error| panic!("corrupt workflow response: {error}"));
++    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
++    let problem = json_response(response).await;
++    assert_eq!(problem["code"], "workflow_overview_failed");
++    assert_eq!(problem["detail"], "Workflow overview could not be loaded.");
++    assert!(!problem.to_string().contains("internal-secret-marker"));
++    assert!(!problem.to_string().contains("project ID"));
++}
++
+ #[tokio::test]
+ async fn project_operation_history_is_project_scoped_and_bounded() {
+     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+@@ -1502,10 +1722,16 @@ fn browser_assets_use_safe_dom_updates_and_central_live_regions() {
+     assert!(javascript.contains("envelope.delivered_at_ms"));
+     assert!(javascript.contains("performance.now()"));
+     assert!(!javascript.contains("Date.now()"));
++    assert!(html.contains("id=\"workflow-heading\">Workflow и деплои</h2>"));
++    assert!(html.contains("Последние попытки workflow для всех установленных проектов"));
++    assert!(javascript.contains("validWorkflowOverview"));
++    assert!(javascript.contains("/api/v1/workflows?limit=20"));
+     assert!(status_javascript.contains("projectConditionLabels"));
++    assert!(status_javascript.contains("workflowAttemptLabels"));
+     assert!(status_javascript.contains("signal_lost: \"× Сигнал потерян\""));
+     assert!(status_javascript.contains("intervalMs * 2"));
+     assert!(status_javascript.contains("intervalMs * 3"));
+     assert!(css.contains("prefers-reduced-motion: reduce"));
+     assert!(css.contains("@supports not (content-visibility: auto)"));
++    assert!(css.contains("overflow-x: auto"));
+ }
+diff --git a/tests/workflow_scheduler_contracts.rs b/tests/workflow_scheduler_contracts.rs
+index 2206c4d..3ef090a 100644
+--- a/tests/workflow_scheduler_contracts.rs
++++ b/tests/workflow_scheduler_contracts.rs
+@@ -10,8 +10,9 @@ use rdashboard::{
+     installed_workflow::InstalledWorkflowCatalogV1,
+     scheduler::{
+         DurableWorkflowScheduler, WorkflowAdmissionV1, WorkflowAttemptStateV1,
+-        WorkflowCleanupReasonV1, WorkflowCleanupStateV1, WorkflowMutationStateV1,
+-        WorkflowNodeStateV1, WorkflowTriggerChannelV1, WorkflowWorkerRegistrationV1,
++        WorkflowCleanupReasonV1, WorkflowCleanupStateV1, WorkflowJournalReaderV1,
++        WorkflowMutationStateV1, WorkflowNodeStateV1, WorkflowTriggerChannelV1,
++        WorkflowWorkerRegistrationV1,
+     },
+     store::{ControlStore, StoreError},
+ };
+@@ -1062,3 +1063,71 @@ fn terminal_and_revoked_cleanup_obligations_bind_their_exact_evidence() {
+             && obligation.terminal_receipt.is_none()
+     }));
+ }
++
++#[test]
++fn workflow_overview_is_bounded_ordered_and_consistent_after_reopen() {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let path = directory.path().join("overview-control.sqlite");
++    let store =
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
++    let scheduler = DurableWorkflowScheduler::new(store.clone());
++    let first_manifest = manifest("ralert", 1);
++    let second_manifest = manifest("second", 1);
++    let first = scheduler
++        .admit(
++            &first_manifest,
++            &admission(
++                &first_manifest,
++                'a',
++                1,
++                WorkflowTriggerChannelV1::GithubWebhook,
++                "overview-first",
++            ),
++            10,
++        )
++        .unwrap_or_else(|error| panic!("admit first workflow: {error}"));
++    let second = scheduler
++        .admit(
++            &second_manifest,
++            &admission(
++                &second_manifest,
++                'b',
++                1,
++                WorkflowTriggerChannelV1::GithubWebhook,
++                "overview-second",
++            ),
++            20,
++        )
++        .unwrap_or_else(|error| panic!("admit second workflow: {error}"));
++    let reader = WorkflowJournalReaderV1::new(store.clone());
++    let page = reader
++        .recent_attempts(1)
++        .unwrap_or_else(|error| panic!("read bounded overview: {error}"));
++    assert!(page.truncated);
++    assert_eq!(page.attempts.len(), 1);
++    assert_eq!(page.attempts[0], second.attempt().clone());
++    assert!(matches!(
++        reader.recent_attempts(0),
++        Err(StoreError::InvalidWorkflowSchedulerInput(
++            "workflow overview limit"
++        ))
++    ));
++    drop(reader);
++    drop(scheduler);
++    drop(store);
++
++    let reopened_store =
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}"));
++    let reopened = WorkflowJournalReaderV1::new(reopened_store);
++    let page = reopened
++        .recent_attempts(2)
++        .unwrap_or_else(|error| panic!("read overview after reopen: {error}"));
++    assert!(!page.truncated);
++    assert_eq!(
++        page.attempts
++            .iter()
++            .map(|attempt| attempt.attempt_id)
++            .collect::<Vec<_>>(),
++        vec![second.attempt().attempt_id, first.attempt().attempt_id]
++    );
++}
+diff --git a/web/app.css b/web/app.css
+index 7fd7a26..3a97408 100644
+--- a/web/app.css
++++ b/web/app.css
+@@ -232,6 +232,7 @@ main {
+ }
+
+ .host-overview,
++.workflow-workspace,
+ .project-workspace,
+ .diagnostic-panel,
+ .partial-panel {
+@@ -240,6 +241,7 @@ main {
+ }
+
+ .host-overview,
++.workflow-workspace,
+ .project-workspace {
+   padding: 1rem;
+ }
+@@ -334,9 +336,15 @@ main {
+
+ .table-frame {
+   min-inline-size: 0;
++  overflow-x: auto;
+   border: 1px solid var(--line);
+ }
+
++.table-frame:focus-visible {
++  outline: 0.1875rem solid var(--focus);
++  outline-offset: 0.1875rem;
++}
++
+ table {
+   width: 100%;
+   border-collapse: collapse;
+@@ -389,6 +397,50 @@ tbody tr:last-child td {
+   table-layout: fixed;
+ }
+
++.section-actions {
++  display: flex;
++  align-items: center;
++  gap: 0.75rem;
++}
++
++.workflow-table {
++  min-width: 68rem;
++  table-layout: fixed;
++}
++
++.workflow-table th:nth-child(1) { width: 11%; }
++.workflow-table th:nth-child(2) { width: 9%; }
++.workflow-table th:nth-child(3) { width: 12%; }
++.workflow-table th:nth-child(4) { width: 23%; }
++.workflow-table th:nth-child(5) { width: 12%; }
++.workflow-table th:nth-child(6) { width: 10%; }
++.workflow-table th:nth-child(7) { width: 8%; }
++.workflow-table th:nth-child(8) { width: 15%; }
++
++.workflow-row > th {
++  color: var(--text);
++  background: var(--surface-raised);
++  font-size: 0.82rem;
++  letter-spacing: normal;
++  text-transform: none;
++  vertical-align: top;
++}
++
++.workflow-row > td {
++  color: var(--muted);
++  vertical-align: top;
++  overflow-wrap: anywhere;
++}
++
++.workflow-row > td > strong {
++  color: var(--text);
++}
++
++.workflow-table .empty-state {
++  display: table-cell;
++  height: 5rem;
++}
++
+ .project-table th:nth-child(1) { width: 8%; }
+ .project-table th:nth-child(2) { width: 10%; }
+ .project-table th:nth-child(3) { width: 22%; }
+@@ -547,6 +599,11 @@ tbody tr:last-child td {
+     flex-direction: column;
+   }
+
++  .section-actions {
++    width: 100%;
++    justify-content: space-between;
++  }
++
+   .lower-grid,
+   .diagnostic-list {
+     grid-template-columns: 1fr;
+diff --git a/web/app.js b/web/app.js
+index 85ef64e..f708644 100644
+--- a/web/app.js
++++ b/web/app.js
+@@ -8,6 +8,11 @@ import {
+   operationResultPresentation,
+   projectConditionPresentation,
+   repositorySizeChange,
++  validWorkflowOverview,
++  workflowAttemptPresentation,
++  workflowCleanupPresentation,
++  workflowCurrentStepLabel,
++  workflowMutationPresentation,
+ } from "./status.js";
+
+ const elements = Object.freeze({
+@@ -35,6 +40,10 @@ const elements = Object.freeze({
+   partialReasons: document.querySelector("#partial-reasons"),
+   projectCount: document.querySelector("#project-count"),
+   projectList: document.querySelector("#project-list"),
++  workflowSummary: document.querySelector("#workflow-summary"),
++  workflowStatus: document.querySelector("#workflow-status"),
++  workflowList: document.querySelector("#workflow-list"),
++  workflowRefresh: document.querySelector("#workflow-refresh"),
+   sqliteVersion: document.querySelector("#sqlite-version"),
+   observationOperation: document.querySelector("#observation-operation"),
+   sampleInterval: document.querySelector("#sample-interval"),
+@@ -65,6 +74,9 @@ const runtime = {
+   projectUpdatesLoading: new Set(),
+   projectErrors: new Map(),
+   projectErrorsLoading: new Set(),
++  workflowOverview: null,
++  workflowLoading: false,
++  workflowFailed: false,
+ };
+
+ const HOST_HISTORY_REFRESH_MS = 60_000;
+@@ -72,6 +84,7 @@ const PROJECT_OPERATIONS_REFRESH_MS = 30_000;
+ const PROJECT_RESOURCES_REFRESH_MS = 60_000;
+ const PROJECT_REPOSITORY_REFRESH_MS = 5 * 60_000;
+ const PROJECT_INTEGRATIONS_REFRESH_MS = 60_000;
++const WORKFLOW_OVERVIEW_REFRESH_MS = 5_000;
+ const PROJECT_INTEGRATIONS_STALE_MS = 15 * 60_000;
+ const HOST_HISTORY_WINDOWS = Object.freeze(["hour", "day", "week", "month"]);
+ const REPOSITORY_PERIODS = Object.freeze([
+@@ -186,6 +199,146 @@ function validTrafficTotals(totals) {
+     && totals.network_tx_covered_ms >= 0;
+ }
+
++async function loadWorkflowOverview(announceResult = false) {
++  if (runtime.workflowLoading) return;
++  runtime.workflowLoading = true;
++  elements.workflowRefresh.disabled = true;
++  if (!runtime.workflowOverview) {
++    elements.workflowStatus.hidden = false;
++    elements.workflowStatus.dataset.state = "loading";
++    elements.workflowStatus.textContent = "Загружается журнал workflow…";
++  }
++  try {
++    const response = await fetch("/api/v1/workflows?limit=20", {
++      headers: { Accept: "application/json" },
++      cache: "no-store",
++    });
++    if (!response.ok) {
++      const problem = await response.json().catch(() => ({ detail: response.statusText }));
++      throw new Error(problem.detail || "Журнал workflow недоступен.");
++    }
++    const overview = await response.json();
++    if (!validWorkflowOverview(overview)) {
++      throw new Error("Сервер вернул неподдерживаемый контракт workflow.");
++    }
++    runtime.workflowOverview = overview;
++    renderWorkflowOverview(overview);
++    if (announceResult) announce("Журнал workflow обновлён.");
++    runtime.workflowFailed = false;
++  } catch (error) {
++    elements.workflowStatus.hidden = false;
++    elements.workflowStatus.dataset.state = "error";
++    elements.workflowStatus.textContent = runtime.workflowOverview
++      ? `${error.message} Показаны последние полученные данные.`
++      : error.message;
++    if (!runtime.workflowOverview) {
++      renderWorkflowPlaceholder("Журнал workflow получить не удалось.");
++      elements.workflowSummary.textContent = "Данные недоступны";
++    }
++    if (announceResult || !runtime.workflowFailed) {
++      announce("Журнал workflow получить не удалось.", true);
++    }
++    runtime.workflowFailed = true;
++  } finally {
++    runtime.workflowLoading = false;
++    elements.workflowRefresh.disabled = false;
++  }
++}
++
++function renderWorkflowOverview(overview) {
++  const count = overview.attempts.length;
++  const generated = new Date(overview.generated_at_ms).toLocaleString("ru-RU");
++  elements.workflowSummary.textContent = `${count} ${workflowAttemptCountLabel(count)} · ${generated}`;
++  elements.workflowStatus.hidden = !overview.truncated;
++  elements.workflowStatus.dataset.state = overview.truncated ? "partial" : "fresh";
++  elements.workflowStatus.textContent = overview.truncated
++    ? "Показаны только 20 последних попыток. Полная история остаётся в durable journal."
++    : "";
++  elements.workflowList.replaceChildren();
++  if (count === 0) {
++    renderWorkflowPlaceholder("Попытки workflow ещё не зафиксированы.");
++    return;
++  }
++  for (const attempt of overview.attempts) {
++    elements.workflowList.append(createWorkflowRow(attempt));
++  }
++}
++
++function createWorkflowRow(attempt) {
++  const row = document.createElement("tr");
++  row.className = "workflow-row";
++
++  const project = document.createElement("th");
++  project.scope = "row";
++  project.textContent = attempt.project_id;
++  appendProjectCellDetail(project, `SHA ${attempt.source_sha.slice(0, 10)}`);
++
++  const attemptCell = document.createElement("td");
++  const attemptNumber = document.createElement("strong");
++  attemptNumber.textContent = `№ ${attempt.attempt_number}`;
++  attemptCell.append(attemptNumber);
++  appendProjectCellDetail(attemptCell, attempt.attempt_id.slice(0, 8));
++
++  const state = workflowAttemptPresentation(attempt.state);
++  const stateCell = workflowStateCell(state);
++
++  const stepCell = document.createElement("td");
++  stepCell.textContent = workflowCurrentStepLabel(attempt);
++  const completed = attempt.nodes.filter((node) => node.state === "succeeded").length;
++  appendProjectCellDetail(stepCell, `${completed} из ${attempt.nodes.length} этапов завершено`);
++
++  const mutationCell = workflowStateCell(workflowMutationPresentation(attempt.mutation_state));
++  const cleanupCell = workflowStateCell(workflowCleanupPresentation(attempt.cleanup_state));
++
++  const priorityCell = document.createElement("td");
++  priorityCell.textContent = String(attempt.priority);
++
++  const updatedCell = document.createElement("td");
++  updatedCell.textContent = new Date(attempt.updated_at_ms).toLocaleString("ru-RU");
++
++  row.append(
++    project,
++    attemptCell,
++    stateCell,
++    stepCell,
++    mutationCell,
++    cleanupCell,
++    priorityCell,
++    updatedCell,
++  );
++  return row;
++}
++
++function workflowStateCell(value) {
++  const cell = document.createElement("td");
++  cell.dataset.state = value.state;
++  const label = document.createElement("strong");
++  label.className = "state-label";
++  label.textContent = value.label;
++  cell.append(label);
++  return cell;
++}
++
++function renderWorkflowPlaceholder(message) {
++  elements.workflowList.replaceChildren();
++  const row = document.createElement("tr");
++  const cell = document.createElement("td");
++  cell.className = "empty-state";
++  cell.colSpan = 8;
++  cell.textContent = message;
++  row.append(cell);
++  elements.workflowList.append(row);
++}
++
++function workflowAttemptCountLabel(count) {
++  const modulo100 = count % 100;
++  const modulo10 = count % 10;
++  if (modulo100 >= 11 && modulo100 <= 14) return "попыток";
++  if (modulo10 === 1) return "попытка";
++  if (modulo10 >= 2 && modulo10 <= 4) return "попытки";
++  return "попыток";
++}
++
+ function renderHistoryCell(cell, window) {
+   cell.replaceChildren();
+   cell.dataset.state = window.complete ? "fresh" : "partial";
+@@ -1275,6 +1428,10 @@ elements.retry.addEventListener("click", async () => {
+   connect();
+ });
+
++elements.workflowRefresh.addEventListener("click", () => {
++  loadWorkflowOverview(true);
++});
++
+ window.addEventListener("online", () => {
+   runtime.reconnectDelayMs = 1_000;
+   connect();
+@@ -1287,6 +1444,7 @@ window.addEventListener("offline", () => {
+
+ window.setInterval(updateSampleAge, 1_000);
+ window.setInterval(() => loadHostHistory(false), HOST_HISTORY_REFRESH_MS);
++window.setInterval(() => loadWorkflowOverview(false), WORKFLOW_OVERVIEW_REFRESH_MS);
+ window.setInterval(() => {
+   if (!runtime.latestSnapshot?.projects) return;
+   for (const project of runtime.latestSnapshot.projects) {
+@@ -1315,6 +1473,7 @@ window.setInterval(() => {
+ }, PROJECT_INTEGRATIONS_REFRESH_MS);
+
+ loadHostHistory(true);
++loadWorkflowOverview(false);
+
+ loadInitialSnapshot()
+   .then(connect)
+diff --git a/web/index.html b/web/index.html
+index 1c7d502..c2c070e 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -102,6 +102,49 @@
+         <ul id="partial-reasons"></ul>
+       </section>
+
++      <section class="workflow-workspace" aria-labelledby="workflow-heading">
++        <div class="section-heading">
++          <div>
++            <p class="eyebrow">Durable journal</p>
++            <h2 id="workflow-heading">Workflow и деплои</h2>
++          </div>
++          <div class="section-actions">
++            <p id="workflow-summary" class="section-meta">Загрузка…</p>
++            <button id="workflow-refresh" class="secondary-action" type="button">Обновить</button>
++          </div>
++        </div>
++        <p id="workflow-status" class="history-status" data-state="loading">
++          Загружается журнал workflow…
++        </p>
++        <div
++          class="table-frame workflow-table-frame"
++          role="group"
++          aria-labelledby="workflow-heading"
++          tabindex="0"
++        >
++          <table class="workflow-table">
++            <caption>Последние попытки workflow для всех установленных проектов</caption>
++            <thead>
++              <tr>
++                <th scope="col">Проект</th>
++                <th scope="col">Попытка</th>
++                <th scope="col">Состояние</th>
++                <th scope="col">Текущий этап</th>
++                <th scope="col">Мутация</th>
++                <th scope="col">Cleanup</th>
++                <th scope="col">Приоритет</th>
++                <th scope="col">Обновлено</th>
++              </tr>
++            </thead>
++            <tbody id="workflow-list">
++              <tr>
++                <td class="empty-state" colspan="8">Загружается журнал workflow…</td>
++              </tr>
++            </tbody>
++          </table>
++        </div>
++      </section>
++
+       <section class="project-workspace" aria-labelledby="projects-heading">
+         <div class="section-heading">
+           <div>
+diff --git a/web/status.js b/web/status.js
+index eb6ba3e..acad69c 100644
+--- a/web/status.js
++++ b/web/status.js
+@@ -64,6 +64,64 @@ const operationPhaseLabels = Object.freeze({
+   reconciliation: "Сверка состояния",
+ });
+
++const workflowAttemptLabels = Object.freeze({
++  queued: { state: "partial", label: "◌ В очереди" },
++  waiting_for_mutation: { state: "partial", label: "◇ Ждёт завершения мутации" },
++  running: { state: "running", label: "↻ Выполняется" },
++  succeeded: { state: "succeeded", label: "● Завершён" },
++  failed: { state: "error", label: "× Ошибка" },
++  superseded: { state: "unknown", label: "◇ Заменён новым" },
++  needs_reconcile: { state: "needs_reconcile", label: "△ Требует сверки" },
++});
++
++const workflowMutationLabels = Object.freeze({
++  not_started: { state: "unknown", label: "Не начата" },
++  owned: { state: "running", label: "Выполняется" },
++  needs_reconcile: { state: "needs_reconcile", label: "Требует сверки" },
++  complete: { state: "succeeded", label: "Завершена" },
++});
++
++const workflowCleanupLabels = Object.freeze({
++  complete: { state: "succeeded", label: "Завершён" },
++  pending: { state: "error", label: "Требуется" },
++});
++
++const workflowNodeKindLabels = Object.freeze({
++  source_admission: "Приём исходников",
++  host_prepare: "Подготовка окружения",
++  verification: "Проверки",
++  release_build: "Сборка релиза",
++  deterministic_reduce: "Сверка доказательств",
++  resource_reservation: "Резерв ресурсов",
++  backup: "Резервная копия",
++  migration: "Миграция",
++  candidate_health: "Проверка кандидата",
++  cutover: "Переключение трафика",
++  released_observation: "Наблюдение релиза",
++  rollback: "Откат",
++});
++
++const workflowNodeStates = new Set([
++  "dormant",
++  "blocked",
++  "ready",
++  "leased",
++  "succeeded",
++  "failed",
++  "cancelled",
++  "needs_reconcile",
++]);
++const workflowWorkerPools = new Set([
++  "controller",
++  "vps_required",
++  "build_compute",
++  "privileged_executor",
++]);
++const workflowIdentifierPattern = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
++const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
++const commitPattern = /^[0-9a-f]{40}$/;
++const digestPattern = /^[0-9a-f]{64}$/;
++
+ export function evaluateHostObservation(snapshot, ageMs) {
+   if (
+     !snapshot
+@@ -153,6 +211,138 @@ export function operationPhaseLabel(phase) {
+   return operationPhaseLabels[phase] ?? "Неизвестная фаза";
+ }
+
++export function workflowAttemptPresentation(state) {
++  const value = workflowAttemptLabels[state];
++  return value ? presentation(value.state, value.label) : presentation("unknown", "? Неизвестно");
++}
++
++export function workflowMutationPresentation(state) {
++  const value = workflowMutationLabels[state];
++  return value ? presentation(value.state, value.label) : presentation("unknown", "Неизвестно");
++}
++
++export function workflowCleanupPresentation(state) {
++  const value = workflowCleanupLabels[state];
++  return value ? presentation(value.state, value.label) : presentation("unknown", "Неизвестно");
++}
++
++export function workflowCurrentStepLabel(attempt) {
++  if (!Array.isArray(attempt?.nodes)) return "Неизвестный этап";
++  const priorities = ["needs_reconcile", "failed", "leased", "ready", "blocked"];
++  for (const state of priorities) {
++    const matching = attempt.nodes.filter((node) => node.state === state);
++    if (matching.length > 0) {
++      const labels = matching.slice(0, 2).map(
++        (node) => workflowNodeKindLabels[node.kind] ?? "Неизвестный этап",
++      );
++      if (matching.length > labels.length) labels.push(`ещё ${matching.length - labels.length}`);
++      return labels.join(" · ");
++    }
++  }
++  return attempt.state === "succeeded" ? "Все этапы завершены" : "Нет активного этапа";
++}
++
++export function validWorkflowOverview(payload) {
++  if (
++    !hasExactKeys(payload, ["schema_version", "generated_at_ms", "truncated", "attempts"])
++    || payload.schema_version !== 1
++    || !safeNonnegativeInteger(payload.generated_at_ms)
++    || typeof payload.truncated !== "boolean"
++    || !Array.isArray(payload.attempts)
++    || payload.attempts.length > 50
++  ) return false;
++  const attemptIds = new Set();
++  let previousUpdatedAt = Number.MAX_SAFE_INTEGER;
++  for (const attempt of payload.attempts) {
++    if (
++      !validWorkflowAttempt(attempt, payload.generated_at_ms)
++      || attemptIds.has(attempt.attempt_id)
++      || attempt.updated_at_ms > previousUpdatedAt
++    ) return false;
++    attemptIds.add(attempt.attempt_id);
++    previousUpdatedAt = attempt.updated_at_ms;
++  }
++  return true;
++}
++
++function validWorkflowAttempt(attempt, generatedAtMs) {
++  if (!hasExactKeys(attempt, [
++    "request_id",
++    "attempt_id",
++    "attempt_number",
++    "project_id",
++    "source_sha",
++    "source_sequence",
++    "workflow_policy_digest",
++    "source_attestation_digest",
++    "preparation_key",
++    "priority",
++    "state",
++    "mutation_state",
++    "cleanup_state",
++    "created_at_ms",
++    "updated_at_ms",
++    "terminal_at_ms",
++    "nodes",
++  ])) return false;
++  if (
++    !uuidPattern.test(attempt.request_id)
++    || !uuidPattern.test(attempt.attempt_id)
++    || !safePositiveInteger(attempt.attempt_number)
++    || !workflowIdentifierPattern.test(attempt.project_id)
++    || !commitPattern.test(attempt.source_sha)
++    || !safePositiveInteger(attempt.source_sequence)
++    || !digestPattern.test(attempt.workflow_policy_digest)
++    || !digestPattern.test(attempt.source_attestation_digest)
++    || !digestPattern.test(attempt.preparation_key)
++    || !safeNonnegativeInteger(attempt.priority)
++    || attempt.priority > 3
++    || !Object.hasOwn(workflowAttemptLabels, attempt.state)
++    || !Object.hasOwn(workflowMutationLabels, attempt.mutation_state)
++    || !Object.hasOwn(workflowCleanupLabels, attempt.cleanup_state)
++    || !safeNonnegativeInteger(attempt.created_at_ms)
++    || !safeNonnegativeInteger(attempt.updated_at_ms)
++    || attempt.updated_at_ms < attempt.created_at_ms
++    || attempt.updated_at_ms > generatedAtMs
++    || !(attempt.terminal_at_ms === null
++      || (safeNonnegativeInteger(attempt.terminal_at_ms)
++        && attempt.terminal_at_ms >= attempt.created_at_ms
++        && attempt.terminal_at_ms <= attempt.updated_at_ms))
++    || !Array.isArray(attempt.nodes)
++    || attempt.nodes.length === 0
++    || attempt.nodes.length > 64
++  ) return false;
++  const nodeIds = new Set();
++  for (const node of attempt.nodes) {
++    if (!validWorkflowNode(node) || nodeIds.has(node.node_id)) return false;
++    nodeIds.add(node.node_id);
++  }
++  return true;
++}
++
++function validWorkflowNode(node) {
++  return hasExactKeys(node, [
++    "node_id",
++    "kind",
++    "profile_id",
++    "worker_pool",
++    "state",
++    "lease_generation",
++    "output_digest",
++    "receipt_digest",
++    "completed_at_ms",
++  ])
++    && workflowIdentifierPattern.test(node.node_id)
++    && Object.hasOwn(workflowNodeKindLabels, node.kind)
++    && workflowIdentifierPattern.test(node.profile_id)
++    && workflowWorkerPools.has(node.worker_pool)
++    && workflowNodeStates.has(node.state)
++    && safeNonnegativeInteger(node.lease_generation)
++    && (node.output_digest === null || digestPattern.test(node.output_digest))
++    && (node.receipt_digest === null || digestPattern.test(node.receipt_digest))
++    && (node.completed_at_ms === null || safeNonnegativeInteger(node.completed_at_ms));
++}
++
+ export function repositorySizeChange(samples, periodMs) {
+   if (!Array.isArray(samples) || samples.length < 2 || !Number.isFinite(periodMs) || periodMs <= 0) {
+     return null;
+@@ -181,6 +371,22 @@ function validRepositoryPoint(sample) {
+     && sample.total_bytes >= 0;
+ }
+
++function hasExactKeys(value, keys) {
++  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
++  const actual = Object.keys(value).sort();
++  const expected = [...keys].sort();
++  return actual.length === expected.length
++    && actual.every((key, index) => key === expected[index]);
++}
++
++function safeNonnegativeInteger(value) {
++  return Number.isSafeInteger(value) && value >= 0;
++}
++
++function safePositiveInteger(value) {
++  return Number.isSafeInteger(value) && value > 0;
++}
++
+ function observation(status, ageSeconds) {
+   return Object.freeze({
+     status,
+[0m
+[0m✱ [0mGrep "fn load_attempt_snapshot"[90m 1 match[0m
+[0m✱ [0mGrep "WorkflowAttemptSnapshotV1"[90m 22 matches[0m
+[0m✱ [0mGrep "ApiProblem"[90m in src · 39 matches[0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=197, limit=50][0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=2760, limit=100][0m
+[0m→ [0mRead src/web/routes.rs[90m [offset=1115, limit=30][0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=2890, limit=20][0m
+[0m✱ [0mGrep "fn load_attempt_context"[90m 1 match[0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=2657, limit=105][0m
+[0m✱ [0mGrep "fn unix_time_ms"[90m 1 match[0m
+[0m✱ [0mGrep "pub enum StoreError"[90m 1 match[0m
+[0m→ [0mRead src/lib.rs[90m [offset=89, limit=10][0m
+[0m→ [0mRead src/store/mod.rs[90m [offset=37, limit=80][0m
+[0m→ [0mRead src/store/mod.rs[90m [offset=117, limit=80][0m
+[0m✱ [0mGrep "data-state"[90m 19 matches[0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=2860, limit=35][0m
+[0m
+[0m$ [0mgit diff --cached -- web/status.js | grep for | head -30
++  waiting_for_mutation: { state: "partial", label: "◇ Ждёт завершения мутации" },
++  for (const state of priorities) {
++  for (const attempt of payload.attempts) {
++  for (const node of attempt.nodes) {
+[0m
+[0m→ [0mRead web/status.js[90m [limit=60][0m
+[0m✱ [0mGrep "Object\.hasOwn"[90m 6 matches[0m
+[0m✱ [0mGrep "pub struct WorkflowAttemptSnapshotV1"[90m 1 match[0m
+[0m
+[0m$ [0mcat bin/ci 2>/dev/null || echo "no bin/ci"
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 0 )); then
+  echo "ERROR: bin/ci accepts no arguments." >&2
+  exit 64
+fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+# Keep native dependency builds hermetic when the host compiler is wrapped by ccache.
+export CCACHE_DIR="${CCACHE_DIR:-$root/target/ccache}"
+export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-$root/target/ccache-tmp}"
+mkdir -p "$CCACHE_DIR" "$CCACHE_TEMPDIR"
+
+if [[ ! -f Cargo.lock ]]; then
+  echo "ERROR: Cargo.lock is required; generate and review it before running CI." >&2
+  exit 66
+fi
+
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v1.json
+cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v2.json
+node --check web/app.js
+node --test tests/browser_status.test.js
+cargo build --workspace --all-targets --all-features --release --locked
+[0m
+[0m✱ [0mGrep "pub struct WorkflowNodeSnapshotV1"[90m 1 match[0m
+[0m✱ [0mGrep "pub enum WorkflowWorkerPoolV1"[90m 1 match[0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=184, limit=30][0m
+[0m→ [0mRead src/domain/workflow.rs[90m [offset=207, limit=25][0m
+[0m✱ [0mGrep "pub enum WorkflowNodeKindV1"[90m 1 match[0m
+[0m→ [0mRead src/domain/workflow.rs[90m [offset=93, limit=55][0m
+[0m✱ [0mGrep "pub enum WorkflowNodeStateV1"[90m 1 match[0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=143, limit=40][0m
+[0m✱ [0mGrep "pub enum WorkflowAttemptStateV1"[90m 1 match[0m
+[0m✱ [0mGrep "pub enum WorkflowMutationStateV1"[90m 1 match[0m
+[0m✱ [0mGrep "pub enum WorkflowCleanupStateV1"[90m 1 match[0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=59, limit=80][0m
+[0m
+[0m$ [0mgrep -B5 'pub struct WorkflowNodeSnapshotV1' /home/denai/RustroverProjects/rdashboard/src/scheduler.rs | grep 'derive\|struct'
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkflowNodeSnapshotV1 {
+[0m
+[0m✱ [0mGrep "impl.*Serialize.*WorkflowAttemptSnapshotV1|Serialize.*derive.*WorkflowAttemptSnapshotV1"[90m 0 matches[0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=195, limit=2][0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=139, limit=6][0m
+[0m→ [0mRead src/scheduler.rs[90m [offset=55, limit=6][0m
+[0m
+[0m$ [0mgrep -n 'pub struct ProjectId\|pub type ProjectId\|pub enum ProjectId\|ProjectId =' /home/denai/RustroverProjects/rdashboard/src/domain/mod.rs /home/denai/RustroverProjects/rdashboard/src/identity.rs 2>/dev/null || grep -rn 'struct ProjectId\|type ProjectId' /home/denai/RustroverProjects/rdashboard/src/ | head -5
+/home/denai/RustroverProjects/rdashboard/src/domain/identifiers.rs:17:pub struct ProjectId(String);
+[0m
+[0m$ [0mgrep -n 'pub struct GitCommitId\|pub struct EvidenceDigest' /home/denai/RustroverProjects/rdashboard/src/domain/identifiers.rs
+65:pub struct GitCommitId(String);
+111:pub struct EvidenceDigest(String);
+[0m
+[0m$ [0mgrep -n 'pub struct WorkflowNodeId\|pub struct WorkflowProfileId' /home/denai/RustroverProjects/rdashboard/src/domain/workflow.rs 2>/dev/null || grep -rn 'struct WorkflowNodeId\|struct WorkflowProfileId' /home/denai/RustroverProjects/rdashboard/src/ | head -5
+(no output)
+[0m
+[0m$ [0mgrep -rn 'WorkflowNodeId\|WorkflowProfileId' /home/denai/RustroverProjects/rdashboard/src/domain/identifiers.rs | head -10
+(no output)
+[0m
+[0m$ [0mgrep -rn 'type WorkflowNodeId\|type WorkflowProfileId\|struct WorkflowNodeId\|struct WorkflowProfileId' /home/denai/RustroverProjects/rdashboard/src/ | head -10
+(no output)
+[0m
+[0m$ [0mgrep -rn "WorkflowNodeId\b" /home/denai/RustroverProjects/rdashboard/src/scheduler.rs | head -5
+14:        WorkflowExecutionProfileV1, WorkflowLeaseV1, WorkflowNodeActivationV1, WorkflowNodeId,
+185:    pub node_id: WorkflowNodeId,
+1400:    node_id: WorkflowNodeId,
+1465:        let node_id = WorkflowNodeId::from_str(&row.node_id)
+1660:    node_id: &'a WorkflowNodeId,
+[0m
+[0m$ [0mgrep -rn "WorkflowNodeId" /home/denai/RustroverProjects/rdashboard/src/domain/workflow.rs | head -5
+70:workflow_token!(WorkflowNodeId, "workflow node ID");
+316:    pub node_id: WorkflowNodeId,
+321:    pub depends_on: Vec<WorkflowNodeId>,
+443:    pub fn node(&self, node_id: &WorkflowNodeId) -> Option<&WorkflowNodeV1> {
+507:    nodes: &BTreeMap<&WorkflowNodeId, &WorkflowNodeV1>,
+[0m
+[0m$ [0mgrep -rn "macro_rules! workflow_token" /home/denai/RustroverProjects/rdashboard/src/ | head -30
+/home/denai/RustroverProjects/rdashboard/src/domain/workflow.rs:27:macro_rules! workflow_token {
+[0m
+[0m→ [0mRead src/domain/workflow.rs[90m [offset=27, limit=40][0m
+[0m
+[0m$ [0mgrep -n "fn valid_workflow_token" /home/denai/RustroverProjects/rdashboard/src/domain/workflow.rs
+77:fn valid_workflow_token(value: &str, maximum: usize) -> bool {
+[0m
+[0m→ [0mRead src/domain/workflow.rs[90m [offset=77, limit=15][0m
+[0m→ [0mRead src/domain/identifiers.rs[90m [offset=17, limit=30][0m
+[0m✱ [0mGrep "fn lock_connection"[90m 1 match[0m
+[0m→ [0mRead src/store/mod.rs[90m [offset=30, limit=10][0m

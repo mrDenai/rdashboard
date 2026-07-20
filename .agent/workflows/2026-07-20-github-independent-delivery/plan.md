@@ -101,7 +101,7 @@ Implementation progress:
 | Step | Status | Current evidence |
 | --- | --- | --- |
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
-| 2. Installed workflow and scheduler journal | In progress | Slice 2a locally implements the strict V2 installed DAG and durable scheduler. Slice 2b adds the single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, canonical cleanup receipts, cleanup-before-reuse and V1/V2-to-V3 migration. Only controller/web projection remains before step 2 can close; the actual generic worker and sealed preparation store are step 4. |
+| 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker and sealed preparation store remain step 4. |
 | 3-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -187,6 +187,31 @@ Implementation ledger:
   in 2 minutes 50 seconds. A fresh exact-manifest `deepseek-free` review returned `SAFE` with no open
   P0-P2 finding for staged hash
   `6f34022a5bd8ec926e14183c713d7a6151f1cba18171c66aefec09aa280d48bb`.
+- Slice 2c adds a narrow read-only scheduler journal reader over a consistent SQLite transaction and
+  exposes at most 50 newest attempts through the authenticated controller surface. Ordering and
+  truncation are deterministic, the response timestamp is captured after the snapshot read, and the
+  HTTP surface has no workflow mutation authority.
+- The dashboard polls 20 attempts every five seconds without overlapping requests, validates an exact
+  versioned wire contract and preserves the last valid snapshot on failure. It renders loading, empty,
+  bounded, success, recovery, cleanup and stale-error states in a semantic table with a native refresh
+  button, keyboard-scrollable overflow and centralized announcements. Modern web guidance was applied
+  for semantics, error announcements and real overflow scrolling; no experimental browser dependency
+  or polyfill was introduced.
+- The post-correction full-worktree bare `bin/ci` passed with 184 library tests (2 credentialed live
+  tests ignored), every binary/integration suite, 29 store/web contracts, 14 scheduler contracts,
+  9 browser contracts and the optimized release build in 2 minutes 51 seconds. A refreshed exact
+  staged export passed bare `bin/ci` independently after the review fixes: 167 library tests (2
+  ignored), every binary/integration suite, 29 store/web contracts, 14 scheduler contracts, 8 browser
+  contracts and the optimized release build in 2 minutes 49 seconds.
+- The first fresh `deepseek-free` review found two P2 error-boundary defects: journal failures used a
+  mutation-oriented 400 response with internal SQLite detail, and the clock path exposed its internal
+  display value. Both now log the real error server-side and return the same fixed generic 500 problem;
+  a corrupt-journal regression proves an internal marker cannot escape. The final exact-staged review
+  returned `SAFE` with no P0-P2 finding for product/test hash
+  `c33ee2422411e306b023cb12f2f69ed5f5b3a907a72260237b1ebd7d52d261df`.
+- The in-app browser-control surface was not available in this session, so visual browser QA remains
+  explicitly unperformed; static semantic, Rust wire-contract and JavaScript state-contract checks
+  passed.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

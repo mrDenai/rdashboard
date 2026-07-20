@@ -8,6 +8,11 @@ import {
   operationResultPresentation,
   projectConditionPresentation,
   repositorySizeChange,
+  validWorkflowOverview,
+  workflowAttemptPresentation,
+  workflowCleanupPresentation,
+  workflowCurrentStepLabel,
+  workflowMutationPresentation,
 } from "./status.js";
 
 const elements = Object.freeze({
@@ -35,6 +40,10 @@ const elements = Object.freeze({
   partialReasons: document.querySelector("#partial-reasons"),
   projectCount: document.querySelector("#project-count"),
   projectList: document.querySelector("#project-list"),
+  workflowSummary: document.querySelector("#workflow-summary"),
+  workflowStatus: document.querySelector("#workflow-status"),
+  workflowList: document.querySelector("#workflow-list"),
+  workflowRefresh: document.querySelector("#workflow-refresh"),
   sqliteVersion: document.querySelector("#sqlite-version"),
   observationOperation: document.querySelector("#observation-operation"),
   sampleInterval: document.querySelector("#sample-interval"),
@@ -65,6 +74,9 @@ const runtime = {
   projectUpdatesLoading: new Set(),
   projectErrors: new Map(),
   projectErrorsLoading: new Set(),
+  workflowOverview: null,
+  workflowLoading: false,
+  workflowFailed: false,
 };
 
 const HOST_HISTORY_REFRESH_MS = 60_000;
@@ -72,6 +84,7 @@ const PROJECT_OPERATIONS_REFRESH_MS = 30_000;
 const PROJECT_RESOURCES_REFRESH_MS = 60_000;
 const PROJECT_REPOSITORY_REFRESH_MS = 5 * 60_000;
 const PROJECT_INTEGRATIONS_REFRESH_MS = 60_000;
+const WORKFLOW_OVERVIEW_REFRESH_MS = 5_000;
 const PROJECT_INTEGRATIONS_STALE_MS = 15 * 60_000;
 const HOST_HISTORY_WINDOWS = Object.freeze(["hour", "day", "week", "month"]);
 const REPOSITORY_PERIODS = Object.freeze([
@@ -184,6 +197,146 @@ function validTrafficTotals(totals) {
     && totals.network_rx_covered_ms >= 0
     && Number.isSafeInteger(totals.network_tx_covered_ms)
     && totals.network_tx_covered_ms >= 0;
+}
+
+async function loadWorkflowOverview(announceResult = false) {
+  if (runtime.workflowLoading) return;
+  runtime.workflowLoading = true;
+  elements.workflowRefresh.disabled = true;
+  if (!runtime.workflowOverview) {
+    elements.workflowStatus.hidden = false;
+    elements.workflowStatus.dataset.state = "loading";
+    elements.workflowStatus.textContent = "Загружается журнал workflow…";
+  }
+  try {
+    const response = await fetch("/api/v1/workflows?limit=20", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(problem.detail || "Журнал workflow недоступен.");
+    }
+    const overview = await response.json();
+    if (!validWorkflowOverview(overview)) {
+      throw new Error("Сервер вернул неподдерживаемый контракт workflow.");
+    }
+    runtime.workflowOverview = overview;
+    renderWorkflowOverview(overview);
+    if (announceResult) announce("Журнал workflow обновлён.");
+    runtime.workflowFailed = false;
+  } catch (error) {
+    elements.workflowStatus.hidden = false;
+    elements.workflowStatus.dataset.state = "error";
+    elements.workflowStatus.textContent = runtime.workflowOverview
+      ? `${error.message} Показаны последние полученные данные.`
+      : error.message;
+    if (!runtime.workflowOverview) {
+      renderWorkflowPlaceholder("Журнал workflow получить не удалось.");
+      elements.workflowSummary.textContent = "Данные недоступны";
+    }
+    if (announceResult || !runtime.workflowFailed) {
+      announce("Журнал workflow получить не удалось.", true);
+    }
+    runtime.workflowFailed = true;
+  } finally {
+    runtime.workflowLoading = false;
+    elements.workflowRefresh.disabled = false;
+  }
+}
+
+function renderWorkflowOverview(overview) {
+  const count = overview.attempts.length;
+  const generated = new Date(overview.generated_at_ms).toLocaleString("ru-RU");
+  elements.workflowSummary.textContent = `${count} ${workflowAttemptCountLabel(count)} · ${generated}`;
+  elements.workflowStatus.hidden = !overview.truncated;
+  elements.workflowStatus.dataset.state = overview.truncated ? "partial" : "fresh";
+  elements.workflowStatus.textContent = overview.truncated
+    ? "Показаны только 20 последних попыток. Полная история остаётся в durable journal."
+    : "";
+  elements.workflowList.replaceChildren();
+  if (count === 0) {
+    renderWorkflowPlaceholder("Попытки workflow ещё не зафиксированы.");
+    return;
+  }
+  for (const attempt of overview.attempts) {
+    elements.workflowList.append(createWorkflowRow(attempt));
+  }
+}
+
+function createWorkflowRow(attempt) {
+  const row = document.createElement("tr");
+  row.className = "workflow-row";
+
+  const project = document.createElement("th");
+  project.scope = "row";
+  project.textContent = attempt.project_id;
+  appendProjectCellDetail(project, `SHA ${attempt.source_sha.slice(0, 10)}`);
+
+  const attemptCell = document.createElement("td");
+  const attemptNumber = document.createElement("strong");
+  attemptNumber.textContent = `№ ${attempt.attempt_number}`;
+  attemptCell.append(attemptNumber);
+  appendProjectCellDetail(attemptCell, attempt.attempt_id.slice(0, 8));
+
+  const state = workflowAttemptPresentation(attempt.state);
+  const stateCell = workflowStateCell(state);
+
+  const stepCell = document.createElement("td");
+  stepCell.textContent = workflowCurrentStepLabel(attempt);
+  const completed = attempt.nodes.filter((node) => node.state === "succeeded").length;
+  appendProjectCellDetail(stepCell, `${completed} из ${attempt.nodes.length} этапов завершено`);
+
+  const mutationCell = workflowStateCell(workflowMutationPresentation(attempt.mutation_state));
+  const cleanupCell = workflowStateCell(workflowCleanupPresentation(attempt.cleanup_state));
+
+  const priorityCell = document.createElement("td");
+  priorityCell.textContent = String(attempt.priority);
+
+  const updatedCell = document.createElement("td");
+  updatedCell.textContent = new Date(attempt.updated_at_ms).toLocaleString("ru-RU");
+
+  row.append(
+    project,
+    attemptCell,
+    stateCell,
+    stepCell,
+    mutationCell,
+    cleanupCell,
+    priorityCell,
+    updatedCell,
+  );
+  return row;
+}
+
+function workflowStateCell(value) {
+  const cell = document.createElement("td");
+  cell.dataset.state = value.state;
+  const label = document.createElement("strong");
+  label.className = "state-label";
+  label.textContent = value.label;
+  cell.append(label);
+  return cell;
+}
+
+function renderWorkflowPlaceholder(message) {
+  elements.workflowList.replaceChildren();
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.className = "empty-state";
+  cell.colSpan = 8;
+  cell.textContent = message;
+  row.append(cell);
+  elements.workflowList.append(row);
+}
+
+function workflowAttemptCountLabel(count) {
+  const modulo100 = count % 100;
+  const modulo10 = count % 10;
+  if (modulo100 >= 11 && modulo100 <= 14) return "попыток";
+  if (modulo10 === 1) return "попытка";
+  if (modulo10 >= 2 && modulo10 <= 4) return "попытки";
+  return "попыток";
 }
 
 function renderHistoryCell(cell, window) {
@@ -1275,6 +1428,10 @@ elements.retry.addEventListener("click", async () => {
   connect();
 });
 
+elements.workflowRefresh.addEventListener("click", () => {
+  loadWorkflowOverview(true);
+});
+
 window.addEventListener("online", () => {
   runtime.reconnectDelayMs = 1_000;
   connect();
@@ -1287,6 +1444,7 @@ window.addEventListener("offline", () => {
 
 window.setInterval(updateSampleAge, 1_000);
 window.setInterval(() => loadHostHistory(false), HOST_HISTORY_REFRESH_MS);
+window.setInterval(() => loadWorkflowOverview(false), WORKFLOW_OVERVIEW_REFRESH_MS);
 window.setInterval(() => {
   if (!runtime.latestSnapshot?.projects) return;
   for (const project of runtime.latestSnapshot.projects) {
@@ -1315,6 +1473,7 @@ window.setInterval(() => {
 }, PROJECT_INTEGRATIONS_REFRESH_MS);
 
 loadHostHistory(true);
+loadWorkflowOverview(false);
 
 loadInitialSnapshot()
   .then(connect)
