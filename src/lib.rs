@@ -76,6 +76,8 @@ pub mod source;
 pub mod source_socket;
 pub mod store;
 pub mod web;
+#[cfg(unix)]
+pub mod worker_socket;
 
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 

@@ -10,10 +10,11 @@ use uuid::Uuid;
 use crate::{
     domain::{
         EvidenceDigest, GitCommitId, OperationKind, ProjectId, ProjectManifestV2,
-        WorkflowArtifactKindV1, WorkflowCleanupResultV1, WorkflowExecutionProfileV1,
-        WorkflowLeaseV1, WorkflowNodeActivationV1, WorkflowNodeId, WorkflowNodeKindV1,
-        WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowProfileId, WorkflowReductionInputV1,
-        WorkflowReductionReceiptV1, WorkflowWorkerPoolV1, valid_workflow_identity,
+        WorkflowArtifactKindV1, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
+        WorkflowExecutionProfileV1, WorkflowLeaseV1, WorkflowNodeActivationV1, WorkflowNodeId,
+        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowProfileId,
+        WorkflowReductionInputV1, WorkflowReductionReceiptV1, WorkflowWorkerPoolV1,
+        valid_workflow_identity,
     },
     store::{ControlStore, StoreError},
 };
@@ -179,7 +180,7 @@ impl WorkflowNodeStateV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkflowNodeSnapshotV1 {
     pub node_id: WorkflowNodeId,
     pub kind: WorkflowNodeKindV1,
@@ -192,7 +193,7 @@ pub struct WorkflowNodeSnapshotV1 {
     pub completed_at_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkflowAttemptSnapshotV1 {
     pub request_id: Uuid,
     pub attempt_id: Uuid,
@@ -231,7 +232,7 @@ impl WorkflowAdmissionOutcomeV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkflowWorkerRegistrationV1 {
     pub worker_id: String,
     pub host_id: String,
@@ -239,7 +240,7 @@ pub struct WorkflowWorkerRegistrationV1 {
 }
 
 impl WorkflowWorkerRegistrationV1 {
-    fn validate(&self) -> Result<(), StoreError> {
+    pub fn validate(&self) -> Result<(), StoreError> {
         if !valid_workflow_identity(&self.worker_id)
             || !valid_workflow_identity(&self.host_id)
             || self.pools.is_empty()
@@ -251,6 +252,36 @@ impl WorkflowWorkerRegistrationV1 {
         }
         Ok(())
     }
+
+    pub fn validate_unprivileged(&self) -> Result<(), StoreError> {
+        self.validate()?;
+        if self.pools.iter().any(|pool| {
+            matches!(
+                pool,
+                WorkflowWorkerPoolV1::Controller | WorkflowWorkerPoolV1::PrivilegedExecutor
+            )
+        }) {
+            return Err(StoreError::InvalidWorkflowSchedulerInput(
+                "unprivileged worker pools",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCleanupReasonV1 {
+    LeaseExpired,
+    LeaseRevoked,
+    TerminalReceiptPending,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkflowCleanupObligationV1 {
+    pub lease: WorkflowLeaseV1,
+    pub terminal_receipt: Option<WorkflowNodeReceiptV1>,
+    pub reason: WorkflowCleanupReasonV1,
 }
 
 #[derive(Clone, Debug)]
@@ -731,6 +762,9 @@ impl DurableWorkflowScheduler {
         }
         self.store.immediate_transaction(|transaction| {
             expire_leases_transaction(transaction, now_ms)?;
+            if worker_has_pending_cleanup(transaction, worker)? {
+                return Ok(None);
+            }
             claim_next_transaction(transaction, worker, now_ms, lease_duration_ms)
         })
     }
@@ -744,6 +778,254 @@ impl DurableWorkflowScheduler {
         self.store
             .immediate_transaction(|transaction| expire_leases_transaction(transaction, now_ms))
     }
+
+    pub fn renew_lease(
+        &self,
+        worker: &WorkflowWorkerRegistrationV1,
+        lease: &WorkflowLeaseV1,
+        now_ms: i64,
+        lease_duration_ms: i64,
+    ) -> Result<WorkflowLeaseV1, StoreError> {
+        worker.validate()?;
+        lease.validate()?;
+        if now_ms < 0
+            || !(MIN_LEASE_MS..=MAX_LEASE_MS).contains(&lease_duration_ms)
+            || worker.worker_id != lease.worker_id
+            || worker.host_id != lease.host_id
+            || !worker.pools.contains(&lease.worker_pool)
+        {
+            return Err(StoreError::InvalidWorkflowSchedulerInput("lease renewal"));
+        }
+        self.store.immediate_transaction(|transaction| {
+            expire_leases_transaction(transaction, now_ms)?;
+            renew_lease_transaction(transaction, lease, now_ms, lease_duration_ms)
+        })
+    }
+
+    pub fn pending_cleanup(
+        &self,
+        worker: &WorkflowWorkerRegistrationV1,
+        limit: usize,
+    ) -> Result<Vec<WorkflowCleanupObligationV1>, StoreError> {
+        worker.validate()?;
+        if !(1..=64).contains(&limit) {
+            return Err(StoreError::InvalidWorkflowSchedulerInput("cleanup limit"));
+        }
+        self.store.read_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT lease.lease_json, lease.state, receipt.receipt_json
+                 FROM workflow_lease_journal AS lease
+                 LEFT JOIN workflow_node_receipts AS receipt ON receipt.lease_id = lease.lease_id
+                 LEFT JOIN workflow_cleanup_receipts AS cleanup ON cleanup.lease_id = lease.lease_id
+                 WHERE lease.worker_id = ?1 AND lease.host_id = ?2
+                   AND cleanup.lease_id IS NULL
+                   AND (
+                     lease.state IN ('expired', 'revoked')
+                     OR (
+                       lease.state = 'committed'
+                       AND json_extract(receipt.receipt_json, '$.cleanup_result') = 'pending'
+                     )
+                   )
+                 ORDER BY lease.closed_at_ms ASC, lease.lease_id ASC
+                 LIMIT ?3",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        worker.worker_id,
+                        worker.host_id,
+                        i64::try_from(limit).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            rows.into_iter()
+                .map(|(lease_json, state, receipt_json)| {
+                    decode_cleanup_obligation(worker, &lease_json, &state, receipt_json.as_deref())
+                })
+                .collect()
+        })
+    }
+
+    pub fn commit_cleanup_receipt(
+        &self,
+        receipt: &WorkflowCleanupReceiptV1,
+        recorded_at_ms: i64,
+    ) -> Result<WorkflowAttemptSnapshotV1, StoreError> {
+        receipt.validate()?;
+        if recorded_at_ms < 0 || receipt.completed_at_ms > recorded_at_ms {
+            return Err(StoreError::InvalidWorkflowSchedulerInput(
+                "cleanup receipt time",
+            ));
+        }
+        let receipt_json = canonical_string(&receipt.canonical_bytes()?)?;
+        self.store.immediate_transaction(|transaction| {
+            commit_cleanup_receipt_transaction(transaction, receipt, &receipt_json, recorded_at_ms)
+        })
+    }
+
+    pub fn reconcile_controller_nodes(&self, now_ms: i64) -> Result<usize, StoreError> {
+        if now_ms < 0 {
+            return Err(StoreError::InvalidWorkflowSchedulerInput(
+                "controller reconciliation time",
+            ));
+        }
+        self.expire_leases(now_ms)?;
+        let attempts: Vec<Uuid> = self.store.read_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT attempt_id FROM workflow_nodes
+                 WHERE node_kind = 'deterministic_reduce' AND state = 'ready'
+                 ORDER BY attempt_id ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|attempt_id| parse_uuid(&attempt_id, "controller reconcile attempt ID"))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        for attempt_id in &attempts {
+            self.reduce_attempt(*attempt_id, now_ms)?;
+        }
+        Ok(attempts.len())
+    }
+}
+
+fn renew_lease_transaction(
+    transaction: &Transaction<'_>,
+    supplied: &WorkflowLeaseV1,
+    now_ms: i64,
+    lease_duration_ms: i64,
+) -> Result<WorkflowLeaseV1, StoreError> {
+    let (lease_json, state) = transaction
+        .query_row(
+            "SELECT lease_json, state FROM workflow_lease_journal WHERE lease_id = ?1",
+            [supplied.lease_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or(StoreError::WorkflowLeaseConflict)?;
+    if state != "active" {
+        return Err(StoreError::WorkflowLeaseConflict);
+    }
+    let current = WorkflowLeaseV1::decode_canonical(lease_json.as_bytes())?;
+    if !same_lease_assignment(&current, supplied) || supplied.expires_at_ms > current.expires_at_ms
+    {
+        return Err(StoreError::WorkflowLeaseConflict);
+    }
+    if supplied.lease_digest != current.lease_digest {
+        return Ok(current);
+    }
+    let expires_at_ms = bounded_lease_expiry(
+        current.leased_at_ms,
+        now_ms,
+        lease_duration_ms,
+        current.timeout_ms,
+    )?;
+    if expires_at_ms <= current.expires_at_ms {
+        return Ok(current);
+    }
+    let renewed = current.renewed(expires_at_ms)?;
+    let renewed_json = canonical_string(&renewed.canonical_bytes()?)?;
+    let changed = transaction.execute(
+        "UPDATE workflow_lease_journal
+         SET lease_digest = ?2, lease_json = ?3, expires_at_ms = ?4
+         WHERE lease_id = ?1 AND state = 'active' AND lease_digest = ?5",
+        params![
+            renewed.lease_id.to_string(),
+            renewed.lease_digest.as_str(),
+            renewed_json,
+            renewed.expires_at_ms,
+            current.lease_digest.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::WorkflowLeaseConflict);
+    }
+    append_transition(
+        transaction,
+        renewed.attempt_id,
+        "lease",
+        &renewed.lease_id.to_string(),
+        Some("active"),
+        "active",
+        "worker_lease_renewed",
+        Some(&renewed.lease_digest),
+        now_ms,
+    )?;
+    Ok(renewed)
+}
+
+fn same_lease_assignment(left: &WorkflowLeaseV1, right: &WorkflowLeaseV1) -> bool {
+    let mut normalized = left.clone();
+    normalized.expires_at_ms = right.expires_at_ms;
+    normalized.lease_digest = right.lease_digest.clone();
+    normalized == *right
+}
+
+fn decode_cleanup_obligation(
+    worker: &WorkflowWorkerRegistrationV1,
+    lease_json: &str,
+    state: &str,
+    receipt_json: Option<&str>,
+) -> Result<WorkflowCleanupObligationV1, StoreError> {
+    let lease = WorkflowLeaseV1::decode_canonical(lease_json.as_bytes())?;
+    if lease.worker_id != worker.worker_id || lease.host_id != worker.host_id {
+        return Err(StoreError::CorruptWorkflowJournal("cleanup worker binding"));
+    }
+    let terminal_receipt = receipt_json
+        .map(|json| WorkflowNodeReceiptV1::decode_canonical(json.as_bytes()))
+        .transpose()?;
+    let reason = match (state, terminal_receipt.as_ref()) {
+        ("expired", None) => WorkflowCleanupReasonV1::LeaseExpired,
+        ("revoked", None) => WorkflowCleanupReasonV1::LeaseRevoked,
+        ("committed", Some(receipt))
+            if receipt.cleanup_result == WorkflowCleanupResultV1::Pending
+                && receipt_matches_lease(receipt, &lease) =>
+        {
+            WorkflowCleanupReasonV1::TerminalReceiptPending
+        }
+        _ => return Err(StoreError::CorruptWorkflowJournal("cleanup obligation")),
+    };
+    Ok(WorkflowCleanupObligationV1 {
+        lease,
+        terminal_receipt,
+        reason,
+    })
+}
+
+fn worker_has_pending_cleanup(
+    transaction: &Transaction<'_>,
+    worker: &WorkflowWorkerRegistrationV1,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1
+               FROM workflow_lease_journal AS lease
+               LEFT JOIN workflow_node_receipts AS receipt ON receipt.lease_id = lease.lease_id
+               LEFT JOIN workflow_cleanup_receipts AS cleanup ON cleanup.lease_id = lease.lease_id
+               WHERE lease.worker_id = ?1 AND lease.host_id = ?2
+                 AND cleanup.lease_id IS NULL
+                 AND (
+                   lease.state IN ('expired', 'revoked')
+                   OR (
+                     lease.state = 'committed'
+                     AND json_extract(receipt.receipt_json, '$.cleanup_result') = 'pending'
+                   )
+                 )
+             )",
+            params![worker.worker_id, worker.host_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
 }
 
 fn expire_leases_transaction(
@@ -828,7 +1110,9 @@ fn expire_one_lease(
             return Err(StoreError::WorkflowStateConflict);
         }
         let changed = transaction.execute(
-            "UPDATE workflow_attempts SET updated_at_ms = ?2 WHERE attempt_id = ?1",
+            "UPDATE workflow_attempts
+             SET cleanup_state = 'pending', updated_at_ms = ?2
+             WHERE attempt_id = ?1",
             params![attempt_id, now_ms],
         )?;
         if changed != 1 {
@@ -915,9 +1199,12 @@ fn claim_next_transaction(
             .lease_generation
             .checked_add(1)
             .ok_or(StoreError::CorruptWorkflowJournal("lease generation"))?;
-        let expires_at_ms = now_ms
-            .checked_add(lease_duration_ms)
-            .ok_or(StoreError::InvalidWorkflowSchedulerInput("lease expiry"))?;
+        let expires_at_ms = bounded_lease_expiry(
+            now_ms,
+            now_ms,
+            lease_duration_ms,
+            candidate.profile.timeout_ms,
+        )?;
         let lease = WorkflowLeaseV1::new(
             Uuid::new_v4(),
             generation,
@@ -945,6 +1232,30 @@ fn claim_next_transaction(
         return Ok(Some(lease));
     }
     Ok(None)
+}
+
+fn bounded_lease_expiry(
+    leased_at_ms: i64,
+    now_ms: i64,
+    lease_duration_ms: i64,
+    execution_timeout_ms: u64,
+) -> Result<i64, StoreError> {
+    let timeout_ms = i64::try_from(execution_timeout_ms)
+        .map_err(|_| StoreError::InvalidWorkflowSchedulerInput("execution timeout"))?;
+    let execution_deadline =
+        leased_at_ms
+            .checked_add(timeout_ms)
+            .ok_or(StoreError::InvalidWorkflowSchedulerInput(
+                "execution deadline",
+            ))?;
+    let requested_expiry = now_ms
+        .checked_add(lease_duration_ms)
+        .ok_or(StoreError::InvalidWorkflowSchedulerInput("lease expiry"))?;
+    let expires_at_ms = requested_expiry.min(execution_deadline);
+    if expires_at_ms <= now_ms {
+        return Err(StoreError::WorkflowLeaseConflict);
+    }
+    Ok(expires_at_ms)
 }
 
 fn persist_active_lease(
@@ -1727,6 +2038,152 @@ fn validate_reduction_evidence(
     }
 }
 
+fn commit_cleanup_receipt_transaction(
+    transaction: &Transaction<'_>,
+    receipt: &WorkflowCleanupReceiptV1,
+    receipt_json: &str,
+    recorded_at_ms: i64,
+) -> Result<WorkflowAttemptSnapshotV1, StoreError> {
+    if let Some((persisted_digest, persisted_json)) = transaction
+        .query_row(
+            "SELECT receipt_digest, receipt_json FROM workflow_cleanup_receipts
+             WHERE lease_id = ?1",
+            [receipt.lease_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        if persisted_digest != receipt.receipt_digest.as_str() || persisted_json != receipt_json {
+            return Err(StoreError::WorkflowCleanupConflict);
+        }
+        return load_attempt_snapshot(transaction, receipt.attempt_id);
+    }
+
+    let (lease_json, lease_state, closed_at_ms, terminal_json) = transaction
+        .query_row(
+            "SELECT lease.lease_json, lease.state, lease.closed_at_ms, receipt.receipt_json
+             FROM workflow_lease_journal AS lease
+             LEFT JOIN workflow_node_receipts AS receipt ON receipt.lease_id = lease.lease_id
+             WHERE lease.lease_id = ?1",
+            [receipt.lease_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::WorkflowCleanupConflict)?;
+    let lease = WorkflowLeaseV1::decode_canonical(lease_json.as_bytes())?;
+    if !cleanup_receipt_matches_lease(receipt, &lease) {
+        return Err(StoreError::WorkflowCleanupConflict);
+    }
+    let closed_at_ms = closed_at_ms.ok_or(StoreError::WorkflowCleanupConflict)?;
+    if receipt.completed_at_ms < closed_at_ms {
+        return Err(StoreError::WorkflowCleanupConflict);
+    }
+    match (lease_state.as_str(), terminal_json.as_deref()) {
+        ("expired" | "revoked", None) if receipt.terminal_receipt_digest.is_none() => {}
+        ("committed", Some(terminal_json)) => {
+            let terminal = WorkflowNodeReceiptV1::decode_canonical(terminal_json.as_bytes())?;
+            if terminal.cleanup_result != WorkflowCleanupResultV1::Pending
+                || !receipt_matches_lease(&terminal, &lease)
+                || receipt.terminal_receipt_digest.as_ref() != Some(&terminal.receipt_digest)
+                || receipt.completed_at_ms < terminal.completed_at_ms
+            {
+                return Err(StoreError::WorkflowCleanupConflict);
+            }
+        }
+        _ => return Err(StoreError::WorkflowCleanupConflict),
+    }
+
+    transaction.execute(
+        "INSERT INTO workflow_cleanup_receipts(
+            receipt_digest, lease_id, attempt_id, node_id, receipt_json, committed_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            receipt.receipt_digest.as_str(),
+            receipt.lease_id.to_string(),
+            receipt.attempt_id.to_string(),
+            receipt.node_id.as_str(),
+            receipt_json,
+            recorded_at_ms,
+        ],
+    )?;
+    let cleanup_state = if unresolved_cleanup_count(transaction, receipt.attempt_id)? == 0 {
+        WorkflowCleanupStateV1::Complete
+    } else {
+        WorkflowCleanupStateV1::Pending
+    };
+    let changed = transaction.execute(
+        "UPDATE workflow_attempts
+         SET cleanup_state = ?2, updated_at_ms = MAX(updated_at_ms, ?3)
+         WHERE attempt_id = ?1",
+        params![
+            receipt.attempt_id.to_string(),
+            cleanup_state.as_str(),
+            recorded_at_ms,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::WorkflowStateConflict);
+    }
+    append_transition(
+        transaction,
+        receipt.attempt_id,
+        "lease",
+        &receipt.lease_id.to_string(),
+        Some(&lease_state),
+        &lease_state,
+        "worker_cleanup_reconciled",
+        Some(&receipt.receipt_digest),
+        recorded_at_ms,
+    )?;
+    load_attempt_snapshot(transaction, receipt.attempt_id)
+}
+
+fn cleanup_receipt_matches_lease(
+    receipt: &WorkflowCleanupReceiptV1,
+    lease: &WorkflowLeaseV1,
+) -> bool {
+    receipt.lease_digest == lease.lease_digest
+        && receipt.lease_id == lease.lease_id
+        && receipt.lease_generation == lease.lease_generation
+        && receipt.attempt_id == lease.attempt_id
+        && receipt.project_id == lease.project_id
+        && receipt.node_id == lease.node_id
+        && receipt.worker_id == lease.worker_id
+        && receipt.host_id == lease.host_id
+}
+
+fn unresolved_cleanup_count(
+    transaction: &Transaction<'_>,
+    attempt_id: Uuid,
+) -> Result<i64, StoreError> {
+    transaction
+        .query_row(
+            "SELECT COUNT(*)
+             FROM workflow_lease_journal AS lease
+             LEFT JOIN workflow_node_receipts AS receipt ON receipt.lease_id = lease.lease_id
+             LEFT JOIN workflow_cleanup_receipts AS cleanup ON cleanup.lease_id = lease.lease_id
+             WHERE lease.attempt_id = ?1
+               AND cleanup.lease_id IS NULL
+               AND (
+                 lease.state IN ('expired', 'revoked')
+                 OR (
+                   lease.state = 'committed'
+                   AND json_extract(receipt.receipt_json, '$.cleanup_result') = 'pending'
+                 )
+               )",
+            [attempt_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
 fn commit_node_receipt_transaction(
     transaction: &Transaction<'_>,
     receipt: &WorkflowNodeReceiptV1,
@@ -2063,12 +2520,7 @@ fn complete_workflow(
         [attempt_id.to_string()],
         |row| row.get(0),
     )?;
-    let pending_cleanup: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM workflow_node_receipts
-         WHERE attempt_id = ?1 AND json_extract(receipt_json, '$.cleanup_result') != 'complete'",
-        [attempt_id.to_string()],
-        |row| row.get(0),
-    )?;
+    let pending_cleanup = unresolved_cleanup_count(transaction, attempt_id)?;
     if incomplete != 0 || pending_cleanup != 0 {
         return Err(StoreError::WorkflowStateConflict);
     }

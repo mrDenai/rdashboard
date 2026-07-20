@@ -101,7 +101,7 @@ Implementation progress:
 | Step | Status | Current evidence |
 | --- | --- | --- |
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
-| 2. Installed workflow and scheduler journal | In progress | Slice 2a locally implements the strict V2 installed DAG, atomic control-schema migration, stable admission identity, fair durable claims, pre-mutation supersession, deploy single-flight, generation-bound leases, mutation reconciliation, deterministic reduction and two-project contracts. The authenticated worker socket/runtime, cleanup reconciliation and controller/web projection remain before step 2 can close. |
+| 2. Installed workflow and scheduler journal | In progress | Slice 2a locally implements the strict V2 installed DAG and durable scheduler. Slice 2b adds the single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, canonical cleanup receipts, cleanup-before-reuse and V1/V2-to-V3 migration. Only controller/web projection remains before step 2 can close; the actual generic worker and sealed preparation store are step 4. |
 | 3-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -170,6 +170,23 @@ Implementation ledger:
   deliberately retains a preceding expiry transaction because the gate proved a late-receipt error
   otherwise rolls the expiry back. The final exact staged code/config/test hash is
   `cf105882140ff6d8b57806823ee6e27cbda9497fc9ee806099bc0df3a204b2df`, with no open P0-P2 finding.
+- Slice 2b adds one fixed unprivileged worker identity and AF_UNIX protocol for every installed
+  project, without repository-selected commands or controller/privileged-executor pools. A separate
+  networkless gateway owns scheduler access; the worker receives only canonical leases, cleanup
+  obligations and attempt snapshots through a peer-UID-checked, bounded socket. The inactive systemd
+  unit grants no Docker, source, executor, production-volume, capability or credential authority.
+- Lease renewal preserves assignment, ID and generation, is bounded by the installed execution
+  timeout and replays the current durable lease after a lost response. Expired, revoked and
+  terminal-pending leases become explicit digest-bound cleanup debt. The scheduler atomically blocks
+  every new claim for that worker/host until all debt is receipted, including after process restart;
+  control schema V3 adds the cleanup journal with tested V1 and V2 reopen migrations.
+- The final bare `bin/ci` passed after self-review tightened cleanup-before-reuse at the scheduler
+  boundary and corrected the prior reissue test to require cleanup. It covered 184 library tests
+  (2 credentialed live tests ignored), every binary/integration suite, 13 scheduler contracts,
+  3 worker-socket contracts, both schema migrations, 8 browser tests and the optimized release build
+  in 2 minutes 50 seconds. A fresh exact-manifest `deepseek-free` review returned `SAFE` with no open
+  P0-P2 finding for staged hash
+  `6f34022a5bd8ec926e14183c713d7a6151f1cba18171c66aefec09aa280d48bb`.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

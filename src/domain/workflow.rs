@@ -13,6 +13,7 @@ use super::{EvidenceDigest, GitCommitId, ProjectId};
 pub const WORKFLOW_POLICY_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_LEASE_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_NODE_RECEIPT_SCHEMA_VERSION: u16 = 1;
+pub const WORKFLOW_CLEANUP_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_REDUCTION_RECEIPT_SCHEMA_VERSION: u16 = 1;
 
 const MAX_WORKFLOW_NODES: usize = 64;
@@ -780,6 +781,18 @@ impl WorkflowLeaseV1 {
         Ok(lease)
     }
 
+    pub fn renewed(&self, expires_at_ms: i64) -> Result<Self, WorkflowContractError> {
+        self.validate()?;
+        if expires_at_ms <= self.expires_at_ms {
+            return Err(WorkflowContractError::InvalidLease);
+        }
+        let mut renewed = self.clone();
+        renewed.expires_at_ms = expires_at_ms;
+        renewed.lease_digest = renewed.calculate_digest()?;
+        renewed.validate()?;
+        Ok(renewed)
+    }
+
     fn calculate_digest(&self) -> Result<EvidenceDigest, WorkflowContractError> {
         Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
             &WorkflowLeaseDigestPayload {
@@ -992,6 +1005,151 @@ impl WorkflowNodeReceiptV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct WorkflowCleanupReceiptV1 {
+    pub schema_version: u16,
+    pub lease_digest: EvidenceDigest,
+    pub lease_id: Uuid,
+    pub lease_generation: u32,
+    pub attempt_id: Uuid,
+    pub project_id: ProjectId,
+    pub node_id: WorkflowNodeId,
+    pub worker_id: String,
+    pub host_id: String,
+    pub terminal_receipt_digest: Option<EvidenceDigest>,
+    pub cleanup_evidence_digest: EvidenceDigest,
+    pub completed_at_ms: i64,
+    pub receipt_digest: EvidenceDigest,
+}
+
+#[derive(Serialize)]
+struct WorkflowCleanupReceiptDigestPayload<'a> {
+    purpose: &'static str,
+    schema_version: u16,
+    lease_digest: &'a EvidenceDigest,
+    lease_id: Uuid,
+    lease_generation: u32,
+    attempt_id: Uuid,
+    project_id: &'a ProjectId,
+    node_id: &'a WorkflowNodeId,
+    worker_id: &'a str,
+    host_id: &'a str,
+    terminal_receipt_digest: &'a Option<EvidenceDigest>,
+    cleanup_evidence_digest: &'a EvidenceDigest,
+    completed_at_ms: i64,
+}
+
+impl WorkflowCleanupReceiptV1 {
+    pub fn new(
+        lease: &WorkflowLeaseV1,
+        terminal_receipt: Option<&WorkflowNodeReceiptV1>,
+        cleanup_evidence_digest: EvidenceDigest,
+        completed_at_ms: i64,
+    ) -> Result<Self, WorkflowContractError> {
+        lease.validate()?;
+        if let Some(receipt) = terminal_receipt {
+            receipt.validate()?;
+            if receipt.cleanup_result != WorkflowCleanupResultV1::Pending
+                || !node_receipt_matches_lease(receipt, lease)
+            {
+                return Err(WorkflowContractError::InvalidCleanupReceipt);
+            }
+        }
+        let mut receipt = Self {
+            schema_version: WORKFLOW_CLEANUP_RECEIPT_SCHEMA_VERSION,
+            lease_digest: lease.lease_digest.clone(),
+            lease_id: lease.lease_id,
+            lease_generation: lease.lease_generation,
+            attempt_id: lease.attempt_id,
+            project_id: lease.project_id.clone(),
+            node_id: lease.node_id.clone(),
+            worker_id: lease.worker_id.clone(),
+            host_id: lease.host_id.clone(),
+            terminal_receipt_digest: terminal_receipt
+                .map(|terminal| terminal.receipt_digest.clone()),
+            cleanup_evidence_digest,
+            completed_at_ms,
+            receipt_digest: EvidenceDigest::sha256([]),
+        };
+        receipt.receipt_digest = receipt.calculate_digest()?;
+        receipt.validate()?;
+        if receipt.completed_at_ms < lease.leased_at_ms
+            || terminal_receipt
+                .is_some_and(|terminal| receipt.completed_at_ms < terminal.completed_at_ms)
+        {
+            return Err(WorkflowContractError::InvalidCleanupReceipt);
+        }
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkflowContractError> {
+        if self.schema_version != WORKFLOW_CLEANUP_RECEIPT_SCHEMA_VERSION
+            || self.lease_id.is_nil()
+            || self.attempt_id.is_nil()
+            || self.lease_generation == 0
+            || self.completed_at_ms < 0
+            || !valid_workflow_identity(&self.worker_id)
+            || !valid_workflow_identity(&self.host_id)
+            || self.receipt_digest != self.calculate_digest()?
+        {
+            return Err(WorkflowContractError::InvalidCleanupReceipt);
+        }
+        Ok(())
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, WorkflowContractError> {
+        self.validate()?;
+        Ok(serde_jcs::to_vec(self)?)
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, WorkflowContractError> {
+        let receipt: Self = serde_json::from_slice(bytes)?;
+        if serde_jcs::to_vec(&receipt)? != bytes {
+            return Err(WorkflowContractError::NoncanonicalDocument);
+        }
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn calculate_digest(&self) -> Result<EvidenceDigest, WorkflowContractError> {
+        Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
+            &WorkflowCleanupReceiptDigestPayload {
+                purpose: "rdashboard.workflow-cleanup-receipt.v1",
+                schema_version: self.schema_version,
+                lease_digest: &self.lease_digest,
+                lease_id: self.lease_id,
+                lease_generation: self.lease_generation,
+                attempt_id: self.attempt_id,
+                project_id: &self.project_id,
+                node_id: &self.node_id,
+                worker_id: &self.worker_id,
+                host_id: &self.host_id,
+                terminal_receipt_digest: &self.terminal_receipt_digest,
+                cleanup_evidence_digest: &self.cleanup_evidence_digest,
+                completed_at_ms: self.completed_at_ms,
+            },
+        )?))
+    }
+}
+
+fn node_receipt_matches_lease(receipt: &WorkflowNodeReceiptV1, lease: &WorkflowLeaseV1) -> bool {
+    receipt.lease_digest == lease.lease_digest
+        && receipt.lease_id == lease.lease_id
+        && receipt.lease_generation == lease.lease_generation
+        && receipt.request_id == lease.request_id
+        && receipt.attempt_id == lease.attempt_id
+        && receipt.project_id == lease.project_id
+        && receipt.source_sha == lease.source_sha
+        && receipt.workflow_policy_digest == lease.workflow_policy_digest
+        && receipt.preparation_key == lease.preparation_key
+        && receipt.node_id == lease.node_id
+        && receipt.node_kind == lease.node_kind
+        && receipt.worker_id == lease.worker_id
+        && receipt.host_id == lease.host_id
+        && receipt.expected_input_digest == lease.expected_input_digest
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowReductionInputV1 {
     pub node_id: WorkflowNodeId,
     pub node_kind: WorkflowNodeKindV1,
@@ -1155,6 +1313,8 @@ pub enum WorkflowContractError {
     InvalidLease,
     #[error("workflow node receipt is structurally invalid or has a mismatched digest")]
     InvalidNodeReceipt,
+    #[error("workflow cleanup receipt is structurally invalid or has a mismatched digest")]
+    InvalidCleanupReceipt,
     #[error("workflow reduction receipt is structurally invalid or has a mismatched digest")]
     InvalidReductionReceipt,
     #[error("workflow document is not canonical JCS")]

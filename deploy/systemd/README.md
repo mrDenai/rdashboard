@@ -45,6 +45,39 @@ Activation order is fail-closed:
 Removing the Kamal Proxy host route and disabling the bridge socket closes external reachability
 without changing the observation services or their local data.
 
+## Generic workflow worker gateway
+
+`rdashboard-workflow-gateway.service` is the controller-side boundary for the single generic worker
+pool. It is repository-agnostic: one installed worker identity can lease `vps_required` and
+`build_compute` nodes for every installed project, while project selection, adapter IDs, resources,
+network class, cache class and artifact contracts remain fixed by the root-owned workflow manifest.
+The worker does not open `control.sqlite`; it can reach only
+`/run/rdashboard-workflow/worker.sock`, and every connection is checked against its exact Unix UID
+before a request is decoded. The gateway has no network namespace, Docker socket, source/executor
+socket, production volume or credential.
+
+The gateway runs as the existing `rdashboard` user with primary group `rdashboard-worker`. Its
+`UMask=0077` keeps SQLite, WAL and shared-memory files owner-only even when the gateway creates them;
+the explicitly mode-`0660` socket is the only group-readable object. Before any activation, create a
+dedicated non-login `rdashboard-worker` user and matching group, then place these non-secret installed
+values in root-owned `/etc/rdashboard/workflow-gateway.env`, mode `0644` or stricter:
+
+```sh
+RDASHBOARD_WORKER_UID=992
+RDASHBOARD_WORKER_ID=shared-vps-worker-1
+RDASHBOARD_WORKER_HOST_ID=production-vps
+```
+
+Use the actual numeric worker UID; the example is not an installation default. IDs are stable
+lowercase workflow identities, not repository names. A lease is short and renewable but can never
+extend past the installed node timeout. Lost renewal responses replay the current canonical lease.
+Expired, revoked or terminal-pending work becomes explicit cleanup debt; the gateway offers that debt
+before new execution, accepts only a digest-bound cleanup receipt, and preserves it across restart.
+
+The generic worker executable, hard storage fence and preparation store belong to the later worker
+activation boundary. Installing this unit or repository checkout alone must not start shadow work,
+change `auto_deploy`, or grant production mutation authority.
+
 ## GlitchTip, DeepSeek and GitHub metadata
 
 The base controller unit intentionally starts without external integration credentials. After each

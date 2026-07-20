@@ -1,11 +1,11 @@
 # GitHub-independent delivery implementation review
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
-- Status: slices 1a, 1b and 2a complete locally; step 2 runtime integration and the authorized live baseline remain pending
+- Status: slices 1a, 1b, 2a and 2b complete locally; step 2 controller/web projection and the authorized live baseline remain pending
 - Review date: 2026-07-20
 - Baseline HEAD: `d20cf342dac204c51d30a32009eeb9c58097c8aa`
 - Local implementation commits: `64e64f2` (`Add persistent resource observer`), `581a432`
-  (`Add adapter execution receipts`)
+  (`Add adapter execution receipts`), `25dff26` (`Add durable workflow scheduler`)
 - Slice 1a staged diff SHA-256: `ca9712b8517e0a7c42c6672d81abed2e8c74165337306dca0ded2bc5c36e6432`
 
 ## Reviewed scope
@@ -279,3 +279,71 @@ Slice 2a is production-worthy as an inactive local foundation and may be committ
 an unauthenticated scheduling surface or activate a deploy: the worker protocol/runtime, cleanup
 reconciliation, controller/web projection and source ingress remain explicit subsequent work. No VPS
 installation, GitHub/provider mutation, push, service restart or deployment was performed.
+
+## Slice 2b: authenticated worker gateway, renewal and cleanup reconciliation
+
+### Reviewed scope
+
+Slice 2b completes the unprivileged transport and cleanup portion of the scheduler boundary without
+installing a worker or granting deployment authority:
+
+- Canonical cleanup receipts bind the exact lease and, when required, its exact terminal-pending node
+  receipt. A new schema-V3 journal accepts exact replay, rejects conflicting evidence and preserves
+  expired, revoked and terminal-pending cleanup debt across restart.
+- Lease renewal keeps the assignment, lease ID and generation stable, changes only expiry/digest,
+  never crosses the installed node timeout and returns the current canonical lease when a prior
+  renewal response was lost.
+- `claim_next` expires leases, checks cleanup debt for the exact worker/host and claims the next node in
+  one immediate transaction. Cleanup therefore cannot be bypassed through another scheduler caller or
+  a race between gateway polling and claiming.
+- One typed AF_UNIX protocol serves every installed project through a fixed worker identity. Peer UID
+  is checked before frame decoding; frames, request deadlines, connections, socket paths and stale
+  socket reconciliation are bounded. Unprivileged registrations cannot name controller or privileged
+  executor pools.
+- The separate gateway binary owns `control.sqlite` access and controller-node reconciliation. Its
+  inactive systemd unit has no network namespace, Docker/source/executor socket, production volume,
+  capability or credential authority. The actual worker executor, sealed preparation store and hard
+  storage fence remain step 4.
+
+The exact staged code/config/test diff contains 12 paths, 2,711 insertions and 31 deletions. Shared
+dirty `src/lib.rs`, `tests/store_and_web.rs` and `deploy/systemd/README.md` were staged by hunk; all
+notification implementation remains unstaged and outside this review.
+
+### Self-review correction and verification
+
+Self-review found that cleanup-before-reuse was initially enforced by the gateway but not by the
+scheduler API itself. This left an alternate caller and a narrow concurrent transition able to claim
+new work after cleanup debt appeared. The invariant now lives inside the same immediate transaction as
+lease expiry and claim. The first full gate after that correction exposed one prior test whose old
+expectation reissued an expired node without cleanup. The test was corrected to prove reopen, blocked
+claim, exact cleanup receipt and generation-2 reissue; no production behavior was weakened to make the
+gate pass.
+
+- Bare `bin/ci`: **passed**, exit code 0, after the final correction.
+- Covered formatting, Clippy with warnings denied, 184 library tests with 2 credentialed live-provider
+  tests ignored, every binary and integration suite, V1-to-V3 and V2-to-V3 control-store migrations,
+  13 scheduler contracts, 3 worker-socket contracts, 8 browser tests and the optimized release build.
+- The optimized release build completed in 2 minutes 50 seconds.
+- `git diff --cached --check`: passed.
+
+### Independent consultation
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 196 seconds;
+- state fingerprint: `eb61db5ad5fd401f8449bef53023fbdca6eb89dfb11b884d735c815dbfe99d1d`;
+- brief SHA-256: `2fcf732ee993d803d3fa96752f7477515f5edde3e69a03713f6bd5aadd5e6cc6`;
+- response: `consult-slice2b-deepseek/response.md`;
+- verdict: `SAFE`, no P0-P2 finding and no open question.
+
+The reviewer independently traced cleanup binding/replay, restart durability, the atomic
+cleanup-before-reuse transaction, bounded renewal/lost-response replay, peer authentication, socket
+lifecycle, systemd least privilege and both schema migrations. The exact staged code/config/test diff
+SHA-256 (workflow artifacts excluded) is
+`6f34022a5bd8ec926e14183c713d7a6151f1cba18171c66aefec09aa280d48bb`.
+
+### Verdict
+
+Slice 2b is production-worthy as an inactive local gateway contract and may be committed. It does not
+install or enable the service, run generic worker jobs, grant Docker/root mutation authority, project
+workflow state into the controller/web UI, complete source ingress or deploy anything. No VPS,
+GitHub/provider or other external system was mutated.

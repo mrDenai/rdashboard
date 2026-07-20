@@ -1,0 +1,1346 @@
+[0m
+> plan · deepseek-v4-flash-free
+[0m
+[0m$ [0mgit diff --cached | sha256sum
+6f34022a5bd8ec926e14183c713d7a6151f1cba18171c66aefec09aa280d48bb  -
+[0m
+[0m$ [0mgit diff --cached --stat
+deploy/systemd/README.md                           |   33 +
+ deploy/systemd/rdashboard-workflow-gateway.service |   48 +
+ src/bin/rdashboard-workflow-gateway.rs             |  201 ++++
+ src/domain/workflow.rs                             |  160 +++
+ src/lib.rs                                         |    2 +
+ src/scheduler.rs                                   |  488 ++++++++-
+ src/store/control.rs                               |   17 +-
+ src/store/mod.rs                                   |    2 +
+ src/worker_socket.rs                               | 1074 ++++++++++++++++++++
+ tests/store_and_web.rs                             |   50 +-
+ tests/worker_socket_contracts.rs                   |  396 ++++++++
+ tests/workflow_scheduler_contracts.rs              |  271 ++++-
+ 12 files changed, 2711 insertions(+), 31 deletions(-)
+[0m
+[0m$ [0mgit diff --cached
+...output truncated...
+
+Full output saved to: /home/denai/.local/share/opencode/tool-output/tool_f811fd0060013vNL9Y2g7nMKtg
+
++            })
++            .await?
++        {
++            WorkflowWorkerResponseV1::LeaseRenewed { lease }
++                if lease.lease_id == lease_id
++                    && lease.worker_id == self.registration.worker_id
++                    && lease.host_id == self.registration.host_id
++                    && lease.validate().is_ok() =>
++            {
++                Ok(*lease)
++            }
++            WorkflowWorkerResponseV1::Rejected { code, retryable } => {
++                Err(WorkflowWorkerClientError::Rejected { code, retryable })
++            }
++            _ => self.wrong_response(),
++        }
++    }
++
++    pub async fn complete_node(
++        &self,
++        receipt: WorkflowNodeReceiptV1,
++    ) -> Result<WorkflowAttemptSnapshotV1, WorkflowWorkerClientError> {
++        self.ensure_negotiated().await?;
++        let attempt_id = receipt.attempt_id;
++        match self
++            .exchange(WorkflowWorkerRequestV1::CompleteNode {
++                receipt: Box::new(receipt),
++            })
++            .await?
++        {
++            WorkflowWorkerResponseV1::NodeAccepted { attempt }
++                if attempt.attempt_id == attempt_id =>
++            {
++                Ok(*attempt)
++            }
++            WorkflowWorkerResponseV1::Rejected { code, retryable } => {
++                Err(WorkflowWorkerClientError::Rejected { code, retryable })
++            }
++            _ => self.wrong_response(),
++        }
++    }
++
++    pub async fn complete_cleanup(
++        &self,
++        receipt: WorkflowCleanupReceiptV1,
++    ) -> Result<WorkflowAttemptSnapshotV1, WorkflowWorkerClientError> {
++        self.ensure_negotiated().await?;
++        let attempt_id = receipt.attempt_id;
++        match self
++            .exchange(WorkflowWorkerRequestV1::CompleteCleanup {
++                receipt: Box::new(receipt),
++            })
++            .await?
++        {
++            WorkflowWorkerResponseV1::CleanupAccepted { attempt }
++                if attempt.attempt_id == attempt_id =>
++            {
++                Ok(*attempt)
++            }
++            WorkflowWorkerResponseV1::Rejected { code, retryable } => {
++                Err(WorkflowWorkerClientError::Rejected { code, retryable })
++            }
++            _ => self.wrong_response(),
++        }
++    }
++
++    async fn ensure_negotiated(&self) -> Result<(), WorkflowWorkerClientError> {
++        if self.negotiated.load(Ordering::Acquire) {
++            return Ok(());
++        }
++        match self
++            .exchange(WorkflowWorkerRequestV1::Negotiate {
++                supported_versions: vec![WORKER_PROTOCOL_VERSION],
++            })
++            .await?
++        {
++            WorkflowWorkerResponseV1::Negotiated {
++                selected_version,
++                registration,
++            } if selected_version == WORKER_PROTOCOL_VERSION
++                && registration == self.registration =>
++            {
++                self.negotiated.store(true, Ordering::Release);
++                Ok(())
++            }
++            WorkflowWorkerResponseV1::Rejected { code, retryable } => {
++                Err(WorkflowWorkerClientError::Rejected { code, retryable })
++            }
++            _ => self.wrong_response(),
++        }
++    }
++
++    fn wrong_response<T>(&self) -> Result<T, WorkflowWorkerClientError> {
++        self.negotiated.store(false, Ordering::Release);
++        Err(WorkflowWorkerClientError::WrongResponse)
++    }
++
++    async fn exchange(
++        &self,
++        request: WorkflowWorkerRequestV1,
++    ) -> Result<WorkflowWorkerResponseV1, WorkflowWorkerClientError> {
++        let request_id = Uuid::new_v4();
++        let request = WorkflowWorkerRequestEnvelopeV1 {
++            version: WORKER_PROTOCOL_VERSION,
++            request_id,
++            request,
++        };
++        let response = timeout(self.request_timeout, async {
++            let mut stream = UnixStream::connect(&self.socket_path)
++                .await
++                .map_err(WorkflowWorkerClientError::Io)?;
++            write_frame(&mut stream, &request, NORMAL_FRAME_MAX_BYTES).await?;
++            stream
++                .shutdown()
++                .await
++                .map_err(WorkflowWorkerClientError::Io)?;
++            let response: WorkflowWorkerResponseEnvelopeV1 =
++                read_frame(&mut stream, NORMAL_FRAME_MAX_BYTES).await?;
++            let mut trailing = [0_u8; 1];
++            if stream
++                .read(&mut trailing)
++                .await
++                .map_err(WorkflowWorkerClientError::Io)?
++                != 0
++            {
++                return Err(WorkflowWorkerClientError::TrailingResponse);
++            }
++            Ok::<_, WorkflowWorkerClientError>(response)
++        })
++        .await
++        .map_err(|_| WorkflowWorkerClientError::DeadlineExceeded)??;
++        if response.version != WORKER_PROTOCOL_VERSION || response.request_id != request_id {
++            return self.wrong_response();
++        }
++        Ok(response.response)
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct WorkflowWorkerServerConfigV1 {
++    allowed_uid: u32,
++    max_connections: usize,
++    request_timeout: Duration,
++}
++
++impl WorkflowWorkerServerConfigV1 {
++    pub fn new(
++        allowed_uid: u32,
++        max_connections: usize,
++        request_timeout: Duration,
++    ) -> Result<Self, WorkflowWorkerServerConfigError> {
++        if allowed_uid == 0 || allowed_uid == u32::MAX {
++            return Err(WorkflowWorkerServerConfigError::InvalidAllowedUid);
++        }
++        if !(1..=MAX_CONNECTIONS).contains(&max_connections) {
++            return Err(WorkflowWorkerServerConfigError::InvalidConnectionLimit);
++        }
++        if request_timeout < Duration::from_millis(MIN_REQUEST_TIMEOUT_MS)
++            || request_timeout > Duration::from_millis(MAX_REQUEST_TIMEOUT_MS)
++        {
++            return Err(WorkflowWorkerServerConfigError::InvalidRequestTimeout);
++        }
++        Ok(Self {
++            allowed_uid,
++            max_connections,
++            request_timeout,
++        })
++    }
++}
++
++pub async fn serve_worker_connection<H: WorkflowWorkerRequestHandlerV1 + 'static>(
++    mut stream: UnixStream,
++    handler: Arc<H>,
++    config: &WorkflowWorkerServerConfigV1,
++) -> Result<(), WorkflowWorkerSocketError> {
++    let peer = stream
++        .peer_cred()
++        .map_err(WorkflowWorkerSocketError::PeerCredentials)?;
++    if peer.uid() != config.allowed_uid {
++        return Err(WorkflowWorkerSocketError::UnauthorizedPeer {
++            received: peer.uid(),
++        });
++    }
++
++    let deadline = Instant::now() + config.request_timeout;
++    let request = timeout_at(deadline, async {
++        let request = read_frame(&mut stream, NORMAL_FRAME_MAX_BYTES).await?;
++        let mut trailing = [0_u8; 1];
++        let trailing_bytes = stream.read(&mut trailing).await.map_err(FrameError::Io)?;
++        if trailing_bytes != 0 {
++            return Err(WorkflowWorkerSocketError::Frame(FrameError::TrailingBytes(
++                trailing_bytes,
++            )));
++        }
++        Ok::<WorkflowWorkerRequestEnvelopeV1, WorkflowWorkerSocketError>(request)
++    })
++    .await
++    .map_err(|_| WorkflowWorkerSocketError::DeadlineExceeded)??;
++
++    let mut handler_task = tokio::task::spawn_blocking(move || handler.handle(request));
++    let response = if let Ok(result) = timeout_at(deadline, &mut handler_task).await {
++        result.map_err(|_| WorkflowWorkerSocketError::HandlerTask)?
++    } else {
++        handler_task
++            .await
++            .map_err(|_| WorkflowWorkerSocketError::HandlerTask)?;
++        return Err(WorkflowWorkerSocketError::DeadlineExceeded);
++    };
++    timeout_at(deadline, async {
++        write_frame(&mut stream, &response, NORMAL_FRAME_MAX_BYTES).await?;
++        stream
++            .shutdown()
++            .await
++            .map_err(WorkflowWorkerSocketError::Write)?;
++        Ok::<(), WorkflowWorkerSocketError>(())
++    })
++    .await
++    .map_err(|_| WorkflowWorkerSocketError::DeadlineExceeded)??;
++    Ok(())
++}
++
++pub async fn serve_worker_until<H, F>(
++    listener: UnixListener,
++    handler: Arc<H>,
++    config: WorkflowWorkerServerConfigV1,
++    shutdown: F,
++) -> Result<(), WorkflowWorkerSocketError>
++where
++    H: WorkflowWorkerRequestHandlerV1 + 'static,
++    F: Future<Output = ()>,
++{
++    let semaphore = Arc::new(Semaphore::new(config.max_connections));
++    let mut tasks = JoinSet::new();
++    tokio::pin!(shutdown);
++    let serve_result = loop {
++        tokio::select! {
++            () = &mut shutdown => break Ok(()),
++            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
++                log_worker_connection_result(result);
++            }
++            accepted = listener.accept() => {
++                let (stream, _) = match accepted {
++                    Ok(accepted) => accepted,
++                    Err(error) if matches!(
++                        error.kind(),
++                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
++                    ) => {
++                        warn!(error = %error, "transient workflow worker socket accept failure");
++                        continue;
++                    }
++                    Err(error) => break Err(WorkflowWorkerSocketError::Accept(error)),
++                };
++                let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
++                    warn!("workflow worker connection limit reached");
++                    continue;
++                };
++                let handler = Arc::clone(&handler);
++                let config = config.clone();
++                tasks.spawn(async move {
++                    let _permit = permit;
++                    serve_worker_connection(stream, handler, &config).await
++                });
++            }
++        }
++    };
++    drop(listener);
++    while let Some(result) = tasks.join_next().await {
++        log_worker_connection_result(result);
++    }
++    serve_result
++}
++
++fn log_worker_connection_result(
++    result: Result<Result<(), WorkflowWorkerSocketError>, tokio::task::JoinError>,
++) {
++    match result {
++        Ok(Ok(())) => {}
++        Ok(Err(error)) => warn!(error = %error, "workflow worker connection rejected"),
++        Err(error) => warn!(error = %error, "workflow worker connection task failed"),
++    }
++}
++
++pub struct BoundWorkflowWorkerSocketV1 {
++    listener: Option<UnixListener>,
++    cleanup: WorkflowWorkerSocketCleanupGuard,
++}
++
++impl BoundWorkflowWorkerSocketV1 {
++    pub fn bind(
++        path: &Path,
++        required_owner_uid: u32,
++        required_group_gid: u32,
++    ) -> Result<Self, WorkflowWorkerSocketError> {
++        if !is_normalized_absolute_path(path) {
++            return Err(WorkflowWorkerSocketError::InvalidBindPath);
++        }
++        let parent = path
++            .parent()
++            .ok_or(WorkflowWorkerSocketError::InvalidBindPath)?;
++        let parent_metadata =
++            fs::symlink_metadata(parent).map_err(WorkflowWorkerSocketError::BindParent)?;
++        if !parent_metadata.is_dir()
++            || parent_metadata.file_type().is_symlink()
++            || parent_metadata.uid() != required_owner_uid
++            || parent_metadata.gid() != required_group_gid
++            || parent_metadata.permissions().mode() & 0o777 != 0o750
++            || required_group_gid == 0
++        {
++            return Err(WorkflowWorkerSocketError::UnsafeBindParent);
++        }
++        match fs::symlink_metadata(path) {
++            Ok(existing) => {
++                let expected_stale_socket = existing.file_type().is_socket()
++                    && existing.uid() == required_owner_uid
++                    && existing.gid() == required_group_gid
++                    && existing.permissions().mode() & 0o777 == 0o660;
++                if !expected_stale_socket {
++                    return Err(WorkflowWorkerSocketError::SocketPathExists);
++                }
++                match StdUnixStream::connect(path) {
++                    Ok(stream) => {
++                        let _ = stream.shutdown(Shutdown::Both);
++                        return Err(WorkflowWorkerSocketError::SocketPathExists);
++                    }
++                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
++                    Err(error) => {
++                        return Err(WorkflowWorkerSocketError::InspectStaleSocket(error));
++                    }
++                }
++                let rechecked = fs::symlink_metadata(path)
++                    .map_err(WorkflowWorkerSocketError::InspectSocketPath)?;
++                if !rechecked.file_type().is_socket()
++                    || rechecked.dev() != existing.dev()
++                    || rechecked.ino() != existing.ino()
++                {
++                    return Err(WorkflowWorkerSocketError::SocketPathChanged);
++                }
++                fs::remove_file(path).map_err(WorkflowWorkerSocketError::RemoveStaleSocket)?;
++            }
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++            Err(error) => return Err(WorkflowWorkerSocketError::InspectSocketPath(error)),
++        }
++
++        let listener = UnixListener::bind(path).map_err(WorkflowWorkerSocketError::Bind)?;
++        let bound =
++            fs::symlink_metadata(path).map_err(WorkflowWorkerSocketError::InspectSocketPath)?;
++        if !bound.file_type().is_socket()
++            || bound.uid() != required_owner_uid
++            || bound.gid() != required_group_gid
++        {
++            return Err(WorkflowWorkerSocketError::BoundPathNotSocket);
++        }
++        fs::set_permissions(path, fs::Permissions::from_mode(0o660))
++            .map_err(WorkflowWorkerSocketError::SetPermissions)?;
++        let protected =
++            fs::symlink_metadata(path).map_err(WorkflowWorkerSocketError::InspectSocketPath)?;
++        if !protected.file_type().is_socket()
++            || protected.uid() != required_owner_uid
++            || protected.gid() != required_group_gid
++            || protected.permissions().mode() & 0o777 != 0o660
++            || protected.dev() != bound.dev()
++            || protected.ino() != bound.ino()
++        {
++            return Err(WorkflowWorkerSocketError::BoundPathNotSocket);
++        }
++        Ok(Self {
++            listener: Some(listener),
++            cleanup: WorkflowWorkerSocketCleanupGuard {
++                path: path.to_owned(),
++                device: protected.dev(),
++                inode: protected.ino(),
++            },
++        })
++    }
++
++    pub fn take_listener(&mut self) -> UnixListener {
++        self.listener
++            .take()
++            .expect("bound workflow worker listener can only be taken once")
++    }
++
++    pub fn path(&self) -> &Path {
++        &self.cleanup.path
++    }
++}
++
++struct WorkflowWorkerSocketCleanupGuard {
++    path: PathBuf,
++    device: u64,
++    inode: u64,
++}
++
++impl Drop for WorkflowWorkerSocketCleanupGuard {
++    fn drop(&mut self) {
++        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
++            return;
++        };
++        if metadata.file_type().is_socket()
++            && metadata.dev() == self.device
++            && metadata.ino() == self.inode
++        {
++            let _ = fs::remove_file(&self.path);
++        }
++    }
++}
++
++fn is_normalized_absolute_path(path: &Path) -> bool {
++    !path.as_os_str().is_empty()
++        && path.as_os_str().as_encoded_bytes().len() <= 512
++        && path.is_absolute()
++        && path
++            .components()
++            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
++        && path.components().collect::<PathBuf>() == path
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
++pub enum WorkflowWorkerValidationError {
++    #[error("unsupported workflow worker protocol version {0}")]
++    UnsupportedVersion(u16),
++    #[error("workflow worker request ID must not be nil")]
++    NilRequestId,
++    #[error("workflow worker version set must contain 1-8 versions")]
++    InvalidVersionSet,
++    #[error("workflow worker lease is invalid")]
++    InvalidLease,
++    #[error("workflow worker node receipt is invalid")]
++    InvalidNodeReceipt,
++    #[error("workflow worker cleanup receipt is invalid")]
++    InvalidCleanupReceipt,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
++pub enum WorkflowWorkerHandlerConfigError {
++    #[error("workflow worker registration is invalid or privileged")]
++    InvalidRegistration,
++    #[error("workflow worker lease duration is outside the supported range")]
++    InvalidLeaseDuration,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
++pub enum WorkflowWorkerServerConfigError {
++    #[error("workflow worker UID must identify a non-root Unix account")]
++    InvalidAllowedUid,
++    #[error("workflow worker connection limit is outside the supported range")]
++    InvalidConnectionLimit,
++    #[error("workflow worker request timeout is outside the supported range")]
++    InvalidRequestTimeout,
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum WorkflowWorkerClientError {
++    #[error("workflow worker client configuration is invalid")]
++    InvalidConfig,
++    #[error("workflow worker request deadline elapsed")]
++    DeadlineExceeded,
++    #[error("workflow worker socket I/O failed: {0}")]
++    Io(io::Error),
++    #[error("workflow worker frame failed: {0}")]
++    Frame(#[from] FrameError),
++    #[error("workflow worker response contains trailing bytes")]
++    TrailingResponse,
++    #[error("workflow worker returned an unexpected or unbound response")]
++    WrongResponse,
++    #[error("workflow worker request was rejected with {code:?}; retryable={retryable}")]
++    Rejected {
++        code: WorkflowWorkerRejectionCodeV1,
++        retryable: bool,
++    },
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum WorkflowWorkerSocketError {
++    #[error("workflow worker bind path is invalid")]
++    InvalidBindPath,
++    #[error("workflow worker socket parent could not be inspected: {0}")]
++    BindParent(io::Error),
++    #[error("workflow worker socket parent is not the required protected directory")]
++    UnsafeBindParent,
++    #[error("workflow worker socket path already exists")]
++    SocketPathExists,
++    #[error("workflow worker stale socket could not be inspected: {0}")]
++    InspectStaleSocket(io::Error),
++    #[error("workflow worker socket path could not be inspected: {0}")]
++    InspectSocketPath(io::Error),
++    #[error("workflow worker socket path changed during reconciliation")]
++    SocketPathChanged,
++    #[error("workflow worker stale socket could not be removed: {0}")]
++    RemoveStaleSocket(io::Error),
++    #[error("workflow worker socket could not be bound: {0}")]
++    Bind(io::Error),
++    #[error("workflow worker bound path is not the required protected socket")]
++    BoundPathNotSocket,
++    #[error("workflow worker socket permissions could not be set: {0}")]
++    SetPermissions(io::Error),
++    #[error("workflow worker peer credentials could not be read: {0}")]
++    PeerCredentials(io::Error),
++    #[error("workflow worker peer UID {received} is not authorized")]
++    UnauthorizedPeer { received: u32 },
++    #[error("workflow worker request deadline elapsed")]
++    DeadlineExceeded,
++    #[error("workflow worker frame failed: {0}")]
++    Frame(#[from] FrameError),
++    #[error("workflow worker handler task failed")]
++    HandlerTask,
++    #[error("workflow worker response could not be closed: {0}")]
++    Write(io::Error),
++    #[error("workflow worker connection could not be accepted: {0}")]
++    Accept(io::Error),
++}
+diff --git a/tests/store_and_web.rs b/tests/store_and_web.rs
+index b992af4..20b285f 100644
+--- a/tests/store_and_web.rs
++++ b/tests/store_and_web.rs
+@@ -247,7 +247,7 @@ fn control_store_rejects_unknown_schema_versions_at_open() {
+         ControlStore::open(&path),
+         Err(StoreError::UnsupportedControlSchemaVersion {
+             actual: 99,
+-            supported: 2
++            supported: 3
+         })
+     ));
+ }
+@@ -265,6 +265,7 @@ fn control_store_migrates_v1_to_the_durable_workflow_journal() {
+     legacy
+         .execute_batch(
+             "DROP TABLE workflow_reductions;
++             DROP TABLE workflow_cleanup_receipts;
+              DROP TABLE workflow_node_receipts;
+              DROP TABLE workflow_lease_journal;
+              DROP TABLE workflow_node_dependencies;
+@@ -293,13 +294,14 @@ fn control_store_migrates_v1_to_the_durable_workflow_journal() {
+             |row| row.get(0),
+         )
+         .unwrap_or_else(|error| panic!("read migrated version: {error}"));
+-    assert_eq!(version, 2);
++    assert_eq!(version, 3);
+     let scheduler_tables: i64 = inspected
+         .query_row(
+             "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'table' AND name IN (
+                 'workflow_requests', 'workflow_attempts', 'workflow_nodes',
+                 'workflow_lease_journal', 'workflow_node_receipts',
++                'workflow_cleanup_receipts',
+                 'workflow_reductions', 'workflow_mutation_locks',
+                 'workflow_transitions', 'workflow_scheduler_cursor'
+              )",
+@@ -307,7 +309,49 @@ fn control_store_migrates_v1_to_the_durable_workflow_journal() {
+             |row| row.get(0),
+         )
+         .unwrap_or_else(|error| panic!("count migrated scheduler tables: {error}"));
+-    assert_eq!(scheduler_tables, 9);
++    assert_eq!(scheduler_tables, 10);
++}
++
++#[test]
++fn control_store_migrates_v2_cleanup_debt_atomically() {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let path = directory.path().join("v2-control.sqlite");
++    let store =
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("create control store: {error}"));
++    drop(store);
++
++    let legacy = rusqlite::Connection::open(&path)
++        .unwrap_or_else(|error| panic!("open simulated v2 store: {error}"));
++    legacy
++        .execute_batch(
++            "DROP TABLE workflow_cleanup_receipts;
++             UPDATE controller_meta SET integer_value = 2 WHERE key = 'schema_version';",
++        )
++        .unwrap_or_else(|error| panic!("downgrade fixture to v2: {error}"));
++    drop(legacy);
++
++    let migrated =
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("migrate v2 store: {error}"));
++    drop(migrated);
++    let inspected = rusqlite::Connection::open(&path)
++        .unwrap_or_else(|error| panic!("inspect migrated store: {error}"));
++    let version: i64 = inspected
++        .query_row(
++            "SELECT integer_value FROM controller_meta WHERE key = 'schema_version'",
++            [],
++            |row| row.get(0),
++        )
++        .unwrap_or_else(|error| panic!("read migrated version: {error}"));
++    assert_eq!(version, 3);
++    let cleanup_table: i64 = inspected
++        .query_row(
++            "SELECT COUNT(*) FROM sqlite_master
++             WHERE type = 'table' AND name = 'workflow_cleanup_receipts'",
++            [],
++            |row| row.get(0),
++        )
++        .unwrap_or_else(|error| panic!("inspect cleanup table: {error}"));
++    assert_eq!(cleanup_table, 1);
+ }
+
+ #[test]
+diff --git a/tests/worker_socket_contracts.rs b/tests/worker_socket_contracts.rs
+new file mode 100644
+index 0000000..e170acf
+--- /dev/null
++++ b/tests/worker_socket_contracts.rs
+@@ -0,0 +1,396 @@
++#![cfg(unix)]
++
++use std::{
++    collections::BTreeSet,
++    fs,
++    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
++    str::FromStr,
++    sync::{
++        Arc,
++        atomic::{AtomicI64, Ordering},
++    },
++    time::Duration,
++};
++
++use rdashboard::{
++    domain::{
++        AbsolutePolicyPath, EvidenceDigest, GitCommitId, HttpEndpoint, OperationKind, ProjectId,
++        ProjectManifestV2, RemoteUrl, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
++        WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
++    },
++    scheduler::{
++        DurableWorkflowScheduler, WorkflowAdmissionV1, WorkflowCleanupReasonV1,
++        WorkflowTriggerChannelV1, WorkflowWorkerRegistrationV1,
++    },
++    store::ControlStore,
++    worker_socket::{
++        BoundWorkflowWorkerSocketV1, SchedulerWorkflowWorkerHandlerV1, WORKER_PROTOCOL_VERSION,
++        WorkflowGatewayClockError, WorkflowGatewayClockV1, WorkflowWorkerAssignmentV1,
++        WorkflowWorkerClientV1, WorkflowWorkerHandlerConfigError, WorkflowWorkerRequestEnvelopeV1,
++        WorkflowWorkerRequestV1, WorkflowWorkerServerConfigV1, WorkflowWorkerSocketError,
++        WorkflowWorkerValidationError, serve_worker_connection, serve_worker_until,
++    },
++};
++use tempfile::tempdir;
++use tokio::{net::UnixStream, sync::oneshot};
++use uuid::Uuid;
++
++fn digest(label: impl AsRef<[u8]>) -> EvidenceDigest {
++    EvidenceDigest::sha256(label)
++}
++
++fn manifest(project: &str, fairness_weight: u16) -> ProjectManifestV2 {
++    let mut manifest: ProjectManifestV2 =
++        serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
++            .unwrap_or_else(|error| panic!("decode workflow manifest: {error}"));
++    manifest.project_id =
++        ProjectId::from_str(project).unwrap_or_else(|error| panic!("project fixture: {error}"));
++    manifest.display_name = format!("{project} worker protocol fixture");
++    manifest.source.remote_url =
++        RemoteUrl::from_str(&format!("https://github.com/example/{project}.git"))
++            .unwrap_or_else(|error| panic!("remote fixture: {error}"));
++    for check in &mut manifest.health_checks {
++        check.endpoint =
++            HttpEndpoint::from_str(&format!("http://{project}:8080/health/{}", check.name))
++                .unwrap_or_else(|error| panic!("health fixture: {error}"));
++    }
++    manifest.data_volumes[0].path =
++        AbsolutePolicyPath::from_str(&format!("/var/lib/{project}/templates"))
++            .unwrap_or_else(|error| panic!("data path fixture: {error}"));
++    manifest.data_volumes[1].path =
++        AbsolutePolicyPath::from_str(&format!("/var/lib/{project}/images"))
++            .unwrap_or_else(|error| panic!("data path fixture: {error}"));
++    manifest.workflow.fairness_weight = fairness_weight;
++    manifest
++        .validate()
++        .unwrap_or_else(|error| panic!("validate workflow fixture: {error}"));
++    manifest
++}
++
++fn admission(
++    manifest: &ProjectManifestV2,
++    sha_byte: char,
++    sequence: u64,
++    delivery_id: &str,
++) -> WorkflowAdmissionV1 {
++    WorkflowAdmissionV1 {
++        project_id: manifest.project_id.clone(),
++        workflow_policy_digest: manifest
++            .workflow_policy_digest()
++            .unwrap_or_else(|error| panic!("policy digest: {error}")),
++        source_sha: GitCommitId::from_str(&sha_byte.to_string().repeat(40))
++            .unwrap_or_else(|error| panic!("source SHA: {error}")),
++        operation_kind: OperationKind::Deploy,
++        source_sequence: sequence,
++        source_attestation_digest: digest(format!("attestation-{delivery_id}")),
++        trigger_channel: WorkflowTriggerChannelV1::GithubWebhook,
++        delivery_id: delivery_id.to_owned(),
++        payload_digest: digest(format!("payload-{delivery_id}")),
++        priority: 2,
++    }
++}
++
++fn worker() -> WorkflowWorkerRegistrationV1 {
++    WorkflowWorkerRegistrationV1 {
++        worker_id: "shared-vps-worker".to_owned(),
++        host_id: "production-vps".to_owned(),
++        pools: BTreeSet::from([
++            WorkflowWorkerPoolV1::BuildCompute,
++            WorkflowWorkerPoolV1::VpsRequired,
++        ]),
++    }
++}
++
++fn protected_directory() -> tempfile::TempDir {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750))
++        .unwrap_or_else(|error| panic!("protect temp dir: {error}"));
++    directory
++}
++
++#[derive(Clone, Debug)]
++struct TestClock {
++    now_ms: Arc<AtomicI64>,
++}
++
++impl TestClock {
++    fn new(now_ms: i64) -> Self {
++        Self {
++            now_ms: Arc::new(AtomicI64::new(now_ms)),
++        }
++    }
++
++    fn set(&self, now_ms: i64) {
++        self.now_ms.store(now_ms, Ordering::Release);
++    }
++}
++
++impl WorkflowGatewayClockV1 for TestClock {
++    fn now_ms(&self) -> Result<i64, WorkflowGatewayClockError> {
++        Ok(self.now_ms.load(Ordering::Acquire))
++    }
++}
++
++fn success_receipt(
++    lease: &rdashboard::domain::WorkflowLeaseV1,
++    label: &str,
++) -> WorkflowNodeReceiptV1 {
++    WorkflowNodeReceiptV1::new(
++        lease,
++        WorkflowNodeOutcomeV1::Succeeded,
++        Some(digest(format!("output-{label}"))),
++        digest(format!("execution-{label}")),
++        digest(format!("cleanup-{label}")),
++        WorkflowCleanupResultV1::Complete,
++        lease.leased_at_ms + 10,
++    )
++    .unwrap_or_else(|error| panic!("success receipt: {error}"))
++}
++
++async fn exercise_two_project_worker_flow(
++    client: &WorkflowWorkerClientV1,
++    registration: &WorkflowWorkerRegistrationV1,
++    clock: &TestClock,
++) {
++    let first_lease = match client
++        .poll()
++        .await
++        .unwrap_or_else(|error| panic!("first poll: {error}"))
++    {
++        WorkflowWorkerAssignmentV1::Lease { lease } => *lease,
++        assignment => panic!("unexpected first assignment: {assignment:?}"),
++    };
++    let second_lease = match client
++        .poll()
++        .await
++        .unwrap_or_else(|error| panic!("second poll: {error}"))
++    {
++        WorkflowWorkerAssignmentV1::Lease { lease } => *lease,
++        assignment => panic!("unexpected second assignment: {assignment:?}"),
++    };
++    assert_eq!(first_lease.worker_id, registration.worker_id);
++    assert_eq!(second_lease.worker_id, registration.worker_id);
++    assert_eq!(
++        BTreeSet::from([
++            first_lease.project_id.to_string(),
++            second_lease.project_id.to_string(),
++        ]),
++        BTreeSet::from(["ralert".to_owned(), "second".to_owned()])
++    );
++
++    clock.set(1_000);
++    let renewed = client
++        .renew_lease(first_lease.clone())
++        .await
++        .unwrap_or_else(|error| panic!("renew lease: {error}"));
++    assert!(renewed.expires_at_ms > first_lease.expires_at_ms);
++    clock.set(1_100);
++    client
++        .complete_node(success_receipt(&renewed, "first-project"))
++        .await
++        .unwrap_or_else(|error| panic!("complete renewed node: {error}"));
++
++    clock.set(second_lease.expires_at_ms);
++    let obligation = match client
++        .poll()
++        .await
++        .unwrap_or_else(|error| panic!("cleanup poll: {error}"))
++    {
++        WorkflowWorkerAssignmentV1::Cleanup { obligation } => *obligation,
++        assignment => panic!("cleanup must precede a replacement lease: {assignment:?}"),
++    };
++    assert_eq!(obligation.lease, second_lease);
++    assert_eq!(obligation.reason, WorkflowCleanupReasonV1::LeaseExpired);
++    let cleanup = WorkflowCleanupReceiptV1::new(
++        &obligation.lease,
++        obligation.terminal_receipt.as_ref(),
++        digest("worker-socket-cleanup"),
++        second_lease.expires_at_ms + 1,
++    )
++    .unwrap_or_else(|error| panic!("cleanup receipt: {error}"));
++    clock.set(cleanup.completed_at_ms + 1);
++    client
++        .complete_cleanup(cleanup)
++        .await
++        .unwrap_or_else(|error| panic!("complete cleanup: {error}"));
++
++    let mut replacement = None;
++    for _ in 0..2 {
++        let lease = match client
++            .poll()
++            .await
++            .unwrap_or_else(|error| panic!("replacement poll: {error}"))
++        {
++            WorkflowWorkerAssignmentV1::Lease { lease } => *lease,
++            assignment => panic!("expected runnable lease: {assignment:?}"),
++        };
++        if lease.project_id == second_lease.project_id && lease.node_id == second_lease.node_id {
++            replacement = Some(lease);
++        }
++    }
++    let replacement = replacement.unwrap_or_else(|| panic!("expired node was reissued"));
++    assert_eq!(replacement.project_id, second_lease.project_id);
++    assert_eq!(replacement.node_id, second_lease.node_id);
++    assert_eq!(
++        replacement.lease_generation,
++        second_lease.lease_generation + 1
++    );
++}
++
++#[test]
++fn protocol_and_handler_configuration_reject_privilege_or_ambiguity() {
++    let request = WorkflowWorkerRequestEnvelopeV1 {
++        version: WORKER_PROTOCOL_VERSION,
++        request_id: Uuid::new_v4(),
++        request: WorkflowWorkerRequestV1::Poll,
++    };
++    assert_eq!(request.validate(), Ok(()));
++    let mut wrong_version = request.clone();
++    wrong_version.version += 1;
++    assert_eq!(
++        wrong_version.validate(),
++        Err(WorkflowWorkerValidationError::UnsupportedVersion(
++            WORKER_PROTOCOL_VERSION + 1
++        ))
++    );
++    let mut nil_request = request;
++    nil_request.request_id = Uuid::nil();
++    assert_eq!(
++        nil_request.validate(),
++        Err(WorkflowWorkerValidationError::NilRequestId)
++    );
++
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let scheduler = DurableWorkflowScheduler::new(
++        ControlStore::open(directory.path().join("control.sqlite"))
++            .unwrap_or_else(|error| panic!("control store: {error}")),
++    );
++    let privileged = WorkflowWorkerRegistrationV1 {
++        worker_id: "bad-worker".to_owned(),
++        host_id: "production-vps".to_owned(),
++        pools: BTreeSet::from([WorkflowWorkerPoolV1::PrivilegedExecutor]),
++    };
++    assert!(matches!(
++        SchedulerWorkflowWorkerHandlerV1::new(
++            scheduler,
++            privileged,
++            Duration::from_secs(15),
++            TestClock::new(1),
++        ),
++        Err(WorkflowWorkerHandlerConfigError::InvalidRegistration)
++    ));
++
++    let service = include_str!("../deploy/systemd/rdashboard-workflow-gateway.service");
++    assert!(service.contains("User=rdashboard\nGroup=rdashboard-worker"));
++    assert!(service.contains("PrivateNetwork=yes"));
++    assert!(service.contains("RestrictAddressFamilies=AF_UNIX"));
++    assert!(!service.contains("docker.sock"));
++    assert!(!service.contains("executor.sock"));
++    assert!(!service.contains("source.sock"));
++    assert!(!service.contains("rimg-worker"));
++}
++
++#[tokio::test]
++async fn one_authenticated_socket_serves_two_projects_and_recovers_cleanup_debt() {
++    let directory = protected_directory();
++    let socket_path = directory.path().join("worker.sock");
++    let metadata = fs::symlink_metadata(directory.path())
++        .unwrap_or_else(|error| panic!("directory metadata: {error}"));
++    assert_ne!(
++        metadata.uid(),
++        0,
++        "test requires an ordinary workspace user"
++    );
++    assert_ne!(
++        metadata.gid(),
++        0,
++        "test requires an ordinary workspace group"
++    );
++    let mut socket =
++        BoundWorkflowWorkerSocketV1::bind(&socket_path, metadata.uid(), metadata.gid())
++            .unwrap_or_else(|error| panic!("bind worker socket: {error}"));
++    let listener = socket.take_listener();
++
++    let control_path = directory.path().join("control.sqlite");
++    let scheduler = DurableWorkflowScheduler::new(
++        ControlStore::open(&control_path)
++            .unwrap_or_else(|error| panic!("open control store: {error}")),
++    );
++    let first = manifest("ralert", 1);
++    let second = manifest("second", 1);
++    scheduler
++        .admit(&first, &admission(&first, 'a', 1, "worker-first"), 1)
++        .unwrap_or_else(|error| panic!("admit first project: {error}"));
++    scheduler
++        .admit(&second, &admission(&second, 'b', 1, "worker-second"), 2)
++        .unwrap_or_else(|error| panic!("admit second project: {error}"));
++
++    let registration = worker();
++    let clock = TestClock::new(10);
++    let handler = Arc::new(
++        SchedulerWorkflowWorkerHandlerV1::new(
++            scheduler.clone(),
++            registration.clone(),
++            Duration::from_secs(15),
++            clock.clone(),
++        )
++        .unwrap_or_else(|error| panic!("worker handler: {error}")),
++    );
++    let server_config =
++        WorkflowWorkerServerConfigV1::new(metadata.uid(), 4, Duration::from_secs(2))
++            .unwrap_or_else(|error| panic!("server config: {error}"));
++    let (shutdown_tx, shutdown_rx) = oneshot::channel();
++    let server = tokio::spawn(async move {
++        serve_worker_until(listener, handler, server_config, async {
++            let _ = shutdown_rx.await;
++        })
++        .await
++    });
++    let client =
++        WorkflowWorkerClientV1::new(&socket_path, Duration::from_secs(2), registration.clone())
++            .unwrap_or_else(|error| panic!("worker client: {error}"));
++
++    exercise_two_project_worker_flow(&client, &registration, &clock).await;
++
++    shutdown_tx
++        .send(())
++        .unwrap_or_else(|()| panic!("server shutdown receiver exists"));
++    server
++        .await
++        .unwrap_or_else(|error| panic!("server task: {error}"))
++        .unwrap_or_else(|error| panic!("server result: {error}"));
++}
++
++#[tokio::test]
++async fn peer_uid_is_rejected_before_the_scheduler_is_touched() {
++    let (server, _client) =
++        UnixStream::pair().unwrap_or_else(|error| panic!("socket pair: {error}"));
++    let peer_uid = server
++        .peer_cred()
++        .unwrap_or_else(|error| panic!("peer credentials: {error}"))
++        .uid();
++    let unauthorized_uid = peer_uid
++        .checked_add(1)
++        .unwrap_or(peer_uid.saturating_sub(1));
++    assert_ne!(unauthorized_uid, 0);
++    let config = WorkflowWorkerServerConfigV1::new(unauthorized_uid, 1, Duration::from_secs(1))
++        .unwrap_or_else(|error| panic!("server config: {error}"));
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let scheduler = DurableWorkflowScheduler::new(
++        ControlStore::open(directory.path().join("control.sqlite"))
++            .unwrap_or_else(|error| panic!("control store: {error}")),
++    );
++    let handler = Arc::new(
++        SchedulerWorkflowWorkerHandlerV1::new(
++            scheduler,
++            worker(),
++            Duration::from_secs(15),
++            TestClock::new(1),
++        )
++        .unwrap_or_else(|error| panic!("handler: {error}")),
++    );
++    assert!(matches!(
++        serve_worker_connection(server, handler, &config).await,
++        Err(WorkflowWorkerSocketError::UnauthorizedPeer { received }) if received == peer_uid
++    ));
++}
+diff --git a/tests/workflow_scheduler_contracts.rs b/tests/workflow_scheduler_contracts.rs
+index 7f4e342..2206c4d 100644
+--- a/tests/workflow_scheduler_contracts.rs
++++ b/tests/workflow_scheduler_contracts.rs
+@@ -4,14 +4,14 @@ use rdashboard::{
+     domain::{
+         AbsolutePolicyPath, EvidenceDigest, GitCommitId, HttpEndpoint, ManifestError,
+         OperationKind, ProjectId, ProjectManifestV2, RemoteUrl, WorkflowAdapterIdV1,
+-        WorkflowArtifactKindV1, WorkflowCleanupResultV1, WorkflowNodeKindV1, WorkflowNodeOutcomeV1,
+-        WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
++        WorkflowArtifactKindV1, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
++        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
+     },
+     installed_workflow::InstalledWorkflowCatalogV1,
+     scheduler::{
+         DurableWorkflowScheduler, WorkflowAdmissionV1, WorkflowAttemptStateV1,
+-        WorkflowMutationStateV1, WorkflowNodeStateV1, WorkflowTriggerChannelV1,
+-        WorkflowWorkerRegistrationV1,
++        WorkflowCleanupReasonV1, WorkflowCleanupStateV1, WorkflowMutationStateV1,
++        WorkflowNodeStateV1, WorkflowTriggerChannelV1, WorkflowWorkerRegistrationV1,
+     },
+     store::{ControlStore, StoreError},
+ };
+@@ -376,7 +376,23 @@ fn fair_queue_and_lease_generation_survive_reopen() {
+             .unwrap_or_else(|error| panic!("expire first lease: {error}")),
+         1
+     );
+-    let replayed = claim(&reopened, &build_worker(), first.expires_at_ms + 1);
++    assert!(
++        reopened
++            .claim_next(&build_worker(), first.expires_at_ms + 1, 1_000)
++            .unwrap_or_else(|error| panic!("block lease before cleanup: {error}"))
++            .is_none()
++    );
++    let cleanup = WorkflowCleanupReceiptV1::new(
++        &first,
++        None,
++        digest("reopened-expired-cleanup"),
++        first.expires_at_ms + 1,
++    )
++    .unwrap_or_else(|error| panic!("cleanup receipt: {error}"));
++    reopened
++        .commit_cleanup_receipt(&cleanup, first.expires_at_ms + 2)
++        .unwrap_or_else(|error| panic!("commit cleanup after reopen: {error}"));
++    let replayed = claim(&reopened, &build_worker(), first.expires_at_ms + 3);
+     assert_eq!(replayed.project_id.as_str(), "ralert");
+     assert_eq!(replayed.node_id, first.node_id);
+     assert_eq!(replayed.lease_generation, 2);
+@@ -430,12 +446,12 @@ fn reducer_binds_the_complete_required_set_and_receipts_are_idempotent() {
+     let store = ControlStore::open(":memory:")
+         .unwrap_or_else(|error| panic!("open control store: {error}"));
+     let scheduler = DurableWorkflowScheduler::new(store);
+-    let manifest = manifest("ralert", 1);
++    let first_manifest = manifest("ralert", 1);
+     scheduler
+         .admit(
+-            &manifest,
++            &first_manifest,
+             &admission(
+-                &manifest,
++                &first_manifest,
+                 'd',
+                 1,
+                 WorkflowTriggerChannelV1::GithubWebhook,
+@@ -807,3 +823,242 @@ fn persisted_reduction_revalidates_its_source_receipts_after_restart() {
+         Err(StoreError::WorkflowContract(_))
+     ));
+ }
++
++#[test]
++fn lease_renewal_is_bounded_idempotent_and_survives_reopen() {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let path = directory.path().join("renewed-control.sqlite");
++    let store =
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
++    let scheduler = DurableWorkflowScheduler::new(store.clone());
++    let manifest = manifest("ralert", 1);
++    scheduler
++        .admit(
++            &manifest,
++            &admission(
++                &manifest,
++                'a',
++                1,
++                WorkflowTriggerChannelV1::GithubWebhook,
++                "renew-1",
++            ),
++            1,
++        )
++        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
++    let worker = build_worker();
++    let original = claim(&scheduler, &worker, 10);
++    let renewed = scheduler
++        .renew_lease(&worker, &original, 500, 1_000)
++        .unwrap_or_else(|error| panic!("renew lease: {error}"));
++    assert_eq!(renewed.lease_id, original.lease_id);
++    assert_eq!(renewed.lease_generation, original.lease_generation);
++    assert!(renewed.expires_at_ms > original.expires_at_ms);
++    assert_ne!(renewed.lease_digest, original.lease_digest);
++
++    let replay = scheduler
++        .renew_lease(&worker, &original, 501, 1_000)
++        .unwrap_or_else(|error| panic!("recover lost renewal response: {error}"));
++    assert_eq!(replay, renewed);
++    drop(scheduler);
++    drop(store);
++
++    let reopened = DurableWorkflowScheduler::new(
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}")),
++    );
++    let renewed_again = reopened
++        .renew_lease(&worker, &renewed, 1_000, 1_000)
++        .unwrap_or_else(|error| panic!("renew after reopen: {error}"));
++    assert!(renewed_again.expires_at_ms > renewed.expires_at_ms);
++    let receipt = success_receipt(&renewed_again, "renewed-prepare");
++    reopened
++        .commit_node_receipt(&receipt, receipt.completed_at_ms + 1)
++        .unwrap_or_else(|error| panic!("commit receipt against latest lease: {error}"));
++    assert!(matches!(
++        reopened.commit_node_receipt(
++            &success_receipt(&original, "stale-renewal"),
++            original.leased_at_ms + 21,
++        ),
++        Err(StoreError::WorkflowReceiptConflict | StoreError::WorkflowLeaseConflict)
++    ));
++}
++
++#[test]
++fn expired_cleanup_debt_is_durable_and_must_reconcile_before_reuse() {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let path = directory.path().join("cleanup-control.sqlite");
++    let store =
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
++    let scheduler = DurableWorkflowScheduler::new(store.clone());
++    let manifest = manifest("ralert", 1);
++    scheduler
++        .admit(
++            &manifest,
++            &admission(
++                &manifest,
++                'b',
++                1,
++                WorkflowTriggerChannelV1::GithubWebhook,
++                "cleanup-expired-1",
++            ),
++            1,
++        )
++        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
++    let worker = build_worker();
++    let expired = claim(&scheduler, &worker, 10);
++    assert_eq!(
++        scheduler
++            .expire_leases(expired.expires_at_ms)
++            .unwrap_or_else(|error| panic!("expire lease: {error}")),
++        1
++    );
++    let attempt = scheduler
++        .attempt(expired.attempt_id)
++        .unwrap_or_else(|error| panic!("load cleanup debt: {error}"))
++        .unwrap_or_else(|| panic!("attempt exists"));
++    assert_eq!(attempt.cleanup_state, WorkflowCleanupStateV1::Pending);
++    assert!(
++        scheduler
++            .claim_next(&worker, expired.expires_at_ms + 1, 1_000)
++            .unwrap_or_else(|error| panic!("claim while cleanup is pending: {error}"))
++            .is_none(),
++        "a worker with unresolved cleanup debt must not receive another lease"
++    );
++    drop(scheduler);
++    drop(store);
++
++    let reopened = DurableWorkflowScheduler::new(
++        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}")),
++    );
++    let obligations = reopened
++        .pending_cleanup(&worker, 4)
++        .unwrap_or_else(|error| panic!("load cleanup obligation: {error}"));
++    assert_eq!(obligations.len(), 1);
++    assert_eq!(obligations[0].lease, expired);
++    assert_eq!(obligations[0].reason, WorkflowCleanupReasonV1::LeaseExpired);
++    assert!(obligations[0].terminal_receipt.is_none());
++    let cleanup = WorkflowCleanupReceiptV1::new(
++        &expired,
++        None,
++        digest("expired-cleanup-proof"),
++        expired.expires_at_ms + 1,
++    )
++    .unwrap_or_else(|error| panic!("cleanup receipt: {error}"));
++    let cleaned = reopened
++        .commit_cleanup_receipt(&cleanup, cleanup.completed_at_ms + 1)
++        .unwrap_or_else(|error| panic!("commit cleanup: {error}"));
++    assert_eq!(cleaned.cleanup_state, WorkflowCleanupStateV1::Complete);
++    assert_eq!(
++        reopened
++            .commit_cleanup_receipt(&cleanup, cleanup.completed_at_ms + 2)
++            .unwrap_or_else(|error| panic!("replay cleanup: {error}")),
++        cleaned
++    );
++    let conflicting = WorkflowCleanupReceiptV1::new(
++        &expired,
++        None,
++        digest("different-cleanup-proof"),
++        expired.expires_at_ms + 1,
++    )
++    .unwrap_or_else(|error| panic!("conflicting cleanup fixture: {error}"));
++    assert!(matches!(
++        reopened.commit_cleanup_receipt(&conflicting, conflicting.completed_at_ms + 1),
++        Err(StoreError::WorkflowCleanupConflict)
++    ));
++    let next = claim(&reopened, &worker, expired.expires_at_ms + 10);
++    assert_eq!(next.node_id, expired.node_id);
++    assert_eq!(next.lease_generation, expired.lease_generation + 1);
++}
++
++#[test]
++fn terminal_and_revoked_cleanup_obligations_bind_their_exact_evidence() {
++    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
++    let store = ControlStore::open(directory.path().join("control.sqlite"))
++        .unwrap_or_else(|error| panic!("open control store: {error}"));
++    let scheduler = DurableWorkflowScheduler::new(store);
++    let first_manifest = manifest("ralert", 1);
++    scheduler
++        .admit(
++            &first_manifest,
++            &admission(
++                &first_manifest,
++                'c',
++                1,
++                WorkflowTriggerChannelV1::GithubWebhook,
++                "cleanup-terminal-1",
++            ),
++            1,
++        )
++        .unwrap_or_else(|error| panic!("admit failed workflow: {error}"));
++    let worker = build_worker();
++    let failed_lease = claim(&scheduler, &worker, 10);
++    let failed = WorkflowNodeReceiptV1::new(
++        &failed_lease,
++        WorkflowNodeOutcomeV1::Failed,
++        None,
++        digest("failed-execution"),
++        digest("pending-cleanup"),
++        WorkflowCleanupResultV1::Pending,
++        20,
++    )
++    .unwrap_or_else(|error| panic!("failed receipt: {error}"));
++    scheduler
++        .commit_node_receipt(&failed, 21)
++        .unwrap_or_else(|error| panic!("commit failed receipt: {error}"));
++    let terminal = scheduler
++        .pending_cleanup(&worker, 4)
++        .unwrap_or_else(|error| panic!("terminal cleanup: {error}"));
++    assert_eq!(terminal.len(), 1);
++    assert_eq!(
++        terminal[0].reason,
++        WorkflowCleanupReasonV1::TerminalReceiptPending
++    );
++    assert_eq!(terminal[0].terminal_receipt.as_ref(), Some(&failed));
++    let terminal_cleanup = WorkflowCleanupReceiptV1::new(
++        &failed_lease,
++        Some(&failed),
++        digest("terminal-cleanup-proof"),
++        22,
++    )
++    .unwrap_or_else(|error| panic!("terminal cleanup receipt: {error}"));
++    let cleaned = scheduler
++        .commit_cleanup_receipt(&terminal_cleanup, 23)
++        .unwrap_or_else(|error| panic!("commit terminal cleanup: {error}"));
++    assert_eq!(cleaned.cleanup_state, WorkflowCleanupStateV1::Complete);
++
++    let newer_manifest = manifest("second", 1);
++    scheduler
++        .admit(
++            &newer_manifest,
++            &admission(
++                &newer_manifest,
++                'd',
++                1,
++                WorkflowTriggerChannelV1::GithubWebhook,
++                "cleanup-revoked-1",
++            ),
++            30,
++        )
++        .unwrap_or_else(|error| panic!("admit revocation workflow: {error}"));
++    let revoked = claim(&scheduler, &worker, 40);
++    scheduler
++        .admit(
++            &newer_manifest,
++            &admission(
++                &newer_manifest,
++                'e',
++                2,
++                WorkflowTriggerChannelV1::GithubWebhook,
++                "cleanup-revoked-2",
++            ),
++            50,
++        )
++        .unwrap_or_else(|error| panic!("supersede leased workflow: {error}"));
++    let revoked_obligations = scheduler
++        .pending_cleanup(&worker, 4)
++        .unwrap_or_else(|error| panic!("revoked cleanup: {error}"));
++    assert!(revoked_obligations.iter().any(|obligation| {
++        obligation.lease.lease_id == revoked.lease_id
++            && obligation.reason == WorkflowCleanupReasonV1::LeaseRevoked
++            && obligation.terminal_receipt.is_none()
++    }));
++}
+[0m
+[0m→ [0mRead src/domain/workflow.rs
+[0m→ [0mRead src/scheduler.rs
+[0m→ [0mRead src/store/control.rs
+[0m→ [0mRead src/worker_socket.rs
+[0m→ [0mRead src/bin/rdashboard-workflow-gateway.rs
+[0m→ [0mRead deploy/systemd/rdashboard-workflow-gateway.service
+[0m→ [0mRead src/scheduler.rs[90m [offset=1462][0m
+[0m→ [0mRead deploy/systemd/README.md
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead src/scheduler.rs[90m [offset=2796][0m
+[0m→ [0mRead src/store/mod.rs
+[0m⚙ [0mcodebase-memory-mcp_search_code {"project":"rdashboard","pattern":"StoreError::Workflow","file_pattern":"*.rs","mode":"compact"}

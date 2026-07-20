@@ -4,14 +4,14 @@ use rdashboard::{
     domain::{
         AbsolutePolicyPath, EvidenceDigest, GitCommitId, HttpEndpoint, ManifestError,
         OperationKind, ProjectId, ProjectManifestV2, RemoteUrl, WorkflowAdapterIdV1,
-        WorkflowArtifactKindV1, WorkflowCleanupResultV1, WorkflowNodeKindV1, WorkflowNodeOutcomeV1,
-        WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
+        WorkflowArtifactKindV1, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
+        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
     },
     installed_workflow::InstalledWorkflowCatalogV1,
     scheduler::{
         DurableWorkflowScheduler, WorkflowAdmissionV1, WorkflowAttemptStateV1,
-        WorkflowMutationStateV1, WorkflowNodeStateV1, WorkflowTriggerChannelV1,
-        WorkflowWorkerRegistrationV1,
+        WorkflowCleanupReasonV1, WorkflowCleanupStateV1, WorkflowMutationStateV1,
+        WorkflowNodeStateV1, WorkflowTriggerChannelV1, WorkflowWorkerRegistrationV1,
     },
     store::{ControlStore, StoreError},
 };
@@ -376,7 +376,23 @@ fn fair_queue_and_lease_generation_survive_reopen() {
             .unwrap_or_else(|error| panic!("expire first lease: {error}")),
         1
     );
-    let replayed = claim(&reopened, &build_worker(), first.expires_at_ms + 1);
+    assert!(
+        reopened
+            .claim_next(&build_worker(), first.expires_at_ms + 1, 1_000)
+            .unwrap_or_else(|error| panic!("block lease before cleanup: {error}"))
+            .is_none()
+    );
+    let cleanup = WorkflowCleanupReceiptV1::new(
+        &first,
+        None,
+        digest("reopened-expired-cleanup"),
+        first.expires_at_ms + 1,
+    )
+    .unwrap_or_else(|error| panic!("cleanup receipt: {error}"));
+    reopened
+        .commit_cleanup_receipt(&cleanup, first.expires_at_ms + 2)
+        .unwrap_or_else(|error| panic!("commit cleanup after reopen: {error}"));
+    let replayed = claim(&reopened, &build_worker(), first.expires_at_ms + 3);
     assert_eq!(replayed.project_id.as_str(), "ralert");
     assert_eq!(replayed.node_id, first.node_id);
     assert_eq!(replayed.lease_generation, 2);
@@ -430,12 +446,12 @@ fn reducer_binds_the_complete_required_set_and_receipts_are_idempotent() {
     let store = ControlStore::open(":memory:")
         .unwrap_or_else(|error| panic!("open control store: {error}"));
     let scheduler = DurableWorkflowScheduler::new(store);
-    let manifest = manifest("ralert", 1);
+    let first_manifest = manifest("ralert", 1);
     scheduler
         .admit(
-            &manifest,
+            &first_manifest,
             &admission(
-                &manifest,
+                &first_manifest,
                 'd',
                 1,
                 WorkflowTriggerChannelV1::GithubWebhook,
@@ -806,4 +822,243 @@ fn persisted_reduction_revalidates_its_source_receipts_after_restart() {
         reopened.reduce_attempt(attempt_id, 70),
         Err(StoreError::WorkflowContract(_))
     ));
+}
+
+#[test]
+fn lease_renewal_is_bounded_idempotent_and_survives_reopen() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("renewed-control.sqlite");
+    let store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store.clone());
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'a',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "renew-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    let worker = build_worker();
+    let original = claim(&scheduler, &worker, 10);
+    let renewed = scheduler
+        .renew_lease(&worker, &original, 500, 1_000)
+        .unwrap_or_else(|error| panic!("renew lease: {error}"));
+    assert_eq!(renewed.lease_id, original.lease_id);
+    assert_eq!(renewed.lease_generation, original.lease_generation);
+    assert!(renewed.expires_at_ms > original.expires_at_ms);
+    assert_ne!(renewed.lease_digest, original.lease_digest);
+
+    let replay = scheduler
+        .renew_lease(&worker, &original, 501, 1_000)
+        .unwrap_or_else(|error| panic!("recover lost renewal response: {error}"));
+    assert_eq!(replay, renewed);
+    drop(scheduler);
+    drop(store);
+
+    let reopened = DurableWorkflowScheduler::new(
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}")),
+    );
+    let renewed_again = reopened
+        .renew_lease(&worker, &renewed, 1_000, 1_000)
+        .unwrap_or_else(|error| panic!("renew after reopen: {error}"));
+    assert!(renewed_again.expires_at_ms > renewed.expires_at_ms);
+    let receipt = success_receipt(&renewed_again, "renewed-prepare");
+    reopened
+        .commit_node_receipt(&receipt, receipt.completed_at_ms + 1)
+        .unwrap_or_else(|error| panic!("commit receipt against latest lease: {error}"));
+    assert!(matches!(
+        reopened.commit_node_receipt(
+            &success_receipt(&original, "stale-renewal"),
+            original.leased_at_ms + 21,
+        ),
+        Err(StoreError::WorkflowReceiptConflict | StoreError::WorkflowLeaseConflict)
+    ));
+}
+
+#[test]
+fn expired_cleanup_debt_is_durable_and_must_reconcile_before_reuse() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("cleanup-control.sqlite");
+    let store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store.clone());
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'b',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "cleanup-expired-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    let worker = build_worker();
+    let expired = claim(&scheduler, &worker, 10);
+    assert_eq!(
+        scheduler
+            .expire_leases(expired.expires_at_ms)
+            .unwrap_or_else(|error| panic!("expire lease: {error}")),
+        1
+    );
+    let attempt = scheduler
+        .attempt(expired.attempt_id)
+        .unwrap_or_else(|error| panic!("load cleanup debt: {error}"))
+        .unwrap_or_else(|| panic!("attempt exists"));
+    assert_eq!(attempt.cleanup_state, WorkflowCleanupStateV1::Pending);
+    assert!(
+        scheduler
+            .claim_next(&worker, expired.expires_at_ms + 1, 1_000)
+            .unwrap_or_else(|error| panic!("claim while cleanup is pending: {error}"))
+            .is_none(),
+        "a worker with unresolved cleanup debt must not receive another lease"
+    );
+    drop(scheduler);
+    drop(store);
+
+    let reopened = DurableWorkflowScheduler::new(
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("reopen control store: {error}")),
+    );
+    let obligations = reopened
+        .pending_cleanup(&worker, 4)
+        .unwrap_or_else(|error| panic!("load cleanup obligation: {error}"));
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(obligations[0].lease, expired);
+    assert_eq!(obligations[0].reason, WorkflowCleanupReasonV1::LeaseExpired);
+    assert!(obligations[0].terminal_receipt.is_none());
+    let cleanup = WorkflowCleanupReceiptV1::new(
+        &expired,
+        None,
+        digest("expired-cleanup-proof"),
+        expired.expires_at_ms + 1,
+    )
+    .unwrap_or_else(|error| panic!("cleanup receipt: {error}"));
+    let cleaned = reopened
+        .commit_cleanup_receipt(&cleanup, cleanup.completed_at_ms + 1)
+        .unwrap_or_else(|error| panic!("commit cleanup: {error}"));
+    assert_eq!(cleaned.cleanup_state, WorkflowCleanupStateV1::Complete);
+    assert_eq!(
+        reopened
+            .commit_cleanup_receipt(&cleanup, cleanup.completed_at_ms + 2)
+            .unwrap_or_else(|error| panic!("replay cleanup: {error}")),
+        cleaned
+    );
+    let conflicting = WorkflowCleanupReceiptV1::new(
+        &expired,
+        None,
+        digest("different-cleanup-proof"),
+        expired.expires_at_ms + 1,
+    )
+    .unwrap_or_else(|error| panic!("conflicting cleanup fixture: {error}"));
+    assert!(matches!(
+        reopened.commit_cleanup_receipt(&conflicting, conflicting.completed_at_ms + 1),
+        Err(StoreError::WorkflowCleanupConflict)
+    ));
+    let next = claim(&reopened, &worker, expired.expires_at_ms + 10);
+    assert_eq!(next.node_id, expired.node_id);
+    assert_eq!(next.lease_generation, expired.lease_generation + 1);
+}
+
+#[test]
+fn terminal_and_revoked_cleanup_obligations_bind_their_exact_evidence() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let store = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let first_manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &first_manifest,
+            &admission(
+                &first_manifest,
+                'c',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "cleanup-terminal-1",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit failed workflow: {error}"));
+    let worker = build_worker();
+    let failed_lease = claim(&scheduler, &worker, 10);
+    let failed = WorkflowNodeReceiptV1::new(
+        &failed_lease,
+        WorkflowNodeOutcomeV1::Failed,
+        None,
+        digest("failed-execution"),
+        digest("pending-cleanup"),
+        WorkflowCleanupResultV1::Pending,
+        20,
+    )
+    .unwrap_or_else(|error| panic!("failed receipt: {error}"));
+    scheduler
+        .commit_node_receipt(&failed, 21)
+        .unwrap_or_else(|error| panic!("commit failed receipt: {error}"));
+    let terminal = scheduler
+        .pending_cleanup(&worker, 4)
+        .unwrap_or_else(|error| panic!("terminal cleanup: {error}"));
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(
+        terminal[0].reason,
+        WorkflowCleanupReasonV1::TerminalReceiptPending
+    );
+    assert_eq!(terminal[0].terminal_receipt.as_ref(), Some(&failed));
+    let terminal_cleanup = WorkflowCleanupReceiptV1::new(
+        &failed_lease,
+        Some(&failed),
+        digest("terminal-cleanup-proof"),
+        22,
+    )
+    .unwrap_or_else(|error| panic!("terminal cleanup receipt: {error}"));
+    let cleaned = scheduler
+        .commit_cleanup_receipt(&terminal_cleanup, 23)
+        .unwrap_or_else(|error| panic!("commit terminal cleanup: {error}"));
+    assert_eq!(cleaned.cleanup_state, WorkflowCleanupStateV1::Complete);
+
+    let newer_manifest = manifest("second", 1);
+    scheduler
+        .admit(
+            &newer_manifest,
+            &admission(
+                &newer_manifest,
+                'd',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "cleanup-revoked-1",
+            ),
+            30,
+        )
+        .unwrap_or_else(|error| panic!("admit revocation workflow: {error}"));
+    let revoked = claim(&scheduler, &worker, 40);
+    scheduler
+        .admit(
+            &newer_manifest,
+            &admission(
+                &newer_manifest,
+                'e',
+                2,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "cleanup-revoked-2",
+            ),
+            50,
+        )
+        .unwrap_or_else(|error| panic!("supersede leased workflow: {error}"));
+    let revoked_obligations = scheduler
+        .pending_cleanup(&worker, 4)
+        .unwrap_or_else(|error| panic!("revoked cleanup: {error}"));
+    assert!(revoked_obligations.iter().any(|obligation| {
+        obligation.lease.lease_id == revoked.lease_id
+            && obligation.reason == WorkflowCleanupReasonV1::LeaseRevoked
+            && obligation.terminal_receipt.is_none()
+    }));
 }

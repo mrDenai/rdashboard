@@ -125,6 +125,8 @@ pub enum StoreError {
     WorkflowLeaseConflict,
     #[error("workflow node receipt conflicts with durable lease or prior receipt evidence")]
     WorkflowReceiptConflict,
+    #[error("workflow cleanup receipt conflicts with durable lease or prior cleanup evidence")]
+    WorkflowCleanupConflict,
     #[error("workflow reduction is incomplete or conflicts with required step evidence")]
     WorkflowReductionConflict,
     #[error("persisted workflow scheduler journal is corrupt: {0}")]

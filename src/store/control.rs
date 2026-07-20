@@ -11,7 +11,7 @@ use crate::domain::{DashboardEvent, EVENT_PROTOCOL_VERSION, EventEnvelope};
 use super::{StoreError, lock_connection, verify_sqlite_version};
 
 const EVENT_HISTORY_LIMIT: i64 = 512;
-const CONTROL_SCHEMA_VERSION: i64 = 2;
+const CONTROL_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Debug)]
 pub struct ControlStore {
@@ -255,6 +255,17 @@ impl ControlStore {
                 receipt_json TEXT NOT NULL,
                 committed_at_ms INTEGER NOT NULL CHECK(committed_at_ms >= 0),
                 UNIQUE(attempt_id, node_id),
+                FOREIGN KEY(attempt_id, node_id)
+                    REFERENCES workflow_nodes(attempt_id, node_id)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_cleanup_receipts (
+                receipt_digest TEXT PRIMARY KEY,
+                lease_id TEXT NOT NULL UNIQUE REFERENCES workflow_lease_journal(lease_id),
+                attempt_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                committed_at_ms INTEGER NOT NULL CHECK(committed_at_ms >= 0),
                 FOREIGN KEY(attempt_id, node_id)
                     REFERENCES workflow_nodes(attempt_id, node_id)
             ) STRICT;
@@ -585,7 +596,7 @@ fn initialize_control_schema_version(transaction: &Transaction<'_>) -> Result<()
         .optional()?;
     match version {
         Some(CONTROL_SCHEMA_VERSION) => Ok(()),
-        Some(1) => {
+        Some(1 | 2) => {
             transaction.execute(
                 "UPDATE controller_meta SET integer_value = ?1 WHERE key = 'schema_version'",
                 [CONTROL_SCHEMA_VERSION],
@@ -626,6 +637,7 @@ fn validate_control_schema(transaction: &Transaction<'_>) -> Result<(), StoreErr
         "workflow_node_dependencies",
         "workflow_lease_journal",
         "workflow_node_receipts",
+        "workflow_cleanup_receipts",
         "workflow_reductions",
         "workflow_mutation_locks",
         "workflow_transitions",
@@ -653,6 +665,7 @@ fn validate_control_schema(transaction: &Transaction<'_>) -> Result<(), StoreErr
         ("workflow_node_dependencies", "dependency_node_id"),
         ("workflow_lease_journal", "lease_json"),
         ("workflow_node_receipts", "receipt_json"),
+        ("workflow_cleanup_receipts", "receipt_json"),
         ("workflow_reductions", "receipt_json"),
         ("workflow_mutation_locks", "state"),
         ("workflow_transitions", "reason"),
