@@ -59,6 +59,13 @@ impl InstalledWorkflowCatalogV1 {
         Self::load_from_owner(Path::new(INSTALLED_WORKFLOW_CATALOG_PATH), 0)
     }
 
+    pub fn load_root_owned_for_group(reader_gid: u32) -> Result<Self, InstalledWorkflowError> {
+        if reader_gid == 0 || reader_gid == u32::MAX {
+            return Err(InstalledWorkflowError::InvalidReaderGroup);
+        }
+        Self::load_from_owner_for_group(Path::new(INSTALLED_WORKFLOW_CATALOG_PATH), 0, reader_gid)
+    }
+
     pub fn project(&self, project_id: &ProjectId) -> Option<&InstalledWorkflowProjectV1> {
         self.projects.get(project_id)
     }
@@ -67,8 +74,27 @@ impl InstalledWorkflowCatalogV1 {
         self.projects.values()
     }
 
-    fn load_from_owner(path: &Path, required_uid: u32) -> Result<Self, InstalledWorkflowError> {
-        validate_private_directory(path, required_uid)?;
+    fn load_from_owner(path: &Path, owner_uid: u32) -> Result<Self, InstalledWorkflowError> {
+        Self::load_from_owner_with_optional_group(path, owner_uid, None)
+    }
+
+    fn load_from_owner_for_group(
+        path: &Path,
+        owner_uid: u32,
+        reader_gid: u32,
+    ) -> Result<Self, InstalledWorkflowError> {
+        if reader_gid == 0 || reader_gid == u32::MAX {
+            return Err(InstalledWorkflowError::InvalidReaderGroup);
+        }
+        Self::load_from_owner_with_optional_group(path, owner_uid, Some(reader_gid))
+    }
+
+    fn load_from_owner_with_optional_group(
+        path: &Path,
+        owner_uid: u32,
+        reader_gid: Option<u32>,
+    ) -> Result<Self, InstalledWorkflowError> {
+        validate_catalog_directory(path, owner_uid, reader_gid)?;
         let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(fs::DirEntry::file_name);
         if entries.is_empty() {
@@ -84,7 +110,7 @@ impl InstalledWorkflowCatalogV1 {
             if entry_path.extension().and_then(|value| value.to_str()) != Some("jcs") {
                 return Err(InstalledWorkflowError::UnexpectedCatalogEntry(entry_path));
             }
-            let bytes = read_stable_private_file(&entry_path, required_uid)?;
+            let bytes = read_stable_manifest(&entry_path, owner_uid, reader_gid)?;
             let manifest = ProjectManifestV2::decode_canonical(&bytes)?;
             let stem = entry_path
                 .file_stem()
@@ -104,15 +130,20 @@ impl InstalledWorkflowCatalogV1 {
     }
 }
 
-fn validate_private_directory(
+fn validate_catalog_directory(
     path: &Path,
-    required_uid: u32,
+    owner_uid: u32,
+    reader_gid: Option<u32>,
 ) -> Result<(), InstalledWorkflowError> {
     let metadata = fs::symlink_metadata(path)?;
+    let access_is_safe = match reader_gid {
+        Some(gid) => metadata.gid() == gid && metadata.mode() & 0o7777 == 0o750,
+        None => metadata.mode() & 0o7777 == 0o700,
+    };
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_dir()
-        || metadata.uid() != required_uid
-        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != owner_uid
+        || !access_is_safe
     {
         return Err(InstalledWorkflowError::UnsafeCatalogPath(
             path.to_path_buf(),
@@ -121,15 +152,20 @@ fn validate_private_directory(
     Ok(())
 }
 
-fn read_stable_private_file(
+fn read_stable_manifest(
     path: &Path,
-    required_uid: u32,
+    owner_uid: u32,
+    reader_gid: Option<u32>,
 ) -> Result<Vec<u8>, InstalledWorkflowError> {
     let path_metadata = fs::symlink_metadata(path)?;
+    let access_is_safe = match reader_gid {
+        Some(gid) => path_metadata.gid() == gid && path_metadata.mode() & 0o7777 == 0o640,
+        None => path_metadata.mode() & 0o7777 == 0o600,
+    };
     if path_metadata.file_type().is_symlink()
         || !path_metadata.file_type().is_file()
-        || path_metadata.uid() != required_uid
-        || path_metadata.mode() & 0o077 != 0
+        || path_metadata.uid() != owner_uid
+        || !access_is_safe
         || path_metadata.len() == 0
         || path_metadata.len() > MAX_MANIFEST_BYTES
     {
@@ -165,6 +201,8 @@ pub enum InstalledWorkflowError {
     Manifest(#[from] ManifestError),
     #[error("installed workflow catalog is empty")]
     EmptyCatalog,
+    #[error("installed workflow catalog reader group is invalid")]
+    InvalidReaderGroup,
     #[error("installed workflow catalog exceeds its project limit")]
     CatalogTooLarge,
     #[error("installed workflow catalog path is not owner-private: {0}")]
@@ -214,6 +252,50 @@ mod tests {
         assert!(matches!(
             InstalledWorkflowCatalogV1::load_from_owner(directory.path(), uid),
             Err(InstalledWorkflowError::UnexpectedCatalogEntry(_))
+        ));
+    }
+
+    #[test]
+    fn installed_loader_accepts_only_exact_read_only_group_access() {
+        let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750))
+            .unwrap_or_else(|error| panic!("catalog permissions: {error}"));
+        let metadata = fs::metadata(directory.path())
+            .unwrap_or_else(|error| panic!("catalog metadata: {error}"));
+        assert_ne!(
+            metadata.gid(),
+            0,
+            "group-readable contract requires non-root GID"
+        );
+        let manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
+                .unwrap_or_else(|error| panic!("manifest fixture: {error}"));
+        let path = directory.path().join("ralert.jcs");
+        fs::write(
+            &path,
+            serde_jcs::to_vec(&manifest)
+                .unwrap_or_else(|error| panic!("canonical manifest: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("write manifest: {error}"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+            .unwrap_or_else(|error| panic!("manifest permissions: {error}"));
+        let loaded = InstalledWorkflowCatalogV1::load_from_owner_for_group(
+            directory.path(),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .unwrap_or_else(|error| panic!("load group-readable catalog: {error}"));
+        assert!(loaded.project(&manifest.project_id).is_some());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|error| panic!("weaken manifest permissions: {error}"));
+        assert!(matches!(
+            InstalledWorkflowCatalogV1::load_from_owner_for_group(
+                directory.path(),
+                metadata.uid(),
+                metadata.gid(),
+            ),
+            Err(InstalledWorkflowError::UnsafeManifest(_))
         ));
     }
 }

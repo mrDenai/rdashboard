@@ -32,10 +32,14 @@ mod git_repository;
 pub use git_repository::{GitSourceProjectConfig, GitSourceRepository, GitSshTransportConfig};
 
 pub const ACCEPTED_HEAD_SCHEMA_VERSION: u16 = 1;
-const SOURCE_SCHEMA_VERSION: i64 = 2;
-const PREVIOUS_SOURCE_SCHEMA_VERSION: i64 = 1;
+pub const SOURCE_OUTBOX_SCHEMA_VERSION: u16 = 1;
+const SOURCE_SCHEMA_VERSION: i64 = 3;
+const PREVIOUS_SOURCE_SCHEMA_VERSION: i64 = 2;
+const LEGACY_SOURCE_SCHEMA_VERSION: i64 = 1;
 const MAX_DELIVERY_ID_BYTES: usize = 128;
 const MAX_WEBHOOK_BODY_BYTES: usize = 1_048_576;
+const MAX_OUTBOX_BATCH: usize = 64;
+const SETTLED_OUTBOX_RETENTION: i64 = 2_048;
 const ACCEPTED_HEAD_DOMAIN: &[u8] = b"rdashboard.accepted-head.v1\0";
 const SOURCE_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS source_meta (
@@ -43,7 +47,7 @@ const SOURCE_SCHEMA_SQL: &str = "
         integer_value INTEGER NOT NULL
     ) STRICT;
     INSERT OR IGNORE INTO source_meta(key, integer_value)
-        VALUES ('schema_version', 2);
+        VALUES ('schema_version', 3);
 
     CREATE TABLE IF NOT EXISTS source_projects (
         project_id TEXT PRIMARY KEY,
@@ -131,6 +135,23 @@ const SOURCE_SCHEMA_SQL: &str = "
         attestation_digest TEXT NOT NULL,
         acquired_at_ms INTEGER NOT NULL
     ) STRICT;
+
+    CREATE TABLE IF NOT EXISTS source_outbox (
+        outbox_sequence INTEGER PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+        attestation_json TEXT NOT NULL,
+        attestation_digest TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'delivered', 'superseded')),
+        enqueued_at_ms INTEGER NOT NULL,
+        settled_at_ms INTEGER,
+        UNIQUE(project_id, source_sequence),
+        CHECK((status = 'pending' AND settled_at_ms IS NULL)
+            OR (status != 'pending' AND settled_at_ms IS NOT NULL))
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS source_outbox_pending_sequence
+        ON source_outbox(status, outbox_sequence);
 ";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -429,6 +450,20 @@ fn migrate_source_schema_v2(connection: &mut Connection) -> Result<(), SourceErr
     Ok(())
 }
 
+fn migrate_source_schema_v3(connection: &mut Connection) -> Result<(), SourceError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE source_meta SET integer_value = 3
+         WHERE key = 'schema_version' AND integer_value = 2",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(SourceError::CorruptLedger("source schema migration"));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 impl SourceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SourceError> {
         let database_path = path.as_ref().to_path_buf();
@@ -445,7 +480,11 @@ impl SourceStore {
         )?;
         match version {
             SOURCE_SCHEMA_VERSION => {}
-            PREVIOUS_SOURCE_SCHEMA_VERSION => migrate_source_schema_v2(&mut connection)?,
+            PREVIOUS_SOURCE_SCHEMA_VERSION => migrate_source_schema_v3(&mut connection)?,
+            LEGACY_SOURCE_SCHEMA_VERSION => {
+                migrate_source_schema_v2(&mut connection)?;
+                migrate_source_schema_v3(&mut connection)?;
+            }
             _ => return Err(SourceError::UnsupportedSchemaVersion(version)),
         }
         Ok(Self {
@@ -640,11 +679,13 @@ impl SourceStore {
         &self,
         claim: &DeliveryClaim,
         outcome: &SourceIngressOutcome,
+        enqueue_deployable: bool,
         completed_at_ms: i64,
     ) -> Result<SourceIngressOutcome, SourceError> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.require_bound_broker_epoch(&transaction)?;
+        validate_delivery_outcome(claim, outcome)?;
         let outcome_json = serde_json::to_string(outcome)?;
         let changed = transaction.execute(
             "UPDATE source_deliveries
@@ -666,8 +707,141 @@ impl SourceStore {
         if changed != 1 {
             return Err(SourceError::DeliveryReservationLost);
         }
+        if enqueue_deployable {
+            enqueue_deployable_outcome(&transaction, outcome, completed_at_ms)?;
+        }
         transaction.commit()?;
         Ok(outcome.clone())
+    }
+
+    fn pending_outbox(&self, limit: usize) -> Result<Vec<SourceOutboxEntryV1>, SourceError> {
+        if !(1..=MAX_OUTBOX_BATCH).contains(&limit) {
+            return Err(SourceError::InvalidOutboxLimit);
+        }
+        let query_limit = i64::try_from(limit).map_err(|_| SourceError::InvalidOutboxLimit)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        self.require_bound_broker_epoch(&transaction)?;
+        let mut statement = transaction.prepare(
+            "SELECT outbox_sequence, project_id, source_sequence, attestation_json,
+                    attestation_digest, enqueued_at_ms
+             FROM source_outbox
+             WHERE status = 'pending'
+             ORDER BY outbox_sequence ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([query_limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction.commit()?;
+        rows.iter().map(decode_outbox_row).collect()
+    }
+
+    fn reconcile_outbox_policy(
+        &self,
+        enabled_projects: &BTreeSet<String>,
+        reconciled_at_ms: i64,
+    ) -> Result<(), SourceError> {
+        if reconciled_at_ms < 0 {
+            return Err(SourceError::TimeRange);
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.require_bound_broker_epoch(&transaction)?;
+        let pending_projects = {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT project_id FROM source_outbox WHERE status = 'pending'",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for value in pending_projects {
+            let project_id = ProjectId::from_str(&value)
+                .map_err(|_| SourceError::CorruptLedger("source outbox project"))?;
+            if !enabled_projects.contains(project_id.as_str()) {
+                transaction.execute(
+                    "UPDATE source_outbox
+                     SET status = 'superseded',
+                         settled_at_ms = MAX(enqueued_at_ms, ?2)
+                     WHERE project_id = ?1 AND status = 'pending'",
+                    params![project_id.as_str(), reconciled_at_ms],
+                )?;
+            }
+        }
+        prune_settled_outbox(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn acknowledge_outbox(
+        &self,
+        outbox_sequence: u64,
+        attestation_digest: &EvidenceDigest,
+        acknowledged_at_ms: i64,
+    ) -> Result<(), SourceError> {
+        if outbox_sequence == 0 || acknowledged_at_ms < 0 {
+            return Err(SourceError::InvalidOutboxAcknowledgement);
+        }
+        let outbox_sequence = i64::try_from(outbox_sequence)
+            .map_err(|_| SourceError::InvalidOutboxAcknowledgement)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.require_bound_broker_epoch(&transaction)?;
+        let stored = transaction
+            .query_row(
+                "SELECT attestation_digest, status, enqueued_at_ms
+                 FROM source_outbox WHERE outbox_sequence = ?1",
+                [outbox_sequence],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(SourceError::OutboxEntryMissing)?;
+        if stored.0 != attestation_digest.as_str() {
+            return Err(SourceError::OutboxAcknowledgementConflict);
+        }
+        if acknowledged_at_ms < stored.2 {
+            return Err(SourceError::InvalidOutboxAcknowledgement);
+        }
+        match stored.1.as_str() {
+            "pending" => {
+                let changed = transaction.execute(
+                    "UPDATE source_outbox
+                     SET status = 'delivered', settled_at_ms = ?3
+                     WHERE outbox_sequence = ?1 AND attestation_digest = ?2
+                       AND status = 'pending'",
+                    params![
+                        outbox_sequence,
+                        attestation_digest.as_str(),
+                        acknowledged_at_ms
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(SourceError::OutboxAcknowledgementConflict);
+                }
+            }
+            "delivered" | "superseded" => {}
+            _ => return Err(SourceError::CorruptLedger("source outbox status")),
+        }
+        prune_settled_outbox(&transaction)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn abandon_delivery(
@@ -1342,6 +1516,143 @@ impl SourceStore {
     }
 }
 
+fn validate_delivery_outcome(
+    claim: &DeliveryClaim,
+    outcome: &SourceIngressOutcome,
+) -> Result<(), SourceError> {
+    let SourceIngressOutcome::Deployable(delivery) = outcome else {
+        return Ok(());
+    };
+    if delivery.channel != claim.channel
+        || delivery.delivery_id != claim.delivery_id
+        || delivery.payload_digest != claim.payload_digest
+        || delivery.attestation.payload.project_id != claim.project_id
+        || delivery.attestation_digest != delivery.attestation.digest()?
+    {
+        return Err(SourceError::CorruptLedger("deployable delivery binding"));
+    }
+    Ok(())
+}
+
+fn enqueue_deployable_outcome(
+    transaction: &Transaction<'_>,
+    outcome: &SourceIngressOutcome,
+    enqueued_at_ms: i64,
+) -> Result<(), SourceError> {
+    let SourceIngressOutcome::Deployable(delivery) = outcome else {
+        return Ok(());
+    };
+    let payload = &delivery.attestation.payload;
+    if enqueued_at_ms < payload.accepted_at_ms {
+        return Err(SourceError::TimeRange);
+    }
+    let source_sequence =
+        i64::try_from(payload.sequence).map_err(|_| SourceError::SequenceRange)?;
+    let canonical = String::from_utf8(serde_jcs::to_vec(&delivery.attestation)?)
+        .map_err(|_| SourceError::CorruptLedger("source outbox encoding"))?;
+    transaction.execute(
+        "UPDATE source_outbox
+         SET status = 'superseded', settled_at_ms = MAX(enqueued_at_ms, ?3)
+         WHERE project_id = ?1 AND source_sequence < ?2 AND status = 'pending'",
+        params![payload.project_id.as_str(), source_sequence, enqueued_at_ms],
+    )?;
+    transaction.execute(
+        "INSERT INTO source_outbox(
+            project_id, source_sequence, attestation_json, attestation_digest,
+            status, enqueued_at_ms, settled_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, 'pending', ?5, NULL)
+         ON CONFLICT(attestation_digest) DO NOTHING",
+        params![
+            payload.project_id.as_str(),
+            source_sequence,
+            canonical,
+            delivery.attestation_digest.as_str(),
+            enqueued_at_ms
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE source_outbox
+         SET status = 'pending', enqueued_at_ms = ?4, settled_at_ms = NULL
+         WHERE project_id = ?1 AND source_sequence = ?2 AND attestation_digest = ?3
+           AND status = 'superseded'",
+        params![
+            payload.project_id.as_str(),
+            source_sequence,
+            delivery.attestation_digest.as_str(),
+            enqueued_at_ms
+        ],
+    )?;
+    let persisted = transaction.query_row(
+        "SELECT outbox_sequence, project_id, source_sequence, attestation_json,
+                attestation_digest, enqueued_at_ms
+         FROM source_outbox WHERE attestation_digest = ?1",
+        [delivery.attestation_digest.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        },
+    )?;
+    let persisted = decode_outbox_row(&persisted)?;
+    if persisted.project_id != payload.project_id
+        || persisted.source_sequence != payload.sequence
+        || persisted.attestation != delivery.attestation
+        || persisted.attestation_digest != delivery.attestation_digest
+    {
+        return Err(SourceError::CorruptLedger("source outbox replay binding"));
+    }
+    prune_settled_outbox(transaction)?;
+    Ok(())
+}
+
+fn prune_settled_outbox(transaction: &Transaction<'_>) -> Result<(), SourceError> {
+    transaction.execute(
+        "DELETE FROM source_outbox
+         WHERE status != 'pending' AND outbox_sequence NOT IN (
+             SELECT outbox_sequence FROM source_outbox
+             WHERE status != 'pending'
+             ORDER BY outbox_sequence DESC
+             LIMIT ?1
+         )",
+        [SETTLED_OUTBOX_RETENTION],
+    )?;
+    Ok(())
+}
+
+fn decode_outbox_row(
+    row: &(i64, String, i64, String, String, i64),
+) -> Result<SourceOutboxEntryV1, SourceError> {
+    let attestation: SignedAcceptedHeadV1 = serde_json::from_str(&row.3)?;
+    if String::from_utf8(serde_jcs::to_vec(&attestation)?)
+        .map_err(|_| SourceError::CorruptLedger("source outbox encoding"))?
+        != row.3
+    {
+        return Err(SourceError::CorruptLedger(
+            "source outbox canonical encoding",
+        ));
+    }
+    let entry = SourceOutboxEntryV1 {
+        schema_version: SOURCE_OUTBOX_SCHEMA_VERSION,
+        outbox_sequence: u64::try_from(row.0)
+            .map_err(|_| SourceError::CorruptLedger("source outbox sequence"))?,
+        project_id: ProjectId::from_str(&row.1)
+            .map_err(|_| SourceError::CorruptLedger("source outbox project"))?,
+        source_sequence: u64::try_from(row.2)
+            .map_err(|_| SourceError::CorruptLedger("source outbox source sequence"))?,
+        attestation,
+        attestation_digest: EvidenceDigest::from_str(&row.4)
+            .map_err(|_| SourceError::CorruptLedger("source outbox attestation digest"))?,
+        enqueued_at_ms: row.5,
+    };
+    entry.validate()?;
+    Ok(entry)
+}
+
 fn load_snapshot(
     connection: &Connection,
     project_id: &ProjectId,
@@ -1700,6 +2011,38 @@ pub enum SourceIngressOutcome {
     BlockedSha { head: GitCommitId },
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceOutboxEntryV1 {
+    pub schema_version: u16,
+    pub outbox_sequence: u64,
+    pub project_id: ProjectId,
+    pub source_sequence: u64,
+    pub attestation: SignedAcceptedHeadV1,
+    pub attestation_digest: EvidenceDigest,
+    pub enqueued_at_ms: i64,
+}
+
+impl SourceOutboxEntryV1 {
+    pub fn validate(&self) -> Result<(), SourceError> {
+        if self.schema_version != SOURCE_OUTBOX_SCHEMA_VERSION
+            || self.outbox_sequence == 0
+            || self.source_sequence == 0
+            || self.enqueued_at_ms < self.attestation.payload.accepted_at_ms
+            || self.project_id != self.attestation.payload.project_id
+            || self.source_sequence != self.attestation.payload.sequence
+            || self.attestation_digest != self.attestation.digest()?
+        {
+            return Err(SourceError::CorruptLedger("source outbox entry"));
+        }
+        Ok(())
+    }
+
+    pub fn scheduler_delivery_id(&self) -> String {
+        format!("source-{}", self.attestation_digest)
+    }
+}
+
 enum DeliveryReservation {
     Claimed(DeliveryClaim),
     Completed(SourceIngressOutcome),
@@ -1814,11 +2157,36 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             policies,
         };
         broker.recover_source_state(started_at_ms)?;
+        let enabled_projects = broker
+            .policies
+            .values()
+            .filter(|policy| policy.auto_deploy)
+            .map(|policy| policy.project_id.to_string())
+            .collect();
+        broker
+            .store
+            .reconcile_outbox_policy(&enabled_projects, started_at_ms)?;
         Ok(broker)
     }
 
     pub const fn store(&self) -> &SourceStore {
         &self.store
+    }
+
+    pub fn pending_outbox(&self, limit: usize) -> Result<Vec<SourceOutboxEntryV1>, SourceError> {
+        self.require_current_lease()?;
+        self.store.pending_outbox(limit)
+    }
+
+    pub fn acknowledge_outbox(
+        &self,
+        outbox_sequence: u64,
+        attestation_digest: &EvidenceDigest,
+        acknowledged_at_ms: i64,
+    ) -> Result<(), SourceError> {
+        self.require_current_lease()?;
+        self.store
+            .acknowledge_outbox(outbox_sequence, attestation_digest, acknowledged_at_ms)
     }
 
     pub fn broker_epoch(&self) -> u64 {
@@ -2191,9 +2559,12 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             })
         })();
         match result {
-            Ok(outcome) => self
-                .store
-                .finish_delivery(&delivery_claim, &outcome, now_ms),
+            Ok(outcome) => self.store.finish_delivery(
+                &delivery_claim,
+                &outcome,
+                installed_policy.auto_deploy,
+                now_ms,
+            ),
             Err(error) => {
                 self.store.abandon_delivery(&delivery_claim, now_ms)?;
                 Err(error)
@@ -2218,12 +2589,13 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             .as_ref()
             .is_some_and(|attestation| now_ms >= attestation.payload.expires_at_ms);
         let payload_digest = EvidenceDigest::sha256(format!(
-            "reconcile.v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "reconcile.v3\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             project_id,
             fetched_head,
             installed_policy.repository_identity,
             installed_policy.installed_policy.digest,
             installed_policy.installed_policy.version,
+            installed_policy.auto_deploy,
             snapshot.head.as_ref().map_or("-", GitCommitId::as_str),
             snapshot.sequence,
             snapshot.state.as_str(),
@@ -2260,9 +2632,12 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             now_ms,
         });
         match result {
-            Ok(outcome) => self
-                .store
-                .finish_delivery(&delivery_claim, &outcome, now_ms),
+            Ok(outcome) => self.store.finish_delivery(
+                &delivery_claim,
+                &outcome,
+                installed_policy.auto_deploy,
+                now_ms,
+            ),
             Err(error) => {
                 self.store.abandon_delivery(&delivery_claim, now_ms)?;
                 Err(error)
@@ -2319,9 +2694,12 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             now_ms,
         });
         match result {
-            Ok(outcome) => self
-                .store
-                .finish_delivery(&delivery_claim, &outcome, now_ms),
+            Ok(outcome) => self.store.finish_delivery(
+                &delivery_claim,
+                &outcome,
+                installed_policy.auto_deploy,
+                now_ms,
+            ),
             Err(error) => {
                 self.store.abandon_delivery(&delivery_claim, now_ms)?;
                 Err(error)
@@ -3152,6 +3530,14 @@ pub enum SourceError {
     DeliveryNotRecorded,
     #[error("source delivery did not produce a deployable accepted head")]
     DeliveryNotDeployable,
+    #[error("source outbox batch limit is invalid")]
+    InvalidOutboxLimit,
+    #[error("source outbox acknowledgement is invalid")]
+    InvalidOutboxAcknowledgement,
+    #[error("source outbox entry does not exist")]
+    OutboxEntryMissing,
+    #[error("source outbox acknowledgement conflicts with durable state")]
+    OutboxAcknowledgementConflict,
     #[error("webhook secret must contain at least 16 bytes")]
     WebhookSecretTooShort,
     #[error("GitHub webhook signature is invalid")]

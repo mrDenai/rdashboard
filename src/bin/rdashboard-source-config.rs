@@ -25,6 +25,8 @@ const MAX_PRIVATE_INPUT_BYTES: u64 = 64 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Arguments {
     source_uid: u32,
+    controller_uid: u32,
+    controller_gid: u32,
     build_reader_gid: u32,
     installed_policy_digest: EvidenceDigest,
     installed_policy_version: u64,
@@ -47,38 +49,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn parse_arguments(values: &[String]) -> Result<Arguments, std::io::Error> {
-    if values.len() != 5 {
+    if values.len() != 7 {
         return Err(invalid_input(
-            "usage: rdashboard-source-config SOURCE_UID BUILD_READER_GID INSTALLED_POLICY_SHA256 INSTALLED_POLICY_VERSION",
+            "usage: rdashboard-source-config SOURCE_UID CONTROLLER_UID CONTROLLER_GID BUILD_READER_GID INSTALLED_POLICY_SHA256 INSTALLED_POLICY_VERSION",
         ));
     }
-    let source_uid = values[1]
-        .parse()
-        .map_err(|_| invalid_input("SOURCE_UID must be a decimal u32"))?;
-    let build_reader_gid = values[2]
-        .parse()
-        .map_err(|_| invalid_input("BUILD_READER_GID must be a decimal u32"))?;
-    let installed_policy_digest = EvidenceDigest::from_str(&values[3])
-        .map_err(|_| invalid_input("INSTALLED_POLICY_SHA256 must be lowercase SHA-256"))?;
-    let installed_policy_version = values[4]
-        .parse()
-        .map_err(|_| invalid_input("INSTALLED_POLICY_VERSION must be a decimal u64"))?;
-    if source_uid == 0
-        || build_reader_gid == 0
-        || installed_policy_version == 0
-        || source_uid == u32::MAX
-        || build_reader_gid == u32::MAX
+    let arguments = Arguments {
+        source_uid: values[1]
+            .parse()
+            .map_err(|_| invalid_input("SOURCE_UID must be a decimal u32"))?,
+        controller_uid: values[2]
+            .parse()
+            .map_err(|_| invalid_input("CONTROLLER_UID must be a decimal u32"))?,
+        controller_gid: values[3]
+            .parse()
+            .map_err(|_| invalid_input("CONTROLLER_GID must be a decimal u32"))?,
+        build_reader_gid: values[4]
+            .parse()
+            .map_err(|_| invalid_input("BUILD_READER_GID must be a decimal u32"))?,
+        installed_policy_digest: EvidenceDigest::from_str(&values[5])
+            .map_err(|_| invalid_input("INSTALLED_POLICY_SHA256 must be lowercase SHA-256"))?,
+        installed_policy_version: values[6]
+            .parse()
+            .map_err(|_| invalid_input("INSTALLED_POLICY_VERSION must be a decimal u64"))?,
+    };
+    if arguments.source_uid == 0
+        || arguments.controller_uid == 0
+        || arguments.controller_gid == 0
+        || arguments.build_reader_gid == 0
+        || arguments.installed_policy_version == 0
+        || arguments.source_uid == u32::MAX
+        || arguments.controller_uid == u32::MAX
+        || arguments.controller_gid == u32::MAX
+        || arguments.build_reader_gid == u32::MAX
     {
         return Err(invalid_input(
             "numeric identities and policy version must be nonzero",
         ));
     }
-    Ok(Arguments {
-        source_uid,
-        build_reader_gid,
-        installed_policy_digest,
-        installed_policy_version,
-    })
+    Ok(arguments)
 }
 
 fn build_config(
@@ -116,6 +125,8 @@ fn build_config(
     let public_key_digest = EvidenceDigest::sha256(public_key);
     InstalledSourceConfigV1::new(InstalledSourceConfigInputV1 {
         source_uid: arguments.source_uid,
+        controller_uid: arguments.controller_uid,
+        controller_gid: arguments.controller_gid,
         build_reader_gid: arguments.build_reader_gid,
         max_connections: 16,
         request_timeout_ms: 2_000,
@@ -182,6 +193,8 @@ mod tests {
     fn arguments() -> Arguments {
         Arguments {
             source_uid: 991,
+            controller_uid: 993,
+            controller_gid: 993,
             build_reader_gid: 992,
             installed_policy_digest: EvidenceDigest::sha256("installed policy"),
             installed_policy_version: 1,
@@ -214,6 +227,8 @@ mod tests {
             vec![
                 "tool".to_owned(),
                 "0".to_owned(),
+                "993".to_owned(),
+                "993".to_owned(),
                 "992".to_owned(),
                 EvidenceDigest::sha256("policy").to_string(),
                 "1".to_owned(),
@@ -221,6 +236,8 @@ mod tests {
             vec![
                 "tool".to_owned(),
                 "991".to_owned(),
+                "993".to_owned(),
+                "993".to_owned(),
                 "992".to_owned(),
                 "not-a-digest".to_owned(),
                 "1".to_owned(),

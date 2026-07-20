@@ -73,6 +73,10 @@ pub mod root_fence_runtime;
 pub mod scheduler;
 pub mod source;
 #[cfg(unix)]
+pub mod source_delivery;
+#[cfg(unix)]
+pub mod source_delivery_socket;
+#[cfg(unix)]
 pub mod source_socket;
 pub mod store;
 pub mod web;

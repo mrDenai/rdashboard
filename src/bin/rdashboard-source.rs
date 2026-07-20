@@ -13,6 +13,10 @@ use rdashboard::{
         validate_source_git_ssh_credentials,
     },
     source::{DurableSourceBroker, GitSourceRepository, SourceProjectState, SourceStore},
+    source_delivery_socket::{
+        BoundSourceDeliverySocketV1, BrokerSourceDeliveryHandlerV1, SourceOutboxReaderV1,
+        serve_source_delivery_until,
+    },
     source_socket::{
         BoundSourceSocketV1, BrokerSourceRequestHandlerV1, SourceSnapshotReaderV1,
         serve_source_until,
@@ -79,12 +83,31 @@ async fn main() -> Result<(), DynError> {
     .await
     .map_err(|_| invalid_data("initial source reconciliation task failed"))??;
 
+    serve_broker(config, broker, export_repository, source_exports).await
+}
+
+async fn serve_broker(
+    config: InstalledSourceConfigV1,
+    broker: Arc<InstalledBroker>,
+    export_repository: GitSourceRepository,
+    source_exports: SourceArchivePublisherV1,
+) -> Result<(), DynError> {
     let mut socket = BoundSourceSocketV1::bind(&config.socket_path, config.source_uid)?;
     let listener = socket.take_listener();
     let handler = Arc::new(BrokerSourceRequestHandlerV1::new(ArcBroker(Arc::clone(
         &broker,
     ))));
     let server_config = config.server_config()?;
+    let mut delivery_socket = BoundSourceDeliverySocketV1::bind(
+        &config.delivery_socket_path,
+        config.source_uid,
+        config.controller_gid,
+    )?;
+    let delivery_listener = delivery_socket.take_listener();
+    let delivery_handler = Arc::new(BrokerSourceDeliveryHandlerV1::system(ArcBroker(
+        Arc::clone(&broker),
+    )));
+    let delivery_server_config = config.delivery_server_config()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let signal_tx = shutdown_tx.clone();
     let signal_task = tokio::spawn(async move {
@@ -100,14 +123,35 @@ async fn main() -> Result<(), DynError> {
     ));
 
     notify_systemd_ready()?;
-    info!(socket = %socket.path().display(), "source broker listening");
-    let serve_result = serve_source_until(
+    info!(
+        source_socket = %socket.path().display(),
+        delivery_socket = %delivery_socket.path().display(),
+        "source broker listening"
+    );
+    let source_server = serve_source_until(
         listener,
         handler,
         server_config,
+        wait_for_shutdown(shutdown_rx.clone()),
+    );
+    let delivery_server = serve_source_delivery_until(
+        delivery_listener,
+        delivery_handler,
+        delivery_server_config,
         wait_for_shutdown(shutdown_rx),
-    )
-    .await;
+    );
+    let serve_result: Result<((), ()), DynError> = tokio::try_join!(
+        async {
+            source_server
+                .await
+                .map_err(|error| -> DynError { Box::new(error) })
+        },
+        async {
+            delivery_server
+                .await
+                .map_err(|error| -> DynError { Box::new(error) })
+        },
+    );
     let _ = shutdown_tx.send(true);
     reconcile_task
         .await
@@ -160,6 +204,25 @@ impl SourceSnapshotReaderV1 for ArcBroker {
         self.0
             .source_tree_observation(project_id)
             .map_err(|_| rdashboard::source::SourceGateError::Unavailable)
+    }
+}
+
+impl SourceOutboxReaderV1 for ArcBroker {
+    fn pending_outbox(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<rdashboard::source::SourceOutboxEntryV1>, rdashboard::source::SourceError> {
+        self.0.pending_outbox(limit)
+    }
+
+    fn acknowledge_outbox(
+        &self,
+        outbox_sequence: u64,
+        attestation_digest: &rdashboard::domain::EvidenceDigest,
+        acknowledged_at_ms: i64,
+    ) -> Result<(), rdashboard::source::SourceError> {
+        self.0
+            .acknowledge_outbox(outbox_sequence, attestation_digest, acknowledged_at_ms)
     }
 }
 

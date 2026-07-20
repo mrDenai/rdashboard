@@ -1,0 +1,46 @@
+[Unit]
+Description=rdashboard signed source workflow dispatcher
+Requires=rdashboard-source.service
+After=local-fs.target rdashboard-source.service
+Before=rdashboard-workflow-gateway.service rdashboard.service
+
+[Service]
+Type=simple
+User=rdashboard
+Group=rdashboard
+ExecStart=/usr/libexec/rdashboard/rdashboard-source-dispatcher
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rdashboard
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+TasksMax=32
+LimitNOFILE=128
+MemoryMax=64M
+CPUQuota=25%
+IOWeight=25
+TimeoutStartSec=10s
+TimeoutStopSec=10s
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,8 +1,8 @@
 [Unit]
 Description=rdashboard isolated source broker
-After=network-online.target local-fs.target
+After=network-online.target local-fs.target systemd-tmpfiles-setup.service
 Wants=network-online.target
-Before=rdashboard-executor.service rdashboard.service
+Before=rdashboard-executor.service rdashboard-source-dispatcher.service rdashboard.service
 
 [Service]
 Type=notify
@@ -28,7 +28,7 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/rdashboard-build/source-exports
+ReadWritePaths=/var/lib/rdashboard-build/source-exports /run/rdashboard-source-delivery
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes

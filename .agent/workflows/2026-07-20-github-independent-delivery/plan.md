@@ -2,7 +2,7 @@
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
 - Status: implementation in progress
-- Last updated: 2026-07-20
+- Last updated: 2026-07-21
 - Depends on: `brief.md`, `research.md`
 
 ## Outcome
@@ -102,7 +102,8 @@ Implementation progress:
 | --- | --- | --- |
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker and sealed preparation store remain step 4. |
-| 3-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
+| 3. Multi-project source ingress and durable controller delivery | In progress | Slice 3a locally implements the signed accepted-source outbox and isolated source-to-controller dispatcher. HTTP webhook ingress, forced-push ingress, multi-project config generation and the authorized timing drill remain in this step. |
+| 4-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
 
@@ -212,6 +213,34 @@ Implementation ledger:
 - The in-app browser-control surface was not available in this session, so visual browser QA remains
   explicitly unperformed; static semantic, Rust wire-contract and JavaScript state-contract checks
   passed.
+- Slice 3a upgrades the source ledger to schema V3 with an atomic, bounded, replayable signed outbox.
+  Newer accepted heads supersede only older pending records; exact lost acknowledgements replay the
+  scheduler identity, and periodic reconciliation re-attests an unchanged head after controller
+  outage or a root-owned `auto_deploy=false` to `true` transition.
+- `rdashboard-source` now serves that outbox on a second AF_UNIX socket in a protected setgid runtime
+  directory. The source side checks the installed controller UID before decoding; the separate
+  networkless `rdashboard-source-dispatcher` checks the source UID before writing, verifies the
+  Ed25519 signature plus exact repository/source/workflow policy binding, and writes only the durable
+  scheduler journal. Neither side opens the other's database or receives the other's credentials.
+- Dispatcher polling is 250 ms while healthy, two seconds after transient transport/scheduler/expired
+  attestation errors and 30 seconds after stable policy rejection. One rejected project is remembered
+  within a bounded drain cycle so other project entries in later batches still progress without log
+  or CPU spin. An already superseded scheduler sequence is safely acknowledged as obsolete.
+- Self-review after the first `SAFE` consultation found that disabling or removing an auto-deploy
+  project did not revoke an already-pending row before the new source socket reopened. Broker startup
+  now reconciles the enabled-project set under the current epoch before bind, exact undelivered rows
+  can reactivate on re-enable, delivered rows do not, and settled retention is also pruned on ACK. A
+  restart regression covers enabled -> disabled -> re-enabled sequence-1 delivery.
+- The full live-worktree bare `bin/ci` passed with 184 active library tests, every binary/integration
+  suite, 30 store/web contracts, 14 scheduler contracts, 9 browser contracts and the optimized release
+  build in 2 minutes 50 seconds. The final refreshed exact staged export passed independently with 167
+  active library tests (2 credentialed provider tests ignored), every suite, 7 source-delivery
+  contracts, 29 store/web, 14 scheduler, 8 browser contracts and release build in 2 minutes 38 seconds.
+- The first and final `deepseek-free` reviews both returned `SAFE`. The final reviewer independently
+  verified the self-review correction, exact product/test hash
+  `0c5f01a1d2c32dc261e586cc8bac0d000275daf18cf7538eaa6ea4cc318c54a8`, all delivery/policy/epoch/socket
+  invariants and no open P0-P2 finding. No service was installed, enabled or restarted and no source,
+  scheduler, GitHub, provider or production state was mutated.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

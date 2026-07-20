@@ -22,6 +22,7 @@ use crate::{
         GitSourceProjectConfig, GitSshTransportConfig, InstalledSourceProjectPolicy,
         SourceAttestationError, SourceAttestationVerifier, SourceProjectState, SourceSnapshot,
     },
+    source_delivery_socket::{SOURCE_DELIVERY_SOCKET_PATH, SourceDeliveryServerConfigV1},
     source_socket::{SOURCE_SOCKET_PATH, SourceServerConfigV1},
 };
 
@@ -33,7 +34,7 @@ pub const SOURCE_ATTESTATION_CREDENTIAL_PATH: &str =
     "/run/credentials/rdashboard-source.service/source-attestation-seed";
 pub const SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY: &str = "/run/credentials/rdashboard-source.service";
 
-const SOURCE_CONFIG_SCHEMA_VERSION: u16 = 3;
+const SOURCE_CONFIG_SCHEMA_VERSION: u16 = 4;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_GIT_SSH_CREDENTIAL_BYTES: u64 = 64 * 1024;
 const MIN_RECONCILE_INTERVAL_MS: u64 = 10_000;
@@ -176,9 +177,12 @@ pub struct InstalledSourceConfigV1 {
     pub purpose: String,
     pub schema_version: u16,
     pub source_uid: u32,
+    pub controller_uid: u32,
+    pub controller_gid: u32,
     pub build_reader_gid: u32,
     pub executor_uid: u32,
     pub socket_path: PathBuf,
+    pub delivery_socket_path: PathBuf,
     pub state_directory: PathBuf,
     pub repository_root: PathBuf,
     pub build_source_export_root: PathBuf,
@@ -196,6 +200,8 @@ pub struct InstalledSourceConfigV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledSourceConfigInputV1 {
     pub source_uid: u32,
+    pub controller_uid: u32,
+    pub controller_gid: u32,
     pub build_reader_gid: u32,
     pub max_connections: u16,
     pub request_timeout_ms: u64,
@@ -223,9 +229,12 @@ struct InstalledSourceConfigPayload<'a> {
     purpose: &'static str,
     schema_version: u16,
     source_uid: u32,
+    controller_uid: u32,
+    controller_gid: u32,
     build_reader_gid: u32,
     executor_uid: u32,
     socket_path: &'a Path,
+    delivery_socket_path: &'a Path,
     state_directory: &'a Path,
     repository_root: &'a Path,
     build_source_export_root: &'a Path,
@@ -242,12 +251,15 @@ struct InstalledSourceConfigPayload<'a> {
 impl InstalledSourceConfigV1 {
     pub fn new(input: InstalledSourceConfigInputV1) -> Result<Self, InstalledSourceError> {
         let mut config = Self {
-            purpose: "rdashboard.installed-source-config.v3".to_owned(),
+            purpose: "rdashboard.installed-source-config.v4".to_owned(),
             schema_version: SOURCE_CONFIG_SCHEMA_VERSION,
             source_uid: input.source_uid,
+            controller_uid: input.controller_uid,
+            controller_gid: input.controller_gid,
             build_reader_gid: input.build_reader_gid,
             executor_uid: 0,
             socket_path: PathBuf::from(SOURCE_SOCKET_PATH),
+            delivery_socket_path: PathBuf::from(SOURCE_DELIVERY_SOCKET_PATH),
             state_directory: PathBuf::from(SOURCE_STATE_DIRECTORY),
             repository_root: PathBuf::from(SOURCE_REPOSITORY_ROOT),
             build_source_export_root: PathBuf::from(BUILD_SOURCE_EXPORT_ROOT),
@@ -267,14 +279,19 @@ impl InstalledSourceConfigV1 {
     }
 
     pub fn validate(&self) -> Result<(), InstalledSourceError> {
-        if self.purpose != "rdashboard.installed-source-config.v3"
+        if self.purpose != "rdashboard.installed-source-config.v4"
             || self.schema_version != SOURCE_CONFIG_SCHEMA_VERSION
             || self.source_uid == 0
             || self.source_uid == u32::MAX
+            || self.controller_uid == 0
+            || self.controller_uid == u32::MAX
+            || self.controller_gid == 0
+            || self.controller_gid == u32::MAX
             || self.build_reader_gid == 0
             || self.build_reader_gid == u32::MAX
             || self.executor_uid != 0
             || self.socket_path != Path::new(SOURCE_SOCKET_PATH)
+            || self.delivery_socket_path != Path::new(SOURCE_DELIVERY_SOCKET_PATH)
             || self.state_directory != Path::new(SOURCE_STATE_DIRECTORY)
             || self.repository_root != Path::new(SOURCE_REPOSITORY_ROOT)
             || self.build_source_export_root != Path::new(BUILD_SOURCE_EXPORT_ROOT)
@@ -304,12 +321,15 @@ impl InstalledSourceConfigV1 {
     fn calculate_digest(&self) -> Result<EvidenceDigest, InstalledSourceError> {
         Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
             &InstalledSourceConfigPayload {
-                purpose: "rdashboard.installed-source-config.v3",
+                purpose: "rdashboard.installed-source-config.v4",
                 schema_version: SOURCE_CONFIG_SCHEMA_VERSION,
                 source_uid: self.source_uid,
+                controller_uid: self.controller_uid,
+                controller_gid: self.controller_gid,
                 build_reader_gid: self.build_reader_gid,
                 executor_uid: self.executor_uid,
                 socket_path: &self.socket_path,
+                delivery_socket_path: &self.delivery_socket_path,
                 state_directory: &self.state_directory,
                 repository_root: &self.repository_root,
                 build_source_export_root: &self.build_source_export_root,
@@ -329,6 +349,17 @@ impl InstalledSourceConfigV1 {
         self.validate()?;
         Ok(SourceServerConfigV1::new(
             self.executor_uid,
+            usize::from(self.max_connections),
+            Duration::from_millis(self.request_timeout_ms),
+        )?)
+    }
+
+    pub fn delivery_server_config(
+        &self,
+    ) -> Result<SourceDeliveryServerConfigV1, InstalledSourceError> {
+        self.validate()?;
+        Ok(SourceDeliveryServerConfigV1::new(
+            self.controller_uid,
             usize::from(self.max_connections),
             Duration::from_millis(self.request_timeout_ms),
         )?)
@@ -363,6 +394,22 @@ impl InstalledSourceConfigV1 {
             .collect()
     }
 
+    pub fn project(&self, project_id: &ProjectId) -> Option<&InstalledSourceProjectV1> {
+        self.projects
+            .iter()
+            .find(|project| project.project_id == *project_id)
+    }
+
+    pub fn attestation_verifier(&self) -> Result<SourceAttestationVerifier, InstalledSourceError> {
+        self.validate()?;
+        Ok(SourceAttestationVerifier::new(
+            std::collections::BTreeMap::from([(
+                self.attestation_key_id.clone(),
+                decode_public_key(&self.attestation_public_key)?,
+            )]),
+        )?)
+    }
+
     pub fn verify_snapshot(
         &self,
         snapshot: &SourceSnapshot,
@@ -386,10 +433,7 @@ impl InstalledSourceConfigV1 {
             .attestation_digest
             .as_ref()
             .ok_or(InstalledSourceError::InvalidSourceSnapshot)?;
-        let verifier = SourceAttestationVerifier::new(std::collections::BTreeMap::from([(
-            self.attestation_key_id.clone(),
-            decode_public_key(&self.attestation_public_key)?,
-        )]))?;
+        let verifier = self.attestation_verifier()?;
         let payload = verifier.verify(signed, now_ms)?;
         if snapshot.state != SourceProjectState::Ready
             || snapshot.head.as_ref() != Some(expected_target)
@@ -723,6 +767,8 @@ pub enum InstalledSourceError {
     #[error(transparent)]
     Socket(#[from] crate::source_socket::SourceSocketError),
     #[error(transparent)]
+    DeliverySocket(#[from] crate::source_delivery_socket::SourceDeliveryServerConfigError),
+    #[error(transparent)]
     Attestation(#[from] SourceAttestationError),
 }
 
@@ -762,6 +808,8 @@ mod tests {
         .expect("source project");
         InstalledSourceConfigV1::new(InstalledSourceConfigInputV1 {
             source_uid,
+            controller_uid: 78,
+            controller_gid: 78,
             build_reader_gid: 77,
             max_connections: 16,
             request_timeout_ms: 2_000,
@@ -797,6 +845,13 @@ mod tests {
         let uid = fs::metadata(directory.path()).expect("metadata").uid();
         let signing_key = SigningKey::from_bytes(&[17_u8; 32]);
         let installed = config(uid, &signing_key);
+        assert_eq!(installed.purpose, "rdashboard.installed-source-config.v4");
+        assert_eq!(
+            installed.delivery_socket_path,
+            Path::new(SOURCE_DELIVERY_SOCKET_PATH)
+        );
+        assert_eq!(installed.controller_uid, 78);
+        assert_eq!(installed.controller_gid, 78);
         let path = directory.path().join("source.json");
         fs::write(
             &path,
@@ -951,7 +1006,18 @@ mod tests {
             unit.lines()
                 .filter(|line| line.starts_with("ReadWritePaths="))
                 .collect::<Vec<_>>(),
-            ["ReadWritePaths=/var/lib/rdashboard-build/source-exports"]
+            [
+                "ReadWritePaths=/var/lib/rdashboard-build/source-exports /run/rdashboard-source-delivery"
+            ]
+        );
+        assert!(
+            unit.lines()
+                .any(|line| { line == "SupplementaryGroups=rdashboard-build-readers" })
+        );
+        assert!(
+            !unit
+                .lines()
+                .any(|line| { line == "SupplementaryGroups=rdashboard rdashboard-build-readers" })
         );
         assert_eq!(
             unit.lines()
@@ -975,6 +1041,29 @@ mod tests {
     }
 
     #[test]
+    fn source_dispatcher_has_only_controller_journal_and_delivery_transport_authority() {
+        let unit = include_str!("../deploy/systemd/rdashboard-source-dispatcher.service");
+        assert!(unit.lines().any(|line| line == "User=rdashboard"));
+        assert!(unit.lines().any(|line| line == "Group=rdashboard"));
+        assert!(
+            unit.lines()
+                .any(|line| line == "Requires=rdashboard-source.service")
+        );
+        assert!(unit.lines().any(|line| line == "PrivateNetwork=yes"));
+        assert!(
+            unit.lines()
+                .any(|line| line == "RestrictAddressFamilies=AF_UNIX")
+        );
+        assert_eq!(
+            unit.lines()
+                .filter(|line| line.starts_with("ReadWritePaths="))
+                .collect::<Vec<_>>(),
+            ["ReadWritePaths=/var/lib/rdashboard"]
+        );
+        assert!(!unit.lines().any(|line| line.starts_with("LoadCredential=")));
+    }
+
+    #[test]
     fn candidate_output_directories_inherit_the_reader_group() {
         let tmpfiles = include_str!("../deploy/systemd/rdashboard-tmpfiles.conf");
         for path in [
@@ -986,6 +1075,9 @@ mod tests {
             let expected = format!("d {path} 2750 rdashboard-build rdashboard-build-readers -");
             assert!(tmpfiles.lines().any(|line| line == expected));
         }
+        assert!(tmpfiles.lines().any(|line| {
+            line == "d /run/rdashboard-source-delivery 2750 rdashboard-source rdashboard -"
+        }));
     }
 
     #[test]

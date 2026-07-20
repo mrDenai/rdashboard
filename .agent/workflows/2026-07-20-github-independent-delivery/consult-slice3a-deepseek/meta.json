@@ -1,0 +1,14 @@
+{
+  "route": "deepseek-free",
+  "model": "opencode/deepseek-v4-flash-free",
+  "cli_version": "1.18.3",
+  "status": "ANSWERED",
+  "repo": "/home/denai/RustroverProjects/rdashboard",
+  "head": "297384725eb1d4eabbcf5aaf157f589ee29625ca",
+  "state_fingerprint": "7dd4a950d4ae46035743077681739f9505df9b01471d27b81131c71bcd6e4ba3",
+  "brief_sha256": "5947b0706b9c9c7f33aaf53c722956c54091ac2a290a8c3d615e50de200531f5",
+  "attempts": 1,
+  "exit_code": 0,
+  "elapsed_seconds": 212,
+  "cacheable": true
+}

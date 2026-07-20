@@ -434,3 +434,93 @@ implementation-plan step 2 locally, but does not install or restart services, ex
 execute worker jobs, activate deployment authority, write to GitHub or deploy anything. The authorized
 live resource baseline remains a separate activation gate; the generic worker and sealed preparation
 store remain step 4 after source-ingress work.
+
+## Slice 3a: signed source outbox and isolated scheduler delivery
+
+### Reviewed scope
+
+Slice 3a implements the durable middle of implementation-plan step 3 without activating an ingress or
+deploy:
+
+- Source schema V3 adds a canonical signed accepted-head outbox committed in the same immediate
+  transaction as the completed deployable source delivery. Newer project sequences supersede older
+  pending rows; lost acknowledgements replay a digest-derived scheduler delivery ID; settled history
+  is capped at 2,048 rows.
+- `rdashboard-source` serves the outbox through a second versioned AF_UNIX protocol. The server checks
+  the installed controller UID before decoding; the client checks the source UID before writing. The
+  request, response, frame, deadline, connection, batch, stale-socket and inode-cleanup contracts are
+  bounded and fail closed.
+- A separate networkless `rdashboard-source-dispatcher` verifies canonical entry binding, Ed25519
+  signature/expiry, current auto-deploy enablement, repository identity, installed source policy and
+  exact workflow-manifest digest before idempotent scheduler admission. It acknowledges only durable
+  admission or a provably stale scheduler sequence and applies bounded transient/permanent backoff
+  without allowing one rejected project to block later batches.
+- Installed source config schema V4 binds both peer identities and socket paths. The root-owned
+  workflow catalog has an exact group-readable installation contract for the unprivileged dispatcher.
+  The source process does not join the controller group; the dispatcher receives no network, source
+  credential, source database, Git, Docker, root or arbitrary-command authority.
+
+The exact final staged product/test diff contains 14 paths, 2,699 insertions and 76 deletions. Shared
+dirty `src/lib.rs` and `deploy/systemd/README.md` were staged by hunk; all notification code and its
+workflow artifacts remain unstaged and outside this review.
+
+### Verification and self-review correction
+
+The first complete live-worktree bare `bin/ci` passed before consultation with 184 active library
+tests, every binary/integration suite, 30 store/web contracts, 14 scheduler contracts, 9 browser
+contracts, schema checks and the optimized release build in 2 minutes 50 seconds.
+
+The first exact-staged consultation returned `SAFE` with no P0-P2 finding or open question:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 212 seconds;
+- state fingerprint: `7dd4a950d4ae46035743077681739f9505df9b01471d27b81131c71bcd6e4ba3`;
+- brief SHA-256: `5947b0706b9c9c7f33aaf53c722956c54091ac2a290a8c3d615e50de200531f5`;
+- response: `consult-slice3a-deepseek/response.md`;
+- reviewed product/test hash:
+  `dbe21b0364dcfacc5d51986989ae2efd1b9c230ca3b6dd5525893bc9cb3979da`.
+
+Post-review self-audit then found a stale-policy path the reviewer missed: a row enqueued while
+`auto_deploy=true` could remain pending after source restarted with that project disabled or removed.
+A dispatcher still holding the old enabled config could fetch it after restart because auto-deploy is
+not part of the signed accepted-head payload.
+
+The correction derives the exact enabled-project set during broker construction and reconciles the
+outbox under the current broker epoch and one immediate transaction after source recovery but before
+any socket can bind. Disabled/removed pending rows become superseded. Re-enabling an unchanged current
+head reactivates only the exact undelivered row; delivered rows remain delivered. ACK now also prunes
+settled retention, and supersession timestamps cannot precede enqueue time. A restart regression proves
+enabled pending -> disabled broker has no pending delivery -> re-enabled reconciliation restores the
+same sequence-1/current-SHA delivery.
+
+A refreshed exact `git checkout-index` staged export passed bare `bin/ci` after that correction:
+
+- 167 active library tests, with 2 credentialed live-provider tests ignored;
+- every binary and integration suite, including 7 source-delivery, 29 store/web, 14 scheduler and
+  8 browser contracts;
+- strict formatting, Clippy with warnings denied, both manifest schema checks and the optimized release
+  build in 2 minutes 38 seconds;
+- `git diff --cached --check`: passed;
+- final product/test diff SHA-256:
+  `0c5f01a1d2c32dc261e586cc8bac0d000275daf18cf7538eaa6ea4cc318c54a8`.
+
+### Final independent consultation
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 242 seconds;
+- state fingerprint: `d786fa4392c1031442329164b30c36ed3b6b773ce4e7c695fd5372b7828b79fa`;
+- brief SHA-256: `c7beb3fae77873920a1dc32ced31368234a5266dfe85d41fccc3de76a4a7a241`;
+- response: `consult-slice3a-deepseek-final/response.md`;
+- verdict: `SAFE`, no actionable P0-P2 finding and no open question.
+
+The final reviewer independently recomputed the exact product/test hash and traced disable/removal
+revocation before socket bind, safe undelivered reactivation, delivered replay, epoch fencing,
+transactional outbox admission, signature/policy/repository verification, bounded cross-project drain,
+socket peer authentication, schema migration and systemd authority separation.
+
+### Verdict
+
+Slice 3a is production-worthy as an inactive local source-to-scheduler delivery boundary and may be
+committed. It does not install/start either service, enable auto-deploy, expose HTTP webhook or
+forced-push ingress, generalize the fixed rimg config generator, run a VPS timing drill, execute a
+workflow, contact GitHub/providers, push or deploy. Those remain explicit later parts of plan step 3.
