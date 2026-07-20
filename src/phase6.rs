@@ -1648,6 +1648,25 @@ const KAMAL_ROLLBACK_ARGV: &[&str] = &[
 
 impl FixedAdapterProfileV1 {
     #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::BackupCapture => "backup-capture",
+            Self::BackupEncryptAge => "backup-encrypt-age",
+            Self::BackupUploadGoogleDrive => "backup-upload-google-drive",
+            Self::BackupReadbackVerify => "backup-readback-verify",
+            Self::RimgDrain => "rimg-drain",
+            Self::RimgSchemaInspect => "rimg-schema-inspect",
+            Self::RimgMigrate => "rimg-migrate",
+            Self::RimgReadiness => "rimg-readiness",
+            Self::RimgConsumerSmoke => "rimg-consumer-smoke",
+            Self::RimgSoakObserve => "rimg-soak-observe",
+            Self::KamalBootstrapDeploy => "kamal-bootstrap-deploy",
+            Self::KamalCandidateDeploy => "kamal-candidate-deploy",
+            Self::KamalCodeRollback => "kamal-code-rollback",
+        }
+    }
+
+    #[must_use]
     pub const fn command(self) -> FixedCommandDefinitionV1 {
         let (executable, argv) = match self {
             Self::BackupCapture => (

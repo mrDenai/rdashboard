@@ -22,6 +22,8 @@ pub mod controller;
 #[cfg(unix)]
 pub mod deploy_driver;
 pub mod domain;
+#[cfg(unix)]
+pub mod execution_receipt;
 pub mod executor;
 #[cfg(unix)]
 pub mod executor_authority;

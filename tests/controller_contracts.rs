@@ -181,6 +181,7 @@ fn failure_capsule() -> FailureCapsule {
         },
         excerpt: "synthetic failure evidence".to_owned(),
         truncated: false,
+        v2: None,
     }
 }
 

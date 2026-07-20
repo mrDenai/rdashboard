@@ -1,5 +1,6 @@
 mod budget;
 mod events;
+mod execution;
 mod failure;
 mod identifiers;
 mod manifest;
@@ -10,6 +11,7 @@ mod telemetry;
 
 pub use budget::*;
 pub use events::*;
+pub use execution::*;
 pub use failure::*;
 pub use identifiers::*;
 pub use manifest::*;

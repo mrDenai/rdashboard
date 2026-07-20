@@ -481,6 +481,7 @@ impl DurableController {
         failure_capsule: FailureCapsule,
         recorded_at_ms: i64,
     ) -> Result<OperationRecord, StoreError> {
+        validate_failure_capsule_input(&failure_capsule)?;
         self.store.immediate_transaction(|transaction| {
             let mut operation = load_attempt(transaction, attempt_id)?;
             if operation.state.phase == OperationPhase::Reconciliation
@@ -682,6 +683,7 @@ impl DurableController {
         failure_capsule: FailureCapsule,
         recorded_at_ms: i64,
     ) -> Result<OperationRecord, StoreError> {
+        validate_failure_capsule_input(&failure_capsule)?;
         self.store.immediate_transaction(|transaction| {
             let mut operation = load_attempt(transaction, attempt_id)?;
             if operation.state.result != OperationResult::Running {
@@ -762,6 +764,7 @@ impl DurableController {
         failure_capsule: FailureCapsule,
         recorded_at_ms: i64,
     ) -> Result<OperationRecord, StoreError> {
+        validate_failure_capsule_input(&failure_capsule)?;
         self.store.immediate_transaction(|transaction| {
             let mut operation = load_attempt(transaction, attempt_id)?;
             if operation.state.result != OperationResult::Running {
@@ -1786,6 +1789,11 @@ fn persist_transition(
     occurred_at_ms: i64,
 ) -> Result<(), StoreError> {
     next_state.validate()?;
+    if let Some(capsule) = &operation.failure_capsule {
+        capsule
+            .validate()
+            .map_err(|_| StoreError::CorruptController("failure capsule"))?;
+    }
     let sequence = u32::try_from(operation.evidence.transitions.len())
         .ok()
         .and_then(|value| value.checked_add(1))
@@ -1836,11 +1844,22 @@ fn persist_transition(
 fn decode_operation(json: &str) -> Result<OperationRecord, StoreError> {
     let operation: OperationRecord = serde_json::from_str(json)?;
     operation.state.validate()?;
+    if let Some(capsule) = &operation.failure_capsule {
+        capsule
+            .validate()
+            .map_err(|_| StoreError::CorruptController("failure capsule"))?;
+    }
     operation
         .operation_kind
         .required_phases(operation.release_class)?;
     validate_authorized_phase_spec_history(&operation.evidence.authorized_phase_spec_digests)?;
     Ok(operation)
+}
+
+fn validate_failure_capsule_input(capsule: &FailureCapsule) -> Result<(), StoreError> {
+    capsule
+        .validate()
+        .map_err(|_| StoreError::InvalidControllerInput("invalid failure capsule"))
 }
 
 fn validate_authorized_phase_spec_history(

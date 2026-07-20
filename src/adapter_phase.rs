@@ -128,6 +128,11 @@ impl<R: FixedAdapterJobRunnerV1> FixedAdapterPhaseExecutorV1<R> {
                 PreparedAdapterJobStateV1::ResultRequiresReconciliation => {
                     job.reconcile_result(spec, &results)?
                 }
+                PreparedAdapterJobStateV1::ExecutionRequiresReconciliation => {
+                    return Err(
+                        crate::adapter::AdapterJobError::ExecutionRequiresReconciliation.into(),
+                    );
+                }
                 PreparedAdapterJobStateV1::ReadyToExecute => {
                     if let Some(identity) = identities.get(&step.sequence) {
                         job.materialize_operation_identity(spec, identity)?;
@@ -150,8 +155,14 @@ fn observe_in(
     let mut results = Vec::with_capacity(spec.steps.len());
     for step in &spec.steps {
         let job = PreparedAdapterJobV1::prepare_in(job_root, required_uid, spec, step.sequence)?;
-        if job.state() == PreparedAdapterJobStateV1::ReadyToExecute {
-            return Ok(None);
+        match job.state() {
+            PreparedAdapterJobStateV1::ReadyToExecute => return Ok(None),
+            PreparedAdapterJobStateV1::ExecutionRequiresReconciliation => {
+                return Err(
+                    crate::adapter::AdapterJobError::ExecutionRequiresReconciliation.into(),
+                );
+            }
+            PreparedAdapterJobStateV1::ResultRequiresReconciliation => {}
         }
         results.push(job.reconcile_result(spec, &results)?);
     }
@@ -232,7 +243,11 @@ mod tests {
     use crate::{
         adapter::AdapterExecutionOutputV1,
         adapter_result::{FixedAdapterEvidenceV1, PhaseObservationEvidenceV1},
-        domain::EvidenceDigest,
+        domain::{
+            EvidenceDigest, ExecutionCleanupReceiptV1, ExecutionCleanupStateV1,
+            ExecutionProcessOutcomeV1, ExecutionResourceUsageV1, ExecutionResultV1,
+            ExecutionStorageUsageV1, ExecutionTerminalReceiptV1,
+        },
         phase6::tests::{test_bootstrap_phase_spec, test_migration_phase_spec},
     };
 
@@ -289,9 +304,47 @@ mod tests {
             fs::File::open(job.job_directory())
                 .and_then(|directory| directory.sync_all())
                 .unwrap_or_else(|error| panic!("sync job: {error}"));
+            let request = spec
+                .fixed_adapter_request(job.sequence())
+                .unwrap_or_else(|error| panic!("request: {error}"));
+            let terminal_receipt = ExecutionTerminalReceiptV1::new(
+                request.request_id,
+                request.attempt_id,
+                EvidenceDigest::sha256("fake execution start"),
+                request.project_id,
+                request.phase,
+                request.profile.id().to_owned(),
+                request.sequence,
+                890,
+                900,
+                ExecutionProcessOutcomeV1 {
+                    result: ExecutionResultV1::Succeeded,
+                    exit_code: Some(0),
+                    signal: None,
+                    timed_out: false,
+                    oom_killed: false,
+                },
+                ExecutionResourceUsageV1::default(),
+                ExecutionStorageUsageV1::default(),
+            )
+            .unwrap_or_else(|error| panic!("terminal receipt: {error}"));
+            let cleanup_receipt = ExecutionCleanupReceiptV1::new(
+                terminal_receipt.attempt_id,
+                terminal_receipt.receipt_digest.clone(),
+                ExecutionCleanupStateV1::Complete,
+                true,
+                None,
+                0,
+                None,
+                None,
+                901,
+            )
+            .unwrap_or_else(|error| panic!("cleanup receipt: {error}"));
             Ok(AdapterExecutionResultV1 {
                 output: AdapterExecutionOutputV1 {
                     unit_name: "fake-adapter.service".to_owned(),
+                    terminal_receipt,
+                    cleanup_receipt,
                 },
                 result,
             })

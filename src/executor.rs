@@ -1668,6 +1668,7 @@ fn source_failure_capsule(error: SourceGateError) -> FailureCapsule {
         },
         excerpt: summary.to_owned(),
         truncated: false,
+        v2: None,
     }
 }
 
@@ -2245,6 +2246,7 @@ fn reconciliation_capsule(phase: OperationPhase) -> FailureCapsule {
         excerpt: "Mutation remains fenced; reconcile the security journal with actual state."
             .to_owned(),
         truncated: false,
+        v2: None,
     }
 }
 

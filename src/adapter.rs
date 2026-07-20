@@ -17,7 +17,16 @@ use crate::{
     adapter_result::{
         AdapterResultContractError, FixedAdapterResultV1, MAX_FIXED_ADAPTER_RESULT_BYTES,
     },
-    domain::EvidenceDigest,
+    domain::{
+        EvidenceDigest, ExecutionCleanupReceiptV1, ExecutionCleanupStateV1, ExecutionResultV1,
+        ExecutionTerminalReceiptV1,
+    },
+    execution_receipt::{
+        ExecutionReceiptRuntimeError, ExecutionTerminationKindV1,
+        INSTALLED_ADAPTER_RECEIPT_EXECUTABLE, execution_started, materialize_cleanup_receipt,
+        materialize_execution_start, materialize_termination_intent, read_cleanup_receipt,
+        read_terminal_receipt,
+    },
     phase6::{
         AdapterResultSchemaV1, AuthorizedPhaseSpecV1, FixedAdapterProfileV1, FixedAdapterRequestV1,
         FixedCommandDefinitionV1, Phase6ContractError,
@@ -54,6 +63,7 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub enum PreparedAdapterJobStateV1 {
     ReadyToExecute,
     ResultRequiresReconciliation,
+    ExecutionRequiresReconciliation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,7 +118,14 @@ impl PreparedAdapterJobV1 {
 
         let result_path = job_directory.join(RESULT_FILE_NAME);
         let operation_identity_path = job_directory.join(OPERATION_IDENTITY_FILE_NAME);
-        let state = inspect_existing_result(&result_path, required_uid)?;
+        let result_state = inspect_existing_result(&result_path, required_uid)?;
+        let state = if result_state == PreparedAdapterJobStateV1::ReadyToExecute
+            && execution_started(&job_directory, required_uid)?
+        {
+            PreparedAdapterJobStateV1::ExecutionRequiresReconciliation
+        } else {
+            result_state
+        };
         Ok(Self {
             job_directory,
             spec_path,
@@ -228,14 +245,34 @@ impl PreparedAdapterJobV1 {
         {
             return Err(AdapterJobError::ResultRequiresReconciliation);
         }
-        read_existing_result(
+        let result = read_existing_result(
             &self.result_path,
             self.required_uid,
             spec,
             self.sequence,
             prior_results,
-        )
+        )?;
+        validate_completed_execution_evidence(self, spec)?;
+        Ok(result)
     }
+}
+
+fn validate_completed_execution_evidence(
+    job: &PreparedAdapterJobV1,
+    spec: &AuthorizedPhaseSpecV1,
+) -> Result<(), AdapterJobError> {
+    if !execution_started(job.job_directory(), job.required_uid)? {
+        return Ok(());
+    }
+    let terminal =
+        read_terminal_receipt(job.job_directory(), job.required_uid, spec, job.sequence)?;
+    let cleanup = read_cleanup_receipt(job.job_directory(), job.required_uid, &terminal)?;
+    if terminal.process.result != ExecutionResultV1::Succeeded
+        || cleanup.state != ExecutionCleanupStateV1::Complete
+    {
+        return Err(AdapterJobError::ExecutionRequiresReconciliation);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,6 +422,7 @@ fn transient_unit_arguments(
         "--property=KillMode=control-group".to_owned(),
         "--property=SendSIGKILL=yes".to_owned(),
         "--property=TimeoutStopSec=10s".to_owned(),
+        format!("--property=ExecStopPost={INSTALLED_ADAPTER_RECEIPT_EXECUTABLE}"),
         "--property=TasksMax=256".to_owned(),
         "--property=LimitNOFILE=4096".to_owned(),
         "--property=MemoryMax=1G".to_owned(),
@@ -484,6 +522,8 @@ fn prior_input_bindings(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterExecutionOutputV1 {
     pub unit_name: String,
+    pub terminal_receipt: ExecutionTerminalReceiptV1,
+    pub cleanup_receipt: ExecutionCleanupReceiptV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -530,11 +570,16 @@ impl SystemdTransientAdapterRunnerV1 {
                 cleanup_failed: false,
             });
         }
+        let request = spec.fixed_adapter_request(job.sequence)?;
+        materialize_execution_start(
+            job.job_directory(),
+            job.required_uid,
+            &request,
+            crate::unix_time_ms().map_err(AdapterJobError::Clock)?,
+        )?;
         let child = spawn_systemd_run(&plan)?;
-        let status = wait_for_systemd_run(child, &plan, &self.cancellation)?;
-        let output = AdapterExecutionOutputV1 {
-            unit_name: plan.unit_name().to_owned(),
-        };
+        let status = wait_for_systemd_run(child, &plan, &self.cancellation, job, spec)?;
+        let output = finalize_execution_receipts(job, spec, &plan, true, None)?;
         if !status.success() {
             return Err(AdapterJobError::UnitFailed {
                 status,
@@ -553,6 +598,9 @@ fn validate_execution_inputs(
 ) -> Result<(), AdapterJobError> {
     if job.required_uid != 0 {
         return Err(AdapterJobError::UnsafeExecutionIdentity);
+    }
+    if execution_started(&job.job_directory, job.required_uid)? {
+        return Err(AdapterJobError::ExecutionRequiresReconciliation);
     }
     if job.state != PreparedAdapterJobStateV1::ReadyToExecute
         || inspect_existing_result(&job.result_path, job.required_uid)?
@@ -575,6 +623,7 @@ fn validate_execution_inputs(
         SYSTEMD_RUN_EXECUTABLE,
         SYSTEMCTL_EXECUTABLE,
         ENV_EXECUTABLE,
+        INSTALLED_ADAPTER_RECEIPT_EXECUTABLE,
         adapter_executable,
     ] {
         validate_installed_executable(executable)?;
@@ -628,6 +677,8 @@ fn wait_for_systemd_run(
     mut child: Child,
     plan: &TransientAdapterUnitPlanV1,
     cancellation: &AdapterExecutionCancellationV1,
+    job: &PreparedAdapterJobV1,
+    spec: &AuthorizedPhaseSpecV1,
 ) -> Result<ExitStatus, AdapterJobError> {
     let deadline = Instant::now() + plan.outer_deadline();
     loop {
@@ -636,6 +687,13 @@ fn wait_for_systemd_run(
             Ok(None) => {}
             Err(error) => {
                 let cleanup_failed = cleanup_failed_child(&mut child, plan.unit_name());
+                finalize_execution_receipts(
+                    job,
+                    spec,
+                    plan,
+                    !cleanup_failed,
+                    cleanup_failed.then(|| "unit-cleanup-unconfirmed".to_owned()),
+                )?;
                 return Err(AdapterJobError::WaitSystemdRun {
                     source: error,
                     cleanup_failed,
@@ -643,15 +701,79 @@ fn wait_for_systemd_run(
             }
         }
         if cancellation.is_cancelled() {
+            let intent_result = crate::unix_time_ms()
+                .map_err(AdapterJobError::Clock)
+                .and_then(|recorded_at_ms| {
+                    materialize_termination_intent(
+                        job.job_directory(),
+                        job.required_uid,
+                        ExecutionTerminationKindV1::Cancelled,
+                        recorded_at_ms,
+                    )
+                    .map_err(AdapterJobError::from)
+                });
             let cleanup_failed = cleanup_failed_child(&mut child, plan.unit_name());
+            let receipt_result = finalize_execution_receipts(
+                job,
+                spec,
+                plan,
+                !cleanup_failed,
+                cleanup_failed.then(|| "unit-cleanup-unconfirmed".to_owned()),
+            );
+            intent_result?;
+            receipt_result?;
             return Err(AdapterJobError::ExecutionCancelled { cleanup_failed });
         }
         if Instant::now() >= deadline {
+            let intent_result = crate::unix_time_ms()
+                .map_err(AdapterJobError::Clock)
+                .and_then(|recorded_at_ms| {
+                    materialize_termination_intent(
+                        job.job_directory(),
+                        job.required_uid,
+                        ExecutionTerminationKindV1::DeadlineExceeded,
+                        recorded_at_ms,
+                    )
+                    .map_err(AdapterJobError::from)
+                });
             let cleanup_failed = cleanup_failed_child(&mut child, plan.unit_name());
+            let receipt_result = finalize_execution_receipts(
+                job,
+                spec,
+                plan,
+                !cleanup_failed,
+                cleanup_failed.then(|| "unit-cleanup-unconfirmed".to_owned()),
+            );
+            intent_result?;
+            receipt_result?;
             return Err(AdapterJobError::DeadlineExceeded { cleanup_failed });
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
     }
+}
+
+fn finalize_execution_receipts(
+    job: &PreparedAdapterJobV1,
+    spec: &AuthorizedPhaseSpecV1,
+    plan: &TransientAdapterUnitPlanV1,
+    unit_collected: bool,
+    error_code: Option<String>,
+) -> Result<AdapterExecutionOutputV1, AdapterJobError> {
+    let terminal_receipt =
+        read_terminal_receipt(job.job_directory(), job.required_uid, spec, job.sequence)?;
+    let cleanup_receipt = materialize_cleanup_receipt(
+        job.job_directory(),
+        job.required_uid,
+        &terminal_receipt,
+        unit_collected,
+        error_code,
+        crate::unix_time_ms().map_err(AdapterJobError::Clock)?,
+    )?;
+    Ok(AdapterExecutionOutputV1 {
+        unit_name: plan.unit_name().to_owned(),
+        terminal_receipt,
+        cleanup_receipt,
+    })
 }
 
 fn cleanup_failed_child(child: &mut Child, unit_name: &str) -> bool {
@@ -1159,6 +1281,8 @@ pub enum AdapterJobError {
     UnsafeResultDocument,
     #[error("an existing fixed adapter result must be reconciled before execution")]
     ResultRequiresReconciliation,
+    #[error("fixed adapter execution evidence already exists and requires reconciliation")]
+    ExecutionRequiresReconciliation,
     #[error("fixed adapter command definition violates the no-shell, clear-environment contract")]
     UnsafeCommandDefinition,
     #[error("fixed adapter job path cannot be represented as a safe systemd bind source")]
@@ -1171,6 +1295,10 @@ pub enum AdapterJobError {
     UnsafeInstalledExecutable,
     #[error("systemd-run could not be started: {0}")]
     SpawnSystemdRun(io::Error),
+    #[error("the host clock could not provide execution receipt time: {0}")]
+    Clock(std::time::SystemTimeError),
+    #[error(transparent)]
+    ExecutionReceipt(#[from] ExecutionReceiptRuntimeError),
     #[error("systemd-run could not be waited (cleanup_failed={cleanup_failed}): {source}")]
     WaitSystemdRun {
         source: io::Error,
@@ -1279,6 +1407,19 @@ mod tests {
         );
     }
 
+    fn assert_receipt_capture_plan(unit: &TransientAdapterUnitPlanV1) {
+        assert!(unit.arguments().contains(&format!(
+            "--property=ExecStopPost={INSTALLED_ADAPTER_RECEIPT_EXECUTABLE}"
+        )));
+        assert_eq!(
+            unit.arguments()
+                .iter()
+                .filter(|argument| argument.starts_with("--property=ExecStopPost="))
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn materializes_exact_owner_only_request_and_replays_it() {
         let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
@@ -1347,6 +1488,7 @@ mod tests {
             unit.arguments()
                 .contains(&"--property=StandardError=null".to_owned())
         );
+        assert_receipt_capture_plan(&unit);
         assert!(!unit.arguments().contains(&"--pipe".to_owned()));
         assert!(unit.arguments().contains(&format!(
             "--property=LoadCredential={KAMAL_SECRETS_CREDENTIAL_NAME}:{KAMAL_SECRETS_CREDENTIAL_SOURCE}"
@@ -1452,6 +1594,32 @@ mod tests {
         );
         assert!(matches!(
             reconcile.execution_command(),
+            Err(AdapterJobError::ResultRequiresReconciliation)
+        ));
+    }
+
+    #[test]
+    fn durable_start_without_result_is_never_reexecuted_ambiguously() {
+        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let root = temp.path().join("adapter-jobs");
+        let spec = test_bootstrap_phase_spec();
+        let uid = path_uid(temp.path());
+        let prepared = PreparedAdapterJobV1::prepare_in(&root, uid, &spec, 1)
+            .unwrap_or_else(|error| panic!("prepare adapter job: {error}"));
+        let request = spec
+            .fixed_adapter_request(1)
+            .unwrap_or_else(|error| panic!("request: {error}"));
+        materialize_execution_start(prepared.job_directory(), uid, &request, 100)
+            .unwrap_or_else(|error| panic!("start: {error}"));
+
+        let replayed = PreparedAdapterJobV1::prepare_in(&root, uid, &spec, 1)
+            .unwrap_or_else(|error| panic!("replay adapter job: {error}"));
+        assert_eq!(
+            replayed.state(),
+            PreparedAdapterJobStateV1::ExecutionRequiresReconciliation
+        );
+        assert!(matches!(
+            replayed.execution_command(),
             Err(AdapterJobError::ResultRequiresReconciliation)
         ));
     }

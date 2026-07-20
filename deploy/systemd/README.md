@@ -264,6 +264,16 @@ the blocking adapter wait and explicitly kills/stops the active transient unit; 
 before starting another queued job, and the intent-persisted journal remains replayable on the next
 start. Omitting the authority keeps mutation unavailable.
 
+Install the repository-built `rdashboard-adapter-receipt` executable at
+`/usr/libexec/rdashboard/rdashboard-adapter-receipt` as a root-owned, non-symlinked executable that
+is not group- or world-writable. Every fixed adapter transient unit binds this exact path through
+`ExecStopPost=`. The helper runs before `systemd-run --collect` can discard the unit cgroup and
+atomically writes owner-only `terminal-receipt.jcs` evidence beside the job request. The root
+executor validates that receipt and then writes `cleanup-receipt.jcs`; a durable
+`execution-start.jcs` without a completed result is reconciliation-only and must never be executed
+again. Completed legacy job directories without `execution-start.jcs` remain readable, while every
+new completed job requires matching successful terminal and complete cleanup receipts.
+
 The backup intent resolver additionally defines one canonical root-owned input at
 `/etc/rdashboard/projects/rimg/backup-mutation-policy.jcs`, mode `0600`. It binds exactly the `rimg`
 project, `backup_only`, the owner policy identity, the installed rimg policy digest, exact backup

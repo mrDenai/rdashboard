@@ -1404,6 +1404,7 @@ fn later_reconciliation_does_not_replay_a_stale_source_completion_receipt() {
                 excerpt: "Reconcile the later health phase without replaying deploy completion."
                     .to_owned(),
                 truncated: false,
+                v2: None,
             },
             now_ms,
         )

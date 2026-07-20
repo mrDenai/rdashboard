@@ -1,9 +1,19 @@
 use regex::Regex;
 
-use super::LOG_EVENT_CAP_BYTES;
+use super::{EvidenceDigest, LOG_EVENT_CAP_BYTES};
 
 const REDACTED: &str = "[REDACTED]";
 const TRUNCATED: &str = "\n[TRUNCATED]";
+const REDACTION_RULESET_V2: &str = concat!(
+    "rdashboard.redaction-ruleset.v2;",
+    "known-exact;private-key;bearer;key-value;jwt;provider-key;ansi;control"
+);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedactionResult {
+    pub text: String,
+    pub replacement_count: u64,
+}
 
 #[derive(Debug)]
 pub struct Redactor {
@@ -13,6 +23,7 @@ pub struct Redactor {
     key_value: Regex,
     jwt: Regex,
     provider_key: Regex,
+    ansi_escape: Regex,
 }
 
 impl Redactor {
@@ -40,27 +51,66 @@ impl Redactor {
             )?,
             jwt: Regex::new(r"\beyJ[a-zA-Z0-9_-]{4,}\.[a-zA-Z0-9_-]{4,}\.[a-zA-Z0-9_-]{4,}\b")?,
             provider_key: Regex::new(r"\b(?:sk-|gh[pousr]_|AIza)[a-zA-Z0-9_-]{12,}\b")?,
+            ansi_escape: Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])")?,
         })
     }
 
     pub fn redact(&self, input: &str) -> String {
-        let mut output = input.to_owned();
+        self.redact_with_evidence(input).text
+    }
+
+    pub fn redact_with_evidence(&self, input: &str) -> RedactionResult {
+        let ansi_count = self.ansi_escape.find_iter(input).count();
+        let without_ansi = self.ansi_escape.replace_all(input, "");
+        let mut control_count = 0_usize;
+        let mut output = without_ansi
+            .chars()
+            .filter(|character| {
+                let retained = *character == '\n'
+                    || *character == '\t'
+                    || (!character.is_control() && *character != '\u{7f}');
+                if !retained {
+                    control_count = control_count.saturating_add(1);
+                }
+                retained
+            })
+            .collect::<String>();
+        let mut replacement_count = ansi_count.saturating_add(control_count);
         for secret in &self.known_secrets {
+            replacement_count = replacement_count.saturating_add(output.matches(secret).count());
             output = output.replace(secret, REDACTED);
         }
+        replacement_count =
+            replacement_count.saturating_add(self.private_key.find_iter(&output).count());
         output = self.private_key.replace_all(&output, REDACTED).into_owned();
+        replacement_count =
+            replacement_count.saturating_add(self.bearer.find_iter(&output).count());
         output = self
             .bearer
             .replace_all(&output, "Bearer [REDACTED]")
             .into_owned();
+        replacement_count =
+            replacement_count.saturating_add(self.key_value.find_iter(&output).count());
         output = self
             .key_value
             .replace_all(&output, "$1$2[REDACTED]")
             .into_owned();
+        replacement_count = replacement_count.saturating_add(self.jwt.find_iter(&output).count());
         output = self.jwt.replace_all(&output, REDACTED).into_owned();
-        self.provider_key
+        replacement_count =
+            replacement_count.saturating_add(self.provider_key.find_iter(&output).count());
+        output = self
+            .provider_key
             .replace_all(&output, REDACTED)
-            .into_owned()
+            .into_owned();
+        RedactionResult {
+            text: output,
+            replacement_count: u64::try_from(replacement_count).unwrap_or(u64::MAX),
+        }
+    }
+
+    pub fn ruleset_digest(&self) -> EvidenceDigest {
+        EvidenceDigest::sha256(REDACTION_RULESET_V2)
     }
 
     pub fn redact_log_event(&self, input: &str) -> String {
@@ -107,5 +157,17 @@ mod tests {
         let output = truncate_utf8(&input, 101, TRUNCATED);
         assert!(output.len() <= 101);
         assert!(output.ends_with(TRUNCATED));
+    }
+
+    #[test]
+    fn strips_terminal_controls_and_reports_redaction_evidence() {
+        let redactor = Redactor::new(["known-secret"]).unwrap_or_else(|error| panic!("{error}"));
+        let result = redactor.redact_with_evidence(
+            "\u{1b}[31mfailed\u{1b}[0m\u{7} token=private-value known-secret",
+        );
+
+        assert_eq!(result.replacement_count, 5);
+        assert_eq!(result.text, "failed token=[REDACTED] [REDACTED]");
+        assert_eq!(redactor.ruleset_digest().as_str().len(), 64);
     }
 }
