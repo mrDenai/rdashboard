@@ -28,7 +28,7 @@
         "profile_id": "host-prepare",
         "adapter_id": "worker_host_prepare_v1",
       "worker_pool": "vps_required",
-        "network_class": "dependency_egress",
+        "network_class": "offline",
         "cache_class": "dependency",
         "timeout_ms": 900000,
         "resources": {
@@ -290,6 +290,11 @@
         "output_contract": "rollback_receipt"
       }
     ]
+  },
+  "host_preparation": {
+    "schema_version": 1,
+    "adapter_id": "source_tree_v1",
+    "platform": "linux-x86_64"
   },
   "health_checks": [
     {

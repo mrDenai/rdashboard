@@ -103,7 +103,7 @@ Implementation progress:
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker remains step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
-| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4b locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants and the fixed peer-authenticated root launcher. The unprivileged generic worker loop and live systemd/quota proof remain next; no activation is implied. |
+| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4c locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, and the unprivileged shared worker with offline source-tree preparation. Networked dependency preparation, operation-owned COW state, and the live systemd/dedicated-filesystem/quota/concurrency proof remain; no activation is implied. |
 | 5-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -308,6 +308,33 @@ Implementation ledger:
   conservative P3 remains: a rejected `systemctl stop` leaves the bounded unit as explicit cleanup debt
   for retry rather than claiming it stopped. No unit was installed, service started, job executed,
   provider contacted, VPS mutated, push performed or deployment attempted.
+- Slice 4c adds one non-root repository-agnostic worker runtime for every installed project. It polls
+  the peer-authenticated gateway with bounded shared slots, deduplicates lease work, renews short
+  leases, drains on shutdown, serves restart cleanup debt before new claims and exits on non-retryable
+  configuration/protocol rejection instead of hot-looping. Every accepted verification lease pins one
+  exact sealed `PreparedRun`, obtains a renewed signed grant, drives the fixed root launcher, observes
+  terminal state, then cleans the unit and pin before committing the scheduler receipt.
+- The first typed host-preparation adapter materializes the exact Git-style source archive once into a
+  sealed `SourceSnapshot`, publishes a policy-bound no-external-dependency marker and then a
+  `PreparedRun`. Archive validation rejects traversal, links, special files, path collisions and byte/
+  inode overflow while preserving executable bits. The adapter is deliberately `offline` and supports
+  only dependency-free or fully vendored repositories; networked lockfile prefetch is not simulated by
+  an empty cache and the inactive `ralert` catalog entry records that restriction.
+- Worker and transient-job units expose no general network, runtime socket, production volume,
+  credential or caller-selected command. The worker has bounded memory, CPU, tasks and shutdown time;
+  the job uses only read-only sealed input plus a byte/inode-bounded executable `/job` tmpfs, forces
+  Cargo offline and cannot access host `/run`. Cleanup and unpin precede receipt renewal/commit, so a
+  gateway outage cannot strand a known transient unit or CAS pin.
+- A refreshed exact staged export passed bare `bin/ci`: formatting, strict Clippy, 204 active library
+  tests with two credentialed provider tests ignored, every binary/integration/socket/scheduler/worker
+  suite, both schema checks, 8 browser contracts and the optimized release build in 3 minutes 15
+  seconds. The exact 21-path product/config/test diff SHA-256 is
+  `e79d6974873df78894ebb200c3cf7887ecbb75e11ecced9fe23c3f4101b6fdc5`.
+- A fresh complete `deepseek-free` review returned `SAFE` with no open question or P0-P2 finding. Its
+  three P3 notes were checked against the implemented deadlines, idempotent launch-renewal contract and
+  bounded non-effectful host-preparation shutdown semantics; none required a correction. No unit was
+  installed or started, no live storage/quota drill or repository job ran, and no provider, VPS,
+  source, push or deployment state was mutated.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

@@ -1,7 +1,8 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use rdashboard::domain::{
-    DataClass, MigrationEntrypoint, ProjectManifestV2, WorkflowAdapterIdV1, WorkflowNodeKindV1,
+    DataClass, MigrationEntrypoint, ProjectManifestV2, WorkflowAdapterIdV1,
+    WorkflowHostPreparationAdapterV1, WorkflowNetworkClassV1, WorkflowNodeKindV1,
     WorkflowWorkerPoolV1, WriteFencePolicy,
 };
 
@@ -138,13 +139,55 @@ fn ralert_contract_separates_stateful_templates_from_disposable_images() {
         .iter()
         .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
         .unwrap_or_else(|| panic!("ralert preparation node is required"));
+    let preparation_profile = manifest
+        .workflow
+        .profile(&preparation.profile_id)
+        .unwrap_or_else(|| panic!("ralert preparation profile is required"));
     assert_eq!(
-        manifest
-            .workflow
-            .profile(&preparation.profile_id)
-            .unwrap_or_else(|| panic!("ralert preparation profile is required"))
-            .worker_pool,
+        preparation_profile.worker_pool,
         WorkflowWorkerPoolV1::VpsRequired,
         "the authoritative preparation cannot be owned only by optional compute"
+    );
+    assert_eq!(
+        preparation_profile.network_class,
+        WorkflowNetworkClassV1::Offline,
+        "source-tree preparation has no dependency-network authority"
+    );
+    let host_preparation = manifest
+        .host_preparation
+        .as_ref()
+        .unwrap_or_else(|| panic!("ralert host-preparation policy is required"));
+    assert_eq!(
+        host_preparation.adapter_id,
+        WorkflowHostPreparationAdapterV1::SourceTreeV1
+    );
+    assert_eq!(host_preparation.platform, "linux-x86_64");
+}
+
+#[test]
+fn source_tree_host_preparation_rejects_dependency_network_authority() {
+    let (_, mut manifest) = catalog()
+        .into_iter()
+        .find(|(id, _)| id == "ralert")
+        .unwrap_or_else(|| panic!("ralert manifest is required"));
+    let preparation_profile_id = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+        .unwrap_or_else(|| panic!("ralert preparation node is required"))
+        .profile_id
+        .clone();
+    manifest
+        .workflow
+        .execution_profiles
+        .iter_mut()
+        .find(|profile| profile.profile_id == preparation_profile_id)
+        .unwrap_or_else(|| panic!("ralert preparation profile is required"))
+        .network_class = WorkflowNetworkClassV1::DependencyEgress;
+
+    assert!(
+        manifest.validate().is_err(),
+        "an offline source-only adapter must not inherit dependency egress"
     );
 }

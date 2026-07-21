@@ -111,6 +111,8 @@ silently replayed. Cleanup is itself journaled before `systemctl stop`; exact re
 evidence. Per-job writable state is an isolated tmpfs with the lease byte and inode ceilings, while the
 sealed prepared input is bind-mounted read-only. The fixed `rdashboard-workflow-job` maps only the
 three installed adapter IDs to fixed script paths and receives an empty, reconstructed environment.
+Cargo state, targets, compiler cache and temporary files live only below `/job`; the launcher forces
+Cargo offline so a verification job cannot turn a cache miss into undeclared network access.
 
 The launcher deliberately has no network namespace, Docker/containerd socket, controller/executor/
 source socket, production volume or credential access. Its only retained capability is read-only DAC
@@ -118,9 +120,58 @@ traversal so it can revalidate the worker-owned mode-`0700` preparation-store ro
 an empty capability set. Installing the binary, policy and unit does not enable or start it, activate a
 worker, change `auto_deploy`, or run a shadow job.
 
-The generic worker loop and the live dedicated-filesystem/quota proof remain a separate activation
-boundary. Installing these units or a repository checkout alone must not start shadow work, change
-`auto_deploy`, or grant production mutation authority.
+## Generic workflow worker and preparation store
+
+`rdashboard-worker.service` is the one non-root worker for every installed project. It polls the
+gateway with one stable worker/host identity, runs up to the configured number of typed leases, and
+never creates a repository-specific service, checkout or dependency cache. A `host_prepare` lease
+copies the exact attested source archive into the shared content-addressed store once; matching leases
+join the same publication. Verification leases pin that sealed `PreparedRun`, ask the root launcher to
+run only the installed fixed adapter, then clean the transient unit and release the pin before
+committing the terminal receipt. Restart cleanup obligations are served before new work by the
+gateway and are idempotent at the launcher and store boundaries.
+
+Create the non-login `rdashboard-worker` user/group and add that user to the existing
+`rdashboard-build-readers` group. Install these non-secret values in root-owned
+`/etc/rdashboard/workflow-worker.env`, mode `0644` or stricter:
+
+```sh
+RDASHBOARD_WORKER_UID=992
+RDASHBOARD_WORKER_ID=shared-vps-worker-1
+RDASHBOARD_WORKER_HOST_ID=production-vps
+RDASHBOARD_WORKER_SLOTS=2
+RDASHBOARD_SOURCE_UID=993
+RDASHBOARD_BUILD_READER_GID=994
+```
+
+All numeric IDs are examples and must match the installed accounts. `RDASHBOARD_WORKER_UID`, worker
+ID and host ID must exactly match both the gateway and launcher policies. The source UID and reader GID
+must match the owner/group of `/var/lib/rdashboard-build/source-exports`; the service receives only
+read access to that tree. Set worker slots no higher than the launcher's `max_concurrent_jobs` or the
+measured CPU/RAM/IO capacity. The worker accepts 1-16 slots, but that protocol maximum is not a safe
+installation default. It has no network namespace, capabilities, Docker/containerd/Podman socket,
+credential, controller state or production volume.
+
+Mount a dedicated filesystem at `/var/lib/rdashboard-build/preparation` before starting the worker.
+Its total size must be at least 6 GiB; using an approximately 8 GiB filesystem leaves metadata margin
+while the store itself still refuses more than 6 GiB or 100,000 inodes. Keep at least 12 GiB free on
+the host root filesystem. The worker refuses startup when this path is not the exact mount point, the
+filesystem is too small, ownership/mode is wrong, the store exceeds either cap, or the root reserve is
+missing. The tmpfiles entry creates the mode-`0700` mountpoint, but it does not create or mount the
+filesystem; installation must provide and persist that hard boundary first.
+
+The only implemented host-preparation policy is `source_tree_v1`. It is deliberately offline and is
+valid only for a dependency-free repository or one whose complete gate dependencies are already
+vendored in the source tree. It publishes a typed no-external-dependency marker, not a populated Cargo,
+Ruby, npm or system-package cache. Networked lockfile prefetch remains a separate future fixed adapter
+with registry allowlists and integrity checks. The catalog `ralert` manifest remains inactive and must
+not be installed until that repository satisfies the source-tree contract or the appropriate
+dependency adapter exists.
+
+Installing the binary, service, environment file or mount does not enable or start shadow work,
+change `auto_deploy`, or grant production mutation authority. Before activation, verify the mount and
+IDs, install the matching gateway/launcher policy, keep only reviewed adapters allowlisted, and run the
+separately authorized live storage/quota and cleanup drill.
 
 ## GlitchTip, DeepSeek and GitHub metadata
 

@@ -23,7 +23,7 @@ fn main() -> Result<(), WorkflowJobError> {
         return Err(WorkflowJobError::InvalidInvocation);
     }
     validate_job_root(Path::new(JOB_ROOT))?;
-    for directory in ["tmp", "target", "ccache", "ccache-tmp"] {
+    for directory in ["tmp", "target", "cargo-home", "ccache", "ccache-tmp"] {
         create_private_job_directory(&Path::new(JOB_ROOT).join(directory))?;
     }
     let script = match adapter.as_str() {

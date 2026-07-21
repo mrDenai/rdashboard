@@ -24,6 +24,16 @@
         "$ref": "#/$defs/HealthCheckPolicy"
       }
     },
+    "host_preparation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WorkflowHostPreparationPolicyV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "migration": {
       "$ref": "#/$defs/MigrationPolicy"
     },
@@ -321,6 +331,35 @@
         "network_class",
         "cache_class",
         "timeout_ms"
+      ]
+    },
+    "WorkflowHostPreparationAdapterV1": {
+      "type": "string",
+      "enum": [
+        "source_tree_v1"
+      ]
+    },
+    "WorkflowHostPreparationPolicyV1": {
+      "type": "object",
+      "properties": {
+        "adapter_id": {
+          "$ref": "#/$defs/WorkflowHostPreparationAdapterV1"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "adapter_id",
+        "platform"
       ]
     },
     "WorkflowNetworkClassV1": {

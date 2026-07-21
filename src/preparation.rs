@@ -629,6 +629,80 @@ impl PreparationStore {
         self.commit_stage(kind, &key, &stage, &reservation, now_ms)
     }
 
+    /// Produces a new non-source entry directly inside bounded CAS staging.
+    ///
+    /// The caller supplies a conservative payload byte/inode ceiling before the producer runs. This
+    /// avoids an unaccounted external scratch copy: staging lives on the same dedicated filesystem as
+    /// the sealed store, is covered by the admission reservation, and is removed on every failure.
+    pub fn get_or_prepare_bounded_directory<F, E>(
+        &self,
+        material: &PreparationKeyMaterialV1,
+        maximum_payload_bytes: u64,
+        maximum_payload_inodes: u64,
+        now_ms: i64,
+        producer: F,
+    ) -> Result<PreparedEntryV1, PreparationStoreError>
+    where
+        F: FnOnce(&Path) -> Result<(), E>,
+        E: std::fmt::Display,
+    {
+        validate_time(now_ms)?;
+        let key = material.key()?;
+        let kind = material.kind();
+        if kind == PreparationObjectKindV1::SourceSnapshot
+            || maximum_payload_bytes == 0
+            || maximum_payload_inodes == 0
+            || maximum_payload_bytes > self.policy.max_bytes
+            || maximum_payload_inodes > self.policy.max_inodes.saturating_sub(4)
+        {
+            return Err(PreparationStoreError::InvalidKeyMaterial);
+        }
+        let key_lock = self.key_lock(&key)?;
+        let _key_guard = lock(&key_lock)?;
+        if let Some(entry) = self.open_existing(kind, &key, now_ms)? {
+            return Ok(entry);
+        }
+
+        let reserved_inodes = maximum_payload_inodes
+            .checked_add(4)
+            .ok_or(PreparationStoreError::PayloadTooLarge)?;
+        let estimate = estimate_payload(
+            maximum_payload_bytes,
+            reserved_inodes,
+            self.probe.inspect()?.allocation_granularity,
+        )?;
+        let reservation = self.reserve(estimate, now_ms)?;
+        let stage = self.create_stage()?;
+        let result = (|| {
+            let payload = stage.join("payload");
+            create_directory(&payload, 0o700)?;
+            producer(&payload)
+                .map_err(|error| PreparationStoreError::ProducerFailed(error.to_string()))?;
+            let inventory = inspect_input_directory(&payload)?;
+            validate_generated_inventory_bounds(
+                &inventory,
+                maximum_payload_bytes,
+                maximum_payload_inodes,
+            )?;
+            let entries = seal_inventory_in_place(
+                &inventory,
+                self.expected_owner_uid,
+                maximum_payload_bytes,
+            )?;
+            seal_stage(
+                &stage,
+                &PreparationEntryManifestV1::new(kind, key.clone(), entries, now_ms)?,
+                self.expected_owner_uid,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            remove_owned_tree(&stage, self.expected_owner_uid)?;
+            return Err(error);
+        }
+        self.commit_stage(kind, &key, &stage, &reservation, now_ms)
+    }
+
     pub fn open_pinned(
         &self,
         kind: PreparationObjectKindV1,
@@ -676,6 +750,36 @@ impl PreparationStore {
                 .ok_or(PreparationStoreError::UntrustedLayout)?,
         )?;
         Ok(())
+    }
+
+    pub fn unpin_if_present(
+        &self,
+        pin_id: Uuid,
+        expected_key: &EvidenceDigest,
+    ) -> Result<bool, PreparationStoreError> {
+        if pin_id.is_nil() {
+            return Err(PreparationStoreError::InvalidPin);
+        }
+        let _commit = lock(&self.commit_lock)?;
+        self.revalidate()?;
+        self.reconcile_evictions()?;
+        let path = self.pin_path(pin_id);
+        let record = match load_pin(&path, self.expected_owner_uid) {
+            Ok(record) => record,
+            Err(PreparationStoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if record.key != *expected_key || record.pin_id != pin_id {
+            return Err(PreparationStoreError::InvalidPin);
+        }
+        fs::remove_file(&path)?;
+        sync_directory(
+            path.parent()
+                .ok_or(PreparationStoreError::UntrustedLayout)?,
+        )?;
+        Ok(true)
     }
 
     fn stage_source_snapshot(
@@ -1614,6 +1718,118 @@ fn estimate_inventory(
         .checked_add(4)
         .ok_or(PreparationStoreError::PayloadTooLarge)?;
     estimate_payload(payload_bytes, inodes, block_size)
+}
+
+fn validate_generated_inventory_bounds(
+    inventory: &InputInventory,
+    maximum_payload_bytes: u64,
+    maximum_payload_inodes: u64,
+) -> Result<(), PreparationStoreError> {
+    let payload_bytes = inventory.entries.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(
+                if entry.kind == PreparationPayloadEntryKindV1::RegularFile {
+                    entry.identity.length
+                } else {
+                    0
+                },
+            )
+            .ok_or(PreparationStoreError::PayloadTooLarge)
+    })?;
+    let payload_inodes = u64::try_from(inventory.entries.len())
+        .map_err(|_| PreparationStoreError::PayloadTooLarge)?;
+    if payload_bytes > maximum_payload_bytes || payload_inodes > maximum_payload_inodes {
+        return Err(PreparationStoreError::PayloadExceededReservation);
+    }
+    Ok(())
+}
+
+fn seal_inventory_in_place(
+    inventory: &InputInventory,
+    expected_owner_uid: u32,
+    maximum_payload_bytes: u64,
+) -> Result<Vec<PreparationPayloadEntryV1>, PreparationStoreError> {
+    let root_metadata = fs::symlink_metadata(&inventory.root)?;
+    if input_identity(&root_metadata) != inventory.root_identity
+        || root_metadata.uid() != expected_owner_uid
+    {
+        return Err(PreparationStoreError::InputChanged);
+    }
+    let mut total_bytes = 0_u64;
+    let mut manifest_entries = Vec::with_capacity(inventory.entries.len());
+    for entry in &inventory.entries {
+        let path = inventory.root.join(&entry.relative);
+        let metadata = fs::symlink_metadata(&path)?;
+        if input_identity(&metadata) != entry.identity || metadata.uid() != expected_owner_uid {
+            return Err(PreparationStoreError::InputChanged);
+        }
+        match entry.kind {
+            PreparationPayloadEntryKindV1::Directory => {
+                manifest_entries.push(PreparationPayloadEntryV1 {
+                    path_base64url: encode_relative_path(&entry.relative)?,
+                    entry_kind: PreparationPayloadEntryKindV1::Directory,
+                    mode: 0o555,
+                    bytes: 0,
+                    sha256: None,
+                });
+            }
+            PreparationPayloadEntryKindV1::RegularFile => {
+                total_bytes = total_bytes
+                    .checked_add(entry.identity.length)
+                    .ok_or(PreparationStoreError::PayloadTooLarge)?;
+                if total_bytes > maximum_payload_bytes {
+                    return Err(PreparationStoreError::PayloadExceededReservation);
+                }
+                let mut file = File::open(&path)?;
+                if input_identity(&file.metadata()?) != entry.identity {
+                    return Err(PreparationStoreError::InputChanged);
+                }
+                let mut hasher = Sha256::new();
+                let mut copied = 0_u64;
+                let mut buffer = vec![0_u8; FILE_COPY_BUFFER_BYTES];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    copied = copied
+                        .checked_add(
+                            u64::try_from(read)
+                                .map_err(|_| PreparationStoreError::PayloadTooLarge)?,
+                        )
+                        .ok_or(PreparationStoreError::PayloadTooLarge)?;
+                    if copied > entry.identity.length {
+                        return Err(PreparationStoreError::InputChanged);
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                if copied != entry.identity.length
+                    || input_identity(&fs::symlink_metadata(&path)?) != entry.identity
+                {
+                    return Err(PreparationStoreError::InputChanged);
+                }
+                file.set_permissions(fs::Permissions::from_mode(entry.sealed_mode))?;
+                file.sync_all()?;
+                let sealed = file.metadata()?;
+                if sealed.uid() != expected_owner_uid
+                    || sealed.nlink() != 1
+                    || sealed.len() != entry.identity.length
+                    || sealed.mode() & 0o7777 != entry.sealed_mode
+                {
+                    return Err(PreparationStoreError::InputChanged);
+                }
+                manifest_entries.push(PreparationPayloadEntryV1 {
+                    path_base64url: encode_relative_path(&entry.relative)?,
+                    entry_kind: PreparationPayloadEntryKindV1::RegularFile,
+                    mode: entry.sealed_mode,
+                    bytes: copied,
+                    sha256: Some(digest_hasher(hasher)?),
+                });
+            }
+        }
+    }
+    manifest_entries.sort_by(compare_manifest_entries);
+    Ok(manifest_entries)
 }
 
 fn estimate_payload(
@@ -3101,6 +3317,7 @@ mod tests {
             EvidenceDigest::sha256("scheduler preparation key"),
             node,
             profile,
+            None,
             vec![crate::domain::WorkflowLeaseInputV1 {
                 node_id: "source".parse().expect("source node ID"),
                 artifact_kind: crate::domain::WorkflowArtifactKindV1::SourceSnapshot,

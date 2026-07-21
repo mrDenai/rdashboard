@@ -459,6 +459,7 @@ fn optional_accelerator_can_verify_but_cannot_own_required_preparation_or_releas
     assert_eq!(prepare.node_kind, WorkflowNodeKindV1::HostPrepare);
     assert_eq!(prepare.worker_pool, WorkflowWorkerPoolV1::VpsRequired);
     assert!(prepare.resources.is_some());
+    assert_eq!(prepare.host_preparation, manifest.host_preparation);
     commit_success(&scheduler, &prepare, "vps-prepare");
 
     let verification = claim(&scheduler, &accelerator_worker(), 30);

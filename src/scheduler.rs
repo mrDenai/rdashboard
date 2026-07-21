@@ -1270,6 +1270,11 @@ fn claim_next_transaction(
             candidate.preparation_key.clone(),
             candidate.node,
             candidate.profile,
+            if candidate.node.kind == WorkflowNodeKindV1::HostPrepare {
+                candidate.manifest.host_preparation.clone()
+            } else {
+                None
+            },
             input_artifacts,
             expected_input_digest,
             worker.worker_id.clone(),

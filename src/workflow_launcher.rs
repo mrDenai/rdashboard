@@ -1500,7 +1500,7 @@ impl WorkflowLaunchSupervisorV1 {
         lease: &WorkflowLeaseV1,
         now_ms: i64,
     ) -> Result<WorkflowLaunchStatusV1, WorkflowLaunchSupervisorError> {
-        validate_launcher_lease(&self.policy, lease)?;
+        validate_launcher_cleanup_lease(&self.policy, lease)?;
         let (status, needs_runtime) = self.journal.begin_cleanup(lease, now_ms)?;
         if !needs_runtime {
             return Ok(status);
@@ -1526,6 +1526,32 @@ fn validate_launcher_lease(
         )
         || lease.network_class != WorkflowNetworkClassV1::Offline
         || !policy.allowed_adapters.contains(&lease.adapter_id)
+        || !matches!(
+            lease.adapter_id,
+            WorkflowAdapterIdV1::WorkerBareBinCiV1
+                | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+                | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+        )
+    {
+        return Err(WorkflowLauncherError::UnsupportedLease);
+    }
+    let _ = required_prepared_run_key(lease)?;
+    Ok(())
+}
+
+fn validate_launcher_cleanup_lease(
+    policy: &WorkflowLauncherPolicyV1,
+    lease: &WorkflowLeaseV1,
+) -> Result<(), WorkflowLauncherError> {
+    policy.validate()?;
+    lease.validate()?;
+    if lease.worker_id != policy.worker_id
+        || lease.host_id != policy.host_id
+        || !matches!(
+            lease.worker_pool,
+            WorkflowWorkerPoolV1::VpsRequired | WorkflowWorkerPoolV1::BuildCompute
+        )
+        || lease.network_class != WorkflowNetworkClassV1::Offline
         || !matches!(
             lease.adapter_id,
             WorkflowAdapterIdV1::WorkerBareBinCiV1
@@ -1924,13 +1950,13 @@ fn transient_unit_arguments(
         format!("--property=TasksMax={}", resources.tasks_max),
         format!("--property=LimitFSIZE={}", resources.output_max_bytes),
         format!("--property=RuntimeMaxSec={}ms", lease.timeout_ms),
-        "--property=InaccessiblePaths=-/etc/rdashboard/credentials -/run/rdashboard -/run/rdashboard-source-ingress -/run/rdashboard-source-delivery -/run/rdashboard-workflow -/run/rdashboard-workflow-launcher -/var/lib/rdashboard-workflow-launcher -/run/systemd/private -/run/dbus/system_bus_socket -/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman/podman.sock".to_owned(),
+        "--property=InaccessiblePaths=-/etc/rdashboard/credentials /run -/var/lib/rdashboard-workflow-launcher".to_owned(),
         format!(
             "--property=BindReadOnlyPaths={}:/workspace",
             prepared_run_path.display()
         ),
         format!(
-            "--property=TemporaryFileSystem=/job:rw,nodev,nosuid,noexec,size={},nr_inodes={},mode=0700,uid={},gid={}",
+            "--property=TemporaryFileSystem=/job:rw,nodev,nosuid,size={},nr_inodes={},mode=0700,uid={},gid={}",
             resources.scratch_max_bytes,
             resources.scratch_max_inodes,
             policy.build_uid,
@@ -1943,6 +1969,8 @@ fn transient_unit_arguments(
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_owned(),
         "HOME=/nonexistent".to_owned(),
         "TMPDIR=/job/tmp".to_owned(),
+        "CARGO_HOME=/job/cargo-home".to_owned(),
+        "CARGO_NET_OFFLINE=true".to_owned(),
         "CARGO_TARGET_DIR=/job/target".to_owned(),
         "CCACHE_DIR=/job/ccache".to_owned(),
         "CCACHE_TEMPDIR=/job/ccache-tmp".to_owned(),
@@ -2125,6 +2153,7 @@ mod tests {
             EvidenceDigest::sha256("preparation key"),
             node,
             profile,
+            None,
             vec![WorkflowLeaseInputV1 {
                 node_id: "prepare".parse().expect("prepare node ID"),
                 artifact_kind: WorkflowArtifactKindV1::PreparedRun,
@@ -2359,11 +2388,17 @@ mod tests {
                 .any(|argument| argument == "--property=PrivateNetwork=yes")
         );
         assert!(launch.arguments.iter().any(|argument| {
+            argument.starts_with("--property=InaccessiblePaths=")
+                && argument.split_ascii_whitespace().any(|path| path == "/run")
+        }));
+        assert!(launch.arguments.iter().any(|argument| {
             argument.starts_with("--property=BindReadOnlyPaths=")
                 && argument.ends_with(":/workspace")
         }));
         assert!(launch.arguments.iter().any(|argument| {
             argument.starts_with("--property=TemporaryFileSystem=/job:")
+                && argument.contains("rw,nodev,nosuid,size=")
+                && !argument.contains("noexec")
                 && argument.contains("size=")
                 && argument.contains("nr_inodes=")
         }));
@@ -2380,6 +2415,8 @@ mod tests {
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
                 "HOME=/nonexistent",
                 "TMPDIR=/job/tmp",
+                "CARGO_HOME=/job/cargo-home",
+                "CARGO_NET_OFFLINE=true",
                 "CARGO_TARGET_DIR=/job/target",
                 "CCACHE_DIR=/job/ccache",
                 "CCACHE_TEMPDIR=/job/ccache-tmp",
@@ -2593,6 +2630,21 @@ mod tests {
             .expect("replay cleanup");
         assert_eq!(replayed_cleanup, cleaned);
         assert_eq!(runtime.terminate_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cleanup_remains_authorized_after_an_adapter_is_removed_from_launch_policy() {
+        let fixture = fixture();
+        let mut rotated_policy = fixture.policy;
+        rotated_policy.allowed_adapters = vec![WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1];
+        rotated_policy.validate().expect("rotated launcher policy");
+
+        assert!(matches!(
+            validate_launcher_lease(&rotated_policy, &fixture.lease),
+            Err(WorkflowLauncherError::UnsupportedLease)
+        ));
+        validate_launcher_cleanup_lease(&rotated_policy, &fixture.lease)
+            .expect("an already-owned unit must remain cleanable after policy rotation");
     }
 
     #[test]

@@ -1,14 +1,14 @@
 # GitHub-independent delivery implementation review
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
-- Status: slices 1a-4b complete locally; the generic worker and separately authorized live gates remain pending
+- Status: slices 1a-4c complete locally; dependency preparation, COW state and separately authorized live gates remain pending
 - Review date: 2026-07-21
 - Baseline HEAD: `d20cf342dac204c51d30a32009eeb9c58097c8aa`
 - Local implementation commits: `64e64f2` (`Add persistent resource observer`), `581a432`
   (`Add adapter execution receipts`), `25dff26` (`Add durable workflow scheduler`), `8b72141`
   (`Add authenticated workflow gateway`), `2973847` (`Add workflow dashboard projection`),
-  `9598582` (`Add durable source delivery`), `1a076e8` (`Add durable GitHub source ingress`) and
-  `bfb887b` (`Add sealed workflow preparation store`)
+  `9598582` (`Add durable source delivery`), `1a076e8` (`Add durable GitHub source ingress`),
+  `bfb887b` (`Add sealed workflow preparation store`) and `a44b279` (`Add signed workflow launch boundary`)
 - Slice 1a staged diff SHA-256: `ca9712b8517e0a7c42c6672d81abed2e8c74165337306dca0ded2bc5c36e6432`
 
 ## Reviewed scope
@@ -817,3 +817,85 @@ not yet materialize a source/dependency snapshot, run the generic worker loop, s
 receipts, install/start either unit, execute repository code, mutate the VPS, contact GitHub/providers,
 push or deploy. The unprivileged generic worker that consumes the exact source and preparation
 contracts, renews leases, drives this launcher and commits receipts is the next local Slice 4c.
+
+## Slice 4c: repository-agnostic worker and offline source-tree preparation
+
+### Reviewed scope
+
+Slice 4c completes the inactive source-only worker path without claiming that external dependency
+preparation or the live host boundary already exists:
+
+- one non-root `rdashboard-worker` serves every installed project through the existing typed,
+  peer-authenticated gateway with 1-16 bounded shared slots, same-lease deduplication, short renewal,
+  panic containment, graceful drain and cleanup-debt-first startup/recovery;
+- `source_tree_v1` validates and extracts the exact attested Git-style archive once, rejects traversal,
+  links, special files, collisions and byte/inode overflow, preserves executable bits, and publishes
+  immutable `SourceSnapshot`, no-external-dependency `DependencySnapshot` and `PreparedRun` objects
+  through the sealed store's single-flight path;
+- the scheduler and manifest bind the typed host-preparation policy into HostPrepare leases, require its
+  network class to be `offline`, and leave the catalog `ralert` project inactive. The adapter supports
+  only dependency-free or fully vendored source; Cargo, Ruby, npm and system dependency prefetch remain
+  explicit future adapters rather than a silent empty-cache fallback;
+- verification pins the exact prepared run, receives a renewed signed grant, asks the fixed root
+  launcher to run bare `bin/ci`, observes its journaled state, cleans the transient unit and releases the
+  CAS pin before committing the terminal receipt. Every launcher ambiguity, renewal/observation failure,
+  shutdown and restart obligation routes through idempotent cleanup;
+- the worker service is networkless, capability-free and has no runtime socket, credentials, controller
+  state or production volume. It has fixed memory, CPU, task and stop bounds. The transient job hides
+  host `/run`, uses only sealed read-only `/workspace` plus a byte/inode-bounded executable `/job` tmpfs,
+  and forces Cargo state and network-offline behavior below `/job`;
+- startup and installation documentation require an exact dedicated preparation mount, 6 GiB store/
+  100,000-inode limits and 12 GiB root-filesystem reserve, but do not create, enable or start a service.
+
+The exact staged product/config/test diff contains 21 paths, 3,480 insertions and 19 deletions. Shared
+dirty `src/lib.rs` and `deploy/systemd/README.md` hunks were staged selectively. Notification code,
+notification workflow artifacts and earlier consultation stderr logs remain outside the reviewed diff.
+
+### Verification
+
+- A fresh exact `git checkout-index` export of the staged product/config/test state ran bare `bin/ci`
+  successfully. It covered formatting, Clippy with warnings denied, 204 active library tests with two
+  credentialed live-provider tests ignored, every binary/integration/socket/scheduler/worker suite,
+  both schema checks, 8 browser contracts and the optimized release build.
+- The exact gate exposed two real integration defects before the final pass: Git archives represent
+  directories with one trailing slash, and compiled Rust test binaries cannot execute from a `noexec`
+  `/job` tmpfs. Archive validation now permits only that exact directory spelling; `/job` remains
+  private, byte/inode bounded, `nodev` and `nosuid` but executable for the fixed gate adapter.
+- The final optimized release build completed in 3 minutes 15 seconds.
+- `git diff --cached --check` passed. The exact product/config/test diff SHA-256, excluding workflow
+  review artifacts, is `e79d6974873df78894ebb200c3cf7887ecbb75e11ecced9fe23c3f4101b6fdc5`.
+- Focused contracts cover unsafe and real Git-style archives, single-flight publication, replay,
+  lease renewal, unsupported adapters, non-retryable gateway failure, launch/observe/cleanup/unpin,
+  shutdown draining, receipt-renewal outage ordering, restart cleanup obligations, adapter-policy
+  rotation cleanup, worker configuration and the installed systemd boundary.
+
+### Independent consultation and finding dispositions
+
+A fresh complete exact-staged review inspected all 21 product/config/test paths and returned `SAFE`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 408 seconds;
+- state fingerprint: `9441838fdc05779553f7b2832096f8c0cd1697c8b5b471fd075f6766e83273f6`;
+- brief SHA-256: `ac28887fa58281df1e0df7b6a5775f8e7ce6323404cacddf79fafc9ddfbc334f`;
+- response: `consult-slice4c-deepseek/response.md`;
+- verdict: no open question or P0-P2 finding.
+
+The three P3 notes were dispositioned as follows:
+
+1. **Reviewed — pin expiry cannot trail a valid scheduler lease.** The pin ends at the node's absolute
+   installed timeout (`leased_at_ms + timeout_ms`); scheduler renewal is bounded by that same deadline
+   and cannot extend work beyond it. Missing-pin cleanup is also idempotent.
+2. **Reviewed — renewal intentionally reuses the launch operation.** A renewed lease must deliver its
+   new signed grant to the root launcher. The fixed launch journal treats the same execution identity as
+   an authorization renewal and does not respawn; focused tests prove that contract.
+3. **Reviewed — blocking host preparation drains safely.** It has no launcher/runtime effect and cannot
+   be cancelled safely mid-filesystem publication. Graceful worker shutdown drains the assignment;
+   process crash leaves only bounded staging that the sealed store reconciles at startup.
+
+### Verdict
+
+Slice 4c is production-worthy as an inactive local source-only worker path and may be committed. It
+does not implement networked lockfile/dependency preparation, operation-owned COW layers, rootless
+integration/OCI adapters or the live dedicated-filesystem/quota/concurrency proof. It does not install
+or start a service, run repository code, mutate the VPS, contact GitHub/providers, push or deploy.
+Those remaining step-4 boundaries and the first authorized `rimg` shadow candidate stay pending.

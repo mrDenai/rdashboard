@@ -94,6 +94,8 @@ pub mod workflow_execution_grant;
 pub mod workflow_launcher;
 #[cfg(unix)]
 pub mod workflow_launcher_socket;
+#[cfg(unix)]
+pub mod workflow_worker;
 
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 

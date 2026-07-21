@@ -9,7 +9,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use url::Url;
 
-use super::{EvidenceDigest, ProjectId, WorkflowNodeKindV1, WorkflowPolicyV1};
+use super::{
+    EvidenceDigest, ProjectId, WorkflowHostPreparationPolicyV1, WorkflowNodeKindV1,
+    WorkflowPolicyV1,
+};
 
 pub const PROJECT_MANIFEST_SCHEMA_VERSION: u16 = 1;
 pub const PROJECT_MANIFEST_V2_SCHEMA_VERSION: u16 = 2;
@@ -56,6 +59,8 @@ pub struct ProjectManifestV2 {
     pub ci: CiPolicy,
     pub build: BuildPolicy,
     pub workflow: WorkflowPolicyV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_preparation: Option<WorkflowHostPreparationPolicyV1>,
     pub health_checks: Vec<HealthCheckPolicy>,
     pub data_volumes: Vec<DataVolumePolicy>,
     pub migration: MigrationPolicy,
@@ -85,6 +90,20 @@ impl ProjectManifestV2 {
         self.workflow
             .validate()
             .map_err(|_| ManifestError::WorkflowInvalid)?;
+        if let Some(policy) = self.host_preparation.as_ref() {
+            let preparation_profile = self
+                .workflow
+                .nodes
+                .iter()
+                .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+                .and_then(|node| self.workflow.profile(&node.profile_id));
+            if policy.validate().is_err()
+                || preparation_profile
+                    .is_none_or(|profile| profile.network_class != policy.required_network_class())
+            {
+                return Err(ManifestError::WorkflowInvalid);
+            }
+        }
 
         let has_backup = self
             .workflow

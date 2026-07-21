@@ -558,6 +558,7 @@ mod tests {
             EvidenceDigest::sha256("preparation key"),
             node,
             profile,
+            None,
             input_artifacts
                 .then(|| WorkflowLeaseInputV1 {
                     node_id: "source".parse().expect("source node ID"),

@@ -15,6 +15,7 @@ pub const WORKFLOW_LEASE_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_NODE_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_CLEANUP_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_REDUCTION_RECEIPT_SCHEMA_VERSION: u16 = 1;
+pub const WORKFLOW_HOST_PREPARATION_SCHEMA_VERSION: u16 = 1;
 
 const MAX_WORKFLOW_NODES: usize = 64;
 const MAX_WORKFLOW_PROFILES: usize = 32;
@@ -227,6 +228,42 @@ pub enum WorkflowCacheClassV1 {
     None,
     Dependency,
     PreparedRun,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowHostPreparationAdapterV1 {
+    SourceTreeV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowHostPreparationPolicyV1 {
+    pub schema_version: u16,
+    pub adapter_id: WorkflowHostPreparationAdapterV1,
+    pub platform: String,
+}
+
+impl WorkflowHostPreparationPolicyV1 {
+    pub fn validate(&self) -> Result<(), WorkflowContractError> {
+        if self.schema_version != WORKFLOW_HOST_PREPARATION_SCHEMA_VERSION
+            || !valid_workflow_token(&self.platform, 64)
+        {
+            return Err(WorkflowContractError::InvalidHostPreparationPolicy);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<EvidenceDigest, WorkflowContractError> {
+        self.validate()?;
+        Ok(EvidenceDigest::sha256(serde_jcs::to_vec(self)?))
+    }
+
+    pub const fn required_network_class(&self) -> WorkflowNetworkClassV1 {
+        match self.adapter_id {
+            WorkflowHostPreparationAdapterV1::SourceTreeV1 => WorkflowNetworkClassV1::Offline,
+        }
+    }
 }
 
 #[derive(
@@ -481,8 +518,10 @@ impl WorkflowPolicyV1 {
 fn profile_matches_kind(profile: &WorkflowExecutionProfileV1, kind: WorkflowNodeKindV1) -> bool {
     match kind {
         WorkflowNodeKindV1::HostPrepare => {
-            profile.network_class == WorkflowNetworkClassV1::DependencyEgress
-                && profile.cache_class == WorkflowCacheClassV1::Dependency
+            matches!(
+                profile.network_class,
+                WorkflowNetworkClassV1::Offline | WorkflowNetworkClassV1::DependencyEgress
+            ) && profile.cache_class == WorkflowCacheClassV1::Dependency
         }
         WorkflowNodeKindV1::Verification | WorkflowNodeKindV1::ReleaseBuild => {
             profile.network_class == WorkflowNetworkClassV1::Offline
@@ -670,6 +709,8 @@ pub struct WorkflowLeaseV1 {
     pub cache_class: WorkflowCacheClassV1,
     pub timeout_ms: u64,
     pub resources: Option<WorkflowResourceEnvelopeV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_preparation: Option<WorkflowHostPreparationPolicyV1>,
     pub input_contracts: Vec<WorkflowArtifactKindV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_artifacts: Vec<WorkflowLeaseInputV1>,
@@ -705,6 +746,8 @@ struct WorkflowLeaseDigestPayload<'a> {
     cache_class: WorkflowCacheClassV1,
     timeout_ms: u64,
     resources: &'a Option<WorkflowResourceEnvelopeV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_preparation: &'a Option<WorkflowHostPreparationPolicyV1>,
     input_contracts: &'a [WorkflowArtifactKindV1],
     #[serde(skip_serializing_if = "<[WorkflowLeaseInputV1]>::is_empty")]
     input_artifacts: &'a [WorkflowLeaseInputV1],
@@ -731,6 +774,7 @@ impl WorkflowLeaseV1 {
         preparation_key: EvidenceDigest,
         node: &WorkflowNodeV1,
         profile: &WorkflowExecutionProfileV1,
+        host_preparation: Option<WorkflowHostPreparationPolicyV1>,
         input_artifacts: Vec<WorkflowLeaseInputV1>,
         expected_input_digest: EvidenceDigest,
         worker_id: String,
@@ -761,6 +805,7 @@ impl WorkflowLeaseV1 {
             cache_class: profile.cache_class,
             timeout_ms: profile.timeout_ms,
             resources: profile.resources.clone(),
+            host_preparation,
             input_contracts: node.input_contracts.clone(),
             input_artifacts,
             output_contract: node.output_contract,
@@ -804,6 +849,11 @@ impl WorkflowLeaseV1 {
             || self.node_kind.expected_pool() != self.worker_pool
             || !profile_matches_kind(&profile, self.node_kind)
             || profile.validate().is_err()
+            || self.host_preparation.as_ref().is_some_and(|policy| {
+                self.node_kind != WorkflowNodeKindV1::HostPrepare
+                    || policy.validate().is_err()
+                    || self.network_class != policy.required_network_class()
+            })
             || !strictly_sorted_unique(&self.input_contracts)
             || !strictly_sorted_unique(&self.input_artifacts)
             || self
@@ -906,6 +956,7 @@ impl WorkflowLeaseV1 {
                 cache_class: self.cache_class,
                 timeout_ms: self.timeout_ms,
                 resources: &self.resources,
+                host_preparation: &self.host_preparation,
                 input_contracts: &self.input_contracts,
                 input_artifacts: &self.input_artifacts,
                 output_contract: self.output_contract,
@@ -1401,6 +1452,8 @@ pub enum WorkflowContractError {
     InvalidExecutionProfile,
     #[error("workflow resource envelope is outside policy bounds")]
     InvalidResourceEnvelope,
+    #[error("workflow host-preparation policy is invalid")]
+    InvalidHostPreparationPolicy,
     #[error("workflow lease is structurally invalid or has a mismatched digest")]
     InvalidLease,
     #[error("legacy workflow lease has no exact source identity and cannot start new work")]
@@ -1458,6 +1511,7 @@ mod tests {
             EvidenceDigest::sha256("preparation key"),
             node,
             profile,
+            None,
             vec![WorkflowLeaseInputV1 {
                 node_id: "source".parse().expect("source node ID"),
                 artifact_kind: WorkflowArtifactKindV1::SourceSnapshot,
@@ -1479,6 +1533,7 @@ mod tests {
             "the optional field preserves the canonical encoding of stored V1 leases"
         );
         assert!(!String::from_utf8_lossy(&canonical).contains("input_artifacts"));
+        assert!(!String::from_utf8_lossy(&canonical).contains("host_preparation"));
         let decoded = WorkflowLeaseV1::decode_canonical(&canonical).expect("decode legacy lease");
         assert_eq!(decoded, lease);
         assert!(matches!(
@@ -1489,5 +1544,54 @@ mod tests {
             decoded.required_input_artifacts(),
             Err(WorkflowContractError::MissingLeaseInputArtifacts)
         ));
+    }
+
+    #[test]
+    fn source_tree_host_preparation_cannot_be_leased_with_dependency_egress() {
+        let manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../../config/project-manifests/ralert.json"))
+                .expect("decode project manifest");
+        let node = manifest
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+            .expect("host prepare node");
+        let mut profile = manifest
+            .workflow
+            .profile(&node.profile_id)
+            .expect("host prepare profile")
+            .clone();
+        profile.network_class = WorkflowNetworkClassV1::DependencyEgress;
+        let source_attestation = EvidenceDigest::sha256("source attestation");
+        let lease = WorkflowLeaseV1::new(
+            Uuid::new_v4(),
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            manifest.project_id.clone(),
+            GitCommitId::from_str(&"a".repeat(40)).expect("source SHA"),
+            7,
+            source_attestation.clone(),
+            manifest
+                .workflow_policy_digest()
+                .expect("workflow policy digest"),
+            EvidenceDigest::sha256("preparation key"),
+            node,
+            &profile,
+            manifest.host_preparation.clone(),
+            vec![WorkflowLeaseInputV1 {
+                node_id: "source".parse().expect("source node ID"),
+                artifact_kind: WorkflowArtifactKindV1::SourceSnapshot,
+                output_digest: source_attestation,
+            }],
+            EvidenceDigest::sha256("expected input"),
+            "shared-worker".to_owned(),
+            "production-vps".to_owned(),
+            100,
+            1_100,
+        );
+
+        assert!(matches!(lease, Err(WorkflowContractError::InvalidLease)));
     }
 }
