@@ -32,6 +32,7 @@ use crate::{
         PREPARATION_STORE_ROOT, PreparationObjectKindV1, PreparationStoreError,
         PreparationStoreReaderV1,
     },
+    rootless_oci::RootlessOciRuntimePolicyV1,
     workflow_execution_grant::{
         VerifiedWorkflowExecutionGrantV1, WorkflowExecutionGrantError,
         WorkflowExecutionGrantVerificationKeyV1, WorkflowExecutionGrantVerifierV1,
@@ -77,6 +78,8 @@ pub struct WorkflowLauncherPolicyV1 {
     pub minimum_grant_key_epoch: u64,
     pub grant_verification_keys: Vec<WorkflowLauncherVerificationKeyConfigV1>,
     pub allowed_adapters: Vec<WorkflowAdapterIdV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootless_oci: Option<RootlessOciRuntimePolicyV1>,
     pub max_concurrent_jobs: u16,
     pub max_journal_records: u32,
 }
@@ -162,6 +165,14 @@ impl WorkflowLauncherPolicyV1 {
                         | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
                 )
             })
+            || self
+                .allowed_adapters
+                .contains(&WorkflowAdapterIdV1::WorkerOciReleaseBuildV1)
+                != self.rootless_oci.is_some()
+            || self
+                .rootless_oci
+                .as_ref()
+                .is_some_and(|policy| policy.validate(self.worker_uid, self.build_uid).is_err())
             || !(1..=MAX_CONCURRENT_JOBS).contains(&self.max_concurrent_jobs)
             || self.max_journal_records == 0
             || self.max_journal_records > MAX_JOURNAL_RECORDS
@@ -2352,6 +2363,7 @@ mod tests {
                 revoked_at_ms: None,
             }],
             allowed_adapters: vec![WorkflowAdapterIdV1::WorkerBareBinCiV1],
+            rootless_oci: None,
             max_concurrent_jobs: 1,
             max_journal_records: 64,
         };
@@ -2574,9 +2586,7 @@ mod tests {
         )
     }
 
-    #[test]
-    fn authorization_binds_the_exact_grant_input_and_fixed_sandbox() {
-        let fixture = fixture();
+    fn assert_rootless_oci_policy_coupling(fixture: &LauncherFixture) {
         let canonical_policy = fixture.policy.canonical_bytes().expect("canonical policy");
         assert_eq!(
             WorkflowLauncherPolicyV1::decode_canonical(&canonical_policy)
@@ -2591,6 +2601,36 @@ mod tests {
             duplicate_adapter_policy.validate(),
             Err(WorkflowLauncherError::InvalidPolicy)
         ));
+        let mut unproven_oci_policy = fixture.policy.clone();
+        unproven_oci_policy.allowed_adapters = vec![WorkflowAdapterIdV1::WorkerOciReleaseBuildV1];
+        assert!(matches!(
+            unproven_oci_policy.validate(),
+            Err(WorkflowLauncherError::InvalidPolicy)
+        ));
+        unproven_oci_policy.rootless_oci = Some(RootlessOciRuntimePolicyV1 {
+            schema_version: crate::rootless_oci::ROOTLESS_OCI_POLICY_SCHEMA_VERSION,
+            daemon_uid: fixture
+                .policy
+                .build_uid
+                .checked_add(1)
+                .expect("BuildKit UID"),
+            daemon_user: "rdashboard-buildkit".to_owned(),
+            buildkitd_sha256: EvidenceDigest::sha256("buildkitd"),
+            buildctl_sha256: EvidenceDigest::sha256("buildctl"),
+            rootlesskit_sha256: EvidenceDigest::sha256("rootlesskit"),
+            runtime_sha256: EvidenceDigest::sha256("runc"),
+            buildkit_config_sha256: EvidenceDigest::sha256("buildkitd.toml"),
+            max_parallelism: 1,
+        });
+        unproven_oci_policy
+            .validate()
+            .expect("OCI policy with an exact rootless runtime contract");
+    }
+
+    #[test]
+    fn authorization_binds_the_exact_grant_input_and_fixed_sandbox() {
+        let fixture = fixture();
+        assert_rootless_oci_policy_coupling(&fixture);
         let grant = fixture
             .signer
             .issue(&fixture.lease, 101, Uuid::from_u128(21))

@@ -1,0 +1,54 @@
+[Unit]
+Description=rdashboard bounded rootless OCI BuildKit
+After=local-fs.target
+RequiresMountsFor=/var/lib/rdashboard-buildkit
+
+[Service]
+Type=exec
+User=rdashboard-buildkit
+Group=rdashboard-build
+ExecStart=/usr/libexec/rdashboard/rootlesskit --net=host --propagation=rslave /usr/libexec/rdashboard/buildkitd --config /etc/rdashboard/buildkitd.toml
+RuntimeDirectory=rdashboard-buildkit
+RuntimeDirectoryMode=0750
+UMask=0007
+Environment=HOME=/nonexistent
+Environment=XDG_RUNTIME_DIR=/run/rdashboard-buildkit
+Environment=PATH=/usr/libexec/rdashboard:/usr/bin
+NoNewPrivileges=no
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=all
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rdashboard-buildkit /run/rdashboard-buildkit
+InaccessiblePaths=-/etc/rdashboard/credentials -/var/lib/rdashboard -/var/lib/rdashboard-build -/var/lib/rdashboard-executor -/var/lib/rdashboard-workflow-launcher -/run/rdashboard -/run/rdashboard-source-ingress -/run/rdashboard-source-delivery -/run/rdashboard-workflow -/run/rdashboard-workflow-launcher -/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman/podman.sock
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=user mnt pid ipc uts net cgroup
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+AmbientCapabilities=
+DevicePolicy=closed
+Delegate=yes
+TasksMax=1024
+LimitNOFILE=4096
+MemoryMax=4G
+MemorySwapMax=0
+CPUQuota=300%
+IOWeight=50
+TimeoutStartSec=15s
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

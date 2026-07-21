@@ -1,7 +1,7 @@
 # GitHub-independent delivery implementation review
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
-- Status: slices 1a-4e complete locally; COW/compiled state and separately authorized live gates remain pending
+- Status: slices 1a-4g complete locally; fixed OCI execution/handoff and separately authorized live gates remain pending
 - Review date: 2026-07-21
 - Baseline HEAD: `d20cf342dac204c51d30a32009eeb9c58097c8aa`
 - Local implementation commits: `64e64f2` (`Add persistent resource observer`), `581a432`
@@ -9,7 +9,9 @@
   (`Add authenticated workflow gateway`), `2973847` (`Add workflow dashboard projection`),
   `9598582` (`Add durable source delivery`), `1a076e8` (`Add durable GitHub source ingress`),
   `bfb887b` (`Add sealed workflow preparation store`), `a44b279` (`Add signed workflow launch boundary`),
-  `d306521` (`Add generic workflow worker`) and `3a3e426` (`Add sealed workflow input composition`)
+  `d306521` (`Add generic workflow worker`), `3a3e426` (`Add sealed workflow input composition`),
+  `ef952c9` (`Add fixed Cargo dependency preparation`) and `6962f58`
+  (`Add bounded compiled operation state`)
 - Slice 1a staged diff SHA-256: `ca9712b8517e0a7c42c6672d81abed2e8c74165337306dca0ded2bc5c36e6432`
 
 ## Reviewed scope
@@ -1205,3 +1207,88 @@ committed. It does not create the dedicated filesystem, install/start the launch
 run a shadow job, assemble an OCI candidate, mutate the VPS/i9, contact GitHub/providers, push or deploy.
 Rootless integration/OCI adapters, the authorized live systemd/filesystem/quota/concurrency proof and
 the first `rimg` shadow candidate remain pending.
+
+## Slice 4g: rootless OCI activation boundary
+
+### Reviewed scope
+
+Slice 4g closes the inactive host-readiness boundary required before a fixed OCI adapter may be
+implemented or enabled:
+
+- `RootlessOciRuntimePolicyV1` binds a distinct non-root daemon identity and exact SHA-256 values for
+  fixed root-owned `buildkitd`, `buildctl`, `rootlesskit`, `runc` and `buildkitd.toml` inputs;
+- launcher policy requires the OCI adapter and rootless contract to be present together. Existing
+  canonical policies remain byte-compatible when the optional contract is absent, and native CI/
+  release adapters do not depend on BuildKit availability;
+- launcher startup verifies trusted file parents, stable single-link regular files, exact modes and
+  digests; root-owned setuid mapping helpers; host-wide safe/non-overlapping subordinate-ID ranges;
+  required kernel/AppArmor user-namespace switches; exact state/runtime ownership; a dedicated bounded
+  filesystem; the 12 GiB root reserve; and a live mode-`0660` Unix socket;
+- every failure produces a stable reason code, concise summary and specific remediation suitable for
+  operator and LLM diagnosis;
+- the inactive service isolates the daemon in a private network namespace with AF_UNIX/AF_NETLINK only,
+  no credentials, application/source/workflow/executor state or Docker/containerd/Podman socket, and
+  explicit CPU/memory/task/swap limits;
+- the strict BuildKit configuration permits no insecure entitlement, enables only the rootless OCI
+  worker with process sandboxing, uses fixed `runc`, one concurrent vertex and bounded history/GC;
+- a dedicated 1.5-2.5 GiB, 50,000-500,000-inode filesystem is the hard BuildKit-state fence. The
+  configured 1.5 GB GC ceiling is supplemental and the root filesystem must retain at least 12 GiB
+  available to ordinary recovery processes.
+
+The final exact staged product/config/test diff contains nine paths, 1,540 insertions and four
+deletions. The only staged `src/lib.rs` change is the two-line rootless module export; unrelated
+notification/dashboard work remains outside the index and review.
+
+### Verification and finding disposition
+
+- Focused verification passed six rootless unit tests, the launcher-policy coupling regression, three
+  systemd worker contracts, formatting and Clippy across all targets/features with warnings denied.
+- Bare `bin/ci` passed after the review correction: 259 library tests with two credentialed
+  live-provider tests ignored by design, every binary and integration suite, schema checks, nine
+  browser contracts and the optimized release build. Release compilation took 4 minutes 58 seconds.
+- `git diff --cached --check` passed. The final exact staged binary diff SHA-256 is
+  `32ba824c16f4ff383aa47c1cec9e49265b1812b05afe7384f609752725ace6ca`.
+- `systemd-analyze verify` parsed the new unit and reported only the expected missing fixed
+  `/usr/libexec/rdashboard/rootlesskit` executable. No vendor bundle was installed merely to make the
+  development-host probe green.
+- The first exact review correctly identified that a low subordinate range belonging to an unrelated
+  account failed with the same `InsufficientSubordinateIds` category as a short BuildKit range. Its
+  suggestion to ignore unrelated low ranges was rejected because setuid mapping helpers must not expose
+  reserved host identities. The real diagnostic defect was fixed with a separate
+  `rootless_oci_subid_layout_unsafe` category/remediation; the host-wide floor/non-overlap rule is now
+  explicit in documentation and regression tests.
+- The review's useful P3 test observations were implemented for optional kernel switches, invalid
+  daemon identity, all supported mountinfo escapes and truncated/unknown escapes. Exact `0644` mode
+  remains a deliberate fixed-installation contract, the rootless TOCTOU helper remains locally stricter
+  than unrelated launcher reads, and `available_space` deliberately preserves recovery capacity usable
+  without root-reserved filesystem blocks.
+
+### Independent consultation
+
+Initial review of superseded hash `0998ac4e...`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 207 seconds;
+- state fingerprint: `9954fc89580175af7727184801fed72ce8aa86ff719f4e010655c083cd76a02c`;
+- brief SHA-256: `4531753c5487f9309278799784fe1f0527c9317b3e1f3a91f76afe3a5a5dfe4b`;
+- response SHA-256: `124e8180ad84767e3fc504be8f7c11313c000e9fab35ff36ab9cba8aefe41c7f`;
+- verdict: `NEEDS_FIX`, with the subordinate-ID diagnostic P2 described above.
+
+Final acceptance review of exact hash `32ba824c...`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 143 seconds;
+- state fingerprint: `5718cb450804bdc5b6a5fac62c06622993f577f2c153b813725947be08fe201e`;
+- brief SHA-256: `432d4555a168c35241e063086c85487f5188f0fbeb341566976ef1bd20d70225`;
+- response SHA-256: `e20a01b8e40530efb171cb1b3bf0706791dcae08b3492418c1cae00cec986d69`;
+- verdict: `SAFE`, no P0-P2 finding and `OPEN QUESTIONS: NONE` after rechecking the global
+  subordinate-ID threat, policy XOR coupling, TOCTOU/file integrity, systemd/BuildKit confinement,
+  resource bounds and error/remediation completeness.
+
+### Verdict
+
+Slice 4g is production-worthy as an inactive local activation boundary and may be committed. It does
+not install or start BuildKit, activate an OCI adapter/project, run an OCI build, prefetch/import base
+images, publish an OCI archive, mutate the VPS/i9, contact GitHub/providers, push or deploy. The next
+local dependency is the fixed OCI build/archive-result handoff; live systemd/filesystem/quota/
+concurrency proof and the first `rimg` shadow candidate remain separately authorized later gates.

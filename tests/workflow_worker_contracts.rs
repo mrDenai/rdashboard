@@ -74,3 +74,58 @@ fn dependency_fetcher_has_one_public_registry_route_and_no_worker_state() {
     assert!(!service.contains("ReadWritePaths="));
     assert!(!service.contains("PrivateNetwork=yes"));
 }
+
+#[test]
+fn rootless_buildkit_is_offline_separate_and_hard_bounded() {
+    let service = include_str!("../deploy/systemd/rdashboard-buildkit.service");
+    let lines = service.lines().collect::<Vec<_>>();
+    for required in [
+        "User=rdashboard-buildkit",
+        "Group=rdashboard-build",
+        "PrivateNetwork=yes",
+        "NoNewPrivileges=no",
+        "ProtectSystem=strict",
+        "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
+        "RestrictNamespaces=user mnt pid ipc uts net cgroup",
+        "CapabilityBoundingSet=CAP_SETUID CAP_SETGID",
+        "AmbientCapabilities=",
+        "DevicePolicy=closed",
+        "Delegate=yes",
+        "MemoryMax=4G",
+        "MemorySwapMax=0",
+        "CPUQuota=300%",
+    ] {
+        assert!(
+            lines.contains(&required),
+            "rootless BuildKit service must contain {required}"
+        );
+    }
+    assert!(service.contains("rootlesskit --net=host --propagation=rslave"));
+    assert!(service.contains("/etc/rdashboard/buildkitd.toml"));
+    assert!(service.contains("/var/lib/rdashboard-buildkit"));
+    assert!(service.contains("/etc/rdashboard/credentials"));
+    assert!(service.contains("/var/lib/rdashboard-build"));
+    assert!(service.contains("/run/docker.sock"));
+    assert!(service.contains("/run/containerd"));
+    assert!(service.contains("/run/podman/podman.sock"));
+    assert!(!service.contains("LoadCredential="));
+
+    let config = include_str!("../deploy/systemd/rdashboard-buildkitd.toml");
+    for required in [
+        "insecure-entitlements = []",
+        "rootless = true",
+        "noProcessSandbox = false",
+        "maxUsedSpace = \"1536MB\"",
+        "minFreeSpace = \"512MB\"",
+        "max-parallelism = 1",
+        "cniPoolSize = 0",
+    ] {
+        assert!(config.lines().any(|line| line.trim() == required));
+    }
+    assert!(config.contains("[worker.containerd]\n  enabled = false"));
+
+    let tmpfiles = include_str!("../deploy/systemd/rdashboard-tmpfiles.conf");
+    assert!(tmpfiles.lines().any(|line| {
+        line == "d /var/lib/rdashboard-buildkit 0700 rdashboard-buildkit rdashboard-build -"
+    }));
+}

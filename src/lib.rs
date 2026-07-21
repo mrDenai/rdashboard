@@ -78,6 +78,8 @@ pub mod rimg_adapter;
 pub mod root_adapter_runtime;
 #[cfg(unix)]
 pub mod root_fence_runtime;
+#[cfg(unix)]
+pub mod rootless_oci;
 pub mod scheduler;
 pub mod source;
 #[cfg(unix)]

@@ -103,7 +103,7 @@ Implementation progress:
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker remains step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
-| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4f locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation and bounded operation-owned compiled state. Rootless integration/OCI adapters plus the live systemd/dedicated-filesystem/quota/concurrency proof remain; no activation is implied. |
+| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4g locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state and the inactive rootless BuildKit activation boundary. The fixed OCI build/archive handoff and live systemd/dedicated-filesystem/quota/concurrency proof remain; no activation is implied. |
 | 5-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -433,6 +433,30 @@ Implementation ledger:
   question after rechecking descriptor bounds, crash cleanup, lease replay, VPS/i9 binding, systemd
   confinement and Cargo reuse. No mount/unit was installed or started and no VPS, i9, provider, push or
   deployment state was mutated.
+- Slice 4g adds an optional strict rootless-OCI contract to the root-owned launcher policy. The OCI
+  adapter and contract are an exact pair: neither can be installed without the other, while native CI
+  and release adapters remain valid with no OCI contract. Launcher startup then fail-closes on pinned
+  root-owned `buildkitd`, `buildctl`, `rootlesskit`, `runc` and configuration, a distinct daemon UID,
+  exact subordinate-ID/kernel policy, a dedicated bounded filesystem, the root recovery reserve and a
+  live owner/group/mode-bound Unix socket. Failures carry stable reason codes, concise summaries and
+  specific remediations.
+- The inactive BuildKit unit has a private systemd network namespace, AF_UNIX/AF_NETLINK only, no
+  credentials/source/controller/executor/container-runtime sockets, no insecure entitlements, process
+  sandboxing, one concurrent vertex, fixed runtime paths and bounded memory/CPU/tasks/GC. Its state must
+  be a separate 1.5-2.5 GiB and 50,000-500,000-inode filesystem while `/` retains at least 12 GiB
+  available to normal recovery processes. GC supplements rather than replaces that hard boundary.
+- The first exact review found that unsafe host-wide subordinate-ID layout and insufficient BuildKit
+  capacity shared a misleading error. The implementation retains the global >=65,536/non-overlap
+  requirement because setuid mapping helpers must not expose reserved host identities, but now reports
+  unsafe layout separately from a short BuildKit range. Documentation and regressions cover an
+  unrelated low range, overlap, optional kernel switches, invalid daemon identity and mountinfo escapes.
+- Final product hash `32ba824c16f4ff383aa47c1cec9e49265b1812b05afe7384f609752725ace6ca`
+  passed bare `bin/ci`: formatting, strict Clippy, 259 library tests with two credentialed live-
+  provider tests ignored, every binary/integration suite, schema checks, 9 browser contracts and the
+  optimized release build; release compilation took 4 minutes 58 seconds. A fresh exact-hash
+  `deepseek-free` review returned `ANSWERED`, `VERDICT: SAFE`, no P0-P2 finding and no open question.
+  No reviewed vendor binary exists on this development host, and no filesystem, unit, policy, build,
+  VPS/i9/provider, push or deployment state was installed, started or mutated.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

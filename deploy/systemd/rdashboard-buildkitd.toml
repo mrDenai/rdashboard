@@ -1,0 +1,42 @@
+root = "/var/lib/rdashboard-buildkit"
+insecure-entitlements = []
+
+[grpc]
+  address = ["unix:///run/rdashboard-buildkit/buildkitd.sock"]
+
+[cdi]
+  disabled = true
+
+[history]
+  maxAge = 86400
+  maxEntries = 32
+
+[worker.containerd]
+  enabled = false
+
+[worker.oci]
+  enabled = true
+  platforms = ["linux/amd64"]
+  snapshotter = "overlayfs"
+  rootless = true
+  noProcessSandbox = false
+  gc = true
+  reservedSpace = "256MB"
+  maxUsedSpace = "1536MB"
+  minFreeSpace = "512MB"
+  binary = "/usr/libexec/rdashboard/runc"
+  max-parallelism = 1
+  cniPoolSize = 0
+
+  [[worker.oci.gcpolicy]]
+    keepDuration = "24h"
+    filters = ["type==source.local", "type==exec.cachemount"]
+    reservedSpace = "256MB"
+    maxUsedSpace = "512MB"
+    minFreeSpace = "512MB"
+
+  [[worker.oci.gcpolicy]]
+    all = true
+    reservedSpace = "256MB"
+    maxUsedSpace = "1536MB"
+    minFreeSpace = "512MB"

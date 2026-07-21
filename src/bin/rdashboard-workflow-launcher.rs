@@ -17,7 +17,7 @@ use rdashboard::{
         WORKFLOW_LAUNCHER_SOCKET_PATH, WorkflowLauncherServerConfigV1, serve_launcher_until,
     },
 };
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 const MAX_CONNECTIONS: usize = 16;
@@ -31,6 +31,19 @@ async fn main() -> Result<(), DynError> {
     }
     init_tracing()?;
     let policy = WorkflowLauncherPolicyV1::load_root_owned()?;
+    if let Some(rootless_oci) = policy.rootless_oci.as_ref()
+        && let Err(preflight) =
+            rootless_oci.verify_installed(policy.worker_uid, policy.build_uid, policy.build_gid)
+    {
+        let failure = preflight.failure();
+        error!(
+            reason_code = failure.reason_code,
+            summary = %failure.summary,
+            remediation = failure.remediation,
+            "rootless OCI activation preflight failed"
+        );
+        return Err(preflight.into());
+    }
     let preparation_reader = installed_preparation_reader(policy.worker_uid)?;
     let now_ms = unix_time_ms()?;
     let journal = WorkflowLaunchJournalV1::open_root_owned(
