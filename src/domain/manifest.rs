@@ -45,7 +45,11 @@ impl ProjectManifestV1 {
             &self.health_checks,
             &self.data_volumes,
             &self.rollback,
-        )
+        )?;
+        if self.build.kind != BuildKind::Oci {
+            return Err(ManifestError::BuildWorkflowMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -90,6 +94,27 @@ impl ProjectManifestV2 {
         self.workflow
             .validate()
             .map_err(|_| ManifestError::WorkflowInvalid)?;
+        let release_adapter = self
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .and_then(|node| self.workflow.profile(&node.profile_id))
+            .map(|profile| profile.adapter_id)
+            .ok_or(ManifestError::BuildWorkflowMismatch)?;
+        let build_matches_release = matches!(
+            (self.build.kind, release_adapter),
+            (
+                BuildKind::Oci,
+                super::WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+            ) | (
+                BuildKind::Native,
+                super::WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+            )
+        );
+        if !build_matches_release {
+            return Err(ManifestError::BuildWorkflowMismatch);
+        }
         if let Some(policy) = self.host_preparation.as_ref() {
             let preparation_profile = self
                 .workflow
@@ -226,18 +251,40 @@ pub enum CiPolicy {
     BinCi,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildKind {
+    #[default]
+    Oci,
+    Native,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn build_kind_is_default(kind: &BuildKind) -> bool {
+    *kind == BuildKind::Oci
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuildPolicy {
     pub context: BuildContext,
-    pub dockerfile: RelativePolicyPath,
+    #[serde(default, skip_serializing_if = "build_kind_is_default")]
+    pub kind: BuildKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<RelativePolicyPath>,
 }
 
 impl BuildPolicy {
     fn validate(&self) -> Result<(), ManifestError> {
-        if std::path::Path::new(self.dockerfile.as_str()).file_name()
-            != Some(std::ffi::OsStr::new("Dockerfile"))
-        {
+        let valid = match (&self.kind, &self.dockerfile) {
+            (BuildKind::Oci, Some(dockerfile)) => {
+                std::path::Path::new(dockerfile.as_str()).file_name()
+                    == Some(std::ffi::OsStr::new("Dockerfile"))
+            }
+            (BuildKind::Native, None) => true,
+            (BuildKind::Oci, None) | (BuildKind::Native, Some(_)) => false,
+        };
+        if !valid {
             return Err(ManifestError::InvalidDockerfilePath);
         }
         Ok(())
@@ -502,6 +549,8 @@ pub enum ManifestError {
     UnsafeDataPath(String),
     #[error("Dockerfile path must end in Dockerfile")]
     InvalidDockerfilePath,
+    #[error("build kind does not match the workflow release adapter")]
+    BuildWorkflowMismatch,
     #[error("soak duration must be between 10 seconds and 24 hours")]
     InvalidSoakDuration,
     #[error("workflow backup node does not match backup-required data")]

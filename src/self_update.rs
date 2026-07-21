@@ -20,6 +20,7 @@ pub const SELF_RELEASE_SCHEMA_VERSION: u16 = 1;
 pub const SELF_UPDATE_POLICY_SCHEMA_VERSION: u16 = 1;
 pub const SELF_UPDATE_BOOTSTRAP_PROTOCOL_V1: u16 = 1;
 pub const SELF_RELEASE_DESCRIPTOR_FILE: &str = "release.jcs";
+pub const SELF_RELEASE_ARCHIVE_FILE: &str = "release.tar";
 
 #[cfg(test)]
 pub(crate) static SELF_UPDATE_FILESYSTEM_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -497,7 +498,7 @@ impl InstalledSelfUpdatePolicyV1 {
         Ok(policy)
     }
 
-    fn verifying_key(&self) -> Result<VerifyingKey, SelfUpdateError> {
+    pub(crate) fn verifying_key(&self) -> Result<VerifyingKey, SelfUpdateError> {
         let bytes = URL_SAFE_NO_PAD
             .decode(&self.public_key)
             .map_err(|_| SelfUpdateError::InvalidPolicy)?;
@@ -544,17 +545,22 @@ pub struct BuiltSelfReleaseV1 {
     pub archive_path: PathBuf,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn build_signed_self_release(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltSelfReleaseArchiveV1 {
+    pub manifest: SelfReleaseManifestV1,
+    pub archive_digest: EvidenceDigest,
+    pub archive_bytes: u64,
+    pub archive_path: PathBuf,
+}
+
+pub fn build_self_release_archive(
     output_root: &Path,
     output_stem: &str,
     manifest_input: SelfReleaseManifestInputV1,
     mut sources: Vec<SelfReleaseSourceV1>,
-    signature_input: SelfReleaseSignatureInputV1,
-    signing_key: &SigningKey,
     producer_uid: u32,
     reader_gid: u32,
-) -> Result<BuiltSelfReleaseV1, SelfUpdateError> {
+) -> Result<BuiltSelfReleaseArchiveV1, SelfUpdateError> {
     validate_directory(output_root, producer_uid, Some(reader_gid), 0o2750)?;
     if !valid_output_stem(output_stem) || sources.is_empty() || sources.len() > MAX_RELEASE_FILES {
         return Err(SelfUpdateError::InvalidBuildInput);
@@ -565,12 +571,9 @@ pub fn build_signed_self_release(
     }
 
     let archive_path = output_root.join(format!("{output_stem}.tar"));
-    let descriptor_path = output_root.join(format!("{output_stem}.jcs"));
-    if fs::symlink_metadata(&archive_path).is_ok() || fs::symlink_metadata(&descriptor_path).is_ok()
-    {
+    if fs::symlink_metadata(&archive_path).is_ok() {
         return Err(SelfUpdateError::OutputExists);
     }
-
     let result = (|| {
         let mut files = Vec::with_capacity(sources.len());
         let archive = create_private_output(&archive_path)?;
@@ -610,11 +613,51 @@ pub fn build_signed_self_release(
             MAX_RELEASE_BYTES,
         )?;
         let manifest = SelfReleaseManifestV1::new(manifest_input, files)?;
-        let descriptor = SignedSelfReleaseV1::issue(
+        Ok(BuiltSelfReleaseArchiveV1 {
             manifest,
+            archive_digest,
+            archive_bytes,
+            archive_path: archive_path.clone(),
+        })
+    })();
+    if result.is_err() {
+        remove_created_file(&archive_path);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_signed_self_release(
+    output_root: &Path,
+    output_stem: &str,
+    manifest_input: SelfReleaseManifestInputV1,
+    sources: Vec<SelfReleaseSourceV1>,
+    signature_input: SelfReleaseSignatureInputV1,
+    signing_key: &SigningKey,
+    producer_uid: u32,
+    reader_gid: u32,
+) -> Result<BuiltSelfReleaseV1, SelfUpdateError> {
+    let archive_path = output_root.join(format!("{output_stem}.tar"));
+    let descriptor_path = output_root.join(format!("{output_stem}.jcs"));
+    if fs::symlink_metadata(&archive_path).is_ok() || fs::symlink_metadata(&descriptor_path).is_ok()
+    {
+        return Err(SelfUpdateError::OutputExists);
+    }
+
+    let result = (|| {
+        let built = build_self_release_archive(
+            output_root,
+            output_stem,
+            manifest_input,
+            sources,
+            producer_uid,
+            reader_gid,
+        )?;
+        let descriptor = SignedSelfReleaseV1::issue(
+            built.manifest,
             SelfReleaseSignatureInputV1 {
-                archive_digest,
-                archive_bytes,
+                archive_digest: built.archive_digest,
+                archive_bytes: built.archive_bytes,
                 ..signature_input
             },
             signing_key,
@@ -636,6 +679,33 @@ pub fn build_signed_self_release(
         remove_created_file(&archive_path);
     }
     result
+}
+
+pub fn verify_signed_self_release_archive(
+    descriptor: &SignedSelfReleaseV1,
+    archive_path: &Path,
+    policy: &InstalledSelfUpdatePolicyV1,
+    now_ms: i64,
+    source_owner_uid: u32,
+    source_reader_gid: u32,
+) -> Result<(), SelfUpdateError> {
+    descriptor.verify(policy, now_ms)?;
+    let (archive_digest, archive_bytes) = hash_stable_file(
+        archive_path,
+        source_owner_uid,
+        Some(source_reader_gid),
+        0o440,
+        policy.maximum_release_bytes,
+    )?;
+    if archive_digest != descriptor.archive_digest || archive_bytes != descriptor.archive_bytes {
+        return Err(SelfUpdateError::ArchiveBinding);
+    }
+    validate_release_archive_contents(
+        archive_path,
+        descriptor,
+        source_owner_uid,
+        source_reader_gid,
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1595,6 +1665,85 @@ fn extract_release_archive(
             expected_file.mode,
             expected_file.bytes,
         )?;
+    }
+    if observed.len() != expected.len()
+        || total_bytes != descriptor.manifest.total_bytes
+        || expected.keys().any(|path| !observed.contains(*path))
+    {
+        return Err(SelfUpdateError::ArchiveBinding);
+    }
+    Ok(())
+}
+
+fn validate_release_archive_contents(
+    archive_path: &Path,
+    descriptor: &SignedSelfReleaseV1,
+    source_owner_uid: u32,
+    source_reader_gid: u32,
+) -> Result<(), SelfUpdateError> {
+    let archive = open_stable_shared_file(
+        archive_path,
+        source_owner_uid,
+        source_reader_gid,
+        0o440,
+        descriptor.archive_bytes,
+    )?;
+    let mut archive = tar::Archive::new(archive);
+    let expected = descriptor
+        .manifest
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed = BTreeSet::new();
+    let mut total_bytes = 0_u64;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.header().entry_type() != tar::EntryType::Regular {
+            return Err(SelfUpdateError::UnsafeArchive);
+        }
+        let path = entry
+            .path()?
+            .into_owned()
+            .into_os_string()
+            .into_string()
+            .map_err(|_| SelfUpdateError::UnsafeArchive)?;
+        if !valid_release_path(&path) || !observed.insert(path.clone()) {
+            return Err(SelfUpdateError::UnsafeArchive);
+        }
+        let expected_file = expected
+            .get(path.as_str())
+            .ok_or(SelfUpdateError::ArchiveBinding)?;
+        let size = entry.header().size()?;
+        let mode = entry.header().mode()? & 0o7777;
+        if size != expected_file.bytes || mode != expected_file.mode {
+            return Err(SelfUpdateError::ArchiveBinding);
+        }
+        total_bytes = total_bytes
+            .checked_add(size)
+            .ok_or(SelfUpdateError::UnsafeArchive)?;
+        if total_bytes > descriptor.manifest.total_bytes {
+            return Err(SelfUpdateError::UnsafeArchive);
+        }
+        let mut hasher = Sha256::new();
+        let mut copied = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let read = entry.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(u64::try_from(read).map_err(|_| SelfUpdateError::UnsafeArchive)?)
+                .ok_or(SelfUpdateError::UnsafeArchive)?;
+            if copied > size {
+                return Err(SelfUpdateError::UnsafeArchive);
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if copied != size || hex_sha256(hasher.finalize()) != expected_file.sha256.as_str() {
+            return Err(SelfUpdateError::ArchiveBinding);
+        }
     }
     if observed.len() != expected.len()
         || total_bytes != descriptor.manifest.total_bytes

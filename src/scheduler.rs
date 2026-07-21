@@ -1736,6 +1736,11 @@ fn load_ready_candidates(
                 "candidate manifest binding",
             ));
         }
+        if verification_feeds_native_release(&manifest, manifest_node)
+            && !worker.pools.contains(&WorkflowWorkerPoolV1::VpsRequired)
+        {
+            continue;
+        }
         by_project.insert(
             project_id.clone(),
             ReadyCandidateOwned {
@@ -1759,6 +1764,22 @@ fn load_ready_candidates(
         );
     }
     Ok(by_project.into_values().collect())
+}
+
+fn verification_feeds_native_release(
+    manifest: &ProjectManifestV2,
+    node: &crate::domain::WorkflowNodeV1,
+) -> bool {
+    node.kind == WorkflowNodeKindV1::Verification
+        && manifest.workflow.nodes.iter().any(|candidate| {
+            candidate.kind == WorkflowNodeKindV1::ReleaseBuild
+                && manifest
+                    .workflow
+                    .profile(&candidate.profile_id)
+                    .is_some_and(|profile| {
+                        profile.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+                    })
+        })
 }
 
 fn read_ready_candidate_rows(

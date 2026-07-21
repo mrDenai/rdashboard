@@ -1437,3 +1437,169 @@ Slice 4h is production-worthy as an inactive local OCI build/result boundary and
 does not install or start BuildKit, create the dedicated result filesystem, prepare base layouts, enable
 a project policy, run an OCI build, mutate VPS/i9/provider state, push or deploy. Project-specific sealed
 base preparation, final release-bundle sealing and the authorized live shadow proof remain pending.
+
+## Slice 12a inactive A/B self-update bootstrap foundation review
+
+### Scope and outcome
+
+This slice implements the local trust, staging and recovery foundation for a future `rdashboard`
+self-deploy without enabling it:
+
+- a canonical Ed25519-signed self-release descriptor binds the exact accepted source sequence/head,
+  source attestation, workflow policy, verification receipt, runtime contract, state schema, complete
+  path/mode/size/hash allowlist and deterministic tar archive;
+- root verifies the installed owner-private policy, stages only the exact immutable release tree and
+  uses relative content-addressed `current` and `last-known-good` pointers;
+- a bounded root-owned journal outside `control.sqlite` records backup, switch, start, health, commit,
+  rollback and reconciliation phases and observes the actual pointer before replaying an effect;
+- online SQLite backups are integrity-checked, hashed and operation-bound. Rollback stops services,
+  restores every verified database, switches the pointer only after all restores complete, starts the
+  prior dependency chain and proves prior health;
+- the persistent root bootstrap has fixed paths, identities, service order, health target and systemd
+  confinement. It cannot run repository-selected commands or consume an unsigned handoff.
+
+The unit and tmpfiles contract are intentionally inactive. Generic-worker self-release production,
+atomic producer publication, versioned executable-path migration, the root recovery CLI, retention,
+host failure/reboot drills and explicit production activation remain later gates.
+
+### Findings and dispositions
+
+- The first exact review found no P0/P1 and one accepted P2: an error after creating a rollback SQLite
+  temporary could leak the file. Restore now verifies while root-owned, delays `chown` until immediately
+  before rename and removes the path on error only if it still names the exact opened inode.
+- Self-review found a broader crash window the first review's post-fix explanation missed. Restore temp
+  names are now deterministic per journal operation and database; replay rejects substituted links or
+  foreign ownership, reconciles only plausible interrupted files and recreates with `create_new`.
+- A later review identified an orphan `.link-*` P3 if the supervisor died immediately before pointer
+  rename. Startup now validates and removes only root-owned `.link-<UUID>` symlinks to an exact
+  `releases/<digest>` target and fsyncs the root; rename errors also clean their own temporary.
+- Full parallel verification exposed delayed advisory-lock release from short-lived staging stores in
+  the sandbox. `SelfReleaseStoreV1` is now deliberately non-clonable, owns one lock file descriptor and
+  mutex directly and explicitly unlocks in `Drop`. The exact same-root second-open rejection remains a
+  regression contract. Filesystem fixtures serialize only their isolated advisory locks.
+- The review observation that the newest source sequence may skip intermediate commits is not a defect:
+  releases must support the actual installed state schema rather than require deployment of every git
+  commit. The producer slice still must bind and prove that compatibility before publication.
+
+### Verification
+
+- Final bare `bin/ci`: passed, exit code 0.
+- It covered formatting, strict Clippy, 285 library tests with two credentialed live-provider tests
+  ignored by design, every binary/integration/socket/scheduler/worker suite, both schema checks, nine
+  browser contracts and the optimized release build. The release phase took 4 minutes 33 seconds.
+- Focused self-update coverage passed 16 contracts for signatures/policy/archive substitution,
+  immutable staging, singleton locking, bounded journal history, success, unhealthy rollback, crash
+  replay, unknown pointer, exact backup/restore, interrupted backup/temp reconciliation and relative
+  pointer cleanup.
+- Final exact staged product/config/test diff SHA-256:
+  `51ca1b73147e563b5dffa7948c90c589c8ff114d06ba6298dc945490f0a66d74`.
+- No service was installed, enabled, started or restarted. No VPS, i9, provider, GitHub, push or deploy
+  state was mutated.
+
+### Independent consultation
+
+The final acceptance review checked the exact staged hash above after the earlier finding/fix rounds:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 95 seconds;
+- state fingerprint: `ac725f5e124b2af8ba60effd7708bc271dedd233d6b0d25f4081380f2ed98c99`;
+- brief SHA-256: `54597a8a09239e51f84cc382d7ce454dd16471b56d4f4af848abe6a19a623bf0`;
+- response SHA-256: `4f0be518ef85cb84605d7c752243873d38f106960a3cb29742d721cf303558e2`;
+- verdict: `SAFE`, no P0-P2 finding and no open question. It explicitly rechecked release-link
+  reconciliation, rename cleanup, non-clonable direct lock ownership, explicit unlock and singleton
+  rejection.
+
+### Verdict
+
+Slice 12a is production-worthy as an inactive local bootstrap foundation and may be committed. It does
+not make a pushed `rdashboard` commit self-deploy yet. The next local slice must let the ordinary generic
+worker build, sign and atomically publish the exact self-release only after successful required
+verification; executable-path migration and root recovery tooling remain subsequent activation gates.
+
+## Slice 12b verified generic-worker self-release producer review
+
+### Scope and outcome
+
+This slice closes the local producer and launcher boundary that slice 12a deliberately left open:
+
+- native release packaging is serial after the exact bare `bin/ci` verification receipt and shares the
+  same VPS-owned operation state, so it reuses existing `target/release` outputs instead of compiling a
+  second time;
+- optional i9 capacity cannot claim verification for a native release whose output must remain on the
+  required VPS. OCI projects retain parallel verification/build and optional-host verification;
+- the installed unprivileged client packages only the policy-listed ready binaries into a deterministic
+  tar and emits a typed unsigned result. It receives no signing key and cannot publish the final handoff;
+- the root launcher independently revalidates the request, archive, manifest, ownership, modes and
+  digests, signs with the separately delivered systemd credential and publishes exactly
+  `<source-sha>/{release.jcs,release.tar}` by one atomic directory rename;
+- startup, process failure, promotion failure, abort and explicit cleanup reconcile bounded partial
+  request/staging state. The bootstrap ignores only structurally valid hidden staging directories and
+  rejects flat, partial, linked, mutable or conflicting publications;
+- V2 project manifests distinguish native from OCI builds and require the build kind to match the exact
+  release adapter. Existing OCI JSON remains backward-compatible through the default build kind;
+- the signing credential is provided only by the optional self-release systemd drop-in, so unrelated
+  launcher installations do not fail because a self-release secret is absent.
+
+The implementation is still inactive. It does not install a `rdashboard` project manifest, enable
+`auto_deploy`, migrate installed executable paths to versioned release slots, provide the root recovery
+CLI, install a signing key, start a service or mutate GitHub/VPS/i9 state.
+
+### Self-review findings and dispositions
+
+- The first scheduler design allowed an optional build-only host to run native verification, which
+  would strand compiled outputs and force either a second VPS build or an unplanned artifact transfer.
+  Native verification now requires a worker that also owns the required VPS pool, and a regression test
+  proves verification and packaging share one state key and host while packaging waits for the receipt.
+- An unconditional `LoadCredential` in the base launcher unit would have made OCI-only and
+  verification-only installations depend on a self-release seed. The credential is now isolated in an
+  explicit drop-in installed only with the matching native policy.
+- A promotion failure after root had sealed the staging directory but before atomic rename could leave
+  cleanup expecting the earlier build-owned shape. Cleanup and startup reconciliation now distinguish
+  the exact build-owned, root-transition and root-sealed shapes, remove only regular single-link files
+  from those bounded directories and reject every unknown ownership/mode combination. A regression
+  covers both build-owned partial and root-sealed interrupted staging.
+- The pre-existing project manifest model required a Dockerfile even for the native adapter. V2 now has
+  a strict `native` build kind with no Dockerfile and rejects adapter/build mismatches; V1 remains
+  OCI-only and both generated schemas were refreshed and checked.
+
+### Verification
+
+- Final bare `bin/ci`: passed, exit code 0.
+- It covered formatting, strict Clippy, all library/binary/integration/socket/scheduler/worker tests,
+  both generated project-manifest schema checks, nine browser contracts and the optimized release
+  build. The final post-correction release phase took 4 minutes 12 seconds.
+- The native scheduler regression passed among 17 scheduler contracts, and launcher authorization
+  proves the installed native client receives only a read-only operation state, its exact request and a
+  lease-owned output directory.
+- No external service, credential, host policy, push or deployment was changed.
+- Final staged product/config/test diff SHA-256:
+  `d3f183e459050eb6ec338096d66e40baeafed19fad12ef5a1e7691fcc326c08b`.
+
+### Independent consultation
+
+The final review inspected the exact product/config/test hash above after the recovery correction:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 140 seconds;
+- state fingerprint: `539f1325109bf2c1f37566cd40051e1751b74f66842f31c2c0386df4d9dd7478`;
+- brief SHA-256: `ddebc2d228b7b3828a6ac2983639ad5568a2a5bcf758a4525b9e246b5c55fad2`;
+- response SHA-256: `848d4e73f31d99cb325c2e69066400031dc203ec28dee65a2ae574c8f188a758`;
+- verdict: `SAFE`, no P0-P2 finding and no open question.
+
+Its two P3 defense-in-depth observations do not require product changes:
+
+- build-owned staging cleanup deliberately permits regular single-link children regardless of file
+  owner because a crash may occur after root has already transferred individual output files but before
+  the directory ownership transition. The exact directory name, owner, group and mode are validated;
+  special entries fail closed, and unlinking an entry inside that bounded root-created directory grants
+  no capability or data access;
+- the bootstrap deliberately performs only a structural check on hidden launcher staging because it
+  neither opens nor removes those entries. The root launcher is the sole cleanup authority and performs
+  the stronger ownership/mode validation; a malformed hidden entry cannot be consumed as a release.
+
+### Verdict
+
+Slice 12b is production-worthy as an inactive verified producer/root-publication boundary and may be
+committed. Executable-path migration, recovery tooling, inactive project/policy onboarding and host
+drills remain the next local/activation slices; this result alone does not make a pushed `rdashboard`
+commit deploy itself.

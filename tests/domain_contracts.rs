@@ -4,13 +4,14 @@ use ed25519_dalek::SigningKey;
 use proptest::prelude::*;
 use rdashboard::{
     domain::{
-        AbsolutePolicyPath, BlockingReason, BuildContext, BuildPolicy, CanonicalBranch, CiPolicy,
-        DataClass, DataVolumePolicy, DiskReservation, DiskReservationError, EvidenceDigest, GIB,
-        GitCommitId, HealthCheckPolicy, HttpEndpoint, ManifestError, MigrationEntrypoint,
-        MigrationPolicy, NotificationPolicy, NotificationRoute, OperationPhase, OperationResult,
-        OperationState, OperationStateError, PROJECT_MANIFEST_SCHEMA_VERSION, ProjectId,
-        ProjectManifestV1, Redactor, RelativePolicyPath, ReleaseClass, RemoteUrl, Retryability,
-        RollbackPolicy, SourcePolicy, StructuredError, WriteFencePolicy,
+        AbsolutePolicyPath, BlockingReason, BuildContext, BuildKind, BuildPolicy, CanonicalBranch,
+        CiPolicy, DataClass, DataVolumePolicy, DiskReservation, DiskReservationError,
+        EvidenceDigest, GIB, GitCommitId, HealthCheckPolicy, HttpEndpoint, ManifestError,
+        MigrationEntrypoint, MigrationPolicy, NotificationPolicy, NotificationRoute,
+        OperationPhase, OperationResult, OperationState, OperationStateError,
+        PROJECT_MANIFEST_SCHEMA_VERSION, ProjectId, ProjectManifestV1, Redactor,
+        RelativePolicyPath, ReleaseClass, RemoteUrl, Retryability, RollbackPolicy, SourcePolicy,
+        StructuredError, WriteFencePolicy,
     },
     policy::{PolicyBundleV1, PolicyError, PolicyVerifier, SignedPolicyBundleV1},
     protocol::{
@@ -34,8 +35,11 @@ fn valid_manifest() -> ProjectManifestV1 {
         ci: CiPolicy::BinCi,
         build: BuildPolicy {
             context: BuildContext::RepositoryRoot,
-            dockerfile: RelativePolicyPath::from_str("Dockerfile")
-                .unwrap_or_else(|error| panic!("fixture: {error}")),
+            kind: BuildKind::Oci,
+            dockerfile: Some(
+                RelativePolicyPath::from_str("Dockerfile")
+                    .unwrap_or_else(|error| panic!("fixture: {error}")),
+            ),
         },
         health_checks: vec![HealthCheckPolicy {
             name: "readiness".to_owned(),
@@ -111,8 +115,10 @@ fn manifest_rejects_traversal_embedded_credentials_and_duplicates() {
     ));
 
     let mut manifest = valid_manifest();
-    manifest.build.dockerfile = RelativePolicyPath::from_str("NotDockerfile")
-        .unwrap_or_else(|error| panic!("Dockerfile fixture: {error}"));
+    manifest.build.dockerfile = Some(
+        RelativePolicyPath::from_str("NotDockerfile")
+            .unwrap_or_else(|error| panic!("Dockerfile fixture: {error}")),
+    );
     assert_eq!(
         manifest.validate(),
         Err(ManifestError::InvalidDockerfilePath)

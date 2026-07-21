@@ -104,7 +104,8 @@ Implementation progress:
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker remains step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
 | 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4h locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state, the inactive rootless BuildKit activation boundary and a verified typed OCI build-result handoff. Live systemd/dedicated-filesystem/quota/concurrency proof and the first project-specific sealed-base preparation remain; no activation is implied. |
-| 5-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
+| 5-11 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
+| 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Executable-path migration, root recovery CLI, installed project/policy integration, failure drills and explicit activation remain. |
 
 Implementation ledger:
 
@@ -495,6 +496,27 @@ Implementation ledger:
   accept a post-process locked re-scan, and deliberately fail closed on unexpected special filesystem
   entries. No BuildKit service, mount, launcher policy, OCI build, VPS/i9/provider, push or deployment
   state was activated or mutated.
+- Slice 12a adds the inactive self-update trust and recovery foundation. A signed canonical descriptor
+  binds the exact accepted source, workflow and verification evidence, runtime contract, state schema,
+  complete file allowlist and deterministic archive. Root stages only the verified immutable tree,
+  journals every backup/switch/start/health/commit/rollback boundary outside `control.sqlite`, and
+  replays the observed pointer after a crash instead of repeating an assumed effect.
+- The persistent bootstrap owns fixed service ordering, online integrity-checked SQLite backups,
+  relative exact `current`/`last-known-good` pointers, candidate health proof and database-first rollback.
+  An unknown pointer or unhealthy prior release becomes `needs_reconcile`. The unit remains inactive;
+  generic-worker handoff production, versioned executable paths, the root recovery CLI and host failure
+  drills remain required before any production authorization.
+- Slice 12b closes the generic-worker producer boundary without adding another build. Native release
+  packaging now depends on the exact verification receipt and reuses the same VPS-owned operation
+  `target`; the scheduler will not strand required outputs on optional i9 capacity. The fixed client
+  packages only policy-listed release binaries and has neither signing material nor handoff publication
+  authority. Root revalidates the unsigned archive, signs it through a separately installed systemd
+  credential and atomically renames an exact two-file SHA directory for the persistent bootstrap.
+- Native and OCI build kinds are now explicit in V2 manifests and must match the release adapter;
+  existing OCI manifests remain canonical-compatible. The self-release launcher credential moved to an
+  optional drop-in so verification-only and OCI-only installations do not acquire a new startup
+  prerequisite. All local producer code remains inactive until its manifest, launcher policy, initial
+  release slots and host drills are installed and authorized together.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

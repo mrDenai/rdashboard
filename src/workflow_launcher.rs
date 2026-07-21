@@ -39,6 +39,10 @@ use crate::{
         ROOTLESS_OCI_BUILD_SOCKET_PATH, RootlessOciBuildError, RootlessOciBuildPolicyV1,
         RootlessOciBuildRequestV1, RootlessOciBuildResultV1, RootlessOciResultStoreV1,
     },
+    self_release_build::{
+        SELF_RELEASE_BUILD_EXECUTABLE, SELF_RELEASE_BUILD_REQUEST_PATH, SelfReleaseBuildError,
+        SelfReleaseBuildPolicyV1, SelfReleaseBuildRequestV1, SelfReleaseHandoffStoreV1,
+    },
     workflow_execution_grant::{
         VerifiedWorkflowExecutionGrantV1, WorkflowExecutionGrantError,
         WorkflowExecutionGrantVerificationKeyV1, WorkflowExecutionGrantVerifierV1,
@@ -88,6 +92,10 @@ pub struct WorkflowLauncherPolicyV1 {
     pub rootless_oci: Option<RootlessOciRuntimePolicyV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rootless_oci_builds: Vec<RootlessOciBuildPolicyV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_release_build: Option<SelfReleaseBuildPolicyV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_release_reader_gid: Option<u32>,
     pub max_concurrent_jobs: u16,
     pub max_journal_records: u32,
 }
@@ -160,7 +168,7 @@ impl WorkflowLauncherPolicyV1 {
             || !valid_workflow_identity(&self.host_id)
             || !(1..=MAX_KEYS).contains(&self.grant_verification_keys.len())
             || self.allowed_adapters.is_empty()
-            || self.allowed_adapters.len() > 2
+            || self.allowed_adapters.len() > 3
             || !self
                 .allowed_adapters
                 .windows(2)
@@ -169,6 +177,7 @@ impl WorkflowLauncherPolicyV1 {
                 !matches!(
                     adapter,
                     WorkflowAdapterIdV1::WorkerBareBinCiV1
+                        | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
                         | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
                 )
             })
@@ -193,6 +202,21 @@ impl WorkflowLauncherPolicyV1 {
                 .rootless_oci
                 .as_ref()
                 .is_some_and(|policy| policy.validate(self.worker_uid, self.build_uid).is_err())
+            || self
+                .allowed_adapters
+                .contains(&WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1)
+                != self.self_release_build.is_some()
+            || self
+                .allowed_adapters
+                .contains(&WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1)
+                != self.self_release_reader_gid.is_some()
+            || self
+                .self_release_build
+                .as_ref()
+                .is_some_and(|policy| policy.validate().is_err())
+            || self
+                .self_release_reader_gid
+                .is_some_and(|gid| gid == 0 || gid == u32::MAX || gid == self.build_gid)
             || !(1..=MAX_CONCURRENT_JOBS).contains(&self.max_concurrent_jobs)
             || self.max_journal_records == 0
             || self.max_journal_records > MAX_JOURNAL_RECORDS
@@ -213,6 +237,20 @@ impl WorkflowLauncherPolicyV1 {
             .ok()
             .map(|index| &self.rootless_oci_builds[index])
             .ok_or(WorkflowLauncherError::UnsupportedLease)
+    }
+
+    fn self_release_build(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<&SelfReleaseBuildPolicyV1, WorkflowLauncherError> {
+        let policy = self
+            .self_release_build
+            .as_ref()
+            .ok_or(WorkflowLauncherError::UnsupportedLease)?;
+        if &policy.project_id != project_id {
+            return Err(WorkflowLauncherError::UnsupportedLease);
+        }
+        Ok(policy)
     }
 
     fn grant_verifier(&self) -> Result<WorkflowExecutionGrantVerifierV1, WorkflowLauncherError> {
@@ -250,6 +288,7 @@ pub struct AuthorizedWorkflowLaunchV1 {
     pub dependency_snapshot_path: PathBuf,
     pub operation_state_path: Option<PathBuf>,
     pub oci_build_request: Option<RootlessOciBuildRequestV1>,
+    pub self_release_build_request: Option<SelfReleaseBuildRequestV1>,
     pub executable: &'static str,
     pub arguments: Vec<String>,
 }
@@ -297,6 +336,15 @@ impl AuthorizedWorkflowLaunchV1 {
         } else {
             None
         };
+        let self_release_build_request =
+            if lease.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 {
+                Some(SelfReleaseBuildRequestV1::from_policy(
+                    lease,
+                    policy.self_release_build(&lease.project_id)?,
+                )?)
+            } else {
+                None
+            };
         let arguments = transient_unit_arguments(
             policy,
             lease,
@@ -305,6 +353,7 @@ impl AuthorizedWorkflowLaunchV1 {
             &dependency_snapshot_path,
             operation_state_path.as_deref(),
             oci_build_request.as_ref(),
+            self_release_build_request.as_ref(),
         )?;
         Ok(Self {
             lease: lease.clone(),
@@ -315,6 +364,7 @@ impl AuthorizedWorkflowLaunchV1 {
             dependency_snapshot_path,
             operation_state_path,
             oci_build_request,
+            self_release_build_request,
             executable: SYSTEMD_RUN_EXECUTABLE,
             arguments,
         })
@@ -1374,13 +1424,20 @@ pub trait WorkflowLaunchRuntimeV1: Send + Sync {
 pub struct SystemdWorkflowLaunchRuntimeV1 {
     oci_results: Option<Arc<RootlessOciResultStoreV1>>,
     active_oci_results: Arc<Mutex<BTreeMap<String, RootlessOciBuildRequestV1>>>,
+    self_releases: Option<Arc<SelfReleaseHandoffStoreV1>>,
+    active_self_releases: Arc<Mutex<BTreeMap<String, SelfReleaseBuildRequestV1>>>,
 }
 
 impl SystemdWorkflowLaunchRuntimeV1 {
-    pub fn new(oci_results: Option<Arc<RootlessOciResultStoreV1>>) -> Self {
+    pub fn new(
+        oci_results: Option<Arc<RootlessOciResultStoreV1>>,
+        self_releases: Option<Arc<SelfReleaseHandoffStoreV1>>,
+    ) -> Self {
         Self {
             oci_results,
             active_oci_results: Arc::new(Mutex::new(BTreeMap::new())),
+            self_releases,
+            active_self_releases: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1493,12 +1550,126 @@ impl SystemdWorkflowLaunchRuntimeV1 {
             None => Ok(()),
         }
     }
+
+    fn prepare_self_release(
+        &self,
+        unit_name: &str,
+        request: &SelfReleaseBuildRequestV1,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        let store = self
+            .self_releases
+            .as_ref()
+            .ok_or(WorkflowLaunchRuntimeError::MissingSelfReleaseStore)?;
+        {
+            let mut active = self
+                .active_self_releases
+                .lock()
+                .map_err(|_| WorkflowLaunchRuntimeError::SelfReleaseLifecycleLockPoisoned)?;
+            if active.contains_key(unit_name) {
+                return Err(WorkflowLaunchRuntimeError::SelfReleaseLifecycleConflict);
+            }
+            active.insert(unit_name.to_owned(), request.clone());
+        }
+        if let Err(error) = store.prepare(request) {
+            let _ = self.clear_active_self_release(unit_name, request);
+            return Err(error.into());
+        }
+        if let Err(error) = self.validate_active_self_release(unit_name, request, false) {
+            let _ = store.discard(request);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn promote_self_release(
+        &self,
+        unit_name: &str,
+        request: &SelfReleaseBuildRequestV1,
+    ) -> Result<EvidenceDigest, WorkflowLaunchRuntimeError> {
+        self.validate_active_self_release(unit_name, request, false)?;
+        let published = self
+            .self_releases
+            .as_ref()
+            .ok_or(WorkflowLaunchRuntimeError::MissingSelfReleaseStore)?
+            .promote(
+                request,
+                crate::unix_time_ms().map_err(WorkflowLaunchRuntimeError::Clock)?,
+            )?;
+        self.clear_active_self_release(unit_name, request)?;
+        Ok(published.output_digest)
+    }
+
+    fn discard_self_release(
+        &self,
+        unit_name: &str,
+        request: &SelfReleaseBuildRequestV1,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        self.validate_active_self_release(unit_name, request, true)?;
+        self.self_releases
+            .as_ref()
+            .ok_or(WorkflowLaunchRuntimeError::MissingSelfReleaseStore)?
+            .discard(request)?;
+        self.clear_active_self_release(unit_name, request)
+    }
+
+    fn discard_self_release_for_unit(
+        &self,
+        unit_name: &str,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        let request = self
+            .active_self_releases
+            .lock()
+            .map_err(|_| WorkflowLaunchRuntimeError::SelfReleaseLifecycleLockPoisoned)?
+            .get(unit_name)
+            .cloned();
+        if let Some(request) = request {
+            self.discard_self_release(unit_name, &request)?;
+        }
+        Ok(())
+    }
+
+    fn validate_active_self_release(
+        &self,
+        unit_name: &str,
+        request: &SelfReleaseBuildRequestV1,
+        allow_missing: bool,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        let active = self
+            .active_self_releases
+            .lock()
+            .map_err(|_| WorkflowLaunchRuntimeError::SelfReleaseLifecycleLockPoisoned)?;
+        match active.get(unit_name) {
+            Some(active_request) if active_request == request => Ok(()),
+            None if allow_missing => Ok(()),
+            Some(_) | None => Err(WorkflowLaunchRuntimeError::SelfReleaseLifecycleConflict),
+        }
+    }
+
+    fn clear_active_self_release(
+        &self,
+        unit_name: &str,
+        request: &SelfReleaseBuildRequestV1,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        let mut active = self
+            .active_self_releases
+            .lock()
+            .map_err(|_| WorkflowLaunchRuntimeError::SelfReleaseLifecycleLockPoisoned)?;
+        match active.get(unit_name) {
+            Some(active_request) if active_request == request => {
+                active.remove(unit_name);
+                Ok(())
+            }
+            Some(_) => Err(WorkflowLaunchRuntimeError::SelfReleaseLifecycleConflict),
+            None => Ok(()),
+        }
+    }
 }
 
 struct SystemdWorkflowLaunchProcessV1 {
     child: Child,
     unit_name: String,
     oci_request: Option<RootlessOciBuildRequestV1>,
+    self_release_request: Option<SelfReleaseBuildRequestV1>,
     runtime: SystemdWorkflowLaunchRuntimeV1,
 }
 
@@ -1519,28 +1690,44 @@ impl WorkflowLaunchProcessV1 for SystemdWorkflowLaunchProcessV1 {
             WorkflowLaunchRuntimeError::Wait(error)
         })?;
         let mut exit = process_exit(status);
-        if exit.exit_code == Some(0)
-            && exit.signal.is_none()
-            && let Some(request) = &self.oci_request
-        {
-            match self.runtime.promote_oci_result(&self.unit_name, request) {
-                Ok(result) => exit.output_digest = Some(result.result_digest),
-                Err(error) => {
-                    exit.exit_code = Some(1);
-                    let failure_digest = error.evidence_digest();
-                    tracing::error!(
-                        reason_code = "rootless_oci_result_promotion_failed",
-                        unit_name = %self.unit_name,
-                        evidence_digest = %failure_digest,
-                        summary = %error,
-                        "rootless OCI result promotion failed"
-                    );
-                    exit.failure_digest = Some(failure_digest);
-                    self.discard_oci_result_with_log(request);
+        let process_succeeded = exit.exit_code == Some(0) && exit.signal.is_none();
+        if process_succeeded {
+            if let Some(request) = &self.oci_request {
+                match self.runtime.promote_oci_result(&self.unit_name, request) {
+                    Ok(result) => exit.output_digest = Some(result.result_digest),
+                    Err(error) => {
+                        mark_result_promotion_failed(
+                            &mut exit,
+                            &self.unit_name,
+                            "rootless_oci_result_promotion_failed",
+                            "rootless OCI result promotion failed",
+                            &error,
+                        );
+                        self.discard_oci_result_with_log(request);
+                    }
+                }
+            } else if let Some(request) = &self.self_release_request {
+                match self.runtime.promote_self_release(&self.unit_name, request) {
+                    Ok(output_digest) => exit.output_digest = Some(output_digest),
+                    Err(error) => {
+                        mark_result_promotion_failed(
+                            &mut exit,
+                            &self.unit_name,
+                            "self_release_promotion_failed",
+                            "signed self release promotion failed",
+                            &error,
+                        );
+                        self.discard_self_release_with_log(request);
+                    }
                 }
             }
-        } else if let Some(request) = &self.oci_request {
-            self.discard_oci_result_with_log(request);
+        } else {
+            if let Some(request) = &self.oci_request {
+                self.discard_oci_result_with_log(request);
+            }
+            if let Some(request) = &self.self_release_request {
+                self.discard_self_release_with_log(request);
+            }
         }
         Ok(exit)
     }
@@ -1562,6 +1749,10 @@ impl WorkflowLaunchProcessV1 for SystemdWorkflowLaunchProcessV1 {
         if let Some(request) = &self.oci_request {
             self.runtime.discard_oci_result(&self.unit_name, request)?;
         }
+        if let Some(request) = &self.self_release_request {
+            self.runtime
+                .discard_self_release(&self.unit_name, request)?;
+        }
         Ok(())
     }
 }
@@ -1578,6 +1769,37 @@ impl SystemdWorkflowLaunchProcessV1 {
             );
         }
     }
+
+    fn discard_self_release_with_log(&self, request: &SelfReleaseBuildRequestV1) {
+        if let Err(error) = self.runtime.discard_self_release(&self.unit_name, request) {
+            tracing::error!(
+                reason_code = "self_release_cleanup_failed",
+                unit_name = %self.unit_name,
+                evidence_digest = %error.evidence_digest(),
+                summary = %error,
+                "self release staging cleanup failed"
+            );
+        }
+    }
+}
+
+fn mark_result_promotion_failed(
+    exit: &mut WorkflowProcessExitV1,
+    unit_name: &str,
+    reason_code: &'static str,
+    message: &'static str,
+    error: &WorkflowLaunchRuntimeError,
+) {
+    exit.exit_code = Some(1);
+    let failure_digest = error.evidence_digest();
+    tracing::error!(
+        reason_code,
+        unit_name,
+        evidence_digest = %failure_digest,
+        summary = %error,
+        "{message}"
+    );
+    exit.failure_digest = Some(failure_digest);
 }
 
 impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
@@ -1594,6 +1816,18 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
                 evidence_digest = %error.evidence_digest(),
                 summary = %error,
                 "rootless OCI result preparation failed"
+            );
+            return Err(error);
+        }
+        if let Some(request) = &launch.self_release_build_request
+            && let Err(error) = self.prepare_self_release(&launch.unit_name, request)
+        {
+            tracing::error!(
+                reason_code = "self_release_prepare_failed",
+                unit_name = %launch.unit_name,
+                evidence_digest = %error.evidence_digest(),
+                summary = %error,
+                "self release staging preparation failed"
             );
             return Err(error);
         }
@@ -1617,6 +1851,18 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
                         "rootless OCI result cleanup after spawn failure failed"
                     );
                 }
+                if let Some(request) = &launch.self_release_build_request
+                    && let Err(cleanup_error) =
+                        self.discard_self_release(&launch.unit_name, request)
+                {
+                    tracing::error!(
+                        reason_code = "self_release_cleanup_failed",
+                        unit_name = %launch.unit_name,
+                        evidence_digest = %cleanup_error.evidence_digest(),
+                        summary = %cleanup_error,
+                        "self release staging cleanup after spawn failure failed"
+                    );
+                }
                 return Err(WorkflowLaunchRuntimeError::Spawn(error));
             }
         };
@@ -1624,6 +1870,7 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
             child,
             unit_name: launch.unit_name.clone(),
             oci_request: launch.oci_build_request.clone(),
+            self_release_request: launch.self_release_build_request.clone(),
             runtime: self.clone(),
         }))
     }
@@ -1640,6 +1887,7 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
             let load_state = systemd_property(unit_name, "LoadState")?;
             if load_state == "not-found" {
                 self.discard_oci_result_for_unit(unit_name)?;
+                self.discard_self_release_for_unit(unit_name)?;
                 return Ok(false);
             }
             return Err(WorkflowLaunchRuntimeError::StopRejected);
@@ -1649,6 +1897,7 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
             return Err(WorkflowLaunchRuntimeError::UnitStillActive);
         }
         self.discard_oci_result_for_unit(unit_name)?;
+        self.discard_self_release_for_unit(unit_name)?;
         let reset = Command::new("/usr/bin/systemctl")
             .args(["reset-failed", "--", unit_name])
             .stdin(Stdio::null())
@@ -1874,12 +2123,17 @@ fn validate_launcher_lease(
             WorkflowWorkerPoolV1::VpsRequired | WorkflowWorkerPoolV1::BuildCompute
         )
         || lease.network_class != WorkflowNetworkClassV1::Offline
-        || (lease.adapter_id == WorkflowAdapterIdV1::WorkerBareBinCiV1)
-            != lease.operation_state.is_some()
+        || matches!(
+            lease.adapter_id,
+            WorkflowAdapterIdV1::WorkerBareBinCiV1
+                | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+        ) != lease.operation_state.is_some()
         || !policy.allowed_adapters.contains(&lease.adapter_id)
         || !matches!(
             lease.adapter_id,
-            WorkflowAdapterIdV1::WorkerBareBinCiV1 | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+            WorkflowAdapterIdV1::WorkerBareBinCiV1
+                | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+                | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
         )
     {
         return Err(WorkflowLauncherError::UnsupportedLease);
@@ -1918,10 +2172,23 @@ fn required_prepared_run_key(
     lease: &WorkflowLeaseV1,
 ) -> Result<&EvidenceDigest, WorkflowLauncherError> {
     let inputs = lease.required_input_artifacts()?;
-    let [input] = inputs else {
+    let mut prepared = inputs
+        .iter()
+        .filter(|input| input.artifact_kind == WorkflowArtifactKindV1::PreparedRun);
+    let Some(input) = prepared.next() else {
         return Err(WorkflowLauncherError::UnsupportedLease);
     };
-    if input.artifact_kind != WorkflowArtifactKindV1::PreparedRun {
+    let valid_input_shape = if lease.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 {
+        inputs.len() == 2
+            && inputs
+                .iter()
+                .filter(|input| input.artifact_kind == WorkflowArtifactKindV1::VerificationReceipt)
+                .count()
+                == 1
+    } else {
+        inputs.len() == 1
+    };
+    if prepared.next().is_some() || !valid_input_shape {
         return Err(WorkflowLauncherError::UnsupportedLease);
     }
     Ok(&input.output_digest)
@@ -2207,6 +2474,16 @@ pub enum WorkflowLaunchRuntimeError {
     OciResultLifecycleLockPoisoned,
     #[error("rootless OCI result lifecycle failed: {0}")]
     RootlessOciBuild(#[from] RootlessOciBuildError),
+    #[error("self-release handoff store is missing for a native release launch")]
+    MissingSelfReleaseStore,
+    #[error("self-release result lifecycle conflicts with its workflow unit")]
+    SelfReleaseLifecycleConflict,
+    #[error("self-release result lifecycle lock is poisoned")]
+    SelfReleaseLifecycleLockPoisoned,
+    #[error("self-release result lifecycle failed: {0}")]
+    SelfReleaseBuild(#[from] SelfReleaseBuildError),
+    #[error("the host clock failed during self-release publication: {0}")]
+    Clock(std::time::SystemTimeError),
 }
 
 impl WorkflowLaunchRuntimeError {
@@ -2239,6 +2516,13 @@ impl WorkflowLaunchRuntimeError {
                 "rootless-oci-result-lifecycle-lock-poisoned".to_owned()
             }
             Self::RootlessOciBuild(error) => return error.evidence_digest(),
+            Self::MissingSelfReleaseStore => "self-release-store-missing".to_owned(),
+            Self::SelfReleaseLifecycleConflict => "self-release-lifecycle-conflict".to_owned(),
+            Self::SelfReleaseLifecycleLockPoisoned => {
+                "self-release-lifecycle-lock-poisoned".to_owned()
+            }
+            Self::SelfReleaseBuild(error) => return error.evidence_digest(),
+            Self::Clock(_) => "self-release-clock-invalid".to_owned(),
         };
         EvidenceDigest::sha256(stable)
     }
@@ -2260,7 +2544,7 @@ pub enum WorkflowLaunchSupervisorError {
     Runtime(#[from] WorkflowLaunchRuntimeError),
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn transient_unit_arguments(
     policy: &WorkflowLauncherPolicyV1,
     lease: &WorkflowLeaseV1,
@@ -2269,13 +2553,18 @@ fn transient_unit_arguments(
     dependency_snapshot_path: &Path,
     operation_state_path: Option<&Path>,
     oci_build_request: Option<&RootlessOciBuildRequestV1>,
+    self_release_build_request: Option<&SelfReleaseBuildRequestV1>,
 ) -> Result<Vec<String>, WorkflowLauncherError> {
     let resources = lease
         .resources
         .as_ref()
         .ok_or(WorkflowLauncherError::UnsupportedLease)?;
     let is_oci = lease.adapter_id == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1;
-    if is_oci != oci_build_request.is_some() {
+    let is_self_release = lease.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1;
+    if is_oci != oci_build_request.is_some()
+        || is_self_release != self_release_build_request.is_some()
+        || oci_build_request.is_some() && self_release_build_request.is_some()
+    {
         return Err(WorkflowLauncherError::UnsupportedLease);
     }
     let mut arguments = vec![
@@ -2375,6 +2664,34 @@ fn transient_unit_arguments(
             "HOME=/nonexistent".to_owned(),
             "TMPDIR=/job".to_owned(),
             ROOTLESS_OCI_BUILD_EXECUTABLE.to_owned(),
+        ]);
+    } else if let Some(request) = self_release_build_request {
+        request.validate_for_lease(lease, policy.self_release_build(&lease.project_id)?)?;
+        let operation_state_path =
+            operation_state_path.ok_or(WorkflowLauncherError::UnsupportedLease)?;
+        let request_path = SelfReleaseHandoffStoreV1::request_path_for(request);
+        let staging_path = SelfReleaseHandoffStoreV1::staging_path_for(request);
+        arguments.extend([
+            "--property=TemporaryFileSystem=/request:ro,nodev,nosuid,noexec,size=1M,mode=0555"
+                .to_owned(),
+            format!(
+                "--property=BindReadOnlyPaths={}:{}",
+                request_path.display(),
+                SELF_RELEASE_BUILD_REQUEST_PATH
+            ),
+            format!(
+                "--property=BindReadOnlyPaths={}:/operation",
+                operation_state_path.display()
+            ),
+            format!("--property=BindPaths={}:/output", staging_path.display()),
+            "--property=ReadWritePaths=/job /output".to_owned(),
+            "--".to_owned(),
+            ENV_EXECUTABLE.to_owned(),
+            "-i".to_owned(),
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_owned(),
+            "HOME=/nonexistent".to_owned(),
+            "TMPDIR=/job".to_owned(),
+            SELF_RELEASE_BUILD_EXECUTABLE.to_owned(),
         ]);
     } else {
         let operation_state_path =
@@ -2477,6 +2794,8 @@ pub enum WorkflowLauncherError {
     PreparedRunMismatch,
     #[error("workflow launcher rootless OCI build contract failed: {0}")]
     RootlessOciBuild(#[from] RootlessOciBuildError),
+    #[error("workflow launcher self-release build contract failed: {0}")]
+    SelfReleaseBuild(#[from] SelfReleaseBuildError),
 }
 
 pub fn installed_preparation_reader(
@@ -2515,6 +2834,10 @@ mod tests {
         preparation::{
             PREPARED_RUN_COMPOSITION_FILE, PREPARED_RUN_SOURCE_DIRECTORY, PreparationKeyMaterialV1,
             PreparationStore, PreparedRunCompositionV1, open_test_preparation_store,
+        },
+        self_release_build::SelfReleaseBinaryV1,
+        self_update::{
+            InstalledSelfUpdatePolicyInputV1, InstalledSelfUpdatePolicyV1, SelfUpdateFilePolicyV1,
         },
         workflow_execution_grant::WorkflowExecutionGrantSignerV1,
     };
@@ -2691,6 +3014,8 @@ mod tests {
             allowed_adapters: vec![WorkflowAdapterIdV1::WorkerBareBinCiV1],
             rootless_oci: None,
             rootless_oci_builds: Vec::new(),
+            self_release_build: None,
+            self_release_reader_gid: None,
             max_concurrent_jobs: 1,
             max_journal_records: 64,
         };
@@ -2947,6 +3272,130 @@ mod tests {
         policy
     }
 
+    fn configured_self_release_policy(fixture: &LauncherFixture) -> WorkflowLauncherPolicyV1 {
+        let signing_key = SigningKey::from_bytes(&[47_u8; 32]);
+        let self_update_policy =
+            InstalledSelfUpdatePolicyV1::new(InstalledSelfUpdatePolicyInputV1 {
+                key_id: "self-release-2026".to_owned(),
+                key_epoch: 1,
+                public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+                runtime_contract_digest: EvidenceDigest::sha256("self-update runtime"),
+                minimum_state_schema_version: 1,
+                maximum_state_schema_version: 1,
+                maximum_release_bytes: 64 * 1024 * 1024,
+                files: vec![SelfUpdateFilePolicyV1 {
+                    path: "bin/rdashboardd".to_owned(),
+                    mode: 0o555,
+                }],
+            })
+            .expect("self-update policy");
+        let mut policy = fixture.policy.clone();
+        policy.allowed_adapters = vec![WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1];
+        policy.self_release_build = Some(
+            SelfReleaseBuildPolicyV1::new(
+                self_update_policy,
+                1,
+                60_000,
+                vec![SelfReleaseBinaryV1 {
+                    binary_name: "rdashboardd".to_owned(),
+                    release_path: "bin/rdashboardd".to_owned(),
+                }],
+            )
+            .expect("self-release build policy"),
+        );
+        policy.self_release_reader_gid =
+            Some(fixture.policy.build_gid.checked_add(1).expect("reader GID"));
+        policy.validate().expect("configured self-release policy");
+        policy
+    }
+
+    fn self_release_lease(fixture: &LauncherFixture) -> WorkflowLeaseV1 {
+        let node = crate::domain::WorkflowNodeV1 {
+            node_id: "release-build".parse().expect("release node ID"),
+            display_name: "Package verified rdashboard binaries".to_owned(),
+            kind: WorkflowNodeKindV1::ReleaseBuild,
+            activation: crate::domain::WorkflowNodeActivationV1::Always,
+            profile_id: "native-self-release".parse().expect("release profile ID"),
+            depends_on: vec![
+                "prepare".parse().expect("prepare node ID"),
+                "verify".parse().expect("verification node ID"),
+            ],
+            input_contracts: vec![
+                WorkflowArtifactKindV1::PreparedRun,
+                WorkflowArtifactKindV1::VerificationReceipt,
+            ],
+            output_contract: WorkflowArtifactKindV1::ReleaseBuildResult,
+        };
+        let profile = crate::domain::WorkflowExecutionProfileV1 {
+            profile_id: node.profile_id.clone(),
+            adapter_id: WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1,
+            worker_pool: crate::domain::WorkflowWorkerPoolV1::VpsRequired,
+            network_class: crate::domain::WorkflowNetworkClassV1::Offline,
+            cache_class: crate::domain::WorkflowCacheClassV1::PreparedRun,
+            timeout_ms: 30_000,
+            resources: fixture.lease.resources.clone(),
+        };
+        let project_id = ProjectId::from_str("rdashboard").expect("rdashboard project ID");
+        let operation_state = crate::domain::WorkflowOperationStateV1::new(
+            fixture.lease.attempt_id,
+            &project_id,
+            &fixture.lease.source_sha,
+            &fixture.lease.workflow_policy_digest,
+            &fixture.lease.preparation_key,
+            &fixture.lease.worker_id,
+            &fixture.lease.host_id,
+            vec![
+                node.node_id.clone(),
+                "verify".parse().expect("verification node ID"),
+            ],
+            6 * 1024 * 1024 * 1024,
+            500_000,
+        )
+        .expect("shared operation state");
+        WorkflowLeaseV1::new(
+            Uuid::from_u128(41),
+            1,
+            Uuid::from_u128(42),
+            fixture.lease.attempt_id,
+            project_id,
+            fixture.lease.source_sha.clone(),
+            fixture
+                .lease
+                .source_identity
+                .as_ref()
+                .expect("source identity")
+                .sequence,
+            fixture
+                .lease
+                .source_identity
+                .as_ref()
+                .expect("source identity")
+                .attestation_digest
+                .clone(),
+            fixture.lease.workflow_policy_digest.clone(),
+            fixture.lease.preparation_key.clone(),
+            &node,
+            &profile,
+            None,
+            vec![
+                fixture.lease.input_artifacts[0].clone(),
+                WorkflowLeaseInputV1 {
+                    node_id: "verify".parse().expect("verification node ID"),
+                    artifact_kind: WorkflowArtifactKindV1::VerificationReceipt,
+                    output_digest: EvidenceDigest::sha256("verified bin/ci receipt"),
+                },
+            ],
+            EvidenceDigest::sha256("prepared run plus verification receipt"),
+            fixture.lease.worker_id.clone(),
+            fixture.lease.host_id.clone(),
+            100,
+            30_100,
+        )
+        .expect("self-release lease")
+        .with_operation_state(operation_state)
+        .expect("stateful self-release lease")
+    }
+
     fn oci_lease(fixture: &LauncherFixture) -> WorkflowLeaseV1 {
         let manifest: ProjectManifestV2 =
             serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
@@ -3167,6 +3616,73 @@ mod tests {
                 "HOME=/nonexistent",
                 "TMPDIR=/job",
                 ROOTLESS_OCI_BUILD_EXECUTABLE,
+            ]
+        );
+    }
+
+    #[test]
+    fn self_release_authorization_reuses_verified_outputs_and_only_the_installed_client() {
+        let fixture = fixture();
+        let policy = configured_self_release_policy(&fixture);
+        let lease = self_release_lease(&fixture);
+        let grant = fixture
+            .signer
+            .issue(&lease, 101, Uuid::from_u128(43))
+            .expect("execution grant");
+        let launch =
+            AuthorizedWorkflowLaunchV1::authorize(&policy, &fixture.reader, &lease, &grant, 101)
+                .expect("authorize self-release launch");
+        let request = launch
+            .self_release_build_request
+            .as_ref()
+            .expect("self-release request");
+        assert_eq!(request.lease_digest, lease.lease_digest);
+        assert_eq!(
+            request.verification_receipt_digest,
+            lease.input_artifacts[1].output_digest
+        );
+        assert!(launch.arguments.iter().any(|argument| {
+            argument
+                == &format!(
+                    "--property=BindReadOnlyPaths={}:{}",
+                    SelfReleaseHandoffStoreV1::request_path_for(request).display(),
+                    SELF_RELEASE_BUILD_REQUEST_PATH
+                )
+        }));
+        assert!(launch.arguments.iter().any(|argument| {
+            argument.starts_with("--property=BindReadOnlyPaths=")
+                && argument.ends_with(":/operation")
+        }));
+        assert!(!launch.arguments.iter().any(|argument| {
+            argument.starts_with("--property=BindPaths=") && argument.ends_with(":/operation")
+        }));
+        assert!(launch.arguments.iter().any(|argument| {
+            argument
+                == &format!(
+                    "--property=BindPaths={}:/output",
+                    SelfReleaseHandoffStoreV1::staging_path_for(request).display()
+                )
+        }));
+        assert!(
+            !launch
+                .arguments
+                .iter()
+                .any(|argument| argument == WORKFLOW_JOB_EXECUTABLE)
+        );
+        let separator = launch
+            .arguments
+            .iter()
+            .position(|argument| argument == "--")
+            .expect("systemd-run separator");
+        assert_eq!(
+            &launch.arguments[separator + 1..],
+            [
+                ENV_EXECUTABLE,
+                "-i",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+                "HOME=/nonexistent",
+                "TMPDIR=/job",
+                SELF_RELEASE_BUILD_EXECUTABLE,
             ]
         );
     }

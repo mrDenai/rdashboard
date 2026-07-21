@@ -114,19 +114,29 @@ tmpfs with the lease byte and inode ceilings. The sealed composition is mounted 
 `/prepared/source` once into `/job/workspace`; the internal composition document never changes the
 repository-visible tree. A separate exact operation-owned directory is mounted at `/operation` only
 for adapters that consume the target and compiler cache. Matching compiled consumers on the VPS
-execute serially against that directory; different attempts and hosts never share writable state. The
-OCI adapter neither mounts nor allocates operation state, so its independently bounded build can run
-beside verification without duplicating the verification cache. An optional build-only host gets a
-one-node local verification state and neither blocks the VPS nor causes its files to be transferred.
+execute serially against that directory; different attempts and hosts never share writable state. A
+native self-release keeps verification and packaging on the same VPS-owned operation state, so an
+optional build-only host cannot strand the required binaries or block the release. The OCI adapter
+neither mounts nor allocates operation state, so its independently bounded build can run beside
+verification without duplicating the verification cache. For OCI projects an optional build-only host
+gets a one-node local verification state and neither blocks the VPS nor causes its files to be
+transferred.
 Each verification source copy preserves the sealed tree's modification times and stable
 `/job/workspace` path, which lets Cargo reuse the operation target instead of invalidating it merely
 because the tmpfs workspace was recreated.
 
-The fixed `rdashboard-workflow-job` maps only the verification adapter to repository `bin/ci`; the
-reserved native-release adapter is not admitted until it has a typed result implementation. The job
-receives an empty, reconstructed environment. The launcher forces Cargo offline so a verification job
-cannot turn a cache miss into undeclared network access. Failed or uncertain execution removes the
-partial operation data; all declared successful consumers remove it after the last use. The retained
+The fixed `rdashboard-workflow-job` maps the verification adapter to repository `bin/ci`. The native
+self-release adapter never invokes a repository packaging script: after the exact verification receipt
+exists, the launcher runs the installed `rdashboard-workflow-self-release-build` client against the
+same read-only operation state. The client packages only policy-listed `target/release` binaries and
+writes an unsigned typed result. Root independently validates every archive entry and digest, signs the
+release with the systemd credential, and atomically publishes the complete SHA-named handoff directory
+for the bootstrap reader. Install `rdashboard-workflow-self-release.conf` as a launcher drop-in only
+when the matching native policy and root-owned `self-release-seed` credential are installed; OCI-only
+and verification-only launchers do not require that credential. The generic job receives an empty,
+reconstructed environment. The launcher forces Cargo offline so verification cannot turn a cache miss
+into undeclared network access. Failed or uncertain execution removes partial operation and handoff
+state; all declared successful consumers remove operation data after the last use. The retained
 root-owned canonical tombstone and per-node launcher journal make cleanup replayable without retaining
 repository-writable bytes. Operation records have a hard cap of 1,024; startup and capacity admission
 prune terminal tombstones back to the newest 512. A non-active partial operation that receives no next

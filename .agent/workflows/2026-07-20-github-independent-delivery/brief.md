@@ -178,3 +178,69 @@ Normalized instruction:
   implementation instead of pausing at an intermediate progress report.
 - Preserve the existing rule that only a genuine architectural choice, unsafe ambiguity or external
   mutation boundary should be returned to the user for a decision.
+
+### U010 — 2026-07-21
+
+Faithful English rendering:
+
+Explain the global situation and actual progress because the implementation sequence is no longer
+understandable from the user's perspective.
+
+Normalized instruction:
+
+- Keep progress reports outcome-oriented: distinguish the completed local control-plane pieces from
+  the still-missing end-to-end deployment path and state the exact current stop point.
+- Do not present an inactive foundation as though a pushed repository already deploys itself.
+
+### U011 — 2026-07-21
+
+Faithful English rendering:
+
+Why is `libvips` relevant?
+
+Normalized correction:
+
+- Do not broaden this work into `rimg` native-library packaging. `rimg` already builds with all of its
+  libraries and that separate work is being completed elsewhere.
+- Keep the active scope on the generic dashboard-owned workflow and `rdashboard` self-deployment path.
+
+### U012 — 2026-07-21
+
+Faithful English rendering:
+
+Do not show more speculative detail. `rimg` already builds with its libraries. Is the dashboard part
+finished?
+
+Normalized instruction:
+
+- Answer component status precisely. The dashboard/control-plane visibility slice is locally built,
+  but the complete delivery product is not finished until the trigger, worker, release, self-update,
+  activation and host-proof path is closed.
+
+### U013 — 2026-07-21
+
+Faithful English rendering:
+
+If I push `rdashboard`, will it deploy itself?
+
+Normalized acceptance criterion:
+
+- The requested observable is an end-to-end self-deploy: an accepted `rdashboard` push must enter the
+  local workflow, pass the exact required gate, produce and atomically publish a signed self-release,
+  and be consumed by the persistent bootstrap with health-checked A/B rollback.
+- Until that complete path is implemented and separately activated on the host, the honest answer is
+  no.
+
+### U014 — 2026-07-21
+
+Faithful English rendering:
+
+What is preventing you from doing that?
+
+Normalized instruction:
+
+- No new blocker or user decision exists. Continue the authorized local implementation of the missing
+  `rdashboard` self-release producer and handoff instead of pausing after its inactive bootstrap
+  foundation.
+- Preserve the external authorization boundary: local code, tests, review and a task-scoped commit are
+  authorized; installing or activating the host path is not.

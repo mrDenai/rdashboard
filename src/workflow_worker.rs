@@ -1128,7 +1128,11 @@ impl WorkflowWorkerRuntimeV1 {
         };
         let output_digest = if !succeeded {
             None
-        } else if lease.adapter_id == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 {
+        } else if matches!(
+            lease.adapter_id,
+            WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+                | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+        ) {
             Some(
                 terminal
                     .output_digest
@@ -1433,10 +1437,23 @@ fn required_prepared_run_key(
     lease: &WorkflowLeaseV1,
 ) -> Result<&EvidenceDigest, WorkflowWorkerError> {
     let inputs = lease.required_input_artifacts()?;
-    let [input] = inputs else {
+    let mut prepared = inputs
+        .iter()
+        .filter(|input| input.artifact_kind == WorkflowArtifactKindV1::PreparedRun);
+    let Some(input) = prepared.next() else {
         return Err(WorkflowWorkerError::InvalidLease);
     };
-    if input.artifact_kind != WorkflowArtifactKindV1::PreparedRun {
+    let valid_input_shape = if lease.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 {
+        inputs.len() == 2
+            && inputs
+                .iter()
+                .filter(|input| input.artifact_kind == WorkflowArtifactKindV1::VerificationReceipt)
+                .count()
+                == 1
+    } else {
+        inputs.len() == 1
+    };
+    if prepared.next().is_some() || !valid_input_shape {
         return Err(WorkflowWorkerError::InvalidLease);
     }
     Ok(&input.output_digest)

@@ -4,11 +4,13 @@ This repository ships the local trust and recovery boundary for a future `rdashb
 self-update. It is intentionally inactive until the installed policy, first release slot, stable
 bootstrap binary and staging-host failure drills have been reviewed and installed explicitly.
 
-The build handoff is `/var/lib/rdashboard-build/self-releases/<git-sha>.{jcs,tar}`. Both files are
-owned by the fixed build UID, grouped to the fixed build-reader GID and mode `0440`. The canonical
-descriptor signs the exact accepted source sequence, workflow and verification receipts, runtime
-contract, state schema, complete file list and deterministic archive. The bootstrap rejects mutable,
-linked, extra, missing, expired, conflicting or policy-incompatible input.
+The build handoff is `/var/lib/rdashboard-build/self-releases/<git-sha>/` with exactly
+`release.jcs` and `release.tar`. The root launcher publishes the complete directory with one atomic
+rename after validating the worker output and signing the exact release. Published directories are
+root-owned, grouped to the bootstrap reader GID and mode `0550`; files are mode `0440`. The handoff
+root is root-owned mode `0711`, so the build UID cannot publish a partial or caller-selected release.
+The bootstrap ignores only structurally valid hidden launcher staging directories and rejects
+mutable, linked, extra, missing, expired, conflicting or policy-incompatible input.
 
 Root stages verified releases at `/var/lib/rdashboard-bootstrap/releases/<manifest-digest>`. Release
 directories and files become immutable before publication. `current` and `last-known-good` are relative
@@ -19,7 +21,6 @@ never followed.
 host identities in root-owned `/etc/rdashboard/self-update.env`:
 
 ```ini
-RDASHBOARD_SELF_RELEASE_UID=<rdashboard-build uid>
 RDASHBOARD_SELF_RELEASE_GID=<rdashboard-build-readers gid>
 ```
 
@@ -38,7 +39,10 @@ invented success.
 Do not enable this unit in production yet. Activation additionally requires:
 
 1. a reviewed initial versioned release and executable-path migration;
-2. the generic worker self-release producer and signed handoff wiring;
-3. the root-only recovery CLI;
-4. disposable-host kill, OOM and reboot drills at every recorded phase;
-5. a fresh explicit production authorization.
+2. the root-only recovery CLI;
+3. disposable-host kill, OOM and reboot drills at every recorded phase;
+4. a fresh explicit production authorization.
+
+The generic worker producer and root-signed atomic handoff are implemented locally. They remain
+inactive until the launcher policy, signing credential, drop-in and bootstrap activation gates above
+are installed together.

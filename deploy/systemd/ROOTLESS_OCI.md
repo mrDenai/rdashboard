@@ -1,10 +1,11 @@
 # Rootless OCI activation boundary
 
 The `worker_oci_release_build_v1` adapter is disabled unless the root-owned launcher policy contains
-one matching `rootless_oci` contract and every live readiness check succeeds. This keeps verification,
+one matching `rootless_oci` contract and every live readiness check succeeds. This keeps verification
 and host preparation available when OCI assembly is unavailable; it does not silently substitute
-Docker or Podman. The domain-level native release adapter remains reserved for a future typed result
-implementation, but the installed launcher does not admit it or invoke an optional repository script.
+Docker or Podman. Native self-release has a separate installed client, policy, signing credential and
+atomic handoff store; enabling it does not enable OCI, and neither adapter invokes an optional
+repository packaging script.
 
 Install reviewed, root-owned `buildkitd`, `buildctl`, `rootlesskit` and `runc` binaries at the fixed
 paths under `/usr/libexec/rdashboard`. Bind their SHA-256 values and the SHA-256 of the installed

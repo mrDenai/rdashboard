@@ -81,6 +81,13 @@
         "repository_root"
       ]
     },
+    "BuildKind": {
+      "type": "string",
+      "enum": [
+        "oci",
+        "native"
+      ]
+    },
     "BuildPolicy": {
       "type": "object",
       "properties": {
@@ -88,13 +95,18 @@
           "$ref": "#/$defs/BuildContext"
         },
         "dockerfile": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/BuildKind"
         }
       },
       "additionalProperties": false,
       "required": [
-        "context",
-        "dockerfile"
+        "context"
       ]
     },
     "CanonicalBranch": {

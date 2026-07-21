@@ -483,7 +483,7 @@ impl WorkflowPolicyV1 {
         }
 
         validate_topology(&nodes)?;
-        validate_standard_graph(&nodes)?;
+        validate_standard_graph(&nodes, &profiles)?;
         Ok(())
     }
 
@@ -577,6 +577,7 @@ fn validate_topology(
 
 fn validate_standard_graph(
     nodes: &BTreeMap<&WorkflowNodeId, &WorkflowNodeV1>,
+    profiles: &BTreeMap<&WorkflowProfileId, &WorkflowExecutionProfileV1>,
 ) -> Result<(), WorkflowContractError> {
     let by_kind = |kind| {
         nodes
@@ -612,9 +613,31 @@ fn validate_standard_graph(
 
     require_dependencies(source, &[])?;
     require_dependencies(prepare, std::slice::from_ref(&source.node_id))?;
-    require_dependencies(build, std::slice::from_ref(&prepare.node_id))?;
     for node in &verification {
         require_dependencies(node, std::slice::from_ref(&prepare.node_id))?;
+    }
+    let build_profile = profiles
+        .get(&build.profile_id)
+        .ok_or_else(|| WorkflowContractError::MissingProfile(build.profile_id.clone()))?;
+    match build_profile.adapter_id {
+        WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 => {
+            require_dependencies(build, std::slice::from_ref(&prepare.node_id))?;
+        }
+        WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 => {
+            let [verification] = verification.as_slice() else {
+                return Err(WorkflowContractError::InvalidNodeCardinality(
+                    WorkflowNodeKindV1::Verification,
+                ));
+            };
+            let mut dependencies = vec![prepare.node_id.clone(), verification.node_id.clone()];
+            dependencies.sort();
+            require_dependencies(build, &dependencies)?;
+        }
+        _ => {
+            return Err(WorkflowContractError::ProfileKindMismatch(
+                build.node_id.clone(),
+            ));
+        }
     }
     let mut reduce_dependencies = verification
         .iter()
@@ -1810,5 +1833,52 @@ mod tests {
             profile.profile_id == prepare_profile_id
                 || profile.network_class != WorkflowNetworkClassV1::DependencyEgress
         }));
+    }
+
+    #[test]
+    fn native_release_build_requires_completed_verification_while_oci_stays_parallel() {
+        let oci: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../../config/project-manifests/ralert.json"))
+                .expect("decode OCI manifest");
+        oci.validate().expect("parallel OCI graph");
+        let mut native = oci.clone();
+        native.build.kind = crate::domain::BuildKind::Native;
+        native.build.dockerfile = None;
+        let release = native
+            .workflow
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .expect("release node");
+        let release_profile_id = release.profile_id.clone();
+        release.depends_on = vec![
+            "prepare".parse().expect("prepare node"),
+            "verify".parse().expect("verification node"),
+        ];
+        release.input_contracts = vec![
+            WorkflowArtifactKindV1::PreparedRun,
+            WorkflowArtifactKindV1::VerificationReceipt,
+        ];
+        native
+            .workflow
+            .execution_profiles
+            .iter_mut()
+            .find(|profile| profile.profile_id == release_profile_id)
+            .expect("release profile")
+            .adapter_id = WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1;
+        native.validate().expect("serial native release graph");
+
+        let release = native
+            .workflow
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .expect("release node");
+        release.depends_on = vec!["prepare".parse().expect("prepare node")];
+        release.input_contracts = vec![WorkflowArtifactKindV1::PreparedRun];
+        assert!(matches!(
+            native.validate(),
+            Err(crate::domain::ManifestError::WorkflowInvalid)
+        ));
     }
 }

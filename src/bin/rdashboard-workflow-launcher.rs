@@ -8,6 +8,7 @@ use std::{
 use rdashboard::{
     operation_state::WorkflowOperationStateStoreV1,
     rootless_oci_build::RootlessOciResultStoreV1,
+    self_release_build::{SelfReleaseHandoffStoreV1, load_installed_self_release_signing_key},
     unix_time_ms,
     workflow_launcher::{
         SystemdWorkflowLaunchRuntimeV1, WORKFLOW_LAUNCHER_JOB_ROOT, WorkflowLaunchJournalV1,
@@ -71,12 +72,30 @@ async fn main() -> Result<(), DynError> {
     } else {
         None
     };
+    let self_releases = if let Some(build_policy) = policy.self_release_build.clone() {
+        let reader_gid = policy
+            .self_release_reader_gid
+            .ok_or(LauncherServiceError::SelfReleasePolicyIncomplete)?;
+        let signing_key = load_installed_self_release_signing_key(&build_policy)?;
+        Some(Arc::new(SelfReleaseHandoffStoreV1::open_installed(
+            policy.build_uid,
+            policy.build_gid,
+            reader_gid,
+            build_policy,
+            signing_key,
+        )?))
+    } else {
+        None
+    };
     let supervisor = Arc::new(WorkflowLaunchSupervisorV1::new(
         policy.clone(),
         preparation_reader,
         journal,
         operation_states,
-        Arc::new(SystemdWorkflowLaunchRuntimeV1::new(oci_results)),
+        Arc::new(SystemdWorkflowLaunchRuntimeV1::new(
+            oci_results,
+            self_releases,
+        )),
     )?);
     let handler = Arc::new(SupervisorWorkflowLauncherHandlerV1::system(supervisor));
     let server_config =
@@ -139,4 +158,6 @@ enum LauncherServiceError {
     InvalidInvocation,
     #[error("workflow launcher runtime directory is unsafe")]
     UnsafeRuntimeDirectory,
+    #[error("workflow launcher self-release policy is incomplete")]
+    SelfReleasePolicyIncomplete,
 }

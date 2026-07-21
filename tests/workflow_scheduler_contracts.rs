@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, str::FromStr};
 
 use rdashboard::{
     domain::{
-        AbsolutePolicyPath, EvidenceDigest, GitCommitId, HttpEndpoint, ManifestError,
+        AbsolutePolicyPath, BuildKind, EvidenceDigest, GitCommitId, HttpEndpoint, ManifestError,
         OperationKind, ProjectId, ProjectManifestV2, RemoteUrl, WorkflowAdapterIdV1,
         WorkflowArtifactKindV1, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
         WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
@@ -47,6 +47,42 @@ fn manifest(project: &str, fairness_weight: u16) -> ProjectManifestV2 {
     manifest
         .validate()
         .unwrap_or_else(|error| panic!("workflow fixture: {error}"));
+    manifest
+}
+
+fn native_manifest(project: &str) -> ProjectManifestV2 {
+    let mut manifest = manifest(project, 1);
+    manifest.build.kind = BuildKind::Native;
+    manifest.build.dockerfile = None;
+    let release = manifest
+        .workflow
+        .nodes
+        .iter_mut()
+        .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+        .unwrap_or_else(|| panic!("release node"));
+    let release_profile_id = release.profile_id.clone();
+    release.depends_on = vec![
+        "prepare"
+            .parse()
+            .unwrap_or_else(|error| panic!("prepare node: {error}")),
+        "verify"
+            .parse()
+            .unwrap_or_else(|error| panic!("verification node: {error}")),
+    ];
+    release.input_contracts = vec![
+        WorkflowArtifactKindV1::PreparedRun,
+        WorkflowArtifactKindV1::VerificationReceipt,
+    ];
+    manifest
+        .workflow
+        .execution_profiles
+        .iter_mut()
+        .find(|profile| profile.profile_id == release_profile_id)
+        .unwrap_or_else(|| panic!("release profile"))
+        .adapter_id = WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1;
+    manifest
+        .validate()
+        .unwrap_or_else(|error| panic!("native workflow fixture: {error}"));
     manifest
 }
 
@@ -486,6 +522,84 @@ fn optional_accelerator_can_verify_but_cannot_own_required_preparation_or_releas
         "OCI output is isolated by its result store and must not allocate compiled state"
     );
     assert_ne!(release.host_id, verification.host_id);
+}
+
+#[test]
+fn native_release_keeps_verification_and_packaging_on_the_same_required_host() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = native_manifest("rdashboard");
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'e',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "rdashboard-native-release",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    assert_eq!(prepare.node_kind, WorkflowNodeKindV1::HostPrepare);
+    commit_success(&scheduler, &prepare, "native-prepare");
+
+    assert!(
+        scheduler
+            .claim_next(&accelerator_worker(), 30, 1_000)
+            .unwrap_or_else(|error| panic!("optional accelerator claim: {error}"))
+            .is_none(),
+        "native verification cannot strand compiled outputs on an intermittent host"
+    );
+    let verification = claim(&scheduler, &worker, 31);
+    assert_eq!(verification.node_kind, WorkflowNodeKindV1::Verification);
+    let state = verification
+        .operation_state
+        .as_ref()
+        .unwrap_or_else(|| panic!("shared native operation state"));
+    assert_eq!(
+        state.consumer_nodes,
+        vec![
+            "release-build"
+                .parse()
+                .unwrap_or_else(|error| panic!("release node: {error}")),
+            verification.node_id.clone(),
+        ]
+    );
+    assert!(
+        scheduler
+            .claim_next(&worker, 32, 1_000)
+            .unwrap_or_else(|error| panic!("premature release claim: {error}"))
+            .is_none(),
+        "native packaging must wait for the exact verification receipt"
+    );
+    commit_success(&scheduler, &verification, "native-verification");
+    let release = claim(&scheduler, &worker, 50);
+    assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+    assert_eq!(release.host_id, verification.host_id);
+    assert_eq!(
+        release
+            .operation_state
+            .as_ref()
+            .unwrap_or_else(|| panic!("release operation state"))
+            .state_key,
+        state.state_key
+    );
+    assert_eq!(
+        release
+            .input_artifacts
+            .iter()
+            .map(|input| input.artifact_kind)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            WorkflowArtifactKindV1::PreparedRun,
+            WorkflowArtifactKindV1::VerificationReceipt,
+        ])
+    );
 }
 
 #[test]
