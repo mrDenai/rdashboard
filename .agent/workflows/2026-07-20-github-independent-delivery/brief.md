@@ -165,3 +165,16 @@ Normalized instruction:
 - Continue autonomously from the completed GitHub source-ingress slice into the next coherent generic
   worker/shared-preparation slice, preserving the existing verification, review, local-commit and
   external-mutation boundaries from U006-U007.
+
+### U009 — 2026-07-21
+
+Faithful English rendering:
+
+What is preventing you from continuing?
+
+Normalized instruction:
+
+- No new blocker or decision boundary has been introduced. Continue the authorized local
+  implementation instead of pausing at an intermediate progress report.
+- Preserve the existing rule that only a genuine architectural choice, unsafe ambiguity or external
+  mutation boundary should be returned to the user for a decision.

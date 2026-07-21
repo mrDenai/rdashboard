@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use ed25519_dalek::SigningKey;
 use rdashboard::{
     domain::{
         AbsolutePolicyPath, EvidenceDigest, GitCommitId, HttpEndpoint, OperationKind, ProjectId,
@@ -29,6 +30,10 @@ use rdashboard::{
         WorkflowWorkerClientV1, WorkflowWorkerHandlerConfigError, WorkflowWorkerRequestEnvelopeV1,
         WorkflowWorkerRequestV1, WorkflowWorkerServerConfigV1, WorkflowWorkerSocketError,
         WorkflowWorkerValidationError, serve_worker_connection, serve_worker_until,
+    },
+    workflow_execution_grant::{
+        WorkflowExecutionGrantSignerV1, WorkflowExecutionGrantVerificationKeyV1,
+        WorkflowExecutionGrantVerifierV1,
     },
 };
 use tempfile::tempdir;
@@ -101,6 +106,44 @@ fn worker() -> WorkflowWorkerRegistrationV1 {
     }
 }
 
+fn grant_signer() -> Arc<WorkflowExecutionGrantSignerV1> {
+    Arc::new(
+        WorkflowExecutionGrantSignerV1::new(
+            "workflow-gateway",
+            "workflow-launcher",
+            "workflow-key-1",
+            1,
+            SigningKey::from_bytes(&[37_u8; 32]),
+        )
+        .expect("workflow grant signer"),
+    )
+}
+
+fn grant_verifier() -> WorkflowExecutionGrantVerifierV1 {
+    WorkflowExecutionGrantVerifierV1::new(
+        "workflow-gateway",
+        "workflow-launcher",
+        1,
+        [WorkflowExecutionGrantVerificationKeyV1::new(
+            "workflow-key-1",
+            1,
+            SigningKey::from_bytes(&[37_u8; 32]).verifying_key(),
+            0,
+            None,
+            None,
+            None,
+        )
+        .expect("grant verification key")],
+    )
+    .expect("grant verifier")
+}
+
+fn verify_execution_grant(token: &str, lease: &rdashboard::domain::WorkflowLeaseV1, now_ms: i64) {
+    grant_verifier()
+        .verify(token, lease, now_ms)
+        .expect("verify execution grant");
+}
+
 fn protected_directory() -> tempfile::TempDir {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750))
@@ -122,6 +165,10 @@ impl TestClock {
 
     fn set(&self, now_ms: i64) {
         self.now_ms.store(now_ms, Ordering::Release);
+    }
+
+    fn get(&self) -> i64 {
+        self.now_ms.load(Ordering::Acquire)
     }
 }
 
@@ -147,6 +194,15 @@ fn success_receipt(
     .unwrap_or_else(|error| panic!("success receipt: {error}"))
 }
 
+fn assert_worker_binding(
+    first: &rdashboard::domain::WorkflowLeaseV1,
+    second: &rdashboard::domain::WorkflowLeaseV1,
+    registration: &WorkflowWorkerRegistrationV1,
+) {
+    assert_eq!(first.worker_id, registration.worker_id);
+    assert_eq!(second.worker_id, registration.worker_id);
+}
+
 async fn exercise_two_project_worker_flow(
     client: &WorkflowWorkerClientV1,
     registration: &WorkflowWorkerRegistrationV1,
@@ -157,7 +213,13 @@ async fn exercise_two_project_worker_flow(
         .await
         .unwrap_or_else(|error| panic!("first poll: {error}"))
     {
-        WorkflowWorkerAssignmentV1::Lease { lease } => *lease,
+        WorkflowWorkerAssignmentV1::Lease {
+            lease,
+            execution_grant,
+        } => {
+            verify_execution_grant(&execution_grant, &lease, clock.get());
+            *lease
+        }
         assignment => panic!("unexpected first assignment: {assignment:?}"),
     };
     let second_lease = match client
@@ -165,11 +227,16 @@ async fn exercise_two_project_worker_flow(
         .await
         .unwrap_or_else(|error| panic!("second poll: {error}"))
     {
-        WorkflowWorkerAssignmentV1::Lease { lease } => *lease,
+        WorkflowWorkerAssignmentV1::Lease {
+            lease,
+            execution_grant,
+        } => {
+            verify_execution_grant(&execution_grant, &lease, clock.get());
+            *lease
+        }
         assignment => panic!("unexpected second assignment: {assignment:?}"),
     };
-    assert_eq!(first_lease.worker_id, registration.worker_id);
-    assert_eq!(second_lease.worker_id, registration.worker_id);
+    assert_worker_binding(&first_lease, &second_lease, registration);
     assert_eq!(
         BTreeSet::from([
             first_lease.project_id.to_string(),
@@ -183,10 +250,11 @@ async fn exercise_two_project_worker_flow(
         .renew_lease(first_lease.clone())
         .await
         .unwrap_or_else(|error| panic!("renew lease: {error}"));
-    assert!(renewed.expires_at_ms > first_lease.expires_at_ms);
+    assert!(renewed.lease.expires_at_ms > first_lease.expires_at_ms);
+    verify_execution_grant(&renewed.execution_grant, &renewed.lease, clock.get());
     clock.set(1_100);
     client
-        .complete_node(success_receipt(&renewed, "first-project"))
+        .complete_node(success_receipt(&renewed.lease, "first-project"))
         .await
         .unwrap_or_else(|error| panic!("complete renewed node: {error}"));
 
@@ -221,7 +289,13 @@ async fn exercise_two_project_worker_flow(
             .await
             .unwrap_or_else(|error| panic!("replacement poll: {error}"))
         {
-            WorkflowWorkerAssignmentV1::Lease { lease } => *lease,
+            WorkflowWorkerAssignmentV1::Lease {
+                lease,
+                execution_grant,
+            } => {
+                verify_execution_grant(&execution_grant, &lease, clock.get());
+                *lease
+            }
             assignment => panic!("expected runnable lease: {assignment:?}"),
         };
         if lease.project_id == second_lease.project_id && lease.node_id == second_lease.node_id {
@@ -276,6 +350,7 @@ fn protocol_and_handler_configuration_reject_privilege_or_ambiguity() {
             privileged,
             Duration::from_secs(15),
             TestClock::new(1),
+            grant_signer(),
         ),
         Err(WorkflowWorkerHandlerConfigError::InvalidRegistration)
     ));
@@ -284,6 +359,9 @@ fn protocol_and_handler_configuration_reject_privilege_or_ambiguity() {
     assert!(service.contains("User=rdashboard\nGroup=rdashboard-worker"));
     assert!(service.contains("PrivateNetwork=yes"));
     assert!(service.contains("RestrictAddressFamilies=AF_UNIX"));
+    assert!(service.contains(
+        "LoadCredential=workflow-grant-seed:/etc/rdashboard/credentials/workflow-grant-seed"
+    ));
     assert!(!service.contains("docker.sock"));
     assert!(!service.contains("executor.sock"));
     assert!(!service.contains("source.sock"));
@@ -333,6 +411,7 @@ async fn one_authenticated_socket_serves_two_projects_and_recovers_cleanup_debt(
             registration.clone(),
             Duration::from_secs(15),
             clock.clone(),
+            grant_signer(),
         )
         .unwrap_or_else(|error| panic!("worker handler: {error}")),
     );
@@ -386,6 +465,7 @@ async fn peer_uid_is_rejected_before_the_scheduler_is_touched() {
             worker(),
             Duration::from_secs(15),
             TestClock::new(1),
+            grant_signer(),
         )
         .unwrap_or_else(|error| panic!("handler: {error}")),
     );

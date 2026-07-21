@@ -1,12 +1,14 @@
 # GitHub-independent delivery implementation review
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
-- Status: slices 1a, 1b, 2a, 2b and 2c complete locally; the separately authorized live baseline remains pending
-- Review date: 2026-07-20
+- Status: slices 1a-4b complete locally; the generic worker and separately authorized live gates remain pending
+- Review date: 2026-07-21
 - Baseline HEAD: `d20cf342dac204c51d30a32009eeb9c58097c8aa`
 - Local implementation commits: `64e64f2` (`Add persistent resource observer`), `581a432`
   (`Add adapter execution receipts`), `25dff26` (`Add durable workflow scheduler`), `8b72141`
-  (`Add authenticated workflow gateway`)
+  (`Add authenticated workflow gateway`), `2973847` (`Add workflow dashboard projection`),
+  `9598582` (`Add durable source delivery`), `1a076e8` (`Add durable GitHub source ingress`) and
+  `bfb887b` (`Add sealed workflow preparation store`)
 - Slice 1a staged diff SHA-256: `ca9712b8517e0a7c42c6672d81abed2e8c74165337306dca0ded2bc5c36e6432`
 
 ## Reviewed scope
@@ -709,3 +711,109 @@ Slice 4a is production-worthy as an inactive local foundation and may be committ
 repository commands, prefetch dependencies, create mutable build slots, install/start a worker, grant
 root authority, mutate the VPS, contact GitHub, push or deploy. The signed execution boundary, fixed root
 launcher and generic worker consumption of this exact CAS are the next local slice of plan step 4.
+
+## Slice 4b: signed execution grants and fixed root launcher
+
+### Reviewed scope
+
+Slice 4b completes the inactive privilege boundary needed before the generic worker may execute a
+sealed input:
+
+- Concrete workflow leases now carry the exact sorted dependency node, artifact kind and output digest
+  set used to calculate `expected_input_digest`. Historical leases remain canonically decodable, but a
+  signer or launcher refuses any lease without exact source and input-artifact identity.
+- The workflow gateway issues canonical, purpose-separated, short-lived Ed25519 execution grants bound
+  to the exact lease, request, attempt, project, worker, host, adapter, nonce, issuer, audience, key ID,
+  key epoch and validity interval. Its raw 32-byte seed is loaded only from a root-owned systemd
+  credential, zeroized after use and required to match the configured public key.
+- The root launcher authenticates the configured worker UID before request decode, verifies the grant,
+  reopens and revalidates the exact sealed `PreparedRun`, and constructs the complete `systemd-run`
+  invocation itself. The worker cannot provide argv, a host path, credentials, a network mode or a
+  systemd property.
+- The derived transient unit uses the fixed build UID/GID, read-only `/workspace`, a private byte/inode-
+  bounded `/job` tmpfs, no network, no capabilities, no controller/source/gateway/launcher/runtime
+  sockets, fixed CPU/memory/task/output/runtime limits and one fixed adapter-to-script mapping. A
+  sorted root-policy allowlist keeps uninstalled native/OCI adapters disabled.
+- A canonical root-private journal persists acceptance before spawn, deduplicates lease renewal by
+  stable execution identity, turns ambiguous accepted/running startup state into `needs_reconcile`,
+  persists cleanup before stop and replays terminal/cleanup evidence idempotently. The record count and
+  concurrent active set are bounded.
+- The gateway and launcher protocols are independently versioned, frame/concurrency/time bounded and
+  peer-UID authenticated. The new service and tmpfiles declarations remain inactive and grant neither
+  Docker nor deployment authority.
+
+The exact staged product/config/test diff contains 19 paths, 5,349 insertions and 78 deletions. Shared
+dirty `src/lib.rs` and `deploy/systemd/README.md` hunks were staged selectively; all notification code,
+notification workflow artifacts and earlier consultation logs remained outside the reviewed diff.
+
+### Verification
+
+- The first live-worktree bare `bin/ci` passed, including the optimized release build in 3 minutes 9
+  seconds, but was not used as the final exact-slice evidence because unrelated notification work is
+  present in that tree.
+- The first exact staged export exposed a parallel restart-test race: a concurrently forked child could
+  briefly retain the journal directory's open-file-description lock until exec. The journal inner now
+  explicitly unlocks at final drop before closing; the restart test passed 100 focused repetitions and
+  the next exact full gate.
+- After the independent review correction, a refreshed `git checkout-index` export passed bare
+  `bin/ci`: formatting, Clippy with warnings denied, 190 active library tests with two credentialed
+  live-provider tests ignored, every binary and integration suite, 3 launcher-socket contracts,
+  3 worker-socket contracts, 14 scheduler contracts, schema checks, 8 browser contracts and the
+  optimized release build in 3 minutes 0 seconds.
+- Five focused launcher tests cover fixed authorization/sandbox derivation, renewal without duplicate
+  spawn, terminal evidence and idempotent cleanup, restart ambiguity, waiter exhaustion before runtime
+  effect, and a post-spawn journal failure that stops the exact unit and reaps the process.
+- `git diff --cached --check` passed. Final exact staged product/config/test diff SHA-256:
+  `93bcaad8b25b666587a75a539f056c15d3271c80328af78538a0f6ec6a153d0f`.
+
+### Independent consultations and finding dispositions
+
+The first complete exact-staged review inspected all 19 paths and returned otherwise safe with one
+concrete P2:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 244 seconds;
+- state fingerprint: `794ff70eb2c84cd3656cf2cf30aa6f555bf62c120908caa5b1e696dc988d784f`;
+- brief SHA-256: `1e89167a0b59fdbf37afb93098da4d28347f8b54ff376dc40b06fa2cb4560d0d`;
+- response: `consult-slice4b-deepseek/response.md`.
+
+Finding dispositions:
+
+1. **Accepted P2 — a successful runtime spawn could lose process ownership after a journal write or
+   waiter-thread failure.** Dropping `std::process::Child` neither stops the transient unit nor reaps it.
+   The waiter is now created before any runtime effect, so waiter exhaustion records `SpawnRejected`
+   with zero spawns. After spawn, journal failure hands the child to that waiter, records reconciliation
+   debt where possible and stops the exact unit. If process handoff itself fails, containment eagerly
+   attempts both exact-unit termination and direct-child abort/reap. Two injected regressions prove the
+   pre-effect and post-effect branches.
+2. **Accepted P3 — verify before sealed-store I/O.** Grant signature/lifetime/lease verification now
+   precedes reopening the prepared entry, avoiding unnecessary sealed-CAS work for an invalid token.
+3. **Reviewed P3 — stop rejection remains explicit debt.** If `systemctl stop` itself is rejected, the
+   direct client is still aborted/reaped where unowned and the journal remains `needs_reconcile`; the
+   bounded unit is retried through cleanup/startup rather than falsely reported as stopped.
+
+A broad post-fix rereview produced no response before its 420-second dispatcher timeout and is recorded
+truthfully rather than counted as review evidence:
+
+- status: `SKIPPED`, exit 124, one attempt;
+- state fingerprint: `f7cbc903259ac1977b007535c023696aff001e3fd4500f5590062a657c549619`;
+- brief SHA-256: `91e738c0d2098973ea4c4f818e299ec68cb35c642611c1ac9100d9a654ffad25`;
+- output directory: `consult-slice4b-deepseek-final/`.
+
+The route remained healthy. A fresh focused review then checked every post-review process-ownership
+change and the five launcher tests against the same final repository fingerprint:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 119 seconds;
+- state fingerprint: `f7cbc903259ac1977b007535c023696aff001e3fd4500f5590062a657c549619`;
+- brief SHA-256: `377ea1490b7ab1cad06311b49398f99c18959eebe213eec632fa59e25a42544e`;
+- response: `consult-slice4b-deepseek-final-focused/response.md`;
+- verdict: `SAFE`, with no open question or P0-P2 finding.
+
+### Verdict
+
+Slice 4b is production-worthy as an inactive local execution boundary and may be committed. It does
+not yet materialize a source/dependency snapshot, run the generic worker loop, submit scheduler
+receipts, install/start either unit, execute repository code, mutate the VPS, contact GitHub/providers,
+push or deploy. The unprivileged generic worker that consumes the exact source and preparation
+contracts, renews leases, drives this launcher and commits receipts is the next local Slice 4c.

@@ -86,6 +86,14 @@ pub mod store;
 pub mod web;
 #[cfg(unix)]
 pub mod worker_socket;
+#[cfg(unix)]
+pub mod workflow_execution_authority;
+#[cfg(unix)]
+pub mod workflow_execution_grant;
+#[cfg(unix)]
+pub mod workflow_launcher;
+#[cfg(unix)]
+pub mod workflow_launcher_socket;
 
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 

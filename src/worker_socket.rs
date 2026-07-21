@@ -35,9 +35,10 @@ use crate::{
     },
     store::StoreError,
     unix_time_ms,
+    workflow_execution_grant::WorkflowExecutionGrantSignerV1,
 };
 
-pub const WORKER_PROTOCOL_VERSION: u16 = 1;
+pub const WORKER_PROTOCOL_VERSION: u16 = 2;
 pub const WORKER_SOCKET_PATH: &str = "/run/rdashboard-workflow/worker.sock";
 
 const MIN_REQUEST_TIMEOUT_MS: u64 = 100;
@@ -129,6 +130,7 @@ pub enum WorkflowWorkerResponseV1 {
     },
     LeaseRenewed {
         lease: Box<WorkflowLeaseV1>,
+        execution_grant: String,
     },
     NodeAccepted {
         attempt: Box<WorkflowAttemptSnapshotV1>,
@@ -147,6 +149,7 @@ pub enum WorkflowWorkerResponseV1 {
 pub enum WorkflowWorkerAssignmentV1 {
     Lease {
         lease: Box<WorkflowLeaseV1>,
+        execution_grant: String,
     },
     Cleanup {
         obligation: Box<WorkflowCleanupObligationV1>,
@@ -165,6 +168,13 @@ pub enum WorkflowWorkerRejectionCodeV1 {
     CleanupConflict,
     SchedulerUnavailable,
     ClockUnavailable,
+    GrantUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowWorkerLeaseGrantV1 {
+    pub lease: WorkflowLeaseV1,
+    pub execution_grant: String,
 }
 
 pub trait WorkflowGatewayClockV1: Send + Sync {
@@ -193,6 +203,7 @@ pub struct SchedulerWorkflowWorkerHandlerV1<C = SystemWorkflowGatewayClockV1> {
     registration: WorkflowWorkerRegistrationV1,
     lease_duration_ms: i64,
     clock: C,
+    grant_signer: Arc<WorkflowExecutionGrantSignerV1>,
 }
 
 impl SchedulerWorkflowWorkerHandlerV1<SystemWorkflowGatewayClockV1> {
@@ -200,12 +211,14 @@ impl SchedulerWorkflowWorkerHandlerV1<SystemWorkflowGatewayClockV1> {
         scheduler: DurableWorkflowScheduler,
         registration: WorkflowWorkerRegistrationV1,
         lease_duration: Duration,
+        grant_signer: Arc<WorkflowExecutionGrantSignerV1>,
     ) -> Result<Self, WorkflowWorkerHandlerConfigError> {
         Self::new(
             scheduler,
             registration,
             lease_duration,
             SystemWorkflowGatewayClockV1,
+            grant_signer,
         )
     }
 }
@@ -216,6 +229,7 @@ impl<C: WorkflowGatewayClockV1> SchedulerWorkflowWorkerHandlerV1<C> {
         registration: WorkflowWorkerRegistrationV1,
         lease_duration: Duration,
         clock: C,
+        grant_signer: Arc<WorkflowExecutionGrantSignerV1>,
     ) -> Result<Self, WorkflowWorkerHandlerConfigError> {
         registration
             .validate_unprivileged()
@@ -230,6 +244,7 @@ impl<C: WorkflowGatewayClockV1> SchedulerWorkflowWorkerHandlerV1<C> {
             registration,
             lease_duration_ms,
             clock,
+            grant_signer,
         })
     }
 
@@ -311,14 +326,22 @@ impl<C: WorkflowGatewayClockV1> SchedulerWorkflowWorkerHandlerV1<C> {
             .scheduler
             .claim_next(&self.registration, now_ms, self.lease_duration_ms)
         {
-            Ok(Some(lease)) => Self::response(
-                request,
-                WorkflowWorkerResponseV1::Assignment {
-                    assignment: WorkflowWorkerAssignmentV1::Lease {
-                        lease: Box::new(lease),
+            Ok(Some(lease)) => match self.grant_signer.issue(&lease, now_ms, Uuid::new_v4()) {
+                Ok(execution_grant) => Self::response(
+                    request,
+                    WorkflowWorkerResponseV1::Assignment {
+                        assignment: WorkflowWorkerAssignmentV1::Lease {
+                            lease: Box::new(lease),
+                            execution_grant,
+                        },
                     },
-                },
-            ),
+                ),
+                Err(_) => Self::rejected(
+                    request,
+                    WorkflowWorkerRejectionCodeV1::GrantUnavailable,
+                    true,
+                ),
+            },
             Ok(None) => Self::response(
                 request,
                 WorkflowWorkerResponseV1::Assignment {
@@ -371,12 +394,20 @@ impl<C: WorkflowGatewayClockV1> SchedulerWorkflowWorkerHandlerV1<C> {
             .scheduler
             .renew_lease(&self.registration, lease, now_ms, self.lease_duration_ms)
         {
-            Ok(lease) => Self::response(
-                request,
-                WorkflowWorkerResponseV1::LeaseRenewed {
-                    lease: Box::new(lease),
-                },
-            ),
+            Ok(lease) => match self.grant_signer.issue(&lease, now_ms, Uuid::new_v4()) {
+                Ok(execution_grant) => Self::response(
+                    request,
+                    WorkflowWorkerResponseV1::LeaseRenewed {
+                        lease: Box::new(lease),
+                        execution_grant,
+                    },
+                ),
+                Err(_) => Self::rejected(
+                    request,
+                    WorkflowWorkerRejectionCodeV1::GrantUnavailable,
+                    true,
+                ),
+            },
             Err(error) => store_rejection(request, &error),
         }
     }
@@ -556,7 +587,7 @@ impl WorkflowWorkerClientV1 {
     pub async fn renew_lease(
         &self,
         lease: WorkflowLeaseV1,
-    ) -> Result<WorkflowLeaseV1, WorkflowWorkerClientError> {
+    ) -> Result<WorkflowWorkerLeaseGrantV1, WorkflowWorkerClientError> {
         self.ensure_negotiated().await?;
         let lease_id = lease.lease_id;
         match self
@@ -565,13 +596,19 @@ impl WorkflowWorkerClientV1 {
             })
             .await?
         {
-            WorkflowWorkerResponseV1::LeaseRenewed { lease }
-                if lease.lease_id == lease_id
-                    && lease.worker_id == self.registration.worker_id
-                    && lease.host_id == self.registration.host_id
-                    && lease.validate().is_ok() =>
+            WorkflowWorkerResponseV1::LeaseRenewed {
+                lease,
+                execution_grant,
+            } if lease.lease_id == lease_id
+                && lease.worker_id == self.registration.worker_id
+                && lease.host_id == self.registration.host_id
+                && lease.validate().is_ok()
+                && !execution_grant.is_empty() =>
             {
-                Ok(*lease)
+                Ok(WorkflowWorkerLeaseGrantV1 {
+                    lease: *lease,
+                    execution_grant,
+                })
             }
             WorkflowWorkerResponseV1::Rejected { code, retryable } => {
                 Err(WorkflowWorkerClientError::Rejected { code, retryable })

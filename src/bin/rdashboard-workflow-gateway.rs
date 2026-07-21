@@ -15,6 +15,10 @@ use rdashboard::{
         BoundWorkflowWorkerSocketV1, SchedulerWorkflowWorkerHandlerV1, WORKER_SOCKET_PATH,
         WorkflowWorkerServerConfigV1, serve_worker_until,
     },
+    workflow_execution_authority::{
+        WORKFLOW_EXECUTION_SIGNING_SCHEMA_VERSION, WorkflowExecutionAuthorityError,
+        WorkflowExecutionSigningConfigV1,
+    },
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -23,6 +27,11 @@ const CONTROL_STORE_PATH: &str = "/var/lib/rdashboard/control.sqlite";
 const WORKER_UID_ENV: &str = "RDASHBOARD_WORKER_UID";
 const WORKER_ID_ENV: &str = "RDASHBOARD_WORKER_ID";
 const WORKER_HOST_ID_ENV: &str = "RDASHBOARD_WORKER_HOST_ID";
+const GRANT_ISSUER_ENV: &str = "RDASHBOARD_WORKFLOW_GRANT_ISSUER";
+const GRANT_AUDIENCE_ENV: &str = "RDASHBOARD_WORKFLOW_GRANT_LAUNCHER_AUDIENCE";
+const GRANT_KEY_ID_ENV: &str = "RDASHBOARD_WORKFLOW_GRANT_KEY_ID";
+const GRANT_KEY_EPOCH_ENV: &str = "RDASHBOARD_WORKFLOW_GRANT_KEY_EPOCH";
+const GRANT_PUBLIC_KEY_ENV: &str = "RDASHBOARD_WORKFLOW_GRANT_PUBLIC_KEY";
 const MAX_CONNECTIONS: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE_DURATION: Duration = Duration::from_secs(15);
@@ -39,6 +48,16 @@ async fn main() -> Result<(), DynError> {
         std::env::var_os(WORKER_ID_ENV),
         std::env::var_os(WORKER_HOST_ID_ENV),
     )?;
+    let grant_signer = Arc::new(
+        configured_signing(
+            std::env::var_os(GRANT_ISSUER_ENV),
+            std::env::var_os(GRANT_AUDIENCE_ENV),
+            std::env::var_os(GRANT_KEY_ID_ENV),
+            std::env::var_os(GRANT_KEY_EPOCH_ENV),
+            std::env::var_os(GRANT_PUBLIC_KEY_ENV),
+        )?
+        .load_system_credential()?,
+    );
     let scheduler = DurableWorkflowScheduler::new(ControlStore::open(CONTROL_STORE_PATH)?);
     let now_ms = unix_time_ms()?;
     let reconciled = scheduler.reconcile_controller_nodes(now_ms)?;
@@ -46,6 +65,7 @@ async fn main() -> Result<(), DynError> {
         scheduler,
         registration.clone(),
         LEASE_DURATION,
+        grant_signer,
     )?);
     let server_config =
         WorkflowWorkerServerConfigV1::new(allowed_uid, MAX_CONNECTIONS, REQUEST_TIMEOUT)?;
@@ -121,6 +141,42 @@ fn configured_identity(
         .map_err(|_| GatewayError::InvalidWorkerIdentity)
 }
 
+fn configured_signing(
+    issuer: Option<OsString>,
+    audience: Option<OsString>,
+    key_id: Option<OsString>,
+    key_epoch: Option<OsString>,
+    public_key: Option<OsString>,
+) -> Result<WorkflowExecutionSigningConfigV1, GatewayError> {
+    let issuer = configured_identity(issuer, GatewayError::MissingGrantIssuer)?;
+    let launcher_audience = configured_identity(audience, GatewayError::MissingGrantAudience)?;
+    let key_id = configured_identity(key_id, GatewayError::MissingGrantKeyId)?;
+    let key_epoch = key_epoch
+        .ok_or(GatewayError::MissingGrantKeyEpoch)?
+        .into_string()
+        .map_err(|_| GatewayError::InvalidGrantKeyEpoch)?
+        .parse::<u64>()
+        .map_err(|_| GatewayError::InvalidGrantKeyEpoch)?;
+    if key_epoch == 0 || key_epoch > i64::MAX.unsigned_abs() {
+        return Err(GatewayError::InvalidGrantKeyEpoch);
+    }
+    let public_key_base64url = public_key
+        .ok_or(GatewayError::MissingGrantPublicKey)?
+        .into_string()
+        .map_err(|_| GatewayError::InvalidGrantPublicKey)?;
+    if public_key_base64url.is_empty() || public_key_base64url.len() > 128 {
+        return Err(GatewayError::InvalidGrantPublicKey);
+    }
+    Ok(WorkflowExecutionSigningConfigV1 {
+        schema_version: WORKFLOW_EXECUTION_SIGNING_SCHEMA_VERSION,
+        issuer,
+        launcher_audience,
+        key_id,
+        key_epoch,
+        public_key_base64url,
+    })
+}
+
 fn init_tracing() -> Result<(), DynError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -160,13 +216,31 @@ enum GatewayError {
     MissingWorkerHostId,
     #[error("workflow worker identity is invalid")]
     InvalidWorkerIdentity,
+    #[error("RDASHBOARD_WORKFLOW_GRANT_ISSUER is required")]
+    MissingGrantIssuer,
+    #[error("RDASHBOARD_WORKFLOW_GRANT_LAUNCHER_AUDIENCE is required")]
+    MissingGrantAudience,
+    #[error("RDASHBOARD_WORKFLOW_GRANT_KEY_ID is required")]
+    MissingGrantKeyId,
+    #[error("RDASHBOARD_WORKFLOW_GRANT_KEY_EPOCH is required")]
+    MissingGrantKeyEpoch,
+    #[error("RDASHBOARD_WORKFLOW_GRANT_KEY_EPOCH is invalid")]
+    InvalidGrantKeyEpoch,
+    #[error("RDASHBOARD_WORKFLOW_GRANT_PUBLIC_KEY is required")]
+    MissingGrantPublicKey,
+    #[error("RDASHBOARD_WORKFLOW_GRANT_PUBLIC_KEY is invalid")]
+    InvalidGrantPublicKey,
+    #[error("workflow execution signing authority is invalid: {0}")]
+    SigningAuthority(#[from] WorkflowExecutionAuthorityError),
     #[error("workflow gateway runtime directory is not protected")]
     UnsafeRuntimeDirectory,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GatewayError, configured_registration, configured_worker_uid};
+    use super::{GatewayError, configured_registration, configured_signing, configured_worker_uid};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::SigningKey;
     use std::ffi::OsString;
 
     #[test]
@@ -196,6 +270,31 @@ mod tests {
         assert!(matches!(
             configured_registration(Some(OsString::from("rimg worker")), None),
             Err(GatewayError::MissingWorkerHostId)
+        ));
+
+        let public_key = URL_SAFE_NO_PAD.encode(
+            SigningKey::from_bytes(&[31_u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let signing = configured_signing(
+            Some(OsString::from("workflow-gateway")),
+            Some(OsString::from("workflow-launcher")),
+            Some(OsString::from("workflow-key-1")),
+            Some(OsString::from("1")),
+            Some(OsString::from(public_key)),
+        )
+        .expect("workflow grant config");
+        assert_eq!(signing.key_epoch, 1);
+        assert!(matches!(
+            configured_signing(
+                Some(OsString::from("workflow-gateway")),
+                Some(OsString::from("workflow-launcher")),
+                Some(OsString::from("workflow-key-1")),
+                Some(OsString::from("0")),
+                Some(OsString::from("invalid")),
+            ),
+            Err(GatewayError::InvalidGrantKeyEpoch)
         ));
     }
 }

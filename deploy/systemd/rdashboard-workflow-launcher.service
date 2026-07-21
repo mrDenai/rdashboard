@@ -1,17 +1,17 @@
 [Unit]
-Description=rdashboard generic workflow worker gateway
-After=local-fs.target
+Description=rdashboard fixed root workflow job launcher
+After=local-fs.target dbus.socket
 Before=rdashboard-worker.service
 
 [Service]
 Type=simple
-User=rdashboard
+User=root
 Group=rdashboard-worker
-ExecStart=/usr/libexec/rdashboard/rdashboard-workflow-gateway
-EnvironmentFile=/etc/rdashboard/workflow-gateway.env
-LoadCredential=workflow-grant-seed:/etc/rdashboard/credentials/workflow-grant-seed
-RuntimeDirectory=rdashboard-workflow
+ExecStart=/usr/libexec/rdashboard/rdashboard-workflow-launcher
+RuntimeDirectory=rdashboard-workflow-launcher
 RuntimeDirectoryMode=0750
+StateDirectory=rdashboard-workflow-launcher
+StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=yes
 PrivateDevices=yes
@@ -25,7 +25,8 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/rdashboard /run/rdashboard-workflow
+ReadWritePaths=/var/lib/rdashboard-workflow-launcher /run/rdashboard-workflow-launcher
+InaccessiblePaths=-/etc/rdashboard/credentials -/run/rdashboard -/run/rdashboard-source-ingress -/run/rdashboard-source-delivery -/run/rdashboard-workflow -/run/docker.sock -/var/run/docker.sock -/run/containerd
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -33,15 +34,16 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+DevicePolicy=closed
 TasksMax=64
 LimitNOFILE=256
 MemoryMax=96M
 CPUQuota=50%
 IOWeight=25
 TimeoutStartSec=10s
-TimeoutStopSec=10s
+TimeoutStopSec=15s
 Restart=on-failure
 RestartSec=2s
 

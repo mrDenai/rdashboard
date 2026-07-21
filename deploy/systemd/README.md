@@ -66,6 +66,11 @@ values in root-owned `/etc/rdashboard/workflow-gateway.env`, mode `0644` or stri
 RDASHBOARD_WORKER_UID=992
 RDASHBOARD_WORKER_ID=shared-vps-worker-1
 RDASHBOARD_WORKER_HOST_ID=production-vps
+RDASHBOARD_WORKFLOW_GRANT_ISSUER=workflow-gateway
+RDASHBOARD_WORKFLOW_GRANT_LAUNCHER_AUDIENCE=workflow-launcher
+RDASHBOARD_WORKFLOW_GRANT_KEY_ID=workflow-key-1
+RDASHBOARD_WORKFLOW_GRANT_KEY_EPOCH=1
+RDASHBOARD_WORKFLOW_GRANT_PUBLIC_KEY=<unpadded-base64url-ed25519-public-key>
 ```
 
 Use the actual numeric worker UID; the example is not an installation default. IDs are stable
@@ -74,9 +79,48 @@ extend past the installed node timeout. Lost renewal responses replay the curren
 Expired, revoked or terminal-pending work becomes explicit cleanup debt; the gateway offers that debt
 before new execution, accepts only a digest-bound cleanup receipt, and preserves it across restart.
 
-The generic worker executable, hard storage fence and preparation store belong to the later worker
-activation boundary. Installing this unit or repository checkout alone must not start shadow work,
-change `auto_deploy`, or grant production mutation authority.
+The gateway loads the matching raw 32-byte Ed25519 seed only through the systemd credential named
+`workflow-grant-seed`. Keep `/etc/rdashboard/credentials/workflow-grant-seed` root-owned, mode `0600`,
+and never put the seed in the environment file. Startup verifies that the configured public key is the
+one derived from that seed. Rotation installs a new higher key epoch in the launcher policy before the
+gateway starts signing with it; old verification keys remain only for their bounded verification
+window and an emergency revocation takes effect at the configured millisecond.
+
+## Fixed workflow launcher
+
+`rdashboard-workflow-launcher.service` is the only root-side boundary for non-mutating workflow jobs.
+The generic worker reaches its mode-`0660` Unix socket as the single configured worker UID. The
+launcher checks peer credentials before decoding, verifies a short-lived Ed25519 grant against the
+exact canonical lease, revalidates the named sealed `PreparedRun`, and derives the unit name, mounts,
+UID/GID, command and resource limits itself. A request cannot supply argv, a host path, a credential,
+a network mode or a systemd property.
+
+Install `/etc/rdashboard/workflow-launcher.jcs` as canonical JCS, root-owned, mode `0600`. It contains
+schema version `1`; the exact worker/build numeric identities and stable worker/host IDs; the matching
+grant issuer and launcher audience; the minimum accepted key epoch and bounded verification-key
+lifecycle list; the sorted, duplicate-free `allowed_adapters`; and `max_concurrent_jobs` plus
+`max_journal_records`. The build UID must differ from the worker UID. The public key is non-secret; no
+signing seed is present in this policy. Keep an adapter absent until its fixed executable, isolation and
+output contract have been installed and reviewed; a signed lease alone cannot enable it.
+
+Before systemd starts an authorized unit, the launcher atomically records the exact execution identity
+under `/var/lib/rdashboard-workflow-launcher/jobs`. A renewed lease for the same execution updates the
+authorization record but never starts a second unit. A launcher restart converts any accepted/running
+record into explicit `needs_reconcile` state, so an uncertain launch is stopped and cleaned rather than
+silently replayed. Cleanup is itself journaled before `systemctl stop`; exact repeats return the same
+evidence. Per-job writable state is an isolated tmpfs with the lease byte and inode ceilings, while the
+sealed prepared input is bind-mounted read-only. The fixed `rdashboard-workflow-job` maps only the
+three installed adapter IDs to fixed script paths and receives an empty, reconstructed environment.
+
+The launcher deliberately has no network namespace, Docker/containerd socket, controller/executor/
+source socket, production volume or credential access. Its only retained capability is read-only DAC
+traversal so it can revalidate the worker-owned mode-`0700` preparation-store root; transient jobs have
+an empty capability set. Installing the binary, policy and unit does not enable or start it, activate a
+worker, change `auto_deploy`, or run a shadow job.
+
+The generic worker loop and the live dedicated-filesystem/quota proof remain a separate activation
+boundary. Installing these units or a repository checkout alone must not start shadow work, change
+`auto_deploy`, or grant production mutation authority.
 
 ## GlitchTip, DeepSeek and GitHub metadata
 

@@ -101,9 +101,9 @@ Implementation progress:
 | Step | Status | Current evidence |
 | --- | --- | --- |
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
-| 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker and sealed preparation store remain step 4. |
+| 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker remains step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
-| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slice 4a locally completes exact source-to-lease binding and the host-local sealed CAS/storage-admission foundation. Worker execution and the fixed job launcher are the next local slice; no activation is implied. |
+| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4b locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants and the fixed peer-authenticated root launcher. The unprivileged generic worker loop and live systemd/quota proof remain next; no activation is implied. |
 | 5-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -281,6 +281,33 @@ Implementation ledger:
   eviction journaling and an exact restart regression close it. The fresh final review returned
   `SAFE` with no open P0-P2 finding; its schema question was resolved against the existing V2 control
   schema. No service, repository, provider, VPS or production state was mutated.
+- Slice 4b extends every concrete work lease with the exact sorted dependency artifact identities used
+  to derive its input digest. The gateway signs a short-lived canonical Ed25519 execution grant only
+  after the lease has exact source and input identity; the root-owned seed arrives only as a systemd
+  credential, is matched to the configured public key and is never exposed to the worker or launcher.
+- A separate root launcher authenticates the one generic worker UID before protocol decode, verifies
+  the exact grant and sealed `PreparedRun`, and derives the transient unit, build identity, read-only
+  workspace mount, private bounded `/job` tmpfs, offline namespace, empty capability set, fixed adapter
+  command and cgroup/runtime ceilings exclusively from root-owned policy. The allowlist keeps native
+  and OCI adapters disabled until their fixed scripts and output contracts are installed and reviewed.
+- The launch journal is canonical, root-private, record/concurrency bounded and restart conservative.
+  Renewal of the same execution updates authorization without another spawn; accepted/running state on
+  restart becomes `needs_reconcile`; cleanup is persisted before `systemctl stop` and exact replay
+  returns the same evidence. A waiter is established before any runtime effect, while post-spawn
+  journal failure transfers the child for reap and stops the exact unit. Exact regressions cover waiter
+  exhaustion, post-spawn journal loss, renewal replay, terminal evidence, restart ambiguity and
+  idempotent cleanup.
+- The final exact staged export passed bare `bin/ci`: 190 active library tests with two credentialed
+  provider tests ignored, every binary/integration/socket suite, 14 scheduler contracts, 8 browser
+  contracts, schema checks, strict Clippy and the optimized release build in 3 minutes. The exact
+  product/config/test diff SHA-256 is
+  `93bcaad8b25b666587a75a539f056c15d3271c80328af78538a0f6ec6a153d0f`.
+- The first full `deepseek-free` review found one P2 orphan-process path after a successful spawn and
+  failed journal/waiter handoff. The lifecycle was reordered and containment hardened; a fresh focused
+  review of the changed ownership paths returned `SAFE` with no open P0-P2 finding. One deliberately
+  conservative P3 remains: a rejected `systemctl stop` leaves the bounded unit as explicit cleanup debt
+  for retry rather than claiming it stopped. No unit was installed, service started, job executed,
+  provider contacted, VPS mutated, push performed or deployment attempted.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

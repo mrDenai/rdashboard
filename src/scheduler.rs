@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     domain::{
         EvidenceDigest, GitCommitId, OperationKind, ProjectId, ProjectManifestV2,
-        WorkflowArtifactKindV1, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
-        WorkflowExecutionProfileV1, WorkflowLeaseV1, WorkflowNodeActivationV1, WorkflowNodeId,
+        WorkflowCleanupReceiptV1, WorkflowCleanupResultV1, WorkflowExecutionProfileV1,
+        WorkflowLeaseInputV1, WorkflowLeaseV1, WorkflowNodeActivationV1, WorkflowNodeId,
         WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowProfileId,
         WorkflowReductionInputV1, WorkflowReductionReceiptV1, WorkflowWorkerPoolV1,
         valid_workflow_identity,
@@ -1245,7 +1245,8 @@ fn claim_next_transaction(
         {
             continue;
         }
-        let expected_input_digest = expected_input_digest(transaction, &candidate)?;
+        let (expected_input_digest, input_artifacts) =
+            expected_input_digest(transaction, &candidate)?;
         let generation = candidate
             .lease_generation
             .checked_add(1)
@@ -1269,6 +1270,7 @@ fn claim_next_transaction(
             candidate.preparation_key.clone(),
             candidate.node,
             candidate.profile,
+            input_artifacts,
             expected_input_digest,
             worker.worker_id.clone(),
             worker.host_id.clone(),
@@ -1677,20 +1679,13 @@ struct ExpectedInputPayload<'a> {
     workflow_policy_digest: &'a EvidenceDigest,
     preparation_key: &'a EvidenceDigest,
     node_id: &'a WorkflowNodeId,
-    dependencies: &'a [ExpectedInputDependency],
-}
-
-#[derive(Serialize)]
-struct ExpectedInputDependency {
-    node_id: WorkflowNodeId,
-    artifact_kind: WorkflowArtifactKindV1,
-    output_digest: EvidenceDigest,
+    dependencies: &'a [WorkflowLeaseInputV1],
 }
 
 fn expected_input_digest(
     transaction: &Transaction<'_>,
     candidate: &ReadyCandidate<'_>,
-) -> Result<EvidenceDigest, StoreError> {
+) -> Result<(EvidenceDigest, Vec<WorkflowLeaseInputV1>), StoreError> {
     let mut statement = transaction.prepare(
         "SELECT dependency.dependency_node_id, node.state, node.output_digest
          FROM workflow_node_dependencies AS dependency
@@ -1726,7 +1721,7 @@ fn expected_input_digest(
         let manifest_node = candidate.manifest.workflow.node(&node_id).ok_or(
             StoreError::CorruptWorkflowJournal("dependency absent from manifest"),
         )?;
-        dependencies.push(ExpectedInputDependency {
+        dependencies.push(WorkflowLeaseInputV1 {
             node_id,
             artifact_kind: manifest_node.output_contract,
             output_digest: parse_digest(
@@ -1740,17 +1735,16 @@ fn expected_input_digest(
     if dependencies.len() != candidate.node.depends_on.len() {
         return Err(StoreError::CorruptWorkflowJournal("dependency cardinality"));
     }
-    Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
-        &ExpectedInputPayload {
-            purpose: "rdashboard.workflow-node-input.v1",
-            project_id: &candidate.project_id,
-            source_sha: &candidate.source_sha,
-            workflow_policy_digest: &candidate.workflow_policy_digest,
-            preparation_key: &candidate.preparation_key,
-            node_id: &candidate.node.node_id,
-            dependencies: &dependencies,
-        },
-    )?))
+    let digest = EvidenceDigest::sha256(serde_jcs::to_vec(&ExpectedInputPayload {
+        purpose: "rdashboard.workflow-node-input.v1",
+        project_id: &candidate.project_id,
+        source_sha: &candidate.source_sha,
+        workflow_policy_digest: &candidate.workflow_policy_digest,
+        preparation_key: &candidate.preparation_key,
+        node_id: &candidate.node.node_id,
+        dependencies: &dependencies,
+    })?);
+    Ok((digest, dependencies))
 }
 
 fn wake_waiting_attempts(transaction: &Transaction<'_>, now_ms: i64) -> Result<(), StoreError> {

@@ -370,6 +370,18 @@ fn fair_queue_and_lease_generation_survive_reopen() {
         first_source.attestation_digest,
         digest("attestation-ralert-1")
     );
+    let [first_input] = first
+        .required_input_artifacts()
+        .unwrap_or_else(|error| panic!("exact first input artifacts: {error}"))
+    else {
+        panic!("host preparation must bind exactly one source input");
+    };
+    assert_eq!(first_input.node_id.as_str(), "source");
+    assert_eq!(
+        first_input.artifact_kind,
+        WorkflowArtifactKindV1::SourceSnapshot
+    );
+    assert_eq!(first_input.output_digest, first_source.attestation_digest);
     drop(scheduler);
     drop(store);
 
@@ -414,6 +426,7 @@ fn fair_queue_and_lease_generation_survive_reopen() {
     assert_eq!(replayed.node_id, first.node_id);
     assert_eq!(replayed.lease_generation, 2);
     assert_eq!(replayed.source_identity, first.source_identity);
+    assert_eq!(replayed.input_artifacts, first.input_artifacts);
 }
 
 #[test]

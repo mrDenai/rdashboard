@@ -182,7 +182,9 @@ pub enum WorkflowNodeActivationV1 {
     OnMutationFailure,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowAdapterIdV1 {
     ControllerSourceAdmissionV1,
@@ -628,6 +630,14 @@ pub struct WorkflowSourceIdentityV1 {
     pub attestation_digest: EvidenceDigest,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLeaseInputV1 {
+    pub node_id: WorkflowNodeId,
+    pub artifact_kind: WorkflowArtifactKindV1,
+    pub output_digest: EvidenceDigest,
+}
+
 impl WorkflowSourceIdentityV1 {
     fn validate(&self) -> Result<(), WorkflowContractError> {
         if self.sequence == 0 {
@@ -661,6 +671,8 @@ pub struct WorkflowLeaseV1 {
     pub timeout_ms: u64,
     pub resources: Option<WorkflowResourceEnvelopeV1>,
     pub input_contracts: Vec<WorkflowArtifactKindV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_artifacts: Vec<WorkflowLeaseInputV1>,
     pub output_contract: WorkflowArtifactKindV1,
     pub expected_input_digest: EvidenceDigest,
     pub worker_id: String,
@@ -694,6 +706,8 @@ struct WorkflowLeaseDigestPayload<'a> {
     timeout_ms: u64,
     resources: &'a Option<WorkflowResourceEnvelopeV1>,
     input_contracts: &'a [WorkflowArtifactKindV1],
+    #[serde(skip_serializing_if = "<[WorkflowLeaseInputV1]>::is_empty")]
+    input_artifacts: &'a [WorkflowLeaseInputV1],
     output_contract: WorkflowArtifactKindV1,
     expected_input_digest: &'a EvidenceDigest,
     worker_id: &'a str,
@@ -717,6 +731,7 @@ impl WorkflowLeaseV1 {
         preparation_key: EvidenceDigest,
         node: &WorkflowNodeV1,
         profile: &WorkflowExecutionProfileV1,
+        input_artifacts: Vec<WorkflowLeaseInputV1>,
         expected_input_digest: EvidenceDigest,
         worker_id: String,
         host_id: String,
@@ -747,6 +762,7 @@ impl WorkflowLeaseV1 {
             timeout_ms: profile.timeout_ms,
             resources: profile.resources.clone(),
             input_contracts: node.input_contracts.clone(),
+            input_artifacts,
             output_contract: node.output_contract,
             expected_input_digest,
             worker_id,
@@ -789,6 +805,19 @@ impl WorkflowLeaseV1 {
             || !profile_matches_kind(&profile, self.node_kind)
             || profile.validate().is_err()
             || !strictly_sorted_unique(&self.input_contracts)
+            || !strictly_sorted_unique(&self.input_artifacts)
+            || self
+                .input_artifacts
+                .windows(2)
+                .any(|pair| pair[0].node_id >= pair[1].node_id)
+            || !self.input_artifacts.is_empty()
+                && (self.input_artifacts.len() != self.input_contracts.len()
+                    || self
+                        .input_artifacts
+                        .iter()
+                        .map(|input| input.artifact_kind)
+                        .collect::<BTreeSet<_>>()
+                        != self.input_contracts.iter().copied().collect())
             || self.output_contract != self.node_kind.expected_output()
             || self.lease_digest != self.calculate_digest()?
         {
@@ -820,6 +849,19 @@ impl WorkflowLeaseV1 {
             .ok_or(WorkflowContractError::MissingLeaseSourceIdentity)
     }
 
+    pub fn required_input_artifacts(
+        &self,
+    ) -> Result<&[WorkflowLeaseInputV1], WorkflowContractError> {
+        self.validate()?;
+        if self.input_contracts.is_empty()
+            || self.input_artifacts.len() == self.input_contracts.len()
+        {
+            Ok(&self.input_artifacts)
+        } else {
+            Err(WorkflowContractError::MissingLeaseInputArtifacts)
+        }
+    }
+
     pub fn renewed(&self, expires_at_ms: i64) -> Result<Self, WorkflowContractError> {
         self.validate()?;
         if expires_at_ms <= self.expires_at_ms {
@@ -830,6 +872,15 @@ impl WorkflowLeaseV1 {
         renewed.lease_digest = renewed.calculate_digest()?;
         renewed.validate()?;
         Ok(renewed)
+    }
+
+    pub fn same_execution_as(&self, other: &Self) -> Result<bool, WorkflowContractError> {
+        self.validate()?;
+        other.validate()?;
+        let mut normalized = self.clone();
+        normalized.expires_at_ms = other.expires_at_ms;
+        normalized.lease_digest = other.lease_digest.clone();
+        Ok(normalized == *other)
     }
 
     fn calculate_digest(&self) -> Result<EvidenceDigest, WorkflowContractError> {
@@ -856,6 +907,7 @@ impl WorkflowLeaseV1 {
                 timeout_ms: self.timeout_ms,
                 resources: &self.resources,
                 input_contracts: &self.input_contracts,
+                input_artifacts: &self.input_artifacts,
                 output_contract: self.output_contract,
                 expected_input_digest: &self.expected_input_digest,
                 worker_id: &self.worker_id,
@@ -1353,6 +1405,8 @@ pub enum WorkflowContractError {
     InvalidLease,
     #[error("legacy workflow lease has no exact source identity and cannot start new work")]
     MissingLeaseSourceIdentity,
+    #[error("legacy workflow lease has no exact input artifacts and cannot start new work")]
+    MissingLeaseInputArtifacts,
     #[error("workflow node receipt is structurally invalid or has a mismatched digest")]
     InvalidNodeReceipt,
     #[error("workflow cleanup receipt is structurally invalid or has a mismatched digest")]
@@ -1404,6 +1458,11 @@ mod tests {
             EvidenceDigest::sha256("preparation key"),
             node,
             profile,
+            vec![WorkflowLeaseInputV1 {
+                node_id: "source".parse().expect("source node ID"),
+                artifact_kind: WorkflowArtifactKindV1::SourceSnapshot,
+                output_digest: EvidenceDigest::sha256("source attestation"),
+            }],
             EvidenceDigest::sha256("expected input"),
             "legacy-worker".to_owned(),
             "legacy-host".to_owned(),
@@ -1412,17 +1471,23 @@ mod tests {
         )
         .expect("new lease");
         lease.source_identity = None;
+        lease.input_artifacts.clear();
         lease.lease_digest = lease.calculate_digest().expect("legacy lease digest");
         let canonical = lease.canonical_bytes().expect("legacy canonical lease");
         assert!(
             !String::from_utf8_lossy(&canonical).contains("source_identity"),
             "the optional field preserves the canonical encoding of stored V1 leases"
         );
+        assert!(!String::from_utf8_lossy(&canonical).contains("input_artifacts"));
         let decoded = WorkflowLeaseV1::decode_canonical(&canonical).expect("decode legacy lease");
         assert_eq!(decoded, lease);
         assert!(matches!(
             decoded.required_source_identity(),
             Err(WorkflowContractError::MissingLeaseSourceIdentity)
+        ));
+        assert!(matches!(
+            decoded.required_input_artifacts(),
+            Err(WorkflowContractError::MissingLeaseInputArtifacts)
         ));
     }
 }

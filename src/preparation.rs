@@ -325,6 +325,37 @@ impl PreparedEntryV1 {
 }
 
 #[derive(Clone, Debug)]
+pub struct PreparationStoreReaderV1 {
+    root: PathBuf,
+    expected_owner_uid: u32,
+}
+
+impl PreparationStoreReaderV1 {
+    pub fn open(
+        root: impl Into<PathBuf>,
+        expected_owner_uid: u32,
+    ) -> Result<Self, PreparationStoreError> {
+        let reader = Self {
+            root: root.into(),
+            expected_owner_uid,
+        };
+        validate_store_root(&reader.root, reader.expected_owner_uid)?;
+        validate_layout(&reader.root, reader.expected_owner_uid)?;
+        Ok(reader)
+    }
+
+    pub fn open_entry(
+        &self,
+        kind: PreparationObjectKindV1,
+        key: &EvidenceDigest,
+    ) -> Result<PreparedEntryV1, PreparationStoreError> {
+        validate_store_root(&self.root, self.expected_owner_uid)?;
+        validate_layout(&self.root, self.expected_owner_uid)?;
+        validate_sealed_entry(&self.root, self.expected_owner_uid, kind, key, 0o555)
+    }
+}
+
+#[derive(Clone, Debug)]
 struct PreparationStorePolicy {
     max_bytes: u64,
     max_inodes: u64,
@@ -367,6 +398,26 @@ struct FilesystemBoundarySnapshot {
 
 trait FilesystemBoundaryProbe: Send + Sync {
     fn inspect(&self) -> Result<FilesystemBoundarySnapshot, PreparationStoreError>;
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestPreparationBoundaryProbe {
+    max_bytes: u64,
+}
+
+#[cfg(test)]
+impl FilesystemBoundaryProbe for TestPreparationBoundaryProbe {
+    fn inspect(&self) -> Result<FilesystemBoundarySnapshot, PreparationStoreError> {
+        Ok(FilesystemBoundarySnapshot {
+            dedicated_mount: true,
+            store_total_bytes: self.max_bytes.max(1024 * 1024 * 1024),
+            store_available_bytes: self.max_bytes.max(1024 * 1024 * 1024),
+            root_available_bytes: MIN_ROOT_EMERGENCY_RESERVE_BYTES
+                .saturating_add(self.max_bytes.max(1024 * 1024 * 1024)),
+            allocation_granularity: 4_096,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -881,26 +932,7 @@ impl PreparationStore {
         key: &EvidenceDigest,
         root_mode: u32,
     ) -> Result<PreparedEntryV1, PreparationStoreError> {
-        let path = self.entry_path(kind, key);
-        validate_directory(&path, self.expected_owner_uid, root_mode)?;
-        let manifest_path = path.join("manifest.jcs");
-        let manifest_bytes = read_trusted_file(
-            &manifest_path,
-            self.expected_owner_uid,
-            0o444,
-            MAX_ENTRY_MANIFEST_BYTES,
-        )?;
-        let manifest = PreparationEntryManifestV1::decode_canonical(&manifest_bytes)?;
-        if manifest.kind != kind || manifest.key != *key {
-            return Err(PreparationStoreError::EntryIdentityMismatch);
-        }
-        let payload = path.join("payload");
-        validate_directory(&payload, self.expected_owner_uid, 0o555)?;
-        let entries = inspect_sealed_payload(&payload, self.expected_owner_uid)?;
-        if entries != manifest.entries {
-            return Err(PreparationStoreError::EntryChecksumMismatch);
-        }
-        Ok(PreparedEntryV1 { manifest, path })
+        validate_sealed_entry(&self.root, self.expected_owner_uid, kind, key, root_mode)
     }
 
     fn reconcile_committing_entries(&self) -> Result<(), PreparationStoreError> {
@@ -1299,6 +1331,56 @@ impl PreparationStore {
             .join("evictions")
             .join(format!("{}-{}.jcs", kind.directory_name(), key.as_str()))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn open_test_preparation_store(
+    root: impl AsRef<Path>,
+    expected_owner_uid: u32,
+    max_bytes: u64,
+) -> Result<PreparationStore, PreparationStoreError> {
+    PreparationStore::open_with_policy(
+        root.as_ref().to_path_buf(),
+        expected_owner_uid,
+        PreparationStorePolicy {
+            max_bytes,
+            max_inodes: 10_000,
+            root_emergency_reserve_bytes: MIN_ROOT_EMERGENCY_RESERVE_BYTES,
+            warm_window_ms: 0,
+        },
+        Arc::new(TestPreparationBoundaryProbe { max_bytes }),
+    )
+}
+
+fn validate_sealed_entry(
+    root: &Path,
+    expected_owner_uid: u32,
+    kind: PreparationObjectKindV1,
+    key: &EvidenceDigest,
+    root_mode: u32,
+) -> Result<PreparedEntryV1, PreparationStoreError> {
+    let path = root
+        .join("objects")
+        .join(kind.directory_name())
+        .join(key.as_str());
+    validate_directory(&path, expected_owner_uid, root_mode)?;
+    let manifest_bytes = read_trusted_file(
+        &path.join("manifest.jcs"),
+        expected_owner_uid,
+        0o444,
+        MAX_ENTRY_MANIFEST_BYTES,
+    )?;
+    let manifest = PreparationEntryManifestV1::decode_canonical(&manifest_bytes)?;
+    if manifest.kind != kind || manifest.key != *key {
+        return Err(PreparationStoreError::EntryIdentityMismatch);
+    }
+    let payload = path.join("payload");
+    validate_directory(&payload, expected_owner_uid, 0o555)?;
+    let entries = inspect_sealed_payload(&payload, expected_owner_uid)?;
+    if entries != manifest.entries {
+        return Err(PreparationStoreError::EntryChecksumMismatch);
+    }
+    Ok(PreparedEntryV1 { manifest, path })
 }
 
 fn source_key_material(
@@ -2667,6 +2749,17 @@ mod tests {
                 & 0o7777,
             0o444
         );
+        let reader = PreparationStoreReaderV1::open(
+            &root,
+            fs::metadata(&root).expect("store metadata").uid(),
+        )
+        .expect("open concurrent read-only store view");
+        assert_eq!(
+            reader
+                .open_entry(PreparationObjectKindV1::DependencySnapshot, &key)
+                .expect("revalidate sealed entry without taking the writer lock"),
+            entry
+        );
     }
 
     #[test]
@@ -3003,11 +3096,16 @@ mod tests {
             manifest.project_id.clone(),
             sha,
             9,
-            attestation_nine,
+            attestation_nine.clone(),
             policy_digest,
             EvidenceDigest::sha256("scheduler preparation key"),
             node,
             profile,
+            vec![crate::domain::WorkflowLeaseInputV1 {
+                node_id: "source".parse().expect("source node ID"),
+                artifact_kind: crate::domain::WorkflowArtifactKindV1::SourceSnapshot,
+                output_digest: attestation_nine.clone(),
+            }],
             EvidenceDigest::sha256("expected input"),
             "vps-build-1".to_owned(),
             "vps-1".to_owned(),
