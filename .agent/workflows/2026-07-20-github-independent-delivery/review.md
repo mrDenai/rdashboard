@@ -1683,3 +1683,102 @@ The final review inspected the corrected exact hash above:
 Slice 12c is production-worthy as an inactive local versioned-runtime and root-recovery boundary and
 may be committed. A push still will not self-deploy on the VPS until the `rdashboard` project/policy,
 initial current/LKG slots, host failure drills and separately authorized activation are completed.
+
+## Slice 12d inactive self-project workflow onboarding review
+
+### Scope and outcome
+
+This slice installs no host state but supplies the reviewed repository candidates and scheduler
+contract needed to treat `rdashboard` as one project of its own generic worker:
+
+- `config/project-manifests/rdashboard.json` binds the exact GitHub repository/main branch, pinned
+  Cargo preparation, bare `bin/ci`, native self-release publication and deterministic evidence
+  reduction; `config/source-projects.json` covers it exactly with `auto_deploy=false`;
+- the explicit `self_update_handoff` workflow mode has exactly five non-privileged-executor nodes. It
+  cannot also enter the ordinary reserve/health/cutover/rollback graph, because the persistent stable
+  bootstrap is the sole A/B pointer, database-backup, service-health and rollback owner;
+- only native `rdashboard`, without manifest-managed data or migration, may select that mode. Existing
+  manifests decode as the default executor-mutation mode and preserve their prior canonical shape;
+- native publication claims the existing per-project delivery lock. Newer heads may still supersede
+  work before publication is claimed, but wait after that boundary. Successful evidence reduction and
+  only successful terminal reduction releases the lock; a failed or expired publication becomes
+  durable reconcile debt and cannot be overtaken because job cleanup cannot prove a post-rename
+  handoff was never visible;
+- bounded `canonicalize-manifest` input provides the strict repository-JSON to installed canonical-JCS
+  path without letting pretty checkout files become runtime authority.
+
+The catalog and controls remain inactive. No webhook, credential, launcher/self-update policy,
+initial release slot, service, VPS/i9/provider setting, push or deployment was changed. A pushed commit
+still does not self-deploy until the remaining host-specific policy, initial-slot, drill and explicit
+activation gates are completed.
+
+### Self-review and independent findings
+
+- Self-review found that reusing the ordinary full workflow would have created two deployment owners:
+  the generic privileged executor and the persistent self-update bootstrap. The dedicated terminal
+  handoff graph removes that conflict instead of implementing no-op executor steps.
+- The first scheduler test showed a newer head correctly superseded a pre-publication attempt. The
+  publication claim is now the exact serialization boundary: once root publication may become visible,
+  a new head waits and any failed or unknown publication becomes reconciliation debt.
+- Post-consult self-review found that `cleanup_result=complete` proves transient job/staging cleanup but
+  not publication absence: `SelfReleaseHandoffStoreV1::promote` can fail after the final directory
+  rename during root fsync or request-file cleanup. The initial clean-failure unlock was removed; both
+  an explicit failed receipt and expiry now retain reconcile ownership so a possibly visible handoff
+  cannot be overtaken.
+- DeepSeek returned `NO_BLOCKER` with no P0-P2 finding. Its P3 expired-lease manifest parse happens only
+  on a rare recovery path and is accepted without adding a persistent schema flag. Its P3 mutation-lock
+  SELECT/INSERT observation is an existing immediate-transaction pattern under SQLite's serialized
+  writer lock. Its bounded `take(max + 1)` observation describes the intended standard oversized-input
+  sentinel and requires no change.
+- The review's only open question asked whether optional `build_compute` could verify a native release
+  away from the VPS. Local evidence resolves it: `verification_feeds_native_release` rejects any worker
+  lacking `vps_required`, and the scheduler regression proves the optional accelerator cannot claim
+  that verification while verification and packaging reuse the same VPS state key and host.
+
+### Verification
+
+- Final bare `bin/ci`: passed, exit code 0.
+- It covered strict formatting and Clippy, 296 active library tests with two credentialed live-provider
+  tests ignored by design, every binary/integration/socket/scheduler/worker suite, generated schema
+  drift, nine browser tests and the optimized release build.
+- The release phase completed in 4 minutes 55 seconds. The 20 scheduler contracts include terminal
+  self-update success, failed post-claim publication debt and expired publication debt.
+- `git diff --cached --check` passed. The second review inspected corrected whole-staged SHA-256
+  `2166f284efcf217d2434eba5512c06be3b2d33d7f663317633520917b66fa8e3`; its exact
+  product/config/test subset SHA-256 is
+  `995980b4cee68497aaf5e6b125a84ddcfe62541e3f19abfa4ec97b94d4093ca5`.
+
+### Independent consultation
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 176 seconds;
+- state fingerprint: `7d0de58ff260c4ef6de6b278100d61c91ff301f7b471030b21f9911de56e8`;
+- brief SHA-256: `51604b9918b205f89aea79664c4d661f9ea999ed24ce983603ef6f3312e9dbd9`;
+- response SHA-256: `90cf3c3ae1367467ecb2cf2cf07a6dc2461b8714e167ee8286d7e6b6f170da8b`;
+- verdict: `NO_BLOCKER`, no P0-P2 finding.
+
+This first review inspected staged SHA-256
+`6c3d237384f888e3d49ff2c636721794970a2d2f9e9eab4c35ddcfc9f239a0fb`. It missed the post-rename
+failure ambiguity found by self-review; its otherwise nonblocking observations and optional-i9 question
+remain dispositioned above.
+
+The second exact review inspected the corrected staged hash after the final gate:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 234 seconds;
+- state fingerprint: `3e1d496689be45dff23d72750dbe515db5bad045a16936ac78b20f4e34d2fe8a`;
+- brief SHA-256: `af72a11e4ef4ad0bb6e1b44a9452f2f60eb4fb5b867253d29f80fe0d8a0c92c0`;
+- response SHA-256: `624c6f6a483900762ead2cf9dccb111f54921886117cf6e697279689787a0033`;
+- verdict: `NO_BLOCKER`, no P0-P2 finding.
+
+It explicitly confirmed that failed publication despite complete job cleanup, expired publication and
+a newer waiting head all remain fail-closed. Its two open questions are accepted recovery semantics,
+not missing automation: a late success after expiry deliberately stays reconciliation debt, and a
+permanent request-removal failure cannot create a scheduler retry loop because `NeedsReconcile` is not
+automatically requeued. The root recovery path must resolve the exact published state.
+
+### Verdict
+
+Slice 12d is production-worthy as an inactive local self-project workflow onboarding boundary and may
+be committed. Host-specific launcher/self-update policy generation, first-slot provisioning, failure
+drills and explicit production activation remain; this commit alone does not make pushes deploy.

@@ -86,6 +86,16 @@ fn native_manifest(project: &str) -> ProjectManifestV2 {
     manifest
 }
 
+fn self_update_manifest() -> ProjectManifestV2 {
+    let manifest: ProjectManifestV2 =
+        serde_json::from_str(include_str!("../config/project-manifests/rdashboard.json"))
+            .unwrap_or_else(|error| panic!("decode self-update manifest: {error}"));
+    manifest
+        .validate()
+        .unwrap_or_else(|error| panic!("self-update workflow fixture: {error}"));
+    manifest
+}
+
 fn admission(
     manifest: &ProjectManifestV2,
     sha_byte: char,
@@ -986,6 +996,238 @@ fn terminal_success_releases_mutation_ownership_and_wakes_the_newer_head() {
     let preparation = claim(&scheduler, &build_worker(), 200);
     assert_eq!(preparation.attempt_id, woken.attempt_id);
     assert_eq!(preparation.node_kind, WorkflowNodeKindV1::HostPrepare);
+}
+
+#[test]
+fn self_update_handoff_finishes_without_claiming_executor_mutation_nodes() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = self_update_manifest();
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '7',
+                7,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "self-update-7",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit self-update workflow: {error}"));
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    assert_eq!(prepare.node_kind, WorkflowNodeKindV1::HostPrepare);
+    commit_success(&scheduler, &prepare, "self-update-prepare");
+    let verify = claim(&scheduler, &worker, 30);
+    assert_eq!(verify.node_kind, WorkflowNodeKindV1::Verification);
+    commit_success(&scheduler, &verify, "self-update-verify");
+    let release = claim(&scheduler, &worker, 50);
+    assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+    assert_eq!(release.host_id, verify.host_id);
+    let newer = scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '8',
+                8,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "self-update-8",
+            ),
+            51,
+        )
+        .unwrap_or_else(|error| panic!("admit newer self-update workflow: {error}"));
+    assert_eq!(
+        newer.attempt().state,
+        WorkflowAttemptStateV1::WaitingForMutation
+    );
+    commit_success(&scheduler, &release, "self-update-release");
+    scheduler
+        .reduce_attempt(prepare.attempt_id, 70)
+        .unwrap_or_else(|error| panic!("reduce self-update evidence: {error}"));
+
+    let completed = scheduler
+        .attempt(prepare.attempt_id)
+        .unwrap_or_else(|error| panic!("load completed self-update: {error}"))
+        .unwrap_or_else(|| panic!("completed self-update exists"));
+    assert_eq!(completed.state, WorkflowAttemptStateV1::Succeeded);
+    assert_eq!(completed.mutation_state, WorkflowMutationStateV1::Complete);
+    assert!(completed.nodes.iter().all(|node| node.kind
+        != WorkflowNodeKindV1::ResourceReservation
+        && !node.kind.is_mutation()));
+    assert!(
+        scheduler
+            .claim_next(&executor_worker(), 80, 1_000)
+            .unwrap_or_else(|error| panic!("probe executor queue: {error}"))
+            .is_none()
+    );
+    assert_eq!(
+        scheduler
+            .attempt(newer.attempt().attempt_id)
+            .unwrap_or_else(|error| panic!("load woken self-update: {error}"))
+            .unwrap_or_else(|| panic!("woken self-update exists"))
+            .state,
+        WorkflowAttemptStateV1::Queued
+    );
+}
+
+#[test]
+fn failed_self_update_publication_stays_reconcile_debt_after_job_cleanup() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = self_update_manifest();
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '5',
+                5,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "self-update-failure-5",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit self-update workflow: {error}"));
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    commit_success(&scheduler, &prepare, "failed-self-update-prepare");
+    let verify = claim(&scheduler, &worker, 30);
+    commit_success(&scheduler, &verify, "failed-self-update-verify");
+    let release = claim(&scheduler, &worker, 50);
+    assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+    let newer = scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '6',
+                6,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "self-update-failure-6",
+            ),
+            51,
+        )
+        .unwrap_or_else(|error| panic!("admit newer self-update workflow: {error}"));
+    assert_eq!(
+        newer.attempt().state,
+        WorkflowAttemptStateV1::WaitingForMutation
+    );
+
+    let failed = WorkflowNodeReceiptV1::new(
+        &release,
+        WorkflowNodeOutcomeV1::Failed,
+        None,
+        digest("failed-self-update-execution"),
+        digest("complete-self-update-cleanup"),
+        WorkflowCleanupResultV1::Complete,
+        60,
+    )
+    .unwrap_or_else(|error| panic!("failed self-update receipt: {error}"));
+    let terminal = scheduler
+        .commit_node_receipt(&failed, 61)
+        .unwrap_or_else(|error| panic!("commit failed self-update receipt: {error}"));
+    assert_eq!(terminal.state, WorkflowAttemptStateV1::NeedsReconcile);
+    assert_eq!(
+        terminal.mutation_state,
+        WorkflowMutationStateV1::NeedsReconcile
+    );
+    assert_eq!(terminal.cleanup_state, WorkflowCleanupStateV1::Complete);
+    assert_eq!(
+        terminal
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .unwrap_or_else(|| panic!("self-update release node exists"))
+            .state,
+        WorkflowNodeStateV1::NeedsReconcile
+    );
+    assert_eq!(
+        scheduler
+            .attempt(newer.attempt().attempt_id)
+            .unwrap_or_else(|error| panic!("load blocked self-update: {error}"))
+            .unwrap_or_else(|| panic!("blocked self-update exists"))
+            .state,
+        WorkflowAttemptStateV1::WaitingForMutation
+    );
+}
+
+#[test]
+fn expired_self_update_publication_stays_reconcile_debt_and_blocks_newer_heads() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = self_update_manifest();
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '3',
+                3,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "self-update-expiry-3",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit self-update workflow: {error}"));
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    commit_success(&scheduler, &prepare, "expired-self-update-prepare");
+    let verify = claim(&scheduler, &worker, 30);
+    commit_success(&scheduler, &verify, "expired-self-update-verify");
+    let release = claim(&scheduler, &worker, 50);
+    let newer = scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '4',
+                4,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "self-update-expiry-4",
+            ),
+            51,
+        )
+        .unwrap_or_else(|error| panic!("admit newer self-update workflow: {error}"));
+
+    assert_eq!(
+        scheduler
+            .expire_leases(release.expires_at_ms)
+            .unwrap_or_else(|error| panic!("expire self-update release lease: {error}")),
+        1
+    );
+    let ambiguous = scheduler
+        .attempt(prepare.attempt_id)
+        .unwrap_or_else(|error| panic!("load ambiguous self-update: {error}"))
+        .unwrap_or_else(|| panic!("ambiguous self-update exists"));
+    assert_eq!(ambiguous.state, WorkflowAttemptStateV1::NeedsReconcile);
+    assert_eq!(
+        ambiguous.mutation_state,
+        WorkflowMutationStateV1::NeedsReconcile
+    );
+    assert_eq!(ambiguous.cleanup_state, WorkflowCleanupStateV1::Pending);
+    assert_eq!(
+        ambiguous
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .unwrap_or_else(|| panic!("self-update release node exists"))
+            .state,
+        WorkflowNodeStateV1::NeedsReconcile
+    );
+    assert_eq!(
+        scheduler
+            .attempt(newer.attempt().attempt_id)
+            .unwrap_or_else(|error| panic!("load blocked self-update: {error}"))
+            .unwrap_or_else(|| panic!("blocked self-update exists"))
+            .state,
+        WorkflowAttemptStateV1::WaitingForMutation
+    );
 }
 
 #[test]

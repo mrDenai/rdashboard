@@ -74,9 +74,11 @@ Do not enable this unit in production yet. Activation additionally requires:
 1. a reviewed initial versioned release with both `current` and `last-known-good` initialized before
    the migrated units are reloaded;
 2. disposable-host kill, OOM and reboot drills at every recorded phase;
-3. installed `rdashboard` project/policy integration with `auto_deploy` still false;
+3. install the reviewed `rdashboard` manifest/source controls and matching launcher/self-update
+   policies with `auto_deploy` still false;
 4. a fresh explicit production authorization.
 
-The generic worker producer, root-signed atomic handoff, versioned executable paths and stable root
+The generic worker producer, explicit terminal self-update workflow, inactive `rdashboard` repository
+catalog/control candidates, root-signed atomic handoff, versioned executable paths and stable root
 recovery CLI are implemented locally. They remain inactive until the launcher policy, signing
 credential, drop-in, initial slots and bootstrap activation gates above are installed together.

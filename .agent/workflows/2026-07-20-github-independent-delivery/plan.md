@@ -105,7 +105,7 @@ Implementation progress:
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
 | 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4h locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state, the inactive rootless BuildKit activation boundary and a verified typed OCI build-result handoff. Live systemd/dedicated-filesystem/quota/concurrency proof and the first project-specific sealed-base preparation remain; no activation is implied. |
 | 5-11 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
-| 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Slice 12c migrates the complete application payload to one atomic `current/bin` slot and adds the stable root recovery CLI. Installed project/policy integration, initial-slot provisioning, failure drills and explicit activation remain. |
+| 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Slice 12c migrates the complete application payload to one atomic `current/bin` slot and adds the stable root recovery CLI. Slice 12d adds the inactive exact `rdashboard` source/workflow catalog and a terminal self-update handoff graph that cannot also enter the generic executor mutation path. Host-specific launcher/self-update policy generation, initial-slot provisioning, failure drills and explicit activation remain. |
 
 Implementation ledger:
 
@@ -523,6 +523,14 @@ Implementation ledger:
   its verified backup, or admit an exact SHA-named signed handoff through the normal coordinator.
   All local producer code remains inactive until its manifest, launcher policy, initial release slots
   and host drills are installed and authorized together.
+- Slice 12d onboards `rdashboard` into the reviewed repository catalog and exact source controls while
+  keeping `auto_deploy=false`. Its explicit `self_update_handoff` graph performs Cargo preparation,
+  bare-gate verification, native signed publication and deterministic evidence reduction only; it has
+  no privileged-executor reserve/health/cutover/rollback nodes because the stable bootstrap exclusively
+  owns those effects. Claiming publication acquires the project delivery lock; any failed or expired
+  publication becomes durable reconcile debt rather than letting a newer push overtake a potentially
+  visible handoff. A strict canonicalization command provides the exact
+  JSON-to-installed-JCS path without weakening installed canonical-byte checks.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

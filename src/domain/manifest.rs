@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use url::Url;
 
 use super::{
-    EvidenceDigest, ProjectId, WorkflowHostPreparationPolicyV1, WorkflowNodeKindV1,
-    WorkflowPolicyV1,
+    EvidenceDigest, ProjectId, WorkflowDeliveryModeV1, WorkflowHostPreparationPolicyV1,
+    WorkflowNodeKindV1, WorkflowPolicyV1,
 };
 
 pub const PROJECT_MANIFEST_SCHEMA_VERSION: u16 = 1;
@@ -94,6 +94,16 @@ impl ProjectManifestV2 {
         self.workflow
             .validate()
             .map_err(|_| ManifestError::WorkflowInvalid)?;
+        if self.workflow.delivery_mode == WorkflowDeliveryModeV1::SelfUpdateHandoff
+            && (self.project_id.as_str() != "rdashboard"
+                || self.build.kind != BuildKind::Native
+                || !self.data_volumes.is_empty()
+                || self.migration.entrypoint != MigrationEntrypoint::None
+                || self.migration.write_fence != WriteFencePolicy::Unsupported
+                || !self.rollback.code_rollback)
+        {
+            return Err(ManifestError::SelfUpdateWorkflowMismatch);
+        }
         let release_adapter = self
             .workflow
             .nodes
@@ -551,6 +561,8 @@ pub enum ManifestError {
     InvalidDockerfilePath,
     #[error("build kind does not match the workflow release adapter")]
     BuildWorkflowMismatch,
+    #[error("self-update handoff workflow is not a native rdashboard release contract")]
+    SelfUpdateWorkflowMismatch,
     #[error("soak duration must be between 10 seconds and 24 hours")]
     InvalidSoakDuration,
     #[error("workflow backup node does not match backup-required data")]

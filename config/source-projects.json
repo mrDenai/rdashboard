@@ -8,6 +8,13 @@
       "auto_deploy": false,
       "maximum_attempts": 3,
       "release_class": "stateful_compatible"
+    },
+    {
+      "project_id": "rdashboard",
+      "installed_policy_version": 1,
+      "auto_deploy": false,
+      "maximum_attempts": 2,
+      "release_class": "code_only_compatible"
     }
   ]
 }

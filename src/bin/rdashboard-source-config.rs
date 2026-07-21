@@ -10,7 +10,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::SigningKey;
 use rdashboard::{
-    domain::{EvidenceDigest, InstalledPolicyIdentity, ProjectId, ReleaseClass},
+    domain::{EvidenceDigest, InstalledPolicyIdentity, ProjectId, ProjectManifestV2, ReleaseClass},
     installed_source::{
         InstalledSourceConfigInputV1, InstalledSourceConfigV1, InstalledSourceGitSshV1,
         InstalledSourceGithubWebhookV1, InstalledSourceProjectInputV1, InstalledSourceProjectV1,
@@ -27,6 +27,7 @@ const SOURCE_CONTROLS_PATH: &str = "/etc/rdashboard/source-projects.jcs";
 const SOURCE_CREDENTIAL_ROOT: &str = "/etc/rdashboard/credentials";
 const SOURCE_CONTROLS_SCHEMA_VERSION: u16 = 1;
 const MAX_PRIVATE_INPUT_BYTES: u64 = 64 * 1024;
+const MAX_MANIFEST_INPUT_BYTES: u64 = 512 * 1024;
 const MAX_WEBHOOK_SECRET_BYTES: u64 = 4 * 1024;
 const MAX_PROJECTS: usize = 64;
 
@@ -44,6 +45,7 @@ struct Arguments {
 enum Command {
     Build(Arguments),
     CanonicalizeControls,
+    CanonicalizeManifest,
     SystemdCredentials,
 }
 
@@ -143,6 +145,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let controls = decode_controls(&bytes)?;
             std::io::stdout().write_all(&serde_jcs::to_vec(&controls)?)?;
         }
+        Command::CanonicalizeManifest => {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(MAX_MANIFEST_INPUT_BYTES.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.is_empty()
+                || bytes.len() > usize::try_from(MAX_MANIFEST_INPUT_BYTES).unwrap_or(usize::MAX)
+            {
+                return Err(invalid_input("project manifest input is oversized").into());
+            }
+            let manifest: ProjectManifestV2 = serde_json::from_slice(&bytes)
+                .map_err(|error| invalid_input(&format!("decode project manifest: {error}")))?;
+            std::io::stdout().write_all(&manifest.canonical_bytes()?)?;
+        }
     }
     Ok(())
 }
@@ -154,9 +170,12 @@ fn parse_command(values: &[String]) -> Result<Command, std::io::Error> {
     if values.len() == 2 && values[1] == "canonicalize-controls" {
         return Ok(Command::CanonicalizeControls);
     }
+    if values.len() == 2 && values[1] == "canonicalize-manifest" {
+        return Ok(Command::CanonicalizeManifest);
+    }
     if values.len() != 8 || values[1] != "build" {
         return Err(invalid_input(
-            "usage: rdashboard-source-config build SOURCE_UID INGRESS_UID INGRESS_GID CONTROLLER_UID CONTROLLER_GID BUILD_READER_GID | rdashboard-source-config canonicalize-controls | rdashboard-source-config systemd-credentials",
+            "usage: rdashboard-source-config build SOURCE_UID INGRESS_UID INGRESS_GID CONTROLLER_UID CONTROLLER_GID BUILD_READER_GID | rdashboard-source-config canonicalize-controls | rdashboard-source-config canonicalize-manifest | rdashboard-source-config systemd-credentials",
         ));
     }
     let parse_identity = |value: &str, name: &str| {
@@ -463,22 +482,34 @@ mod tests {
         let decoded: SourceProjectControlsCatalogV1 =
             serde_json::from_slice(&canonical).expect("decode canonical source controls");
         assert_eq!(decoded, controls);
-        let manifest: ProjectManifestV2 =
+        let ralert: ProjectManifestV2 =
             serde_json::from_str(include_str!("../../config/project-manifests/ralert.json"))
                 .expect("ralert manifest");
-        let workflows =
-            InstalledWorkflowCatalogV1::from_manifests([manifest]).expect("workflow catalog");
-        let config = build_config(&arguments(), &workflows, &controls, &[61_u8; 32], |path| {
-            assert_eq!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some("source-webhook-ralert-secret")
-            );
-            Ok(b"ralert webhook secret".to_vec())
-        })
-        .expect("source config from repository controls");
-        assert_eq!(config.projects.len(), 1);
+        let rdashboard: ProjectManifestV2 = serde_json::from_str(include_str!(
+            "../../config/project-manifests/rdashboard.json"
+        ))
+        .expect("rdashboard manifest");
+        let workflows = InstalledWorkflowCatalogV1::from_manifests([ralert, rdashboard])
+            .expect("workflow catalog");
+        let config =
+            build_config(
+                &arguments(),
+                &workflows,
+                &controls,
+                &[61_u8; 32],
+                |path| match path.file_name().and_then(|name| name.to_str()) {
+                    Some("source-webhook-ralert-secret") => Ok(b"ralert webhook secret".to_vec()),
+                    Some("source-webhook-rdashboard-secret") => {
+                        Ok(b"rdashboard webhook secret".to_vec())
+                    }
+                    other => panic!("unexpected repository credential {other:?}"),
+                },
+            )
+            .expect("source config from repository controls");
+        assert_eq!(config.projects.len(), 2);
         assert_eq!(config.projects[0].project_id.as_str(), "ralert");
-        assert!(!config.projects[0].auto_deploy);
+        assert_eq!(config.projects[1].project_id.as_str(), "rdashboard");
+        assert!(config.projects.iter().all(|project| !project.auto_deploy));
     }
 
     #[test]
@@ -580,6 +611,11 @@ mod tests {
             parse_command(&["tool".to_owned(), "canonicalize-controls".to_owned()])
                 .expect("canonical controls mode"),
             Command::CanonicalizeControls
+        );
+        assert_eq!(
+            parse_command(&["tool".to_owned(), "canonicalize-manifest".to_owned()])
+                .expect("canonical manifest mode"),
+            Command::CanonicalizeManifest
         );
         for values in [
             vec!["tool".to_owned()],

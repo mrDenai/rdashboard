@@ -19,3 +19,11 @@ The `ralert.json` entry is the first V2 catalog migration and remains inactive. 
 reviewed source-side mirror must be upgraded, its dependency model must satisfy the declared
 `source_tree_v1` policy (or explicitly move to `cargo_crates_io_v1`), and both repositories' bare gates
 must pass; loading this controller catalog alone never enables a deploy.
+
+The `rdashboard.json` entry is also inactive. It uses the explicit `self_update_handoff` delivery mode:
+the generic VPS worker prepares pinned Cargo inputs once, runs the exact bare `bin/ci`, packages the
+verified native binaries and publishes the root-validated signed handoff. Its finite graph ends at the
+controller evidence reduction and contains no privileged-executor deployment nodes, because the
+separately installed persistent bootstrap is the only A/B pointer, service-health and rollback owner.
+The source controls keep `auto_deploy=false`; installing or validating this catalog cannot create a
+release, start the bootstrap or mutate a host.

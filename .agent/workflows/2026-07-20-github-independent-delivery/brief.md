@@ -257,3 +257,16 @@ Normalized instruction:
   implementation with another status explanation.
 - Complete the versioned executable-path and controller-independent root recovery boundary while
   preserving the existing no-host-mutation authorization boundary.
+
+### U016 — 2026-07-21
+
+Faithful English rendering:
+
+Continue.
+
+Normalized instruction:
+
+- Continue local implementation past the completed versioned-runtime/recovery slice into inactive
+  `rdashboard` project and policy onboarding.
+- Preserve `auto_deploy=false` and every host/provider mutation gate; the next local result must not
+  imply that a push deploys before the separately authorized installation and activation drills.

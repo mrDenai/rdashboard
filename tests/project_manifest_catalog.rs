@@ -1,13 +1,94 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use rdashboard::domain::{
-    DataClass, MigrationEntrypoint, ProjectManifestV2, WorkflowAdapterIdV1,
-    WorkflowHostPreparationAdapterV1, WorkflowNetworkClassV1, WorkflowNodeKindV1,
-    WorkflowWorkerPoolV1, WriteFencePolicy,
+    BuildKind, DataClass, MigrationEntrypoint, ProjectManifestV2, WorkflowAdapterIdV1,
+    WorkflowDeliveryModeV1, WorkflowHostPreparationAdapterV1, WorkflowNetworkClassV1,
+    WorkflowNodeKindV1, WorkflowWorkerPoolV1, WriteFencePolicy,
 };
 
 fn catalog_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/project-manifests")
+}
+
+#[test]
+fn rdashboard_contract_ends_at_the_signed_self_update_handoff() {
+    let (_, manifest) = catalog()
+        .into_iter()
+        .find(|(id, _)| id == "rdashboard")
+        .unwrap_or_else(|| panic!("rdashboard manifest is required"));
+
+    assert_eq!(
+        manifest.source.remote_url.as_str(),
+        "https://github.com/mrDenai/rdashboard.git"
+    );
+    assert_eq!(manifest.build.kind, BuildKind::Native);
+    assert_eq!(
+        manifest.workflow.delivery_mode,
+        WorkflowDeliveryModeV1::SelfUpdateHandoff
+    );
+    assert!(manifest.data_volumes.is_empty());
+    assert_eq!(manifest.migration.entrypoint, MigrationEntrypoint::None);
+    assert_eq!(manifest.workflow.nodes.len(), 5);
+    assert!(manifest.workflow.nodes.iter().all(|node| {
+        manifest
+            .workflow
+            .profile(&node.profile_id)
+            .is_some_and(|profile| profile.worker_pool != WorkflowWorkerPoolV1::PrivilegedExecutor)
+    }));
+
+    let preparation = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+        .unwrap_or_else(|| panic!("rdashboard preparation node is required"));
+    let preparation_profile = manifest
+        .workflow
+        .profile(&preparation.profile_id)
+        .unwrap_or_else(|| panic!("rdashboard preparation profile is required"));
+    assert_eq!(
+        preparation_profile.network_class,
+        WorkflowNetworkClassV1::DependencyEgress
+    );
+    assert_eq!(
+        manifest
+            .host_preparation
+            .as_ref()
+            .unwrap_or_else(|| panic!("rdashboard host preparation policy is required"))
+            .adapter_id,
+        WorkflowHostPreparationAdapterV1::CargoCratesIoV1
+    );
+
+    let release = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+        .unwrap_or_else(|| panic!("rdashboard release node is required"));
+    assert!(
+        release
+            .depends_on
+            .iter()
+            .any(|node| node.as_str() == "verify")
+    );
+    assert_eq!(
+        manifest
+            .workflow
+            .profile(&release.profile_id)
+            .unwrap_or_else(|| panic!("rdashboard release profile is required"))
+            .adapter_id,
+        WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+    );
+
+    let mut wrong_project = manifest.clone();
+    wrong_project.project_id = "rdashboard-copy"
+        .parse()
+        .unwrap_or_else(|error| panic!("project fixture: {error}"));
+    assert!(wrong_project.validate().is_err());
+
+    let mut executor_mode = manifest;
+    executor_mode.workflow.delivery_mode = WorkflowDeliveryModeV1::ExecutorMutation;
+    assert!(executor_mode.validate().is_err());
 }
 
 fn catalog() -> Vec<(String, ProjectManifestV2)> {

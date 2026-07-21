@@ -302,6 +302,13 @@
         "prepared_run"
       ]
     },
+    "WorkflowDeliveryModeV1": {
+      "type": "string",
+      "enum": [
+        "executor_mutation",
+        "self_update_handoff"
+      ]
+    },
     "WorkflowExecutionProfileV1": {
       "type": "object",
       "properties": {
@@ -457,6 +464,9 @@
     "WorkflowPolicyV1": {
       "type": "object",
       "properties": {
+        "delivery_mode": {
+          "$ref": "#/$defs/WorkflowDeliveryModeV1"
+        },
         "execution_profiles": {
           "type": "array",
           "items": {

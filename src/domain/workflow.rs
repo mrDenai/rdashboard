@@ -233,6 +233,19 @@ pub enum WorkflowCacheClassV1 {
     PreparedRun,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDeliveryModeV1 {
+    #[default]
+    ExecutorMutation,
+    SelfUpdateHandoff,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn delivery_mode_is_default(mode: &WorkflowDeliveryModeV1) -> bool {
+    *mode == WorkflowDeliveryModeV1::ExecutorMutation
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowHostPreparationAdapterV1 {
@@ -409,6 +422,8 @@ impl WorkflowNodeV1 {
 pub struct WorkflowPolicyV1 {
     pub schema_version: u16,
     pub fairness_weight: u16,
+    #[serde(default, skip_serializing_if = "delivery_mode_is_default")]
+    pub delivery_mode: WorkflowDeliveryModeV1,
     pub execution_profiles: Vec<WorkflowExecutionProfileV1>,
     pub nodes: Vec<WorkflowNodeV1>,
 }
@@ -483,7 +498,14 @@ impl WorkflowPolicyV1 {
         }
 
         validate_topology(&nodes)?;
-        validate_standard_graph(&nodes, &profiles)?;
+        match self.delivery_mode {
+            WorkflowDeliveryModeV1::ExecutorMutation => {
+                validate_executor_mutation_graph(&nodes, &profiles)?;
+            }
+            WorkflowDeliveryModeV1::SelfUpdateHandoff => {
+                validate_self_update_handoff_graph(&nodes, &profiles)?;
+            }
+        }
         Ok(())
     }
 
@@ -575,7 +597,7 @@ fn validate_topology(
     Ok(())
 }
 
-fn validate_standard_graph(
+fn validate_executor_mutation_graph(
     nodes: &BTreeMap<&WorkflowNodeId, &WorkflowNodeV1>,
     profiles: &BTreeMap<&WorkflowProfileId, &WorkflowExecutionProfileV1>,
 ) -> Result<(), WorkflowContractError> {
@@ -674,6 +696,51 @@ fn validate_standard_graph(
     require_dependencies(observe, std::slice::from_ref(&cutover.node_id))?;
     require_dependencies(rollback, std::slice::from_ref(&cutover.node_id))?;
     Ok(())
+}
+
+fn validate_self_update_handoff_graph(
+    nodes: &BTreeMap<&WorkflowNodeId, &WorkflowNodeV1>,
+    profiles: &BTreeMap<&WorkflowProfileId, &WorkflowExecutionProfileV1>,
+) -> Result<(), WorkflowContractError> {
+    let exactly_one = |kind| {
+        let matches = nodes
+            .values()
+            .copied()
+            .filter(|node| node.kind == kind)
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            Ok(matches[0])
+        } else {
+            Err(WorkflowContractError::InvalidNodeCardinality(kind))
+        }
+    };
+    if nodes.len() != 5 {
+        return Err(WorkflowContractError::InvalidWorkflowBounds);
+    }
+
+    let source = exactly_one(WorkflowNodeKindV1::SourceAdmission)?;
+    let prepare = exactly_one(WorkflowNodeKindV1::HostPrepare)?;
+    let verification = exactly_one(WorkflowNodeKindV1::Verification)?;
+    let build = exactly_one(WorkflowNodeKindV1::ReleaseBuild)?;
+    let reduce = exactly_one(WorkflowNodeKindV1::DeterministicReduce)?;
+    let build_profile = profiles
+        .get(&build.profile_id)
+        .ok_or_else(|| WorkflowContractError::MissingProfile(build.profile_id.clone()))?;
+    if build_profile.adapter_id != WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 {
+        return Err(WorkflowContractError::ProfileKindMismatch(
+            build.node_id.clone(),
+        ));
+    }
+
+    require_dependencies(source, &[])?;
+    require_dependencies(prepare, std::slice::from_ref(&source.node_id))?;
+    require_dependencies(verification, std::slice::from_ref(&prepare.node_id))?;
+    let mut build_dependencies = vec![prepare.node_id.clone(), verification.node_id.clone()];
+    build_dependencies.sort();
+    require_dependencies(build, &build_dependencies)?;
+    let mut reduce_dependencies = vec![build.node_id.clone(), verification.node_id.clone()];
+    reduce_dependencies.sort();
+    require_dependencies(reduce, &reduce_dependencies)
 }
 
 fn require_dependencies(

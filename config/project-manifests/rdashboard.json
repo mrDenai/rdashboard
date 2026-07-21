@@ -1,0 +1,165 @@
+{
+  "schema_version": 2,
+  "project_id": "rdashboard",
+  "display_name": "rdashboard delivery controller",
+  "source": {
+    "remote_url": "https://github.com/mrDenai/rdashboard.git",
+    "branch": "main"
+  },
+  "ci": "bin_ci",
+  "build": {
+    "context": "repository_root",
+    "kind": "native"
+  },
+  "workflow": {
+    "schema_version": 1,
+    "fairness_weight": 1,
+    "delivery_mode": "self_update_handoff",
+    "execution_profiles": [
+      {
+        "profile_id": "source-controller",
+        "adapter_id": "controller_source_admission_v1",
+        "worker_pool": "controller",
+        "network_class": "offline",
+        "cache_class": "none",
+        "timeout_ms": 1000,
+        "resources": null
+      },
+      {
+        "profile_id": "cargo-prepare",
+        "adapter_id": "worker_host_prepare_v1",
+        "worker_pool": "vps_required",
+        "network_class": "dependency_egress",
+        "cache_class": "dependency",
+        "timeout_ms": 900000,
+        "resources": {
+          "cpu_millicores": 3000,
+          "memory_max_bytes": 4294967296,
+          "tasks_max": 1024,
+          "scratch_max_bytes": 6442450944,
+          "scratch_max_inodes": 500000,
+          "output_max_bytes": 2147483648
+        }
+      },
+      {
+        "profile_id": "bare-bin-ci",
+        "adapter_id": "worker_bare_bin_ci_v1",
+        "worker_pool": "build_compute",
+        "network_class": "offline",
+        "cache_class": "prepared_run",
+        "timeout_ms": 900000,
+        "resources": {
+          "cpu_millicores": 3000,
+          "memory_max_bytes": 4294967296,
+          "tasks_max": 1024,
+          "scratch_max_bytes": 6442450944,
+          "scratch_max_inodes": 500000,
+          "output_max_bytes": 1073741824
+        }
+      },
+      {
+        "profile_id": "native-self-release",
+        "adapter_id": "worker_native_release_build_v1",
+        "worker_pool": "vps_required",
+        "network_class": "offline",
+        "cache_class": "prepared_run",
+        "timeout_ms": 120000,
+        "resources": {
+          "cpu_millicores": 1000,
+          "memory_max_bytes": 536870912,
+          "tasks_max": 128,
+          "scratch_max_bytes": 536870912,
+          "scratch_max_inodes": 10000,
+          "output_max_bytes": 536870912
+        }
+      },
+      {
+        "profile_id": "reduce-controller",
+        "adapter_id": "controller_reduce_v1",
+        "worker_pool": "controller",
+        "network_class": "offline",
+        "cache_class": "none",
+        "timeout_ms": 1000,
+        "resources": null
+      }
+    ],
+    "nodes": [
+      {
+        "node_id": "source",
+        "display_name": "Accept exact rdashboard source",
+        "kind": "source_admission",
+        "activation": "always",
+        "profile_id": "source-controller",
+        "depends_on": [],
+        "input_contracts": [],
+        "output_contract": "source_snapshot"
+      },
+      {
+        "node_id": "prepare",
+        "display_name": "Prepare pinned Cargo inputs once on the VPS",
+        "kind": "host_prepare",
+        "activation": "always",
+        "profile_id": "cargo-prepare",
+        "depends_on": ["source"],
+        "input_contracts": ["source_snapshot"],
+        "output_contract": "prepared_run"
+      },
+      {
+        "node_id": "verify",
+        "display_name": "Run the exact bare bin/ci gate on the VPS",
+        "kind": "verification",
+        "activation": "always",
+        "profile_id": "bare-bin-ci",
+        "depends_on": ["prepare"],
+        "input_contracts": ["prepared_run"],
+        "output_contract": "verification_receipt"
+      },
+      {
+        "node_id": "release-build",
+        "display_name": "Publish the verified signed self-release handoff",
+        "kind": "release_build",
+        "activation": "always",
+        "profile_id": "native-self-release",
+        "depends_on": ["prepare", "verify"],
+        "input_contracts": ["prepared_run", "verification_receipt"],
+        "output_contract": "release_build_result"
+      },
+      {
+        "node_id": "reduce",
+        "display_name": "Seal the verification and handoff evidence",
+        "kind": "deterministic_reduce",
+        "activation": "always",
+        "profile_id": "reduce-controller",
+        "depends_on": ["release-build", "verify"],
+        "input_contracts": ["verification_receipt", "release_build_result"],
+        "output_contract": "reduction_receipt"
+      }
+    ]
+  },
+  "host_preparation": {
+    "schema_version": 1,
+    "adapter_id": "cargo_crates_io_v1",
+    "platform": "linux-x86_64"
+  },
+  "health_checks": [
+    {
+      "name": "controller",
+      "endpoint": "http://127.0.0.1:3100/health",
+      "expected_status": 200,
+      "timeout_seconds": 5
+    }
+  ],
+  "data_volumes": [],
+  "migration": {
+    "entrypoint": "none",
+    "write_fence": "unsupported"
+  },
+  "rollback": {
+    "code_rollback": true,
+    "soak_seconds": 60
+  },
+  "notifications": {
+    "route": "telegram_default",
+    "maintenance_suppression": true
+  }
+}

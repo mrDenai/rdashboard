@@ -350,12 +350,26 @@ Install the canonical workflow manifest catalog first at
 read directly in production. The source generator and dispatcher both require the exact installed
 catalog, preventing their repository and workflow-policy identities from drifting apart.
 
+Render each reviewed repository manifest through the strict domain type before atomic installation;
+do not copy the pretty JSON directly into the installed JCS catalog:
+
+```sh
+/usr/libexec/rdashboard/rdashboard-source-config canonicalize-manifest \
+  < config/project-manifests/rdashboard.json \
+  > /etc/rdashboard/project-manifests/rdashboard.jcs.new
+```
+
+Repeat for every catalog member, set the ownership/mode above and rename the complete reviewed set
+into place together. The `rdashboard` member declares `self_update_handoff`: native verification and
+packaging stay on the required VPS, and the graph ends after signed handoff evidence instead of
+entering the ordinary privileged-executor mutation graph.
+
 Review the repository candidate `config/source-projects.json`, render it as canonical JCS, then install it as
 `/etc/rdashboard/source-projects.jcs`, root-owned mode `0600`. It must cover the workflow catalog
 exactly and contains only owner-controlled deployment values:
 
 ```json
-{"projects":[{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":3,"project_id":"ralert","release_class":"stateful_compatible"}],"purpose":"rdashboard.source-project-controls.v1","schema_version":1}
+{"projects":[{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":3,"project_id":"ralert","release_class":"stateful_compatible"},{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":2,"project_id":"rdashboard","release_class":"code_only_compatible"}],"purpose":"rdashboard.source-project-controls.v1","schema_version":1}
 ```
 
 Render the reviewed candidate without accepting trailing whitespace or noncanonical installed bytes:

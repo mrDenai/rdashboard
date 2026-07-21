@@ -1152,7 +1152,10 @@ fn expire_one_lease(
     if changed != 1 {
         return Err(StoreError::WorkflowLeaseConflict);
     }
-    if node_kind.is_mutation() {
+    let context = load_attempt_context(transaction, parse_uuid(attempt_id, "expired attempt ID")?)?;
+    let uncertain_delivery =
+        node_kind.is_mutation() || is_self_update_handoff_release(&context.manifest, node_kind);
+    if uncertain_delivery {
         expire_mutation_lease(transaction, attempt_id, node_id, now_ms)?;
     } else {
         let changed = transaction.execute(
@@ -1180,7 +1183,7 @@ fn expire_one_lease(
         lease_id,
         Some("active"),
         "expired",
-        if node_kind.is_mutation() {
+        if uncertain_delivery {
             "mutation_requires_reconciliation"
         } else {
             "worker_lease_expired"
@@ -1243,7 +1246,7 @@ fn claim_next_transaction(
     let (last_project_id, remaining_weight) = load_fairness_cursor(transaction)?;
     let ordered = fair_candidate_order(&candidates, last_project_id.as_deref(), remaining_weight)?;
     for candidate in ordered {
-        if candidate.node.kind.is_mutation()
+        if candidate_requires_exclusive_delivery(&candidate)
             && !acquire_mutation_lock(transaction, &candidate, now_ms)?
         {
             continue;
@@ -1304,6 +1307,19 @@ fn claim_next_transaction(
         return Ok(Some(lease));
     }
     Ok(None)
+}
+
+fn candidate_requires_exclusive_delivery(candidate: &ReadyCandidate<'_>) -> bool {
+    candidate.node.kind.is_mutation()
+        || is_self_update_handoff_release(&candidate.manifest, candidate.node.kind)
+}
+
+fn is_self_update_handoff_release(
+    manifest: &ProjectManifestV2,
+    node_kind: WorkflowNodeKindV1,
+) -> bool {
+    manifest.workflow.delivery_mode == crate::domain::WorkflowDeliveryModeV1::SelfUpdateHandoff
+        && node_kind == WorkflowNodeKindV1::ReleaseBuild
 }
 
 enum OperationStateSelection {
@@ -2158,7 +2174,13 @@ impl DurableWorkflowScheduler {
                 Some(&reduction.receipt_digest),
                 reduced_at_ms,
             )?;
-            advance_ready_nodes(transaction, attempt_id)?;
+            if context.manifest.workflow.delivery_mode
+                == crate::domain::WorkflowDeliveryModeV1::SelfUpdateHandoff
+            {
+                complete_workflow(transaction, attempt_id, reduced_at_ms)?;
+            } else {
+                advance_ready_nodes(transaction, attempt_id)?;
+            }
             Ok(reduction)
         })
     }
@@ -2524,8 +2546,16 @@ fn commit_node_receipt_transaction(
         return Ok(replayed);
     }
     validate_active_receipt_lease(transaction, receipt, recorded_at_ms)?;
-    persist_node_receipt(transaction, receipt, receipt_json, recorded_at_ms)?;
-    apply_node_receipt_outcome(transaction, receipt, recorded_at_ms)?;
+    let context = load_attempt_context(transaction, receipt.attempt_id)?;
+    let handoff_publication = is_self_update_handoff_release(&context.manifest, receipt.node_kind);
+    persist_node_receipt(
+        transaction,
+        receipt,
+        receipt_json,
+        recorded_at_ms,
+        handoff_publication,
+    )?;
+    apply_node_receipt_outcome(transaction, receipt, recorded_at_ms, handoff_publication)?;
     load_attempt_snapshot(transaction, receipt.attempt_id)
 }
 
@@ -2591,6 +2621,7 @@ fn persist_node_receipt(
     receipt: &WorkflowNodeReceiptV1,
     receipt_json: &str,
     recorded_at_ms: i64,
+    handoff_publication: bool,
 ) -> Result<(), StoreError> {
     transaction.execute(
         "INSERT INTO workflow_node_receipts(
@@ -2618,7 +2649,7 @@ fn persist_node_receipt(
     if changed != 1 {
         return Err(StoreError::WorkflowLeaseConflict);
     }
-    let node_state = receipt_terminal_node_state(receipt);
+    let node_state = receipt_terminal_node_state(receipt, handoff_publication);
     let changed = transaction.execute(
         "UPDATE workflow_nodes
          SET state = ?3, output_digest = ?4, receipt_digest = ?5, completed_at_ms = ?6
@@ -2657,10 +2688,13 @@ fn persist_node_receipt(
     )
 }
 
-fn receipt_terminal_node_state(receipt: &WorkflowNodeReceiptV1) -> WorkflowNodeStateV1 {
+fn receipt_terminal_node_state(
+    receipt: &WorkflowNodeReceiptV1,
+    handoff_publication: bool,
+) -> WorkflowNodeStateV1 {
     match receipt.outcome {
         WorkflowNodeOutcomeV1::Succeeded => WorkflowNodeStateV1::Succeeded,
-        WorkflowNodeOutcomeV1::Failed if receipt.node_kind.is_mutation() => {
+        WorkflowNodeOutcomeV1::Failed if receipt.node_kind.is_mutation() || handoff_publication => {
             WorkflowNodeStateV1::NeedsReconcile
         }
         WorkflowNodeOutcomeV1::Failed => WorkflowNodeStateV1::Failed,
@@ -2671,6 +2705,7 @@ fn apply_node_receipt_outcome(
     transaction: &Transaction<'_>,
     receipt: &WorkflowNodeReceiptV1,
     recorded_at_ms: i64,
+    handoff_publication: bool,
 ) -> Result<(), StoreError> {
     match receipt.outcome {
         WorkflowNodeOutcomeV1::Succeeded
@@ -2690,6 +2725,7 @@ fn apply_node_receipt_outcome(
             receipt.attempt_id,
             receipt.node_kind,
             receipt.cleanup_result,
+            handoff_publication,
             recorded_at_ms,
         ),
     }
@@ -2754,40 +2790,65 @@ fn fail_workflow(
     attempt_id: Uuid,
     node_kind: WorkflowNodeKindV1,
     cleanup_result: WorkflowCleanupResultV1,
+    handoff_publication: bool,
     recorded_at_ms: i64,
 ) -> Result<(), StoreError> {
-    if node_kind.is_mutation() {
-        let changed = transaction.execute(
-            "UPDATE workflow_attempts
-             SET state = 'needs_reconcile', mutation_state = 'needs_reconcile',
-                 cleanup_state = ?2, updated_at_ms = ?3
-             WHERE attempt_id = ?1",
-            params![
-                attempt_id.to_string(),
-                match cleanup_result {
-                    WorkflowCleanupResultV1::Complete => WorkflowCleanupStateV1::Complete.as_str(),
-                    WorkflowCleanupResultV1::Pending => WorkflowCleanupStateV1::Pending.as_str(),
-                },
-                recorded_at_ms,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::WorkflowStateConflict);
-        }
-        let changed = transaction.execute(
-            "UPDATE workflow_mutation_locks
-             SET state = 'needs_reconcile', updated_at_ms = ?2
-             WHERE attempt_id = ?1",
-            params![attempt_id.to_string(), recorded_at_ms],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::CorruptWorkflowJournal(
-                "mutation failure without lock",
-            ));
-        }
-        return Ok(());
+    if node_kind.is_mutation() || handoff_publication {
+        return mark_workflow_needs_reconcile(
+            transaction,
+            attempt_id,
+            cleanup_result,
+            recorded_at_ms,
+        );
     }
 
+    fail_terminal_workflow(transaction, attempt_id, cleanup_result, recorded_at_ms)
+}
+
+fn mark_workflow_needs_reconcile(
+    transaction: &Transaction<'_>,
+    attempt_id: Uuid,
+    cleanup_result: WorkflowCleanupResultV1,
+    recorded_at_ms: i64,
+) -> Result<(), StoreError> {
+    let cleanup_state = match cleanup_result {
+        WorkflowCleanupResultV1::Complete => WorkflowCleanupStateV1::Complete,
+        WorkflowCleanupResultV1::Pending => WorkflowCleanupStateV1::Pending,
+    };
+    let changed = transaction.execute(
+        "UPDATE workflow_attempts
+         SET state = 'needs_reconcile', mutation_state = 'needs_reconcile',
+             cleanup_state = ?2, updated_at_ms = ?3
+         WHERE attempt_id = ?1",
+        params![
+            attempt_id.to_string(),
+            cleanup_state.as_str(),
+            recorded_at_ms,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::WorkflowStateConflict);
+    }
+    let changed = transaction.execute(
+        "UPDATE workflow_mutation_locks
+         SET state = 'needs_reconcile', updated_at_ms = ?2
+         WHERE attempt_id = ?1",
+        params![attempt_id.to_string(), recorded_at_ms],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::CorruptWorkflowJournal(
+            "mutation failure without lock",
+        ));
+    }
+    Ok(())
+}
+
+fn fail_terminal_workflow(
+    transaction: &Transaction<'_>,
+    attempt_id: Uuid,
+    cleanup_result: WorkflowCleanupResultV1,
+    recorded_at_ms: i64,
+) -> Result<(), StoreError> {
     let active_leases = transaction.query_row(
         "SELECT COUNT(*) FROM workflow_lease_journal
          WHERE attempt_id = ?1 AND state = 'active'",
