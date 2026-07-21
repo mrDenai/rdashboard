@@ -2,7 +2,7 @@
 
 Workflow: `.agent/workflows/2026-07-15-rdashboard-production`
 
-Status: rimg production deployment preflight and pipeline hardening in progress
+Status: compact production overview deployed; private source and provider integrations pending
 
 Last updated: 2026-07-17
 
@@ -1202,3 +1202,785 @@ Commit `429c1f6` (`feat: harden rimg production operations`) records the exact 3
 candidate. The repository commit hook repeated the same complete `bin/ci` gate successfully, and
 the rimg working tree is clean with `main` one commit ahead of `origin/main`. No push or production
 mutation has occurred yet; the repository workflow starts only from an explicitly authorized push.
+
+U027 confirmed both repositories were pushed. Remote reconciliation found `origin/main` at exact
+rimg commit `429c1f6`, and GitHub Actions run `29539612292` executed CI for the full SHA
+`429c1f65fdf0bdfad9b90edf292c1150712bd9f3`. CI failed after 26 minutes and the dependent deploy
+job was correctly skipped, so production retained no rimg container, bootstrap marker or partial
+state.
+
+The failure reproduced the native dependency symptom but exposed a different remaining root cause.
+`bin/update` successfully exported the development toolchain, including `libjxl.pc`, yet `bin/ci`
+set `PKG_CONFIG_PATH` to a repository-relative value. Cargo dependency build scripts run outside
+the repository root, so `jpegxl-sys` could not resolve that path on a clean hosted runner. Local
+verification had been falsely insulated by a separate system libjxl 0.12 installation under
+`/usr/local/lib64/pkgconfig`. The remediation derives an absolute native sysroot/prefix after the
+script enters the repository, fixes `PKG_CONFIG_PATH` and `PKG_CONFIG_LIBDIR` to the exact exported
+directory, sets `PKG_CONFIG_SYSROOT_DIR` so `/opt/4u` metadata relocates into `.titanium`, and
+asserts exact libjxl 0.12 resolution from that directory before compilation. `bin/bench` now uses
+the same clean-host environment. A fresh required gate is pending on this corrected target.
+
+DeepSeek Free reviewed the corrected native-path diff at `/tmp/rimg-ci-native-path-review` and
+returned `ANSWERED/CORRECT`. It confirmed the absolute path, exact `PKG_CONFIG_LIBDIR` and sysroot
+close both dependency-build-script cwd drift and host fallback. Its material observation that
+`bin/bench` lacked the same exact toolchain assertion was accepted. Its low direct-Cargo gap was
+also real because the README documents `cargo run`; a repository `.cargo/config.toml` now forces
+the same config-relative absolute pkg-config directory and sysroot for every Cargo build script.
+The Cargo path semantics were checked against the official Cargo configuration contract.
+
+Fresh bare `bin/ci` on the review-remediated target exited 0. It validated the exact pinned
+pkg-config directory and libjxl 0.12 before strict formatting/Clippy, then passed all 34 executable
+Rust tests and the operational shell behavior suite. One benchmark remains intentionally ignored;
+local cargo-audit remains explicitly unavailable while hosted CI installs and requires it. No
+production mutation occurred.
+
+Commit `87bcc89` (`fix: pin native CI toolchain paths`) records only `.cargo/config.toml`,
+`README.md`, `bin/bench` and `bin/ci`. Its commit hook repeated the full green gate. The rimg tree
+is clean and exactly one commit ahead of `origin/main`; the next workflow run requires only that
+rimg follow-up push. No rdashboard code change or production rollback is needed.
+
+### rimg Titanium cache parity
+
+U029's suspicion was confirmed from source rather than inferred from duration. Sartuli's
+`bin/update` maintains per-library content directories under `.titanium/builds`, assembles the
+toolchain from those immutable outputs and runs on a persistent self-hosted workspace whose
+checkout deliberately preserves `.titanium`. In contrast, rimg's `bin/update` had only one final
+fingerprint and final `.titanium/opt/4u` fast path, while its CI job runs on a fresh hosted runner
+without cache restore/save. The Dockerfile still contains the correct independent multi-stage
+library graph, but no state survived for BuildKit to reuse it across runs. Run `29541492295`
+confirmed the practical effect: more than 26 minutes remained entirely inside the native build
+step on the second push.
+
+The remediation keeps hosted CI isolated from production while making its cache persistent and
+content-addressed. GitHub Actions restores `.titanium/opt/4u`, the exact fingerprint state and a
+BuildKit `mode=max` local cache. An exact recipe/manifest/CPU key gives unchanged runs an immediate
+assembled-toolchain hit; a nearest prior key lets BuildKit reuse unaffected library stages after a
+recipe change. Hosted artifacts use `x86-64-v3` rather than runner-dependent `-march=native`, so a
+cache never crosses incompatible hosted CPUs. `bin/update` imports and transactionally rotates the
+optional BuildKit cache, validates the libvips object plus libjxl pkg-config/header contract before
+accepting or installing an export, and supports a fail-closed warm-only postcondition.
+
+Bare `bin/ci` is now the local pre-push boundary requested by U030. It validates source manifests,
+runs the real update, immediately requires a warm hit, then confirms exact relocated pkg-config
+resolution before Rust compilation. The new isolated shell harness mocks only Docker transport and
+proves cold export/cache creation, no-build warm reuse, stale-cache rejection, previous-cache
+import and preservation of the prior toolchain/state/cache when a build fails. The real gate still
+executes the actual Docker graph whenever local inputs or output completeness require a rebuild.
+
+The first full local gate exercised that real cold path after the old export failed the new
+fingerprint/completeness contract: BuildKit completed all 70 graph vertices in 230.6 seconds, the
+immediate second update was a warm hit, the shell harness passed, and strict Clippy plus all 34
+executable Rust tests passed. After review cleanup, a second fresh bare `bin/ci` again exited 0; it
+reported two immediate real-toolchain warm hits, passed the expanded absolute/relative cache-path
+harness, operational scripts, strict Clippy and the same 34 executable tests. One benchmark remains
+intentionally ignored and local `cargo-audit` remains explicitly unavailable while hosted CI
+installs and requires it. `git diff --check` is clean.
+
+DeepSeek Free reviewed the uncommitted cache target at `/tmp/rimg-titanium-cache-review` and
+returned `ANSWERED/CONDITIONAL_PASS`. It found no blocking correctness, invalidation, atomicity,
+portability or test defect. Its duplicate-work finding incorrectly said the second update would
+cold-build again; the first successful update has already persisted the exact fingerprint, so the
+next call is a warm exit. The useful underlying simplification was still accepted: the separate
+workflow update step was removed and `bin/ci` is now the sole owner. Its cache-key-versus-local-
+fingerprint difference was accepted as intentional: changing cache orchestration obtains a new
+hosted cache key without forcing a local native rebuild when recipe inputs are identical. Its
+relative-path coverage observation was accepted and the mock harness now validates both relative
+Titanium root and BuildKit cache locations.
+
+The already-pushed runtime candidate remained independent of this delivery optimization. Remote
+run `29541492295` eventually completed its native step successfully after 31 minutes 32 seconds,
+quantifying the cold-hosted cost; it then proceeded to the mandatory cargo-audit installation.
+
+Commit `0f74380` (`fix: persist Titanium native caches`) records exactly the five reviewed files:
+the hosted cache integration, local update/cache behavior, gate ownership, regression harness and
+documentation. Its commit hook repeated the complete warm `bin/ci` successfully. The rimg tree is
+clean and one commit ahead of `origin/main`; no push was performed for this optimization, so it did
+not start a competing deployment while the authorized `87bcc89` bootstrap workflow is active.
+
+The user pushed `0f74380` while the earlier run was completing, starting run `29543108084`; it is
+allowed to continue because its cold execution will populate the new Titanium cache. The prior
+run's complete CI was green in 39 minutes 42 seconds, but its deploy job stopped after nine seconds
+at `Prepare persistent storage`, before image build or application effects. Exact log evidence was
+`install: invalid user: '10001'`: coreutils `install -o` treated the numeric string as an account
+name on this host. Post-failure production inspection still found zero rimg containers, no
+bootstrap marker and no recovery files.
+
+The remediation replaces the inline privileged command with `bin/prepare-storage`. It validates a
+non-root absolute target, numeric UID:GID and explicit sudo mode; creates `/var/lib/rimg` as `0755`
+and the three service directories as `0750`; then applies numeric ownership using `chown`, whose
+numeric contract does not require a passwd entry. Its isolated behavior harness checks exact
+modes, UID:GID and write access plus rejection of root-path, named-owner and invalid-sudo inputs.
+A fresh bare `bin/ci` and the commit hook both passed the new harness, all operational checks,
+strict Clippy and all 34 executable Rust tests; local cargo-audit remains explicitly unavailable.
+Commit `ed06435` (`fix: prepare numeric storage ownership`) contains only the workflow step, gate,
+script and test. The rimg tree is clean and one commit ahead of `origin/main`; this deployment fix
+requires the user push while run `29543108084` warms the cache.
+
+Run `29543108084` did not reach a native compile and therefore did not warm the cache. Its exact
+fail-closed error was `Cache export is not supported for the docker driver`; the hosted runner's
+default Docker driver lacks the local cache exporter that the workstation's containerd-backed
+Docker driver supports. The post-cache save correctly did not run on the failed CI, and deploy was
+skipped. This is a provider integration difference, not a native graph or relocation defect.
+
+The corrected workflow now installs Docker's official `docker/setup-buildx-action@v4` before the
+cache restore, selecting a cache-capable docker-container builder. The current official release was
+verified as v4.2.0. A local warm graph plus real `mode=max` export completed and measured the cache
+at 1.6 GB (51 blobs), within the repository cache limit but large enough to make its cost explicit;
+export took about 87 seconds while the graph itself was entirely cached. The exact assembled
+toolchain remains cached separately for the common immediate-hit path. Fresh bare `bin/ci` and the
+commit hook both passed after the workflow correction. Commit `3ac57a0` (`fix: enable hosted
+BuildKit cache export`) contains only the three-line setup action and awaits push because a local
+Codex PreToolUse policy blocks `git push` even after session authorization.
+
+### rimg dependency update review
+
+Review baseline is rimg `main` at `3ac57a009f1514b6f059defaf0f84c74160d7b51`. The pinned open
+targets are PR 9 `cddb5fb265e31fa93cccadaad7b573e54fa80227` (libffi 3.7.1), PR 10
+`ecd74ce0ab5fe2d3747854bf3c5e5ac92c2800d7` (rustls 0.23.42), PR 11
+`c6bc74e1eeef3b0bea9b1cbaa6c6d660b0fdd240` (actions/checkout v7), PR 12
+`56e7f620ae97cc3b264c3f0c8fb367bf4474c464` (GLib 2.89.2), PR 13
+`7894f61f795f198279eb74f4451e78add308c899` (Sentry 0.48.5), PR 14
+`d0bbd319c70c10e9729dc9772879ca4e8a4e6815` (Tokio 1.52.4), and PR 15
+`018b4600542d103e5bd2d8a6172735910a9f077b` (toml 1.1.3). All seven PRs are
+single-file patch updates. Their historical red checks are not accepted as compatibility evidence
+because the branches predate part or all of the corrected Titanium cache workflow.
+
+The native PRs are incomplete as submitted: PRs 9 and 12 change Dockerfile versions without the
+matching `config/native-checksums.sha256` entry that the build intentionally requires. They must be
+completed with independently downloaded upstream archive digests before integration. PR 9 fixes
+memory corruption on AArch64 plus non-production platform defects; no upstream security advisory
+was claimed. The remaining release-note and runner-compatibility review is in progress. No PR has
+been merged and no dependency update has been applied to current main yet.
+
+The seven updates were therefore applied to current main as one coherent batch rather than merging
+the stale PR branches and triggering seven production deploys. Upstream review classified GLib
+2.89.2 as the direct security update because it bounds pre-authentication GDBusServer SASL input;
+libffi 3.7.1 fixes AArch64 memory corruption and other platform defects; Sentry 0.48.5 prevents a
+panic/double-panic abort path; Tokio 1.52.4 fixes skipped runtime-driver work; rustls 0.23.42 keeps
+the prior default while adding RFC 9149 ticket requests; toml 1.1.3 fixes writer overflow; and
+checkout v7 includes its current Node dependency and fork-checkout hardening. The production
+self-hosted runner is `2.335.1`, which satisfies checkout v7's Node 24 runner requirement. GitHub
+reported no open Dependabot alerts, so the batch is preventative and bug-fix hardening rather than
+a response to an undisclosed repository alert. The libffi and GLib archives were independently
+downloaded and matched upstream SHA-256 values
+`d5e9a6638ddbd2513ddb54518eb67e4bbe6fa707bcc01c10f6212f0a088d819d` and
+`894fd527e305041f7723071297d79a78af4719dbd0d8fb77f6b1a85c9f5475b9`.
+
+The first local batch gate exposed the real cause of the user's full Titanium rebuilds. All native
+version arguments and `CPU_FLAGS` were redeclared in the shared build-base stage, and one aggregate
+checksum manifest was copied there. Changing any single version or checksum therefore invalidated
+the common ancestor of every library stage. The remediation scopes each version and CPU argument
+to only the stage that consumes it, splits integrity metadata into stable per-library checksum
+files, copies only the matching file into each archive stage, and keeps `native-git-refs` scoped to
+libjxl. Strict `sha256sum --check` remains fail-closed and the permissive `--ignore-missing` mode is
+removed. A new gate check rejects shared mutable inputs, missing stage-local arguments, aggregate or
+mis-scoped manifests, permissive checksum verification, incorrect manifest counts and missing
+CPU-flag declarations.
+
+The final bare `bin/ci` passed the native source and cache-layout contracts, the real toolchain
+build followed by the mandatory warm hit, operational syntax/behavior, strict formatting and
+Clippy, and all 34 executable Rust tests; one benchmark remains intentionally ignored and local
+`cargo-audit` remains explicitly unavailable while hosted CI installs and requires it. Three
+libheif download attempts initially failed with wget network exit 4 while all completed stages were
+preserved. A host-network container diagnostic downloaded the exact asset through the machine's
+VPN/TUN path and verified its pinned digest. The next complete gate succeeded and provided a live
+selective-reuse proof: every independent completed stage was `CACHED`, then only libheif and its
+dependent libvips stage ran before the warm postcondition. Local `bin/update` already defaults to
+`--network host`; hosted CI intentionally selects `default` on its separate runner.
+
+DeepSeek Free reviewed the exact final uncommitted target at `/tmp/rimg-final-review` and returned
+`ANSWERED/PASS` with no material deploy blocker. It independently confirmed Dockerfile ARG and
+per-library manifest isolation, deterministic GitHub cache hashing, benign Linux impact of the
+transitive Windows-only resolver changes and safety of the Rust patch updates. Its only LOW note
+was that the structural test checks presence rather than textual instruction order. This does not
+create a green false positive because the same mandatory gate parses and executes the real
+Dockerfile before any Rust check; an invalid ARG/COPY/RUN order fails that build. No source change
+was warranted after this review, so the green bare `bin/ci` remains the final target verification.
+
+Commit `126f27b` (`fix: isolate native caches and update dependencies`) records the exact reviewed
+27-file batch. Its commit hook repeated the complete warm `bin/ci` successfully. The rimg tracked
+working tree is clean, and U035's manual push was reconciled: local `main` and `origin/main` both
+equal full SHA `126f27be578bb4b5f0b112ef869f1820c1ce999b`. Exact push run `29546207917` entered CI.
+Superseded run `29543709811` had completed its cold hosted CI but was still rebuilding obsolete
+`3ac57a0` in the deploy job while the exact run remained pending. It was cancelled before any rimg
+container existed; its mandatory cleanup released the Kamal lock and completed the 1 GB BuildKit
+prune, after which the exact run started. No PR was merged through an API.
+
+### Private rimg health integration
+
+The production observer keeps rimg unpublished. `rdashboard-rimg-health.socket` binds only
+`127.0.0.1:18080`; its short-lived root service queries the fixed local Docker socket for full
+container IDs with exact Kamal labels, revalidates running plus Docker-healthy state and accepts
+only a private IPv4 address on the named `kamal` network. It then replaces itself with the fixed
+`/usr/lib/systemd/systemd-socket-proxyd`, capped at eight connections and one idle second, to the
+selected container's port 8080. The controller has no Docker socket and loads a source-controlled
+loopback origin after the optional operator environment so that file cannot accidentally retarget
+health collection. Live production inspection confirmed systemd 259 provides the exact proxy
+binary/options and that `kamal` is `172.19.0.0/16` with gateway `172.19.0.1`.
+
+DeepSeek Pro's first focused review found a real Kamal rolling-deploy race between `docker ps` and
+per-container `docker inspect`, plus missing discovery-path tests. The helper now skips an inspect
+failure only after an exact filtered `docker ps --all` confirms that full container ID was removed;
+an existing candidate or any other Docker failure still aborts fail-closed. A scripted Docker
+client test covers both branches end-to-end, while separate tests bind output limits, exact socket
+proxy argv, metadata gates and systemd authority separation. Its environment-precedence note is
+covered at the actual boundary by ordering the two systemd EnvironmentFiles and a source assertion;
+simulating that precedence inside rdashboard would only retest systemd. Its suggested preflight
+`stat` was rejected as a redundant TOCTOU check because executing the fixed Docker path and querying
+the fixed socket already produces the authoritative fail-closed result. DeepSeek Free route check
+was healthy but the provider skipped the final response; it is recorded as `SKIPPED`, not a pass.
+After the race remediation, bare `bin/ci` exited 0 with strict fmt/Clippy, 132 library tests, seven
+helper tests, all integration/browser/schema checks and the optimized release build. Final
+DeepSeek Pro verification returned `ANSWERED/PASS`; no material blocker survived. Its useful minor
+note about the empty and all-ineligible discovery paths was accepted as an eighth helper test. Its
+private-prefix concern was rejected because the template reads only the address under the exact
+network name `kamal`, independent of what other networks are attached. The code-level timeout idea
+was not applied because the installed unit already enforces an absolute five-second start timeout
+and duplicate process-level timing would add cancellation complexity without a stronger boundary.
+The final post-review bare `bin/ci` again exited 0 across the complete gate.
+
+Commit `4ac31c7` (`feat: observe private rimg health`) contains exactly the seven reviewed
+source/systemd/documentation paths; workflow artifacts and `.idea` were excluded. The global Codex
+PreToolUse hook rejected the authorized `git push origin main`, so the commit remains local pending
+the user's manual push. Production installation must wait for that remote provenance, but rimg's
+independent exact CI/deploy continues.
+
+### Exact rimg production bootstrap and webhook drift
+
+U035's exact push workflow `29546207917` completed successfully: hosted CI took 32m05s and its
+native step about 28 minutes after restoring the old cache, compared with 37m26s on the prior cold
+layout. The post-cache save succeeded. Self-hosted Kamal deploy took 20m31s, released its lock and
+pruned the persistent BuildKit cache to 1 GB. Exact image tag
+`ghcr.io/mrdenai/rimg:126f27be578bb4b5f0b112ef869f1820c1ce999b` is running as the sole rimg
+web container with image/repository digest
+`sha256:0f9fb40dd79be2bd44dc0ae54e42bf5e43fa2fece68429a5ebe6a44a621d625a`, Docker
+`healthy`, zero restarts, exact labels and no host port bindings. It uses only the private `kamal`
+network at `172.19.0.14`. Sartuli uploads are mounted read-only; data, derived and masters mounts
+are writable. Their host directories are exact UID:GID `10001:10001` mode `0750` under root-owned
+`/var/lib/rimg` mode `0755`.
+
+Independent live probes returned 204 for both `/health/live` and `/health/ready`. Status schema v1
+was ready with normal mode, open intake, no active epoch/token/leases/jobs/deliveries and writable
+database/uploads/masters. Schema inspection returned current/latest application schema 4/4,
+zero pending migrations and integrity `ok`. `/var/lib/rimg/.bootstrap-deployed` records exact SHA
+`126f27b...` at `2026-07-17T01:54:48Z`; no `.containers` or `.migrated` recovery file remained.
+
+The same status contradicted the intended production contract by reporting `webhook.enabled=true`.
+Kamal 2.12 source confirmed the root cause: `Kamal::Utils.argumentize` emits only an env key when a
+clear value is empty, so Docker copied the deploy-host's nonempty `RAILS_WEBHOOK_URL`. Hotfix commit
+`b923636` replaces that ambiguous input with nonempty `RIMG_WEBHOOK_ENABLED=false`; the parser
+applies it after URL/secret overrides, clears both on false, preserves absent/true behavior and
+rejects every other spelling. Bare `bin/ci` passed before and after DeepSeek Free's `ANSWERED/PASS`
+review, and the commit hook passed again; native validation hit the same cache immediately each
+time. The global hook blocked its push. The live service remains ready with zero work but webhook
+enabled until the hotfix is pushed and a deliberate replacement is authorized; the existing
+bootstrap marker correctly prevents silently treating a second automatic deploy as safe.
+
+### Private rimg health production activation
+
+U036 reconciled the pushed rdashboard commit: local and remote `main` are exact full SHA
+`4ac31c712f089a36e259fb00edabce72fb4efe67`. A fresh bare `bin/ci` exited 0 with 132 library
+tests, eight helper tests, one controller-binary test, all integration suites, five browser TAP
+tests, schema/document checks and the optimized release build. No test failed or was ignored.
+
+Production preflight revalidated the prior controller SHA-256 `c8e1a6fa…702230`, zero restarts,
+healthy loopback service and the sole old rimg container as running, Docker-healthy, zero-restart
+and private at `172.19.0.14`. The rollback-armed installation then placed helper SHA-256
+`c6128e1886cc7519c40c62a2af52822cb3f0d62c5e3d38d4d61daf60ea7ea81e`, the fixed loopback
+environment and exact systemd units, enabled the socket and restarted only the controller. Every
+installed file digest matches the local gated target. `systemd-analyze verify` accepted these
+units; it emitted only the host's unrelated pre-existing warning that `CPUAccounting=` in
+`system-xfs_scrub.slice` is obsolete.
+
+The final production observable is green: controller, executor and health socket are active;
+controller `NRestarts=0`; listeners remain the protected `127.0.0.1:3100`, private Kamal gateway
+`172.19.0.1:3100`, and new loopback-only `127.0.0.1:18080`; loopback and bridge health return 200;
+an assertion-free protected request returns 403. The helper returns the exact live rimg status,
+and five consecutive `project_samples` rows at the five-second collection interval report
+`rimg` as fresh `healthy`. Their detail still reports `webhook_enabled=true`, truthfully exposing
+the known runtime drift until the separately authorized hotfix cutover.
+
+### Titanium-owned cargo-audit cache
+
+U037 identified the remaining hosted CI delay from exact run `29575934981`: Titanium cache restore
+took 17 seconds, but the separate unpinned `cargo install cargo-audit --locked` compiled for 5m29s
+on every fresh runner. The complete repository check step then took only 2m42s. This was not a
+remaining native-library cache miss.
+
+The corrected workflow uses the existing Titanium Actions cache rather than adding a second cache.
+The first implementation added `.titanium/tools`, bumped the combined key to schema v2 and retained
+the prior native key as a restore prefix. Exact pushed run `29577464028` proved that this was
+insufficient: `actions/cache` scopes entries by a version derived from both compression and the
+path set, so the fourth path made the old three-path archive ineligible and the log reported
+`Cache not found` before beginning a full native rebuild. The run was cancelled after 12m08s,
+before post-save or deploy, instead of completing irrelevant work.
+
+Follow-up `c270a33` keeps the original three-path set and stores the tool below the already cached
+`.titanium/state/tools` subtree. The exact key still hashes `bin/ensure-cargo-audit`, so a pinned
+tool/version change creates a new cache key while the prior-key fallback remains version-compatible
+and preserves unchanged native outputs.
+The installer pins current stable cargo-audit 0.22.2, serializes local use, installs into a staging
+root, requires exact `cargo-audit 0.22.2` output before publication, preserves the old directory on
+install failure and removes only exact interrupted staging/rollback names. `bin/ci` now owns the
+installer and always runs `cargo audit` locally and in hosted CI; the former optional local skip is
+gone. The stored binary is 23 MiB.
+
+The behavior harness proves cold install arguments, warm no-install reuse, cleanup after an
+interrupted publication, replacement of a wrong-version binary, preservation on failed install,
+and the single-cache workflow/key/fallback contract. The first bare `bin/ci` performed the one-time
+real cold installation and passed all native, operational, fmt, Clippy, 35 executable Rust tests
+and RustSec audit checks; the existing benchmark remains intentionally ignored. An immediate
+second bare gate reused the exact cached binary with no install and passed. A final fresh bare gate
+after review remediation was also warm and exited 0 with the same complete result.
+
+DeepSeek Free initial review at fingerprint
+`c6a0bc7216ea0369229397fd8c1f8f3d183680d7a78474921afd4d397ff1115b` returned one P2: workflow
+tests were tied to exact YAML indentation. It was fixed by checking distinctive semantic values
+without full-line spacing anchors. Its useful lower-severity orphan-cleanup and wrong-version-test
+notes were also accepted. The exact remediated closure at fingerprint
+`ea344ae37f7c6a3df1fef1157cc6c9fad92cdf5efd37706e6afbec429aa5c8a7` returned `ANSWERED/PASS`
+with no P0/P1/P2 or open question. Its remaining P3 hard-crash micro-window can cause one cold
+rebuild on the next run but cannot skip audit or accept a wrong tool, so it is an explicit bounded
+performance residual rather than a correctness defect. No production command or deployment was
+performed by this optimization. Commit `4845fd0` (`fix: cache cargo-audit in Titanium`) records
+exactly the five reviewed workflow, installer, test, gate and documentation paths; its commit hook
+repeated the complete warm `bin/ci` successfully.
+
+The compatibility follow-up passed bare `bin/ci` after a one-time local cargo-audit fill (44.33s),
+then an immediate complete warm gate in 3.9s with no tool or native build. The commit hook repeated
+that warm gate. Commit `c270a33` records the four-file correction and a regression assertion that
+rejects reintroducing `.titanium/tools` into the workflow path list. The global Codex PreToolUse
+hook rejected `git push origin main`, so the hosted fallback and subsequent exact-key warm-hit
+timings initially remained pending the user's manual push.
+
+U039 reconciled local and remote `main` to exact full SHA
+`c270a338372dbd116cba2a67a2aeaccf7dfb5d79`. Push run `29578601776` attempt 1 restored the prior
+1,691,046,582-byte native archive from exact key
+`rimg-titanium-Linux-x86-64-v3-88cda7ac03409a6ae6bd3aad593d863d5f2401b9df5bcbf66699a60acb9421f4`,
+reported both native checks current, compiled cargo-audit exactly once in 5m19s and saved the new
+1,699,203,266-byte combined cache under exact v2 key
+`rimg-titanium-v2-Linux-x86-64-v3-73161ae825d7e23945e955e3504d897d1c5a9a4a50c16c61039964194c0a7af1`.
+The complete check step passed in 7m53s.
+
+Attempt 2 restored that exact v2 key, reported both native checks current, contained no
+`installing cargo-audit` line and passed the same full check step in 2m38s; total CI was 3m33s.
+This is the required cross-run warm proof. Both known marker-ineligible deploy jobs were cancelled
+after successful CI, and their always-run Kamal lock release plus bounded BuildKit prune completed.
+Live production remained the sole original exact container `f50a4135c09b`, image tag `126f27b...`,
+Docker-healthy with no recovery files; its status remains ready and truthfully reports the separate
+known `webhook.enabled=true` drift. No production cutover occurred.
+
+### Production BuildKit retention boundary
+
+The exact hotfix deploy log exposed a separate self-hosted-runner cost after hosted Titanium was
+fixed. With an unchanged Dockerfile, BuildKit no longer retained the actual
+`vips-build-base` package layer: that apt/toolchain step and its dependent native RUN stages
+executed again, and the registry image build took 1108.947 seconds. The former daemon
+`maxUsedSpace = "1GB"` and matching always-run `--max-used-space 1gb` cannot retain that complete
+graph. Live inspection after cancelled-run cleanup found only 217.6 MB in the dedicated builder;
+the VPS filesystem remained bounded at 67 GB total, 45 GB used and 22 GB available.
+
+The reviewed change raises the common maximum to 6 GB and adds a 12 GB minimum-free-space target
+in both BuildKit daemon configuration and the always-run prune command. The maximum bounds normal
+cache growth while the free-space target causes earlier eviction if unrelated VPS data consumes
+the remaining disk. `bin/test-native-cache-layout` binds both paired values and rejects the former
+1 GB workflow flag. The README records the operational contract. Bare `bin/ci` passed after the
+change, and task-scoped commit `10d549e` repeated the complete gate in its commit hook.
+
+DeepSeek Free reviewed the exact four-file diff at `/tmp/rimg-buildkit-gc-review` and returned
+`ANSWERED/PASS` with no P0/P1/P2. Its only compatibility P3 speculated that the runner might not
+support `--min-free-space`; the live runner's own `docker buildx prune --help` explicitly lists
+that option, so no source change was required. Its suggested two-pass cache retention proof is the
+correct post-push runtime acceptance test: the first marker-blocked deploy fills the newly recreated
+builder once, and a rerun of the same SHA must show native stages cached before reaching cutover.
+
+The user pushed `10d549e` exactly to `origin/main`, and run `29580086966` completed that two-pass
+proof. Attempt 1 passed hosted CI in 3m18s and cold-built the production image in 1140.6 seconds.
+The live builder grew to 5.79 GB, proving that the former 1 GB ceiling could not retain the graph.
+The pre-app-boot hook then failed closed on the unchanged bootstrap marker. Lock release and the
+new 6 GB/12 GB cleanup both succeeded; prune reported 0 B deleted and the VPS still had 17 GB free.
+
+Attempt 2 reran the identical `10d549e3c5c999c831c10017a2c716920fee64df` source. Hosted CI again
+passed in 3m18s, while BuildKit reported the expensive package base, libaom, libjxl, libheif,
+libvips, jpegli and Rust build stages as `CACHED`. The image build fell from 1140.6 to 14.0 seconds,
+and the complete production job fell from 19m16s to 25 seconds before the same intentional marker
+failure. The second cleanup again deleted 0 B and retained the exact 5.79 GB cache. Production
+remained on sole healthy container `f50a4135c09b` / image `126f27b...`; the marker timestamp and
+contents were unchanged, there were no recovery files, and the loopback health contract remained
+`ready=true`. No production cutover occurred; the known `webhook.enabled=true` drift remains until
+an explicitly authorized one-time replacement.
+
+### Authorized rimg cutover and observer recovery
+
+U041 authorized exactly one replacement. Preflight reconciled local and remote rimg main to full
+SHA `10d549e3c5c999c831c10017a2c716920fee64df`; the sole prior `126f27b...` container was healthy
+with zero restarts, schema 4/4, no active work and the expected private mounts. The exact candidate
+image was already present, the 5.79 GB BuildKit graph remained intact and the old bootstrap marker
+was copied to an owner-only deploy state file before any mutation.
+
+Run `29580086966` attempt 3 reran only the failed production job after reusing the already green CI
+dependency. The marker was removed only after that exact job entered `in_progress`. BuildKit
+reported every graph step cached; Kamal stopped the old container, persisted the migration report,
+started exact tag `10d549e...`, observed Docker health, passed both consumer-network checks 120
+seconds apart, renewed the marker and cleared its `.containers`/`.migrated` recovery state. The
+job completed successfully in 2m36s, with Kamal itself reporting 144.2 seconds; lock release and
+the 6 GB/12 GB prune succeeded and prune deleted 0 B.
+
+Post-cutover evidence shows sole running container `b47bcd787470...` on private `kamal` address
+`172.19.0.12`, exact four mounts with Sartuli uploads read-only, zero restarts and Docker healthy.
+Live and ready return 204; status schema v1 is ready/normal with zero active work, all writable
+probes true and `webhook.enabled=false`; no `RAILS_WEBHOOK_URL` remains in the container
+environment. Schema inspection is current 4/4 with zero pending migrations and integrity `ok`.
+The exact marker records `10d549e...` at `2026-07-17T13:01:56Z`, and the persisted migration report
+is owner `10001:10001`, mode `0600`.
+
+The rolling gap exposed a directly coupled rdashboard service defect. At `12:59:47Z`, while no
+healthy container existed, the collector's parallel probe burst triggered five expected
+fail-closed helper exits in one second. systemd exhausted its default service start limit and marked
+both `rdashboard-rimg-health.service` and its listening socket failed, so observation did not resume
+when the candidate became healthy. Resetting only those failed states and restarting the socket
+immediately restored the exact new status. Eight consecutive five-second SQLite project samples
+then reported `healthy`, live/ready 204 and `webhook_enabled=false`; the controller remained active
+with zero restarts.
+
+The source correction adds `StartLimitIntervalSec=0` under the helper's `[Unit]`, pins it in the
+installed-unit test and documents why transient fail-closed activations must not permanently fail
+the socket. It does not change helper exit semantics, Docker target validation, the loopback-only
+listener, five-second start/stop deadlines, empty capability sets, address-family restriction,
+32-task/256-fd/32-MiB limits or the controller's lack of Docker authority. The installed host's
+`systemd.unit` manual explicitly defines zero as disabling start rate limiting. Bare `bin/ci`
+passed this exact three-file source diff with exit 0: 132 library tests, all binary/integration,
+five browser tests, schema/document checks and optimized release build.
+
+Required DeepSeek Free consultation used fresh runtime evidence and state fingerprint
+`95c2d42e8ade423fbe8002c1727f964d7f17fc0c9ee681fe843d1f9d3be8ee95` at
+`/tmp/rdashboard-rimg-health-start-limit-review`. The route check was `OK`, but both dispatcher
+attempts ended `ERROR` without a response: the model ignored the requested working-tree diff,
+expanded `HEAD~1` (the entire prior health integration commit) and exhausted its bounded attempt.
+It is not represented as a pass. Adversarial local review found no material regression: unlimited
+start attempts remain reachable only through a loopback socket, every activation is systemd-
+bounded, and preserving failed exits keeps signal loss explicit while allowing the next bounded
+collection to recover automatically.
+
+Commit `1ce0e3c` (`fix: recover rimg health socket after cutover`) records exactly the service unit,
+installed-unit contract test and deployment documentation after the green gate. The global
+PreToolUse hook blocked the authorized `git push origin main`; production installation of the
+durable unit change therefore awaits manual remote provenance. The live socket remains restored
+and healthy in the meantime. After all candidate, marker, migration, health and dashboard evidence
+passed, the temporary old-marker copy was removed; the bootstrap state directory is empty and the
+new exact marker remains.
+
+### Production control-center history and project overview
+
+U042 was implemented as three coherent local vertical slices without enabling an unconfigured
+external integration. Host history now combines durable minute sketches and remaining raw samples
+into completed-minute median windows for one hour, one day, one week and 30 days with explicit
+coverage. The generic Intent/Attempt observation workspace was removed from the page while its
+fail-closed API remains available for the later concrete deploy journey. The first reusable project
+overview shows rimg health, bounded durable deploy/rollback/backup history and truthful unavailable
+states for container resources, dependency updates and GlitchTip rather than fabricated data.
+
+The accepted-repository path is bounded across both privilege boundaries. Source protocol v2
+measures only the exact accepted Git tree, revalidates the accepted ref before and after `ls-tree`,
+and returns logical tracked-file bytes and count without disclosing repository paths or Git command
+authority to the controller. Control protocol v2 carries that observation through the root
+executor. Metrics schema v4 stores at most one durable point per project per hour across restarts,
+preserves errors alongside last-known data and exposes a 31-day query capped at 745 points so the
+UI can calculate a covered 30-day change. Collection failures retry after five minutes without
+increasing the successful hourly sampling rate.
+
+DeepSeek Free reviewed the complete 29-path non-workflow diff and returned `PASS`. Its host-history
+double-count concern is not reachable: rollup insertion and raw deletion share one SQLite
+transaction, so the independent history connection observes either state, never the intermediate
+state. Its project-index question is already answered by
+`UNIQUE(project_id, target_key, operation_kind)`, whose SQLite index has `project_id` as its leading
+column. The corrupt-metric case already returns a typed store error rather than panicking, and the
+fixed 30-day window matches U042. Its one valid P2 was fixed: completion of a single project's
+operation or repository request now replaces only that project article instead of rebuilding every
+project. The open systemd reachability question is pinned by an installed-unit contract proving the
+base executor keeps `rdashboard-source` and the mutation drop-in adds its two groups without an
+empty `SupplementaryGroups=` reset.
+
+The final bare `bin/ci` exited 0 after review remediation: 132 library tests, all binary and
+integration suites including nine executor-socket and 19 store/web contracts, seven browser tests,
+documentation/schema checks and the optimized release build. A preceding final-gate attempt found
+only a 101-line collector function against the deny-level 100-line Clippy limit; dependency setup
+was extracted into a cohesive helper and the full gate was rerun. In-app browser automation was not
+available in this session, so no screenshot claim is made; semantic/responsive markup is covered by
+the browser contract suite and source inspection. Container resource history, dependency-update and
+GlitchTip adapters, Telegram failure delivery and the concrete authorized deploy UI remain explicit
+next slices; this change does not claim or deploy them.
+
+Task-scoped commit `16d61b9` (`feat: add production control center history`) records exactly the 26
+reviewed product, contract, deployment and documentation paths. The three authoritative workflow
+artifacts remain intentionally uncommitted. The commit is local only; no production deployment or
+external integration mutation was performed for U042.
+
+### Control-center production deployment
+
+U043 reconciled local and remote `main` to exact full SHA
+`16d61b9a8c87ab3062afbc8f5ae0586d8d3ca05b`; `1ce0e3c` is its direct parent. U044 explicitly
+authorized installing that pushed target. Read-only production preflight found 17.29 GB free,
+active zero-restart controller and executor services, active private bridge and rimg observer, a
+ready rimg container at exact deployed head `10d549e...`, and no active writes/jobs/deliveries.
+The source service, source config/credential/state, mutation drop-in and tmpfiles config were all
+absent. Existing Access values were inspected only by key names and remain unchanged.
+
+Source-broker preflight then found a real missing contract before any service or data mutation:
+`rimg` is private, while production has no broker-scoped Git credential. The source boundary
+deliberately clears the credential helper, interactive prompting, HOME and global/system Git config;
+the deploy user's existing SSH identity is therefore neither reachable nor an acceptable implicit
+workaround. The failed preflight left the old binaries, units, active services and data hashes
+unchanged, created no release state and installed no source file. The already-created isolated
+source/build identities are inert. Supporting the private remote requires a source-controlled,
+auditable credential and pinned-host contract followed by the full gate and review.
+
+Consultation fingerprint `5a29a043355d943d6eb4379b86751fdcbbd6e20a2a572aaa7046e595b16375ac`
+used `/tmp/rdashboard-production-deploy-review.md`. DeepSeek Free returned `ERROR` after two attempts
+despite an immediate healthy route check and is not represented as a review. DeepSeek Pro returned
+`ANSWERED/CONCERNS` at `/tmp/rdashboard-production-deploy-review-pro`. Its valid minor rollback
+ordering finding was fixed by stopping both rimg health service and socket before restoring their
+old unit. The tmpfiles finding assumed an old file contradicted by live preflight; exact rollback
+must restore its original absence. The direct successful `127.0.0.1:18080/health/status` request is
+stronger than checking the intentionally short-lived socket service as active. Socket units are
+unchanged and their exact installed hashes were part of preflight. The reviewed source-install form
+was consequently not executed.
+
+The narrowed rollback-armed script has SHA-256
+`8fd2ce7643d4ce35d1e37f6c6c489709596411456c9cca47020deb4ea482d620`; it stops the controller
+before copying the entire StateDirectory and restores that pre-v4 directory with the exact prior
+controller, executor and units on any trapped error. It completed for exact pushed SHA
+`16d61b9a8c87ab3062afbc8f5ae0586d8d3ca05b`. Installed controller and executor SHA-256 values are
+`09e1ac4aedb2df49ce5744a9cb4bb80f97c53a005b8dfec48666ae0b519da5a7` and
+`82187836f9d8dc4eb98e9d78f709ef44c70fcdc9181126f35ffb7b7dfb290680`; the executor and rimg-health
+unit hashes are `60c9d618…1fc9` and `482ec765…fb99`.
+
+Controller and executor are active/running with zero restarts, their loopback and private-bridge
+health both return 200, the assertion-free snapshot returns 403, and no warning-or-higher journal
+entry exists for either service after cutover. The sole rimg container remains exact image
+`10d549e…`, running/healthy and ready/idle with no active writes, jobs or webhook delivery. Normal
+controller startup migrated metrics to schema v4. Independent inspection found advancing host and
+rimg project series (24 points each in the preceding two minutes at inspection time), while
+`project_repository_samples` remains empty because source config, credential, state, unit and socket
+all remain absent. That is a truthful partial production state, not fabricated repository data.
+
+Public `https://dev.4u.ge/` returns the expected Cloudflare Access 302 and assertion-free internals
+remain closed; the authenticated render still requires the user's browser identity. The root-only
+deployment state records the exact commit, schema v4 and
+`repository_source=unavailable_private_remote`; the staging bundle and unused generated seed were
+removed after post-cutover verification.
+
+### Compact operator overview and traffic totals
+
+U045 replaces the expanded project articles with one native table row per project and explicit
+columns for state, resources, deployments, backups, repository, updates and errors. The table has a
+caption, scoped column and row headers, DOM order equal to visual order, text state labels alongside
+symbols, a sticky project column and native horizontal overflow. These choices follow the bundled
+`modern-web-guidance` accessibility and CSS-layout guides. Successful history accumulation prose,
+the redundant current-node label and the primary PSI row are gone. Raw `contract_v1` health detail
+and raw executor/source failures are deliberately excluded from the overview; concise unavailable
+states and valid last-known repository data remain visible.
+
+Host-history API schema v2 carries received and sent byte totals plus their independent covered
+durations. The durable minute rollup accumulates only deltas between monotonic counter samples. A
+counter decrease excludes that unknowable interval from both total and coverage instead of
+fabricating traffic, and the mixed raw/rollup path is covered by focused store contracts. Current
+traffic uses the host counters directly; hour/day/week/month cells render counter-derived volume,
+while CPU, memory and disk continue to use completed-minute medians.
+
+DeepSeek Free reviewed the complete product diff and returned `PASS` with fingerprint
+`27d553fec5abdaeb7e2cc4e274860dc6d9723cd6a089288ec2c00984507abd74`; its output is retained at
+`/tmp/rdashboard-compact-review`. Its valid safe-integer formatting observation was fixed, and the
+table minimum width was aligned with the explicit column widths. Its theoretical overlap concern is
+bounded to conservative undercounting in a defensive merge and cannot invent bytes. The final bare
+`bin/ci` then exited 0: 132 library tests, all binary and integration suites including 20 store/web
+contracts and seven browser tests, documentation/schema checks and the optimized release build.
+In-app browser automation was unavailable in this session, so no screenshot claim is made. This
+slice changes no production service or external integration. Task-scoped commit `8de0a3d`
+(`feat: compact production overview`) records exactly the seven reviewed
+product/test/documentation paths; the workflow artifacts remain intentionally uncommitted.
+
+### Compact-overview production deployment
+
+U046 reconciled local and remote `main` to exact full SHA
+`8de0a3dd9b4f2351f3a7e316b6c80674d9bcb10c`. Bare `bin/ci` reran on that exact target and exited 0
+with 132 library tests, all binary/integration suites including 20 store/web contracts, seven
+browser tests and the optimized release build. The existing DeepSeek Free `PASS` applies to the
+same unchanged product target; deployment introduced no new code or configuration scope requiring
+another consultation.
+
+Read-only preflight found 16.79 GB free, active zero-restart controller and executor services,
+active private bridge and rimg-health socket, metrics schema v4 with advancing host and rimg
+samples, no repository samples, and one sole healthy exact `10d549e...` rimg container. The prior
+controller hash was `09e1ac4aedb2df49ce5744a9cb4bb80f97c53a005b8dfec48666ae0b519da5a7`.
+Only the controller was in scope: the candidate binary hash was
+`7cf5a9f97c775a4842219a33352a6da043c00dff6c64a77012afefd8c6871d18` and matched again after
+upload and installation.
+
+The rollback-armed installation stopped the controller before copying its complete StateDirectory
+and retained that copy plus the prior binary under root-only release
+`/var/lib/rdashboard-releases/20260717T154924Z-8de0a3dd9b4f`. Any install, startup or health error
+would have restored both. Candidate health succeeded, so no rollback ran. The controller is now
+active/running with zero restarts; loopback and private-bridge health both return 200, an
+assertion-free protected request remains 403, metrics schema remains v4, and 36 host plus 36 rimg
+samples advanced during the initial soak. Latest network counters are populated. The unchanged
+sole rimg container remains healthy on exact `10d549e...`.
+
+The installed binary contains the requested semantic project table and history API v2 browser
+contract. Public `https://dev.4u.ge/` returns the expected Cloudflare Access 302. There are zero
+controller error lines after cutover. One repository-observation warning is expected because the
+private source service remains uninstalled, and the deliberate assertion-free smoke generated one
+fixed authorization warning. Browser setup was attempted through the bundled in-app-browser skill,
+but this session exposes no required browser-control JavaScript tool, so the authenticated visual
+render was not claimed. Repository samples remain zero, and no source broker, mutation authority,
+project-resource collector, dependency update, GlitchTip or Telegram integration was installed or
+enabled.
+
+## 2026-07-17 rimg failed push-deploy diagnosis
+
+GitHub Actions run `29592074146`, job `87924148149`, did not fail while compiling or
+publishing the image. The deploy reached `.kamal/hooks/pre-app-boot`, where
+`bin/predeploy-migrate` rejected the cutover because the production bootstrap marker exists.
+That marker is an intentional contract: automatic push cutovers remain disabled until the
+stable rdashboard-owned release path is installed. The current production container stayed
+healthy and no candidate boot occurred.
+
+The rimg workflow now evaluates the same marker immediately after checkout. When stable cutover
+is required, all effectful steps are skipped and the job emits a notice instead of creating a
+known-failing deployment. The lower-level predeploy hook remains unchanged as defense in depth.
+Operational tests cover both marker states and verify that the builder, storage, deploy, lock
+cleanup, and cache cleanup share the same decision. Bare `bin/ci` passed. DeepSeek reviewed the
+frozen change and reported no P0-P2 findings; its minor exact-count and test-seam observations
+were either intentional contract checks or clarified before the final gate.
+
+## 2026-07-17 first real project-resource source
+
+The visible host heading/status and both nested table scroll containers are removed. Native tables
+remain in normal document flow with captions, scoped headers and one project row. Percentage column
+widths replace the forced 64/98-rem canvases, so the operator uses the page scrollbar rather than a
+second table viewport. Browser control could not be initialized because this session exposes no
+required JavaScript control tool; no visual screenshot claim is made. Static HTML and browser
+contracts assert that the removed heading/status/scroll classes do not return.
+
+The rimg resource cell now has a real source. A private mode-`0600` Unix socket owned by the
+`rdashboard` account starts one short-lived root template service per request. Its fixed protocol
+accepts only `resources-v1`; the existing helper selects only full Docker IDs with exact
+`service=rimg` and `role=web` labels, revalidates running/healthy state and the private Kamal
+address, then executes one fixed bounded `docker stats --no-stream` format for that ID. The
+controller receives only versioned numeric CPU, memory, network and block-I/O values and never
+receives Docker socket or command authority. The socket waits for the executor-created runtime
+directory, and all request/response, process, time and memory bounds fail closed.
+
+Metrics schema v5 transactionally adds resource fields to production v4 project samples. The exact
+v4-to-v5 migration is exercised with an existing project row before the first resource write. Raw
+fresh/partial samples are compacted into mergeable minute sketches; stale cached values remain
+visible but are not counted again. Monotonic network/block counter decreases omit the unknowable
+restart interval. The project-scoped API returns completed hour/day/week/month windows with medians,
+totals and independent coverage, and the compact cell renders current CPU/RAM, all four CPU/RAM
+medians and one-hour traffic without exposing raw health text.
+
+Bare `bin/ci` passed after the v4 migration contract: Clippy with warnings denied, 134 library
+tests, 10 root-helper tests, 23 store/web tests, all other integration suites, seven browser tests,
+the schema/document checks and optimized release build. DeepSeek Free consultation first returned
+`ERROR` with empty responses, then `PARTIAL` after reading the narrowed high-risk files; its only
+response was a request to continue reading, so it is explicitly not treated as PASS or as a
+finding. Local risk review subsequently tightened the runtime-directory ordering and browser
+contract validation. Repository, dependency-update and GlitchTip integrations remain disabled and
+truthfully unavailable pending their real production identities and credentials.
+
+## 2026-07-17 project-resource production deployment
+
+U049 paused further source work and explicitly authorized deploying the already gated revision.
+Direct remote reconciliation found both commits already present: rdashboard
+`5961b63b4b4cf6f843619ba4e03f469690ea2fe5` and rimg
+`00cdcbfd9df53d2565efca0b394e82586158f480`. The local Codex push attempt was blocked by the
+operator's `PreToolUse` hook before execution; no bypass was attempted. The subsequent remote read
+confirmed the operator-side push had completed.
+
+Read-only production preflight found 16.77 GB free, an active zero-restart controller, active
+executor/health socket, no resource units yet, one healthy rimg container on exact image
+`10d549e...`, and prior controller/helper hashes `7cf5a9f...1d18` and `c6128e1...ea81e`.
+The uploaded six-file bundle passed SHA-256 verification on the host before installation.
+
+The rollback-armed installation stopped the controller before copying its complete schema-v4
+StateDirectory. It retained that directory plus every replaced binary, unit and fixed environment
+file under root-only release `/var/lib/rdashboard-releases/20260717T174409Z-5961b63`. The trap would
+stop the new socket, move aside candidate state/files and restore the old state, binaries and units
+on any install, startup, health or exact-hash error. No error occurred and no rollback ran.
+
+Production now runs controller SHA-256
+`53474403a072596704d48247f09aee1ea17705f7a0a9b60e8b4f8abca88ff425` and resource-helper SHA-256
+`5243aa45b64c4ecd3b2916c8f54616992ed5445b19a6d1f90ada4d0d64f968bf`. The controller and both
+observation sockets are active; controller restarts remain zero. The resource socket is exactly
+`rdashboard:rdashboard` mode `0600`, its direct fixed-protocol response reported real numeric CPU,
+RAM, network and block-I/O values for the healthy rimg container, schema migrated transactionally
+to v5, and successive fresh project samples advanced at five-second timestamps. Loopback and the
+private Kamal-network bridge returned 200, a protected request without an Access assertion remained
+403, and public `https://dev.4u.ge/` returned the expected Access 302. Warning and error journal
+counts after cutover were both zero.
+
+The bridge smoke initially pulled the 9.56 MB `curlimages/curl:8.13.0` image because it was absent.
+After confirming the disposable container had already been removed and no container referenced the
+image, the exact newly pulled image was deleted; it is not retained as production state.
+
+The pushed rimg correction is independently proven by run `29600740331`. CI passed, the deploy job
+completed successfully in nine seconds, `Check automatic deployment mode` passed, and builder,
+storage, Deploy, Kamal-lock cleanup and cache cleanup were all skipped. The existing production rimg
+container was not replaced. This is the intended successful no-op until the rdashboard-owned stable
+cutover path exists.
+
+## 2026-07-17 private source credential boundary
+
+U050 clarified that missing production credentials block activation, not continued implementation.
+The source boundary now removes the first such blocker without borrowing the deploy user's identity.
+Canonical installed-source schema v3 binds each SSH project to project-derived credential names and
+the exact SHA-256 identities of its OpenSSH private key and known-hosts file. An SSH remote without
+that binding, a binding attached to HTTPS, a renamed/cross-project credential, unsafe file metadata,
+digest change, malformed OpenSSH framing or missing exact host pin fails before reconciliation.
+
+The Git adapter receives a validated per-project command rather than one global identity. It clears
+the environment and disables HOME/global/system configuration, credential helpers, terminal
+prompting, SSH agents/default identities, passwords, keyboard interaction, global known hosts and
+host-key updates. Strict host checking uses only the project credential copy loaded by the separate
+`rdashboard-source-git-ssh.conf` systemd drop-in. The base unit remains usable for credential-free
+HTTPS projects, and the web controller receives neither the credentials nor a Git command surface.
+
+The new fixed-pilot `rdashboard-source-config` reads the three root-owned rimg files only from
+`/etc/rdashboard/credentials`, derives the attestation public identity and credential digests, and
+emits canonical JCS without putting private bytes in argv or stdout. It keeps auto-deploy disabled
+and requires the exact installed owner-policy identity instead of inventing one. Future repositories
+receive separate credential names; extending generation remains typed rather than hand-editing a
+digest-covered document.
+
+DeepSeek Free independently reviewed the complete source/transport/config/systemd diff at
+`/tmp/rdashboard-source-ssh-review`, fingerprint
+`a0b72b1cac948516e079af4c60cdd3210cf45a97fd595fbe4036d3839570b095`, and returned `ANSWERED/PASS`
+with no P0-P2 finding. Its key-isolation, per-project binding, host-pinning, no-agent environment and
+secret-free config observations match the locally inspected code.
+
+The first bare `bin/ci` correctly failed Clippy because `parse_arguments` took an owned vector it did
+not consume. The implementation was changed to accept a slice; no lint was suppressed. The complete
+bare gate then passed: Clippy with warnings denied, 137 library tests, all binaries including 10
+root-helper and two source-config tests, every integration suite including 23 store/web contracts,
+seven Node browser tests, schema/document checks and the optimized release build in two minutes.
+No production key, credential file, source config, repository state, service/drop-in activation,
+GitHub permission or source fetch was created by this local slice.
+
+## 2026-07-17 stable installed-deploy review
+
+DeepSeek Pro reviewed the uncommitted installed-update/router/rollback diff through the global
+`consult` dispatcher at `/tmp/rdashboard-stable-deploy-consult`. Route
+`deepseek-pro` (`deepseek/deepseek-v4-pro`) returned `ANSWERED/CONCERNS` for repository fingerprint
+`0d18979d7bf79eebe18380fcfcd993fbb97c36e51a0aa6cbd592c03912bf215c`.
+
+Its high-confidence alias-exclusivity finding was valid: checking the owned router's own alias did
+not exclude a second container advertising `rimg` on the same Docker network. The adapter now
+enumerates the bounded exact network membership after bootstrap adoption, reopens each full Docker
+container ID without a shell, and fails closed unless the exact owned router is the sole `rimg`
+alias holder. The medium backup-freshness question was already enforced by
+`resolve_base_backup_chain` against trusted boundary time and `code_only_backup_max_age_ms`; a new
+cross-attempt installed-deploy contract test now proves stale historical backup rejection. The
+low-confidence expiring-spec concern describes an intentional fail-closed recovery boundary: an
+expired immutable phase authority is never silently refreshed after a crash because effect absence
+may be ambiguous; it remains an operator-visible reconciliation failure rather than a repeated
+privileged effect.

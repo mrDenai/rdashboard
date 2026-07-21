@@ -2,7 +2,7 @@
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
 - Status: implementation in progress
-- Last updated: 2026-07-21
+- Last updated: 2026-07-22
 
 ## User input log
 
@@ -286,3 +286,30 @@ Normalized instruction:
   release does not depend on an already initialized `current` pointer.
 - Do not install credentials, write VPS state, reload units or activate automatic deployment in this
   local slice.
+
+### U018 — 2026-07-22
+
+Faithful English rendering:
+
+Commit what you implemented.
+
+Normalized authorization:
+
+- Confirm and report the task-scoped local commit for the completed inactive self-update
+  configuration and initial-slot provisioning slice.
+- Do not stage or commit unrelated notification/dashboard work, workflow artifacts or consultation
+  scratch state. Do not push or deploy.
+
+### U019 — 2026-07-22
+
+Faithful English rendering:
+
+We are not ready to conduct any drills; the implementation will have to proceed without them.
+
+Normalized decision and constraint:
+
+- Do not run disposable-host, production-host, failure-injection, kill/OOM, reboot or recovery drills.
+- The absence of those drills must remain explicit evidence debt and must not be represented as
+  verified activation safety.
+- This decision does not authorize VPS installation, service changes, credential installation,
+  `auto_deploy` activation, push or deployment.
