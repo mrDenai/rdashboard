@@ -899,3 +899,78 @@ does not implement networked lockfile/dependency preparation, operation-owned CO
 integration/OCI adapters or the live dedicated-filesystem/quota/concurrency proof. It does not install
 or start a service, run repository code, mutate the VPS, contact GitHub/providers, push or deploy.
 Those remaining step-4 boundaries and the first authorized `rimg` shadow candidate stay pending.
+
+## Slice 4d: sealed input composition and private writable workspace
+
+### Reviewed scope
+
+Slice 4d closes the input-composition boundary needed before a real dependency adapter can populate
+shared state:
+
+- every new `PreparedRun` contains a canonical digest-protected composition binding its own typed key,
+  exact `SourceSnapshot`, exact `DependencySnapshot`, installed workflow-policy digest and versioned
+  generated-input digest;
+- controller metadata and repository bytes occupy separate sealed paths. Only `source/` becomes the
+  job workspace, while a repository-owned `.rdashboard-prepared-run.jcs` inside that source subtree is
+  preserved as ordinary source without colliding with the controller document;
+- the source-tree adapter's generated-input digest now includes the composition-layout purpose and
+  schema. Existing Slice 4c source-only objects therefore have a different PreparedRun key and cannot
+  replay as the new layout;
+- a PreparedRun pin validates the composite object and both referenced sealed snapshots under the CAS
+  commit lock. Its backward-compatible canonical V1 record persists the two sorted transitive keys, so
+  cold LRU cannot evict a live source or dependency and admission need not repeatedly hash them;
+- the root launcher rejects a composition from another workflow policy, reopens the exact dependency
+  snapshot and derives read-only `/prepared` and `/dependencies` mounts itself;
+- the fixed job validates both sealed roots, creates only private directories below the byte/inode-
+  bounded `/job` tmpfs, copies `/prepared/source` into `/job/workspace`, preserves only executable vs
+  non-executable semantics, rejects links/special files/unsafe modes/identity changes, and enforces
+  100,000-entry/2-GiB secondary ceilings before executing the fixed adapter script;
+- the explicitly empty `source_tree_v1` dependency marker remains the only installed dependency
+  adapter. No networked Cargo/Ruby/npm/system dependency population is claimed by this slice.
+
+The exact staged product/config/test diff contains 5 paths, 884 insertions and 43 deletions. Only the
+three workflow documentation hunks in shared dirty `deploy/systemd/README.md` were staged; its unrelated
+notification section and all notification code/workflow artifacts remained outside the reviewed diff.
+
+### Verification
+
+- A `git checkout-index` export of the exact staged state passed bare `bin/ci`: formatting, Clippy with
+  warnings denied, 207 active library tests with two credentialed live-provider tests ignored, every
+  binary/integration/socket/scheduler/worker suite, both schema checks, 8 browser contracts and the
+  optimized release build.
+- The first sandboxed exact run allowed normal compilation but denied four existing temporary Unix-
+  socket binds with `EPERM`. Re-running the unchanged export with local socket creation allowed passed;
+  this was an execution-sandbox restriction rather than a product failure.
+- The final optimized release phase completed in 2 minutes 43 seconds.
+- `git diff --cached --check` passed. Exact staged product/config/test diff SHA-256:
+  `db0c76a6916a8febcd8dfffcd6fd043bacff4887984bab59127d43a00a428e7f`.
+- Focused regressions cover canonical composition and key validation, incomplete-reference rejection
+  before pin creation, transitive eviction protection, legacy non-composite pin serialization,
+  metadata/source basename isolation, workflow-policy substitution, exact read-only mounts, private
+  workspace copying, executable-bit preservation, and link/non-empty-destination rejection.
+
+### Independent consultation and finding disposition
+
+A fresh complete exact-staged review inspected all five paths and returned `SAFE`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 237 seconds;
+- state fingerprint: `76e0e6aec497ee8e41ca4d1fa66c683d200d6027e1b476078a4204da3866f611`;
+- brief SHA-256: `05caa962d36542170bcc49063795b0089d68afb88fba5ab4135b9a8b82ec6160`;
+- response SHA-256 after Markdown trailing-space normalization:
+  `901c54620b1be31eeb83a56d37762014bd1fa1989470d7c5b5901c5b4a24d862`;
+- response: `consult-slice4d-deepseek/response.md`;
+- verdict: no open question or P0-P2 finding.
+
+The sole P3 note observed that `PinRecordV1::validate` rejects primary-key inclusion, duplicate or
+unsorted protected keys, while `PinRecordV1::new` establishes those invariants for new records. That is
+the intended fail-closed deserialization boundary, not an executable defect; no correction was needed.
+
+### Verdict
+
+Slice 4d is production-worthy as an inactive local composition/execution foundation and may be
+committed. It does not yet populate a networked dependency snapshot, expose it through a fixed package-
+manager adapter, provide filesystem-level COW layers, run a real repository shadow, install/start a
+unit, mutate the VPS, contact GitHub/providers, push or deploy. The next local Slice 4e is the reviewed-
+lockfile dependency-prefetch boundary, starting with the measured Cargo/native requirements needed by
+`rimg` without making i9 availability authoritative.

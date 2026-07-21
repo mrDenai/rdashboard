@@ -39,7 +39,12 @@ const PREPARATION_PIN_SCHEMA_VERSION: u16 = 1;
 const PREPARATION_PIN_PURPOSE: &str = "rdashboard.preparation-pin.v1";
 const PREPARATION_ACCESS_SCHEMA_VERSION: u16 = 1;
 const PREPARATION_ACCESS_PURPOSE: &str = "rdashboard.preparation-access.v1";
+const PREPARED_RUN_COMPOSITION_SCHEMA_VERSION: u16 = 1;
+const PREPARED_RUN_COMPOSITION_PURPOSE: &str = "rdashboard.prepared-run-composition.v1";
+pub const PREPARED_RUN_COMPOSITION_FILE: &str = ".rdashboard-prepared-run.jcs";
+pub const PREPARED_RUN_SOURCE_DIRECTORY: &str = "source";
 const MAX_ENTRY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PREPARED_RUN_COMPOSITION_BYTES: u64 = 64 * 1024;
 const MAX_PAYLOAD_PATH_BYTES: usize = 4_096;
 const MAX_PLATFORM_BYTES: usize = 256;
 const MAX_PIN_DURATION_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -148,6 +153,102 @@ impl PreparationKeyMaterialV1 {
             }
             _ => Ok(()),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedRunCompositionV1 {
+    purpose: String,
+    schema_version: u16,
+    pub prepared_run_key: EvidenceDigest,
+    pub source_snapshot_key: EvidenceDigest,
+    pub dependency_snapshot_key: EvidenceDigest,
+    pub workflow_policy_digest: EvidenceDigest,
+    pub generated_input_digest: EvidenceDigest,
+    document_digest: EvidenceDigest,
+}
+
+#[derive(Serialize)]
+struct PreparedRunCompositionPayload<'a> {
+    purpose: &'static str,
+    schema_version: u16,
+    prepared_run_key: &'a EvidenceDigest,
+    source_snapshot_key: &'a EvidenceDigest,
+    dependency_snapshot_key: &'a EvidenceDigest,
+    workflow_policy_digest: &'a EvidenceDigest,
+    generated_input_digest: &'a EvidenceDigest,
+}
+
+impl PreparedRunCompositionV1 {
+    pub fn new(material: &PreparationKeyMaterialV1) -> Result<Self, PreparationStoreError> {
+        let PreparationKeyMaterialV1::PreparedRun {
+            source_snapshot_key,
+            dependency_snapshot_key,
+            workflow_policy_digest,
+            generated_input_digest,
+        } = material
+        else {
+            return Err(PreparationStoreError::InvalidPreparedRunComposition);
+        };
+        let mut composition = Self {
+            purpose: PREPARED_RUN_COMPOSITION_PURPOSE.to_owned(),
+            schema_version: PREPARED_RUN_COMPOSITION_SCHEMA_VERSION,
+            prepared_run_key: material.key()?,
+            source_snapshot_key: source_snapshot_key.clone(),
+            dependency_snapshot_key: dependency_snapshot_key.clone(),
+            workflow_policy_digest: workflow_policy_digest.clone(),
+            generated_input_digest: generated_input_digest.clone(),
+            document_digest: EvidenceDigest::sha256([]),
+        };
+        composition.document_digest = composition.calculate_digest()?;
+        composition.validate()?;
+        Ok(composition)
+    }
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PreparationStoreError> {
+        self.validate()?;
+        Ok(serde_jcs::to_vec(self)?)
+    }
+
+    fn decode_canonical(bytes: &[u8]) -> Result<Self, PreparationStoreError> {
+        let composition: Self = serde_json::from_slice(bytes)?;
+        if serde_jcs::to_vec(&composition)? != bytes {
+            return Err(PreparationStoreError::NonCanonicalDocument);
+        }
+        composition.validate()?;
+        Ok(composition)
+    }
+
+    fn validate(&self) -> Result<(), PreparationStoreError> {
+        let material = PreparationKeyMaterialV1::PreparedRun {
+            source_snapshot_key: self.source_snapshot_key.clone(),
+            dependency_snapshot_key: self.dependency_snapshot_key.clone(),
+            workflow_policy_digest: self.workflow_policy_digest.clone(),
+            generated_input_digest: self.generated_input_digest.clone(),
+        };
+        if self.purpose != PREPARED_RUN_COMPOSITION_PURPOSE
+            || self.schema_version != PREPARED_RUN_COMPOSITION_SCHEMA_VERSION
+            || self.prepared_run_key != material.key()?
+            || self.document_digest != self.calculate_digest()?
+        {
+            return Err(PreparationStoreError::InvalidPreparedRunComposition);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<EvidenceDigest, PreparationStoreError> {
+        Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
+            &PreparedRunCompositionPayload {
+                purpose: PREPARED_RUN_COMPOSITION_PURPOSE,
+                schema_version: self.schema_version,
+                prepared_run_key: &self.prepared_run_key,
+                source_snapshot_key: &self.source_snapshot_key,
+                dependency_snapshot_key: &self.dependency_snapshot_key,
+                workflow_policy_digest: &self.workflow_policy_digest,
+                generated_input_digest: &self.generated_input_digest,
+            },
+        )?))
     }
 }
 
@@ -321,6 +422,86 @@ impl PreparedEntryV1 {
 
     pub fn payload_path(&self) -> PathBuf {
         self.path.join("payload")
+    }
+
+    pub fn prepared_run_composition(
+        &self,
+    ) -> Result<PreparedRunCompositionV1, PreparationStoreError> {
+        if self.manifest.kind != PreparationObjectKindV1::PreparedRun {
+            return Err(PreparationStoreError::InvalidPreparedRunComposition);
+        }
+        let relative = Path::new(PREPARED_RUN_COMPOSITION_FILE);
+        let encoded = encode_relative_path(relative)?;
+        let expected = self
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path_base64url == encoded)
+            .ok_or(PreparationStoreError::InvalidPreparedRunComposition)?;
+        if expected.entry_kind != PreparationPayloadEntryKindV1::RegularFile
+            || expected.mode != 0o444
+            || expected.bytes == 0
+            || expected.bytes > MAX_PREPARED_RUN_COMPOSITION_BYTES
+        {
+            return Err(PreparationStoreError::InvalidPreparedRunComposition);
+        }
+        let source_relative = Path::new(PREPARED_RUN_SOURCE_DIRECTORY);
+        let source_encoded = encode_relative_path(source_relative)?;
+        let source_entry = self
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path_base64url == source_encoded)
+            .ok_or(PreparationStoreError::InvalidPreparedRunComposition)?;
+        if source_entry.entry_kind != PreparationPayloadEntryKindV1::Directory
+            || source_entry.mode != 0o555
+            || self.manifest.entries.iter().any(|entry| {
+                match decode_relative_path(&entry.path_base64url) {
+                    Ok(path) => path != relative && !path.starts_with(source_relative),
+                    Err(_) => true,
+                }
+            })
+        {
+            return Err(PreparationStoreError::InvalidPreparedRunComposition);
+        }
+        let source_path = self.payload_path().join(source_relative);
+        let source_metadata = fs::symlink_metadata(source_path)?;
+        if source_metadata.file_type().is_symlink()
+            || !source_metadata.file_type().is_dir()
+            || source_metadata.mode() & 0o7777 != 0o555
+        {
+            return Err(PreparationStoreError::InvalidPreparedRunComposition);
+        }
+        let path = self.payload_path().join(relative);
+        let before = fs::symlink_metadata(&path)?;
+        if !before.file_type().is_file()
+            || before.file_type().is_symlink()
+            || before.nlink() != 1
+            || before.mode() & 0o7777 != 0o444
+            || before.len() != expected.bytes
+        {
+            return Err(PreparationStoreError::InvalidPreparedRunComposition);
+        }
+        let file = File::open(&path)?;
+        let opened = file.metadata()?;
+        if input_identity(&before) != input_identity(&opened) {
+            return Err(PreparationStoreError::EntryChanged);
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+        file.take(MAX_PREPARED_RUN_COMPOSITION_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        let after = fs::symlink_metadata(&path)?;
+        if input_identity(&opened) != input_identity(&after)
+            || bytes.len() != usize::try_from(opened.len()).unwrap_or(usize::MAX)
+            || expected.sha256.as_ref() != Some(&EvidenceDigest::sha256(&bytes))
+        {
+            return Err(PreparationStoreError::EntryChanged);
+        }
+        let composition = PreparedRunCompositionV1::decode_canonical(&bytes)?;
+        if composition.prepared_run_key != self.manifest.key {
+            return Err(PreparationStoreError::InvalidPreparedRunComposition);
+        }
+        Ok(composition)
     }
 }
 
@@ -723,7 +904,29 @@ impl PreparationStore {
         self.reconcile_evictions()?;
         self.cleanup_expired_pins(now_ms)?;
         let entry = self.validate_entry(kind, key)?;
-        self.write_pin(&PinRecordV1::new(pin_id, key.clone(), pin_expires_at_ms)?)?;
+        let protected_keys = if kind == PreparationObjectKindV1::PreparedRun {
+            let composition = entry.prepared_run_composition()?;
+            self.validate_entry(
+                PreparationObjectKindV1::SourceSnapshot,
+                &composition.source_snapshot_key,
+            )?;
+            self.validate_entry(
+                PreparationObjectKindV1::DependencySnapshot,
+                &composition.dependency_snapshot_key,
+            )?;
+            vec![
+                composition.source_snapshot_key,
+                composition.dependency_snapshot_key,
+            ]
+        } else {
+            Vec::new()
+        };
+        self.write_pin(&PinRecordV1::new(
+            pin_id,
+            key.clone(),
+            protected_keys,
+            pin_expires_at_ms,
+        )?)?;
         self.touch_access(key, now_ms, true)?;
         Ok(entry)
     }
@@ -1337,6 +1540,7 @@ impl PreparationStore {
             let record = load_pin(&entry.path(), self.expected_owner_uid)?;
             if record.expires_at_ms > now_ms {
                 keys.insert(record.key);
+                keys.extend(record.protected_keys);
             }
         }
         Ok(keys)
@@ -1346,7 +1550,11 @@ impl PreparationStore {
         let path = self.pin_path(record.pin_id);
         if path.try_exists()? {
             let existing = load_pin(&path, self.expected_owner_uid)?;
-            if existing.pin_id != record.pin_id || existing.key != record.key {
+            if existing.pin_id != record.pin_id
+                || existing.key != record.key
+                || (!existing.protected_keys.is_empty()
+                    && existing.protected_keys != record.protected_keys)
+            {
                 return Err(PreparationStoreError::InvalidPin);
             }
         } else {
@@ -2502,6 +2710,8 @@ struct PinRecordV1 {
     schema_version: u16,
     pin_id: Uuid,
     key: EvidenceDigest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    protected_keys: Vec<EvidenceDigest>,
     expires_at_ms: i64,
     document_digest: EvidenceDigest,
 }
@@ -2512,6 +2722,8 @@ struct PinRecordPayload<'a> {
     schema_version: u16,
     pin_id: Uuid,
     key: &'a EvidenceDigest,
+    #[serde(skip_serializing_if = "<[EvidenceDigest]>::is_empty")]
+    protected_keys: &'a [EvidenceDigest],
     expires_at_ms: i64,
 }
 
@@ -2519,13 +2731,17 @@ impl PinRecordV1 {
     fn new(
         pin_id: Uuid,
         key: EvidenceDigest,
+        mut protected_keys: Vec<EvidenceDigest>,
         expires_at_ms: i64,
     ) -> Result<Self, PreparationStoreError> {
+        protected_keys.sort();
+        protected_keys.dedup();
         let mut record = Self {
             purpose: PREPARATION_PIN_PURPOSE.to_owned(),
             schema_version: PREPARATION_PIN_SCHEMA_VERSION,
             pin_id,
             key,
+            protected_keys,
             expires_at_ms,
             document_digest: EvidenceDigest::sha256([]),
         };
@@ -2538,6 +2754,12 @@ impl PinRecordV1 {
         if self.purpose != PREPARATION_PIN_PURPOSE
             || self.schema_version != PREPARATION_PIN_SCHEMA_VERSION
             || self.pin_id.is_nil()
+            || self.protected_keys.len() > 2
+            || self.protected_keys.iter().any(|key| key == &self.key)
+            || self
+                .protected_keys
+                .windows(2)
+                .any(|keys| keys[0] >= keys[1])
             || self.expires_at_ms < 0
             || self.document_digest != self.calculate_digest()?
         {
@@ -2553,6 +2775,7 @@ impl PinRecordV1 {
                 schema_version: self.schema_version,
                 pin_id: self.pin_id,
                 key: &self.key,
+                protected_keys: &self.protected_keys,
                 expires_at_ms: self.expires_at_ms,
             },
         )?))
@@ -2740,6 +2963,8 @@ pub enum PreparationStoreError {
     EntryChanged,
     #[error("preparation entry payload does not match its sealed checksums")]
     EntryChecksumMismatch,
+    #[error("prepared-run composition is missing, invalid, or does not match its sealed key")]
+    InvalidPreparedRunComposition,
     #[error("preparation source archive does not match the exact workflow lease")]
     SourceLeaseMismatch,
     #[error("preparation producer failed: {0}")]
@@ -2867,6 +3092,93 @@ mod tests {
         root
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn publish_test_source_snapshot(
+        directory: &TempDir,
+        store: &PreparationStore,
+        label: &str,
+        now_ms: i64,
+    ) -> PreparedEntryV1 {
+        let source_root = directory.path().join(format!("source-exports-{label}"));
+        fs::create_dir(&source_root).expect("create source root");
+        fs::set_permissions(&source_root, fs::Permissions::from_mode(0o2750))
+            .expect("set source root mode");
+        let source_metadata = fs::metadata(&source_root).expect("source root metadata");
+        let publisher = SourceArchivePublisherV1::open(
+            &source_root,
+            source_metadata.uid(),
+            source_metadata.gid(),
+        )
+        .expect("open source publisher");
+        let manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
+                .expect("decode workflow manifest");
+        let policy_digest = manifest
+            .workflow_policy_digest()
+            .expect("workflow policy digest");
+        let source_sha = GitCommitId::from_str(&"a".repeat(40)).expect("source SHA");
+        let attestation = EvidenceDigest::sha256(format!("source-attestation-{label}"));
+        publisher
+            .publish(
+                SourceArchiveInputV1 {
+                    project_id: manifest.project_id.clone(),
+                    head: source_sha.clone(),
+                    sequence: 1,
+                    source_attestation_digest: attestation.clone(),
+                    installed_policy: InstalledPolicyIdentity {
+                        digest: policy_digest.clone(),
+                        version: 1,
+                    },
+                    repository_identity: EvidenceDigest::sha256(format!("repository-{label}")),
+                    exported_at_ms: 1,
+                },
+                |archive| archive.write_all(b"exact source archive"),
+            )
+            .expect("publish source archive");
+        let reader =
+            SourceArchiveReaderV1::open(&source_root, source_metadata.uid(), source_metadata.gid())
+                .expect("open source reader");
+        let node = manifest
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+            .expect("host preparation node");
+        let profile = manifest
+            .workflow
+            .profile(&node.profile_id)
+            .expect("host preparation profile");
+        let lease = WorkflowLeaseV1::new(
+            Uuid::new_v4(),
+            1,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            manifest.project_id,
+            source_sha,
+            1,
+            attestation.clone(),
+            policy_digest,
+            EvidenceDigest::sha256(format!("preparation-{label}")),
+            node,
+            profile,
+            None,
+            vec![crate::domain::WorkflowLeaseInputV1 {
+                node_id: "source".parse().expect("source node ID"),
+                artifact_kind: crate::domain::WorkflowArtifactKindV1::SourceSnapshot,
+                output_digest: attestation,
+            }],
+            EvidenceDigest::sha256(format!("input-{label}")),
+            "shared-worker".to_owned(),
+            "vps".to_owned(),
+            1,
+            10_001,
+        )
+        .expect("source lease");
+        store
+            .publish_source_snapshot(&reader, &lease, now_ms)
+            .expect("publish source snapshot")
+    }
+
     #[test]
     fn preparation_keys_are_deterministic_typed_and_policy_bound() {
         let dependency = dependency_material("same");
@@ -2895,6 +3207,123 @@ mod tests {
             prepared.key().expect("prepared key"),
             changed_policy.key().expect("policy-bound key")
         );
+    }
+
+    #[test]
+    fn a_non_composite_pin_keeps_the_compatible_v1_wire_shape() {
+        let record = PinRecordV1::new(
+            Uuid::new_v4(),
+            EvidenceDigest::sha256("dependency"),
+            Vec::new(),
+            1_000,
+        )
+        .expect("plain pin record");
+        let bytes = record.canonical_bytes().expect("canonical plain pin");
+        assert!(!String::from_utf8_lossy(&bytes).contains("protected_keys"));
+        assert_eq!(
+            PinRecordV1::decode_canonical(&bytes).expect("decode compatible plain pin"),
+            record
+        );
+    }
+
+    #[test]
+    fn prepared_run_pin_protects_and_validates_its_exact_composition() {
+        let directory = tempdir().expect("temp dir");
+        let root = store_root(&directory);
+        let store = open_test_store(
+            &root,
+            policy(8 * 1024 * 1024, 1_000, 0),
+            probe(8 * 1024 * 1024),
+        );
+        let source = publish_test_source_snapshot(&directory, &store, "composition", 10);
+        let dependency_input = input_directory(&directory, "dependency", b"sealed dependencies");
+        let dependency_material = dependency_material("composition");
+        let dependency = store
+            .get_or_prepare_directory(&dependency_material, 11, || {
+                Ok::<_, io::Error>(dependency_input.clone())
+            })
+            .expect("publish dependency snapshot");
+        let prepared_material = PreparationKeyMaterialV1::PreparedRun {
+            source_snapshot_key: source.manifest.key.clone(),
+            dependency_snapshot_key: dependency.manifest.key.clone(),
+            workflow_policy_digest: EvidenceDigest::sha256("workflow policy"),
+            generated_input_digest: EvidenceDigest::sha256("prepared layout"),
+        };
+        let prepared_input = directory.path().join("prepared-input");
+        fs::create_dir(&prepared_input).expect("create prepared input");
+        fs::create_dir(prepared_input.join(PREPARED_RUN_SOURCE_DIRECTORY))
+            .expect("create prepared source");
+        fs::write(
+            prepared_input
+                .join(PREPARED_RUN_SOURCE_DIRECTORY)
+                .join("Cargo.lock"),
+            b"version = 4\n",
+        )
+        .expect("write prepared source");
+        fs::write(
+            prepared_input.join(PREPARED_RUN_COMPOSITION_FILE),
+            PreparedRunCompositionV1::new(&prepared_material)
+                .expect("prepared composition")
+                .canonical_bytes()
+                .expect("canonical prepared composition"),
+        )
+        .expect("write prepared composition");
+        let prepared = store
+            .get_or_prepare_directory(&prepared_material, 12, || {
+                Ok::<_, io::Error>(prepared_input.clone())
+            })
+            .expect("publish prepared run");
+
+        let pin_id = Uuid::new_v4();
+        store
+            .open_pinned(
+                PreparationObjectKindV1::PreparedRun,
+                &prepared.manifest.key,
+                pin_id,
+                1_000,
+                13,
+            )
+            .expect("pin complete prepared run");
+        let pin = load_pin(&store.pin_path(pin_id), store.expected_owner_uid)
+            .expect("load composition-aware pin");
+        let expected_protected =
+            BTreeSet::from([source.manifest.key.clone(), dependency.manifest.key.clone()]);
+        assert_eq!(
+            pin.protected_keys.into_iter().collect::<BTreeSet<_>>(),
+            expected_protected
+        );
+        assert_eq!(
+            store.live_pinned_keys(14).expect("live pin closure"),
+            BTreeSet::from([
+                prepared.manifest.key.clone(),
+                source.manifest.key.clone(),
+                dependency.manifest.key.clone(),
+            ])
+        );
+
+        store
+            .unpin(pin_id, &prepared.manifest.key)
+            .expect("release complete composition");
+        store
+            .remove_entry(
+                PreparationObjectKindV1::DependencySnapshot,
+                &dependency.manifest.key,
+            )
+            .expect("remove dependency fixture");
+        let incomplete_pin_id = Uuid::new_v4();
+        assert!(
+            store
+                .open_pinned(
+                    PreparationObjectKindV1::PreparedRun,
+                    &prepared.manifest.key,
+                    incomplete_pin_id,
+                    1_000,
+                    15,
+                )
+                .is_err(),
+            "a prepared run with a missing referenced dependency must not become live"
+        );
+        assert!(!store.pin_path(incomplete_pin_id).exists());
     }
 
     #[test]

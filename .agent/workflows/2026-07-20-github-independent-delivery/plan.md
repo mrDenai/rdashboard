@@ -335,6 +335,32 @@ Implementation ledger:
   bounded non-effectful host-preparation shutdown semantics; none required a correction. No unit was
   installed or started, no live storage/quota drill or repository job ran, and no provider, VPS,
   source, push or deployment state was mutated.
+- Slice 4d makes `PreparedRun` an explicit canonical composition of one exact source snapshot, one
+  exact dependency snapshot, the installed workflow policy and a versioned generated-input layout.
+  Controller metadata lives beside a distinct sealed `source/` subtree, so it never changes the
+  repository-visible workspace and a repository-owned file with the same hidden basename cannot
+  collide. The new generated-input digest prevents a source-only Slice 4c cache object from being
+  accepted as the composite layout.
+- Acquiring a PreparedRun pin now checksum-validates the composition and both referenced snapshots
+  under the store commit lock, then persists their two sorted protected keys in the bounded canonical
+  pin. Eviction therefore protects the complete live input without rehashing a large dependency tree
+  on every later admission. Existing non-composite V1 pins keep their exact wire shape and can be
+  upgraded only after the new composition validates.
+- The root launcher additionally revalidates and mounts the exact dependency snapshot read-only. The
+  fixed job receives only read-only `/prepared` and `/dependencies` plus the lease-bounded `/job`
+  tmpfs, copies only sealed `/prepared/source` once into private `/job/workspace`, and rejects links,
+  special files, unsafe modes, identity changes, more than 100,000 entries or 2 GiB. Repository
+  mutations, targets and tool caches disappear with the transient unit; shared CAS inputs stay sealed.
+- An exact staged export passed bare `bin/ci`: formatting, strict Clippy, 207 active library tests with
+  two credentialed live-provider tests ignored, every binary/integration/socket/scheduler/worker suite,
+  both schema checks, 8 browser contracts and the optimized release build. The release phase completed
+  in 2 minutes 43 seconds. The exact 5-path product/config/test diff SHA-256 is
+  `db0c76a6916a8febcd8dfffcd6fd043bacff4887984bab59127d43a00a428e7f`.
+- A fresh complete `deepseek-free` review returned `SAFE` with no open question or P0-P2 finding. Its
+  sole P3 note confirms that direct/deserialized pin records fail closed unless constructor-established
+  protected-key invariants hold; no change was required. No service or job was started, no dependency
+  was fetched, and no provider, VPS, push or deployment state was mutated. Networked lockfile prefetch
+  remains the next local Slice 4e boundary before any `rimg` shadow run.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

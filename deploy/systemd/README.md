@@ -91,9 +91,9 @@ window and an emergency revocation takes effect at the configured millisecond.
 `rdashboard-workflow-launcher.service` is the only root-side boundary for non-mutating workflow jobs.
 The generic worker reaches its mode-`0660` Unix socket as the single configured worker UID. The
 launcher checks peer credentials before decoding, verifies a short-lived Ed25519 grant against the
-exact canonical lease, revalidates the named sealed `PreparedRun`, and derives the unit name, mounts,
-UID/GID, command and resource limits itself. A request cannot supply argv, a host path, a credential,
-a network mode or a systemd property.
+exact canonical lease, revalidates the named sealed `PreparedRun` composition and its exact
+`DependencySnapshot`, and derives the unit name, mounts, UID/GID, command and resource limits itself.
+A request cannot supply argv, a host path, a credential, a network mode or a systemd property.
 
 Install `/etc/rdashboard/workflow-launcher.jcs` as canonical JCS, root-owned, mode `0600`. It contains
 schema version `1`; the exact worker/build numeric identities and stable worker/host IDs; the matching
@@ -108,11 +108,14 @@ under `/var/lib/rdashboard-workflow-launcher/jobs`. A renewed lease for the same
 authorization record but never starts a second unit. A launcher restart converts any accepted/running
 record into explicit `needs_reconcile` state, so an uncertain launch is stopped and cleaned rather than
 silently replayed. Cleanup is itself journaled before `systemctl stop`; exact repeats return the same
-evidence. Per-job writable state is an isolated tmpfs with the lease byte and inode ceilings, while the
-sealed prepared input is bind-mounted read-only. The fixed `rdashboard-workflow-job` maps only the
+evidence. Per-job writable state is an isolated tmpfs with the lease byte and inode ceilings. The
+sealed composition is mounted read-only at `/prepared`, its dependency snapshot at `/dependencies`,
+and the fixed job copies only `/prepared/source` once into `/job/workspace`; the internal composition
+document never changes the repository-visible tree. The fixed `rdashboard-workflow-job` maps only the
 three installed adapter IDs to fixed script paths and receives an empty, reconstructed environment.
-Cargo state, targets, compiler cache and temporary files live only below `/job`; the launcher forces
-Cargo offline so a verification job cannot turn a cache miss into undeclared network access.
+Source mutations, Cargo state, targets, compiler cache and temporary files live only below `/job`;
+the launcher forces Cargo offline so a verification job cannot turn a cache miss into undeclared
+network access. No writable repository, target or dependency cache persists after the transient unit.
 
 The launcher deliberately has no network namespace, Docker/containerd socket, controller/executor/
 source socket, production volume or credential access. Its only retained capability is read-only DAC
@@ -126,10 +129,12 @@ worker, change `auto_deploy`, or run a shadow job.
 gateway with one stable worker/host identity, runs up to the configured number of typed leases, and
 never creates a repository-specific service, checkout or dependency cache. A `host_prepare` lease
 copies the exact attested source archive into the shared content-addressed store once; matching leases
-join the same publication. Verification leases pin that sealed `PreparedRun`, ask the root launcher to
-run only the installed fixed adapter, then clean the transient unit and release the pin before
-committing the terminal receipt. Restart cleanup obligations are served before new work by the
-gateway and are idempotent at the launcher and store boundaries.
+join the same publication. Each `PreparedRun` has one canonical composition document binding its
+source, dependency, installed workflow policy and versioned generated-input layout. Verification pins
+that sealed composition and transitively protects both referenced snapshots from eviction, asks the
+root launcher to run only the installed fixed adapter, then cleans the transient unit and releases the
+pin before committing the terminal receipt. Restart cleanup obligations are served before new work by
+the gateway and are idempotent at the launcher and store boundaries.
 
 Create the non-login `rdashboard-worker` user/group and add that user to the existing
 `rdashboard-build-readers` group. Install these non-secret values in root-owned

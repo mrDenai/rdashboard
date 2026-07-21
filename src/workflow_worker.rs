@@ -28,8 +28,9 @@ use crate::{
         WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1,
     },
     preparation::{
-        MAX_PREPARATION_STORE_BYTES, MAX_PREPARATION_STORE_INODES, PreparationKeyMaterialV1,
-        PreparationStore, PreparationStoreError,
+        MAX_PREPARATION_STORE_BYTES, MAX_PREPARATION_STORE_INODES, PREPARED_RUN_COMPOSITION_FILE,
+        PREPARED_RUN_SOURCE_DIRECTORY, PreparationKeyMaterialV1, PreparationStore,
+        PreparationStoreError, PreparedRunCompositionV1,
     },
     scheduler::{WorkflowCleanupObligationV1, WorkflowWorkerRegistrationV1},
     unix_time_ms,
@@ -44,6 +45,7 @@ use crate::{
 const MAX_SOURCE_PATH_BYTES: usize = 4_096;
 const DEPENDENCY_MARKER_FILE: &str = "source-tree.jcs";
 const DEPENDENCY_MARKER_PURPOSE: &str = "rdashboard.source-tree-dependency.v1";
+const PREPARED_SOURCE_INPUT_PURPOSE: &str = "rdashboard.prepared-source-input.v1";
 const PREPARATION_EVIDENCE_PURPOSE: &str = "rdashboard.host-preparation-evidence.v1";
 const PREPARATION_CLEANUP_PURPOSE: &str = "rdashboard.host-preparation-cleanup.v1";
 const WORKER_FAILURE_PURPOSE: &str = "rdashboard.workflow-worker-failure.v1";
@@ -123,18 +125,52 @@ impl WorkflowHostPreparerV1 {
             |payload| write_new_file(&payload.join(DEPENDENCY_MARKER_FILE), &marker_bytes),
         )?;
 
+        let generated_input_digest =
+            EvidenceDigest::sha256(serde_jcs::to_vec(&PreparedSourceInputV1 {
+                purpose: PREPARED_SOURCE_INPUT_PURPOSE,
+                schema_version: 1,
+                host_preparation_policy_digest: policy_digest,
+            })?);
         let prepared_material = PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key: source.manifest.key.clone(),
             dependency_snapshot_key: dependency.manifest.key.clone(),
             workflow_policy_digest: lease.workflow_policy_digest.clone(),
-            generated_input_digest: policy_digest,
+            generated_input_digest,
         };
+        let composition_bytes =
+            PreparedRunCompositionV1::new(&prepared_material)?.canonical_bytes()?;
+        let composition_length = u64::try_from(composition_bytes.len())
+            .map_err(|_| WorkflowWorkerError::SourcePayloadTooLarge)?;
+        let prepared_payload_bytes = inventory
+            .payload_bytes
+            .checked_add(composition_length)
+            .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?;
+        let prepared_payload_inodes = inventory
+            .payload_inodes
+            .checked_add(2)
+            .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?;
+        if prepared_payload_bytes > maximum_payload_bytes
+            || prepared_payload_inodes > maximum_payload_inodes
+        {
+            return Err(WorkflowWorkerError::SourcePayloadTooLarge);
+        }
         let prepared = self.store.get_or_prepare_bounded_directory(
             &prepared_material,
-            inventory.payload_bytes,
-            inventory.payload_inodes,
+            prepared_payload_bytes,
+            prepared_payload_inodes,
             now_ms,
-            |payload| inventory.extract(&source_archive, payload),
+            |payload| {
+                let source = payload.join(PREPARED_RUN_SOURCE_DIRECTORY);
+                let mut builder = DirBuilder::new();
+                builder.mode(0o700);
+                builder.create(&source)?;
+                inventory.extract(&source_archive, &source)?;
+                write_new_file(
+                    &payload.join(PREPARED_RUN_COMPOSITION_FILE),
+                    &composition_bytes,
+                )?;
+                Ok::<_, WorkflowWorkerError>(())
+            },
         )?;
         Ok(WorkflowHostPreparationResultV1 {
             source_snapshot_key: source.manifest.key,
@@ -170,6 +206,13 @@ impl WorkflowHostPreparationResultV1 {
 
 #[derive(Serialize)]
 struct SourceTreeDependencyMarkerV1 {
+    purpose: &'static str,
+    schema_version: u16,
+    host_preparation_policy_digest: EvidenceDigest,
+}
+
+#[derive(Serialize)]
+struct PreparedSourceInputV1 {
     purpose: &'static str,
     schema_version: u16,
     host_preparation_policy_digest: EvidenceDigest,
@@ -1587,6 +1630,12 @@ mod tests {
         append_tar_directory(&mut archive, "bin/", 0o755)?;
         append_tar_file(&mut archive, "bin/ci", b"#!/bin/sh\nexit 0\n", 0o755)?;
         append_tar_file(&mut archive, "Cargo.lock", b"version = 4\n", 0o644)?;
+        append_tar_file(
+            &mut archive,
+            PREPARED_RUN_COMPOSITION_FILE,
+            b"repository-owned bytes\n",
+            0o644,
+        )?;
         archive.finish()
     }
 
@@ -2041,12 +2090,26 @@ mod tests {
                 300,
             )
             .expect("open prepared run");
+        let composition = prepared
+            .prepared_run_composition()
+            .expect("decode sealed prepared-run composition");
+        assert_eq!(composition.prepared_run_key, first.prepared_run_key);
+        assert_eq!(composition.source_snapshot_key, first.source_snapshot_key);
         assert_eq!(
-            fs::read(prepared.payload_path().join("Cargo.lock")).expect("read Cargo.lock"),
+            composition.dependency_snapshot_key,
+            first.dependency_snapshot_key
+        );
+        assert_eq!(
+            composition.workflow_policy_digest,
+            fixture.lease.workflow_policy_digest
+        );
+        let prepared_source = prepared.payload_path().join(PREPARED_RUN_SOURCE_DIRECTORY);
+        assert_eq!(
+            fs::read(prepared_source.join("Cargo.lock")).expect("read Cargo.lock"),
             b"version = 4\n"
         );
         assert_eq!(
-            fs::metadata(prepared.payload_path().join("Cargo.lock"))
+            fs::metadata(prepared_source.join("Cargo.lock"))
                 .expect("Cargo.lock metadata")
                 .permissions()
                 .mode()
@@ -2054,12 +2117,25 @@ mod tests {
             0o444
         );
         assert_eq!(
-            fs::metadata(prepared.payload_path().join("bin/ci"))
+            fs::metadata(prepared_source.join("bin/ci"))
                 .expect("bin/ci metadata")
                 .permissions()
                 .mode()
                 & 0o7777,
             0o555
+        );
+        assert_eq!(
+            fs::metadata(prepared.payload_path().join(PREPARED_RUN_COMPOSITION_FILE))
+                .expect("prepared composition metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o444
+        );
+        assert_eq!(
+            fs::read(prepared_source.join(PREPARED_RUN_COMPOSITION_FILE))
+                .expect("read repository-owned file with the reserved basename"),
+            b"repository-owned bytes\n"
         );
         assert_ne!(
             first

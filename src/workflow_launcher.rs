@@ -200,6 +200,7 @@ pub struct AuthorizedWorkflowLaunchV1 {
     pub unit_name: String,
     pub job_directory: PathBuf,
     pub prepared_run_path: PathBuf,
+    pub dependency_snapshot_path: PathBuf,
     pub executable: &'static str,
     pub arguments: Vec<String>,
 }
@@ -219,18 +220,34 @@ impl AuthorizedWorkflowLaunchV1 {
             .verify(execution_grant, lease, now_ms)?;
         let prepared = preparation_reader
             .open_entry(PreparationObjectKindV1::PreparedRun, prepared_run_key)?;
+        let composition = prepared.prepared_run_composition()?;
+        if composition.workflow_policy_digest != lease.workflow_policy_digest {
+            return Err(WorkflowLauncherError::PreparedRunMismatch);
+        }
+        let dependency = preparation_reader.open_entry(
+            PreparationObjectKindV1::DependencySnapshot,
+            &composition.dependency_snapshot_key,
+        )?;
         let compact_lease_id = lease.lease_id.simple();
         let unit_name = unit_name(lease);
         let job_directory = Path::new(WORKFLOW_LAUNCHER_JOB_ROOT)
             .join(format!("{compact_lease_id}-g{}", lease.lease_generation));
         let prepared_run_path = prepared.payload_path();
-        let arguments = transient_unit_arguments(policy, lease, &unit_name, &prepared_run_path)?;
+        let dependency_snapshot_path = dependency.payload_path();
+        let arguments = transient_unit_arguments(
+            policy,
+            lease,
+            &unit_name,
+            &prepared_run_path,
+            &dependency_snapshot_path,
+        )?;
         Ok(Self {
             lease: lease.clone(),
             grant,
             unit_name,
             job_directory,
             prepared_run_path,
+            dependency_snapshot_path,
             executable: SYSTEMD_RUN_EXECUTABLE,
             arguments,
         })
@@ -1896,6 +1913,7 @@ fn transient_unit_arguments(
     lease: &WorkflowLeaseV1,
     unit_name: &str,
     prepared_run_path: &Path,
+    dependency_snapshot_path: &Path,
 ) -> Result<Vec<String>, WorkflowLauncherError> {
     let resources = lease
         .resources
@@ -1910,7 +1928,7 @@ fn transient_unit_arguments(
         "--expand-environment=no".to_owned(),
         "--service-type=exec".to_owned(),
         format!("--unit={unit_name}"),
-        "--working-directory=/workspace".to_owned(),
+        "--working-directory=/job".to_owned(),
         format!("--property=User={}", policy.build_uid),
         format!("--property=Group={}", policy.build_gid),
         "--property=UMask=0077".to_owned(),
@@ -1952,8 +1970,12 @@ fn transient_unit_arguments(
         format!("--property=RuntimeMaxSec={}ms", lease.timeout_ms),
         "--property=InaccessiblePaths=-/etc/rdashboard/credentials /run -/var/lib/rdashboard-workflow-launcher".to_owned(),
         format!(
-            "--property=BindReadOnlyPaths={}:/workspace",
+            "--property=BindReadOnlyPaths={}:/prepared",
             prepared_run_path.display()
+        ),
+        format!(
+            "--property=BindReadOnlyPaths={}:/dependencies",
+            dependency_snapshot_path.display()
         ),
         format!(
             "--property=TemporaryFileSystem=/job:rw,nodev,nosuid,size={},nr_inodes={},mode=0700,uid={},gid={}",
@@ -1974,6 +1996,8 @@ fn transient_unit_arguments(
         "CARGO_TARGET_DIR=/job/target".to_owned(),
         "CCACHE_DIR=/job/ccache".to_owned(),
         "CCACHE_TEMPDIR=/job/ccache-tmp".to_owned(),
+        "RDASHBOARD_PREPARED_ROOT=/prepared".to_owned(),
+        "RDASHBOARD_DEPENDENCY_ROOT=/dependencies".to_owned(),
         WORKFLOW_JOB_EXECUTABLE.to_owned(),
         adapter.to_owned(),
     ])
@@ -2047,6 +2071,8 @@ pub enum WorkflowLauncherError {
     Workflow(#[from] crate::domain::WorkflowContractError),
     #[error("workflow launcher prepared input failed validation: {0}")]
     Preparation(#[from] PreparationStoreError),
+    #[error("workflow launcher prepared input does not match the installed workflow policy")]
+    PreparedRunMismatch,
 }
 
 pub fn installed_preparation_reader(
@@ -2077,7 +2103,10 @@ mod tests {
     use super::*;
     use crate::{
         domain::{GitCommitId, ProjectManifestV2, WorkflowLeaseInputV1, WorkflowNodeKindV1},
-        preparation::{PreparationKeyMaterialV1, PreparationStore, open_test_preparation_store},
+        preparation::{
+            PREPARED_RUN_COMPOSITION_FILE, PREPARED_RUN_SOURCE_DIRECTORY, PreparationKeyMaterialV1,
+            PreparationStore, PreparedRunCompositionV1, open_test_preparation_store,
+        },
         workflow_execution_grant::WorkflowExecutionGrantSignerV1,
     };
 
@@ -2092,8 +2121,12 @@ mod tests {
         owner_uid: u32,
     }
 
-    #[allow(clippy::too_many_lines)]
     fn fixture() -> LauncherFixture {
+        fixture_with_composition_policy_mismatch(false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fixture_with_composition_policy_mismatch(mismatched: bool) -> LauncherFixture {
         let directory = tempdir().expect("temporary directory");
         let preparation_root = directory.path().join("preparation");
         fs::create_dir(&preparation_root).expect("create preparation root");
@@ -2108,28 +2141,61 @@ mod tests {
         );
         let store = open_test_preparation_store(&preparation_root, owner_uid, 32 * 1024 * 1024)
             .expect("open preparation store");
+        let manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
+                .expect("manifest");
+        let workflow_policy_digest = manifest.workflow_policy_digest().expect("workflow policy");
+        let dependency_input = directory.path().join("dependency-input");
+        fs::create_dir(&dependency_input).expect("create dependency input");
+        fs::write(dependency_input.join("source-tree.jcs"), b"{}")
+            .expect("write dependency marker");
+        let dependency_material = PreparationKeyMaterialV1::DependencySnapshot {
+            toolchain_digest: EvidenceDigest::sha256("source-tree toolchain"),
+            lockfile_digest: EvidenceDigest::sha256("source-tree lockfile"),
+            platform: "linux-x86_64".to_owned(),
+            workflow_policy_digest: workflow_policy_digest.clone(),
+        };
+        let dependency = store
+            .get_or_prepare_directory(&dependency_material, 99, || {
+                Ok::<_, io::Error>(dependency_input.clone())
+            })
+            .expect("publish dependency snapshot");
         let input = directory.path().join("prepared-input");
         fs::create_dir(&input).expect("create prepared input");
-        fs::create_dir(input.join("bin")).expect("create bin directory");
-        fs::write(input.join("bin/ci"), b"#!/bin/sh\nexit 0\n").expect("write bin/ci");
-        fs::set_permissions(input.join("bin/ci"), fs::Permissions::from_mode(0o755))
-            .expect("make bin/ci executable");
-        fs::write(input.join("Cargo.lock"), b"# exact input\n").expect("write lockfile");
+        let source_input = input.join(PREPARED_RUN_SOURCE_DIRECTORY);
+        fs::create_dir(&source_input).expect("create prepared source input");
+        fs::create_dir(source_input.join("bin")).expect("create bin directory");
+        fs::write(source_input.join("bin/ci"), b"#!/bin/sh\nexit 0\n").expect("write bin/ci");
+        fs::set_permissions(
+            source_input.join("bin/ci"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("make bin/ci executable");
+        fs::write(source_input.join("Cargo.lock"), b"# exact input\n").expect("write lockfile");
         let material = PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key: EvidenceDigest::sha256("source"),
-            dependency_snapshot_key: EvidenceDigest::sha256("dependencies"),
-            workflow_policy_digest: EvidenceDigest::sha256("installed policy"),
+            dependency_snapshot_key: dependency.manifest.key.clone(),
+            workflow_policy_digest: if mismatched {
+                EvidenceDigest::sha256("other installed workflow policy")
+            } else {
+                workflow_policy_digest.clone()
+            },
             generated_input_digest: EvidenceDigest::sha256("generated input"),
         };
+        fs::write(
+            input.join(PREPARED_RUN_COMPOSITION_FILE),
+            PreparedRunCompositionV1::new(&material)
+                .expect("prepared composition")
+                .canonical_bytes()
+                .expect("canonical prepared composition"),
+        )
+        .expect("write prepared composition");
         let prepared = store
             .get_or_prepare_directory(&material, 100, || Ok::<_, io::Error>(input.clone()))
             .expect("publish prepared run");
         let reader = PreparationStoreReaderV1::open(&preparation_root, owner_uid)
             .expect("open preparation reader");
 
-        let manifest: ProjectManifestV2 =
-            serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
-                .expect("manifest");
         let node = manifest
             .workflow
             .nodes
@@ -2149,7 +2215,7 @@ mod tests {
             GitCommitId::from_str(&"a".repeat(40)).expect("source SHA"),
             7,
             EvidenceDigest::sha256("source attestation"),
-            manifest.workflow_policy_digest().expect("workflow policy"),
+            workflow_policy_digest,
             EvidenceDigest::sha256("preparation key"),
             node,
             profile,
@@ -2393,8 +2459,18 @@ mod tests {
         }));
         assert!(launch.arguments.iter().any(|argument| {
             argument.starts_with("--property=BindReadOnlyPaths=")
-                && argument.ends_with(":/workspace")
+                && argument.ends_with(":/prepared")
         }));
+        assert!(launch.arguments.iter().any(|argument| {
+            argument.starts_with("--property=BindReadOnlyPaths=")
+                && argument.ends_with(":/dependencies")
+        }));
+        assert!(
+            launch
+                .arguments
+                .iter()
+                .any(|argument| argument == "--working-directory=/job")
+        );
         assert!(launch.arguments.iter().any(|argument| {
             argument.starts_with("--property=TemporaryFileSystem=/job:")
                 && argument.contains("rw,nodev,nosuid,size=")
@@ -2420,6 +2496,8 @@ mod tests {
                 "CARGO_TARGET_DIR=/job/target",
                 "CCACHE_DIR=/job/ccache",
                 "CCACHE_TEMPDIR=/job/ccache-tmp",
+                "RDASHBOARD_PREPARED_ROOT=/prepared",
+                "RDASHBOARD_DEPENDENCY_ROOT=/dependencies",
                 WORKFLOW_JOB_EXECUTABLE,
                 "bare-bin-ci-v1",
             ]
@@ -2436,6 +2514,26 @@ mod tests {
                 101,
             ),
             Err(WorkflowLauncherError::Workflow(_) | WorkflowLauncherError::UnsupportedLease)
+        ));
+    }
+
+    #[test]
+    fn authorization_rejects_a_prepared_run_from_another_workflow_policy() {
+        let fixture = fixture_with_composition_policy_mismatch(true);
+        let grant = fixture
+            .signer
+            .issue(&fixture.lease, 101, Uuid::from_u128(22))
+            .expect("execution grant");
+
+        assert!(matches!(
+            AuthorizedWorkflowLaunchV1::authorize(
+                &fixture.policy,
+                &fixture.reader,
+                &fixture.lease,
+                &grant,
+                101,
+            ),
+            Err(WorkflowLauncherError::PreparedRunMismatch)
         ));
     }
 
