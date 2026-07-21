@@ -23,6 +23,11 @@ use crate::{
         EvidenceDigest, ProjectId, WorkflowAdapterIdV1, WorkflowArtifactKindV1, WorkflowLeaseV1,
         WorkflowNetworkClassV1, WorkflowWorkerPoolV1, valid_workflow_identity,
     },
+    operation_state::{
+        WORKFLOW_OPERATION_STATE_ROOT, WorkflowOperationStateError,
+        WorkflowOperationStateManagerV1, WorkflowOperationStateOutcomeV1,
+        WorkflowOperationStateReleaseV1,
+    },
     preparation::{
         PREPARATION_STORE_ROOT, PreparationObjectKindV1, PreparationStoreError,
         PreparationStoreReaderV1,
@@ -201,6 +206,7 @@ pub struct AuthorizedWorkflowLaunchV1 {
     pub job_directory: PathBuf,
     pub prepared_run_path: PathBuf,
     pub dependency_snapshot_path: PathBuf,
+    pub operation_state_path: Option<PathBuf>,
     pub executable: &'static str,
     pub arguments: Vec<String>,
 }
@@ -234,12 +240,18 @@ impl AuthorizedWorkflowLaunchV1 {
             .join(format!("{compact_lease_id}-g{}", lease.lease_generation));
         let prepared_run_path = prepared.payload_path();
         let dependency_snapshot_path = dependency.payload_path();
+        let operation_state_path = lease.operation_state.as_ref().map(|state| {
+            Path::new(WORKFLOW_OPERATION_STATE_ROOT)
+                .join(state.state_key.as_str())
+                .join("data")
+        });
         let arguments = transient_unit_arguments(
             policy,
             lease,
             &unit_name,
             &prepared_run_path,
             &dependency_snapshot_path,
+            operation_state_path.as_deref(),
         )?;
         Ok(Self {
             lease: lease.clone(),
@@ -248,6 +260,7 @@ impl AuthorizedWorkflowLaunchV1 {
             job_directory,
             prepared_run_path,
             dependency_snapshot_path,
+            operation_state_path,
             executable: SYSTEMD_RUN_EXECUTABLE,
             arguments,
         })
@@ -418,6 +431,8 @@ impl WorkflowLaunchTerminalV1 {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowLaunchCleanupV1 {
     pub unit_was_loaded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_state: Option<WorkflowOperationStateReleaseV1>,
     pub completed_at_ms: i64,
     pub evidence_digest: EvidenceDigest,
 }
@@ -428,6 +443,8 @@ struct WorkflowLaunchCleanupPayload<'a> {
     execution_identity_digest: &'a EvidenceDigest,
     unit_name: &'a str,
     unit_was_loaded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_state: &'a Option<WorkflowOperationStateReleaseV1>,
     completed_at_ms: i64,
 }
 
@@ -436,10 +453,12 @@ impl WorkflowLaunchCleanupV1 {
         lease: &WorkflowLeaseV1,
         unit_name: &str,
         unit_was_loaded: bool,
+        operation_state: Option<WorkflowOperationStateReleaseV1>,
         completed_at_ms: i64,
     ) -> Result<Self, WorkflowLaunchJournalError> {
         let mut cleanup = Self {
             unit_was_loaded,
+            operation_state,
             completed_at_ms,
             evidence_digest: EvidenceDigest::sha256([]),
         };
@@ -454,6 +473,11 @@ impl WorkflowLaunchCleanupV1 {
         unit_name: &str,
     ) -> Result<(), WorkflowLaunchJournalError> {
         if self.completed_at_ms < lease.leased_at_ms
+            || self.operation_state.is_some() != lease.operation_state.is_some()
+            || self.operation_state.as_ref().is_some_and(|release| {
+                release.completed_at_ms > self.completed_at_ms
+                    || release.validate_for(lease).is_err()
+            })
             || self.evidence_digest != self.calculate_digest(lease, unit_name)?
         {
             return Err(WorkflowLaunchJournalError::InvalidRecord);
@@ -473,6 +497,7 @@ impl WorkflowLaunchCleanupV1 {
                 execution_identity_digest: &execution_identity_digest,
                 unit_name,
                 unit_was_loaded: self.unit_was_loaded,
+                operation_state: &self.operation_state,
                 completed_at_ms: self.completed_at_ms,
             },
         )?))
@@ -1017,6 +1042,7 @@ impl WorkflowLaunchJournalV1 {
         &self,
         lease: &WorkflowLeaseV1,
         unit_was_loaded: bool,
+        operation_state: Option<WorkflowOperationStateReleaseV1>,
         completed_at_ms: i64,
     ) -> Result<WorkflowLaunchStatusV1, WorkflowLaunchJournalError> {
         self.update_record(lease, |record| {
@@ -1039,6 +1065,7 @@ impl WorkflowLaunchJournalV1 {
                 &record.lease,
                 &record.unit_name,
                 unit_was_loaded,
+                operation_state,
                 completed_at_ms,
             )?);
             record.state = WorkflowLaunchStateV1::Cleaned;
@@ -1363,6 +1390,7 @@ pub struct WorkflowLaunchSupervisorV1 {
     policy: WorkflowLauncherPolicyV1,
     preparation_reader: PreparationStoreReaderV1,
     journal: WorkflowLaunchJournalV1,
+    operation_states: Arc<dyn WorkflowOperationStateManagerV1>,
     runtime: Arc<dyn WorkflowLaunchRuntimeV1>,
 }
 
@@ -1371,6 +1399,7 @@ impl WorkflowLaunchSupervisorV1 {
         policy: WorkflowLauncherPolicyV1,
         preparation_reader: PreparationStoreReaderV1,
         journal: WorkflowLaunchJournalV1,
+        operation_states: Arc<dyn WorkflowOperationStateManagerV1>,
         runtime: Arc<dyn WorkflowLaunchRuntimeV1>,
     ) -> Result<Self, WorkflowLaunchSupervisorError> {
         policy.validate()?;
@@ -1381,6 +1410,7 @@ impl WorkflowLaunchSupervisorV1 {
             policy,
             preparation_reader,
             journal,
+            operation_states,
             runtime,
         })
     }
@@ -1418,6 +1448,13 @@ impl WorkflowLaunchSupervisorV1 {
                 .accept(&launch, now_ms, self.policy.max_concurrent_jobs)?;
         if !is_new {
             return Ok(status);
+        }
+        let operation_state = self.operation_states.acquire(lease, now_ms)?;
+        if launch.operation_state_path.as_ref() != Some(&operation_state.data_path)
+            || lease.operation_state.as_ref().map(|state| &state.state_key)
+                != Some(&operation_state.state_key)
+        {
+            return Err(WorkflowLaunchSupervisorError::OperationStatePathMismatch);
         }
         let (process_sender, process_receiver) =
             std::sync::mpsc::sync_channel::<Box<dyn WorkflowLaunchProcessV1>>(1);
@@ -1523,9 +1560,21 @@ impl WorkflowLaunchSupervisorV1 {
             return Ok(status);
         }
         let unit_was_loaded = self.runtime.terminate(&unit_name(lease))?;
+        let outcome = match status.terminal.as_ref() {
+            Some(terminal) if terminal.succeeded => WorkflowOperationStateOutcomeV1::Succeeded,
+            Some(_) => WorkflowOperationStateOutcomeV1::Failed,
+            None => WorkflowOperationStateOutcomeV1::Unknown,
+        };
+        let operation_state = if lease.operation_state.is_some() {
+            Some(self.operation_states.release(lease, outcome, now_ms)?)
+        } else {
+            // Leases accepted by an older installed launcher have no operation-state contract.
+            // They still need to be stoppable and journalled as clean during a rolling upgrade.
+            None
+        };
         Ok(self
             .journal
-            .finish_cleanup(lease, unit_was_loaded, now_ms)?)
+            .finish_cleanup(lease, unit_was_loaded, operation_state, now_ms)?)
     }
 }
 
@@ -1542,6 +1591,7 @@ fn validate_launcher_lease(
             WorkflowWorkerPoolV1::VpsRequired | WorkflowWorkerPoolV1::BuildCompute
         )
         || lease.network_class != WorkflowNetworkClassV1::Offline
+        || lease.operation_state.is_none()
         || !policy.allowed_adapters.contains(&lease.adapter_id)
         || !matches!(
             lease.adapter_id,
@@ -1900,10 +1950,14 @@ impl WorkflowLaunchRuntimeError {
 pub enum WorkflowLaunchSupervisorError {
     #[error("workflow launcher policy does not match its journal")]
     PolicyJournalMismatch,
+    #[error("workflow operation-state path does not match its authorized lease")]
+    OperationStatePathMismatch,
     #[error("workflow launch authorization failed: {0}")]
     Launcher(#[from] WorkflowLauncherError),
     #[error("workflow launch journal failed: {0}")]
     Journal(#[from] WorkflowLaunchJournalError),
+    #[error("workflow operation-state lifecycle failed: {0}")]
+    OperationState(#[from] WorkflowOperationStateError),
     #[error("workflow launch runtime failed: {0}")]
     Runtime(#[from] WorkflowLaunchRuntimeError),
 }
@@ -1914,12 +1968,15 @@ fn transient_unit_arguments(
     unit_name: &str,
     prepared_run_path: &Path,
     dependency_snapshot_path: &Path,
+    operation_state_path: Option<&Path>,
 ) -> Result<Vec<String>, WorkflowLauncherError> {
     let resources = lease
         .resources
         .as_ref()
         .ok_or(WorkflowLauncherError::UnsupportedLease)?;
     let adapter = adapter_argument(lease.adapter_id)?;
+    let operation_state_path =
+        operation_state_path.ok_or(WorkflowLauncherError::UnsupportedLease)?;
     Ok(vec![
         "--no-ask-password".to_owned(),
         "--quiet".to_owned(),
@@ -1963,12 +2020,17 @@ fn transient_unit_arguments(
         "--property=TimeoutStopSec=10s".to_owned(),
         "--property=StandardOutput=journal".to_owned(),
         "--property=StandardError=journal".to_owned(),
-        format!("--property=CPUQuota={}", cpu_quota(resources.cpu_millicores)),
+        format!(
+            "--property=CPUQuota={}",
+            cpu_quota(resources.cpu_millicores)
+        ),
         format!("--property=MemoryMax={}", resources.memory_max_bytes),
         format!("--property=TasksMax={}", resources.tasks_max),
         format!("--property=LimitFSIZE={}", resources.output_max_bytes),
         format!("--property=RuntimeMaxSec={}ms", lease.timeout_ms),
-        "--property=InaccessiblePaths=-/etc/rdashboard/credentials /run -/var/lib/rdashboard-workflow-launcher".to_owned(),
+        format!(
+            "--property=InaccessiblePaths=-/etc/rdashboard/credentials /run -/var/lib/rdashboard-workflow-launcher -{WORKFLOW_OPERATION_STATE_ROOT}"
+        ),
         format!(
             "--property=BindReadOnlyPaths={}:/prepared",
             prepared_run_path.display()
@@ -1976,6 +2038,10 @@ fn transient_unit_arguments(
         format!(
             "--property=BindReadOnlyPaths={}:/dependencies",
             dependency_snapshot_path.display()
+        ),
+        format!(
+            "--property=BindPaths={}:/operation",
+            operation_state_path.display()
         ),
         format!(
             "--property=TemporaryFileSystem=/job:rw,nodev,nosuid,size={},nr_inodes={},mode=0700,uid={},gid={}",
@@ -1993,11 +2059,12 @@ fn transient_unit_arguments(
         "TMPDIR=/job/tmp".to_owned(),
         "CARGO_HOME=/job/cargo-home".to_owned(),
         "CARGO_NET_OFFLINE=true".to_owned(),
-        "CARGO_TARGET_DIR=/job/target".to_owned(),
-        "CCACHE_DIR=/job/ccache".to_owned(),
+        "CARGO_TARGET_DIR=/operation/target".to_owned(),
+        "CCACHE_DIR=/operation/ccache".to_owned(),
         "CCACHE_TEMPDIR=/job/ccache-tmp".to_owned(),
         "RDASHBOARD_PREPARED_ROOT=/prepared".to_owned(),
         "RDASHBOARD_DEPENDENCY_ROOT=/dependencies".to_owned(),
+        "RDASHBOARD_OPERATION_ROOT=/operation".to_owned(),
         WORKFLOW_JOB_EXECUTABLE.to_owned(),
         adapter.to_owned(),
     ])
@@ -2103,6 +2170,11 @@ mod tests {
     use super::*;
     use crate::{
         domain::{GitCommitId, ProjectManifestV2, WorkflowLeaseInputV1, WorkflowNodeKindV1},
+        operation_state::{
+            WorkflowOperationStateAcquisitionV1, WorkflowOperationStateDispositionV1,
+            WorkflowOperationStateManagerV1, WorkflowOperationStateOutcomeV1,
+            WorkflowOperationStateReleaseV1,
+        },
         preparation::{
             PREPARED_RUN_COMPOSITION_FILE, PREPARED_RUN_SOURCE_DIRECTORY, PreparationKeyMaterialV1,
             PreparationStore, PreparedRunCompositionV1, open_test_preparation_store,
@@ -2117,6 +2189,7 @@ mod tests {
         policy: WorkflowLauncherPolicyV1,
         lease: WorkflowLeaseV1,
         signer: WorkflowExecutionGrantSignerV1,
+        operation_states: Arc<TestOperationStates>,
         journal_root: PathBuf,
         owner_uid: u32,
     }
@@ -2206,17 +2279,33 @@ mod tests {
             .workflow
             .profile(&node.profile_id)
             .expect("verification profile");
+        let attempt_id = Uuid::from_u128(13);
+        let source_sha = GitCommitId::from_str(&"a".repeat(40)).expect("source SHA");
+        let preparation_key = EvidenceDigest::sha256("preparation key");
+        let operation_state = crate::domain::WorkflowOperationStateV1::new(
+            attempt_id,
+            &manifest.project_id,
+            &source_sha,
+            &workflow_policy_digest,
+            &preparation_key,
+            "shared-vps-worker",
+            "production-vps",
+            vec![node.node_id.clone()],
+            6 * 1024 * 1024 * 1024,
+            500_000,
+        )
+        .expect("operation state");
         let lease = WorkflowLeaseV1::new(
             Uuid::from_u128(11),
             1,
             Uuid::from_u128(12),
-            Uuid::from_u128(13),
+            attempt_id,
             manifest.project_id.clone(),
-            GitCommitId::from_str(&"a".repeat(40)).expect("source SHA"),
+            source_sha,
             7,
             EvidenceDigest::sha256("source attestation"),
             workflow_policy_digest,
-            EvidenceDigest::sha256("preparation key"),
+            preparation_key,
             node,
             profile,
             None,
@@ -2231,6 +2320,7 @@ mod tests {
             100,
             15_100,
         )
+        .and_then(|lease| lease.with_operation_state(operation_state))
         .expect("verification lease");
         let signing_key = SigningKey::from_bytes(&[23_u8; 32]);
         let signer = WorkflowExecutionGrantSignerV1::new(
@@ -2277,8 +2367,76 @@ mod tests {
             policy,
             lease,
             signer,
+            operation_states: Arc::new(TestOperationStates::default()),
             journal_root,
             owner_uid,
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestOperationStates {
+        acquire_calls: AtomicUsize,
+        release_calls: AtomicUsize,
+    }
+
+    impl TestOperationStates {
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.acquire_calls.load(Ordering::SeqCst),
+                self.release_calls.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    impl WorkflowOperationStateManagerV1 for TestOperationStates {
+        fn acquire(
+            &self,
+            lease: &WorkflowLeaseV1,
+            _now_ms: i64,
+        ) -> Result<WorkflowOperationStateAcquisitionV1, WorkflowOperationStateError> {
+            self.acquire_calls.fetch_add(1, Ordering::SeqCst);
+            let state = lease
+                .operation_state
+                .as_ref()
+                .ok_or(WorkflowOperationStateError::MissingStateContract)?;
+            Ok(WorkflowOperationStateAcquisitionV1 {
+                data_path: Path::new(WORKFLOW_OPERATION_STATE_ROOT)
+                    .join(state.state_key.as_str())
+                    .join("data"),
+                state_key: state.state_key.clone(),
+                record_digest: EvidenceDigest::sha256("acquired operation state"),
+            })
+        }
+
+        fn release(
+            &self,
+            lease: &WorkflowLeaseV1,
+            outcome: WorkflowOperationStateOutcomeV1,
+            completed_at_ms: i64,
+        ) -> Result<WorkflowOperationStateReleaseV1, WorkflowOperationStateError> {
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
+            let (disposition, reusable) = match outcome {
+                WorkflowOperationStateOutcomeV1::Succeeded => (
+                    WorkflowOperationStateDispositionV1::RemovedAfterSuccess,
+                    true,
+                ),
+                WorkflowOperationStateOutcomeV1::Failed => (
+                    WorkflowOperationStateDispositionV1::RemovedAfterFailure,
+                    false,
+                ),
+                WorkflowOperationStateOutcomeV1::Unknown => {
+                    (WorkflowOperationStateDispositionV1::Reset, false)
+                }
+            };
+            WorkflowOperationStateReleaseV1::from_manager(
+                lease,
+                disposition,
+                reusable,
+                0,
+                0,
+                completed_at_ms,
+                Some(EvidenceDigest::sha256("released operation state")),
+            )
         }
     }
 
@@ -2465,6 +2623,9 @@ mod tests {
             argument.starts_with("--property=BindReadOnlyPaths=")
                 && argument.ends_with(":/dependencies")
         }));
+        assert!(launch.arguments.iter().any(|argument| {
+            argument.starts_with("--property=BindPaths=") && argument.ends_with(":/operation")
+        }));
         assert!(
             launch
                 .arguments
@@ -2493,11 +2654,12 @@ mod tests {
                 "TMPDIR=/job/tmp",
                 "CARGO_HOME=/job/cargo-home",
                 "CARGO_NET_OFFLINE=true",
-                "CARGO_TARGET_DIR=/job/target",
-                "CCACHE_DIR=/job/ccache",
+                "CARGO_TARGET_DIR=/operation/target",
+                "CCACHE_DIR=/operation/ccache",
                 "CCACHE_TEMPDIR=/job/ccache-tmp",
                 "RDASHBOARD_PREPARED_ROOT=/prepared",
                 "RDASHBOARD_DEPENDENCY_ROOT=/dependencies",
+                "RDASHBOARD_OPERATION_ROOT=/operation",
                 WORKFLOW_JOB_EXECUTABLE,
                 "bare-bin-ci-v1",
             ]
@@ -2552,6 +2714,7 @@ mod tests {
             fixture.policy.clone(),
             fixture.reader.clone(),
             journal,
+            fixture.operation_states.clone(),
             runtime.clone(),
         )
         .expect("supervisor");
@@ -2606,6 +2769,7 @@ mod tests {
             fixture.policy.clone(),
             fixture.reader.clone(),
             journal,
+            fixture.operation_states.clone(),
             runtime.clone(),
         )
         .expect("supervisor");
@@ -2647,6 +2811,7 @@ mod tests {
             fixture.policy.clone(),
             fixture.reader.clone(),
             journal,
+            fixture.operation_states.clone(),
             runtime.clone(),
         )
         .expect("supervisor");
@@ -2728,6 +2893,7 @@ mod tests {
             .expect("replay cleanup");
         assert_eq!(replayed_cleanup, cleaned);
         assert_eq!(runtime.terminate_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.operation_states.counts(), (1, 1));
     }
 
     #[test]

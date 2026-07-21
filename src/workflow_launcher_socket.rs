@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::{
     domain::WorkflowLeaseV1,
+    operation_state::WorkflowOperationStateError,
     protocol::{FrameError, NORMAL_FRAME_MAX_BYTES, read_frame, write_frame},
     unix_time_ms,
     workflow_launcher::{
@@ -327,12 +328,18 @@ fn supervisor_rejection(
     request: &WorkflowLauncherRequestEnvelopeV1,
     error: &WorkflowLaunchSupervisorError,
 ) -> WorkflowLauncherResponseEnvelopeV1 {
+    warn!(
+        request_id = %request.request_id,
+        error = %error,
+        "workflow launcher request rejected"
+    );
     let (code, retryable) = match error {
         WorkflowLaunchSupervisorError::Launcher(WorkflowLauncherError::Preparation(_)) => {
             (WorkflowLauncherRejectionCodeV1::AuthorizationRejected, true)
         }
         WorkflowLaunchSupervisorError::Launcher(_)
-        | WorkflowLaunchSupervisorError::PolicyJournalMismatch => (
+        | WorkflowLaunchSupervisorError::PolicyJournalMismatch
+        | WorkflowLaunchSupervisorError::OperationStatePathMismatch => (
             WorkflowLauncherRejectionCodeV1::AuthorizationRejected,
             false,
         ),
@@ -341,14 +348,25 @@ fn supervisor_rejection(
         }
         WorkflowLaunchSupervisorError::Journal(
             WorkflowLaunchJournalError::StateConflict | WorkflowLaunchJournalError::InvalidLocator,
+        )
+        | WorkflowLaunchSupervisorError::OperationState(
+            WorkflowOperationStateError::IdentityConflict
+            | WorkflowOperationStateError::TerminalState
+            | WorkflowOperationStateError::ConsumerAlreadyCompleted,
         ) => (WorkflowLauncherRejectionCodeV1::StateConflict, false),
         WorkflowLaunchSupervisorError::Journal(
             WorkflowLaunchJournalError::JournalFull | WorkflowLaunchJournalError::ConcurrencyLimit,
+        )
+        | WorkflowLaunchSupervisorError::OperationState(
+            WorkflowOperationStateError::Busy
+            | WorkflowOperationStateError::FilesystemCapacityExceeded
+            | WorkflowOperationStateError::RecordCapacityExceeded,
         ) => (WorkflowLauncherRejectionCodeV1::CapacityUnavailable, true),
         WorkflowLaunchSupervisorError::Journal(_) => {
             (WorkflowLauncherRejectionCodeV1::JournalUnavailable, true)
         }
-        WorkflowLaunchSupervisorError::Runtime(_) => {
+        WorkflowLaunchSupervisorError::Runtime(_)
+        | WorkflowLaunchSupervisorError::OperationState(_) => {
             (WorkflowLauncherRejectionCodeV1::RuntimeUnavailable, true)
         }
     };

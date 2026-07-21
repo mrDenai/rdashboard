@@ -1075,3 +1075,133 @@ committed. It does not activate a project manifest, install or start either unit
 run repository code, mutate the VPS, contact GitHub/providers, push or deploy. Whole-lock vendor source
 deduplication across different lock plans, operation-owned COW/compiled state, dedicated-filesystem/
 quota/concurrency proof and the first separately authorized `rimg` shadow remain pending.
+
+## Slice 4f: bounded operation-owned compiled state
+
+### Reviewed scope
+
+Slice 4f closes the local writable compiled-state boundary without turning a per-worker or global cache
+into correctness authority:
+
+- `WorkflowOperationStateV1` is optional for legacy lease decoding but required for new compiled
+  verification/release launches. Its canonical state key binds the attempt, project, source SHA,
+  installed workflow policy, exact PreparedRun, worker/host, sorted consumer set and byte/inode limits.
+- Control schema V4 persists one operation-state binding per attempt. Matching compiled VPS consumers
+  are serialized and reuse that binding across lease generations/restarts. A persisted VPS binding can
+  never migrate to an optional accelerator after expiry; an available i9 receives independent one-node
+  state and transfers nothing back to the authoritative VPS path.
+- `WorkflowOperationStateStoreV1` is a root-owned singleton over the exact
+  `/var/lib/rdashboard-build/operations` mount. It rejects a non-dedicated mount or capacity outside
+  6-8 GiB and 100,000-1,000,000 inodes, enforces a per-state maximum of 6 GiB/500,000 inodes, preserves
+  at least a fixed admission margin and caps retained metadata at 1,024 records/newest 512 terminals.
+- Canonical state records and a root lock make acquire/release replay exact. State creation is staged
+  and fsynced before rename. Removal first persists `data_removal_pending`; startup completes either
+  side of an interrupted unlink. Terminal record pruning renames/fsyncs a `.deleting-*` tombstone before
+  removal. Failure, unknown cleanup, over-limit output and one-hour inactive partial state all remove
+  data rather than allowing a later consumer to trust it.
+- Usage accounting includes every entry and `max(logical length, st_blocks*512)`. The final scanner is
+  fd-relative: root and child directories are opened with no-follow semantics, every entry is pinned by
+  `O_PATH|O_NOFOLLOW`, directory traversal opens `.` from that pinned inode and verifies identity.
+  Rename/symlink substitution cannot redirect the launcher outside state. Traversal is immediate depth-
+  first with a 64-level ceiling, so wide siblings never accumulate descriptors and peak traversal stays
+  about 129 descriptors below installed `LimitNOFILE=256`.
+- The root launcher acquires state only after durable launch acceptance, binds only the exact data path
+  at `/operation`, and stops/contains the transient unit before state release. Same-execution lease
+  renewal updates the journal/grant without acquiring or spawning twice. Any launcher ambiguity becomes
+  cleanup debt; legacy no-state records remain stoppable during rolling upgrade.
+- `/job` continues to own only per-node workspace, Cargo configuration and temporary files. Target and
+  ccache alone live in `/operation`. Copying sealed source now preserves file and directory mtimes at
+  stable `/job/workspace`, which permits Cargo reuse between serialized consumers without sharing state
+  across attempts, sources or hosts.
+- Worker receipt reduction requires both process success and reusable operation cleanup. A process that
+  exits successfully after a limit/removal/uncertain state disposition commits deterministic
+  `operation_state_unusable` failure evidence instead of authorizing downstream release.
+- The launcher unit gains only the fixed operation mount as writable state plus the DAC/chown
+  capabilities required to create and remove build-owned data. Jobs retain an empty capability set,
+  cannot see the parent operation root and receive no network, credential, Docker/containerd,
+  controller/executor/source socket or production-volume authority.
+
+The final exact product/config/test diff contains 19 paths, 3,291 insertions and 55 deletions. Shared
+dirty `src/lib.rs`, `deploy/systemd/README.md` and `tests/store_and_web.rs` hunks were staged selectively.
+All notification code, notification workflow artifacts and earlier consultation stderr logs remain
+outside the reviewed product diff.
+
+### Verification and hardening corrections
+
+- Focused verification passed strict Clippy and all ten operation-state tests. Those tests cover
+  sequential reuse, concurrent-owner rejection, failure/reset/limit removal, stale partial-state
+  cleanup, deletion and tombstone crash windows, hard filesystem bounds, rename-plus-external-symlink
+  substitution and deterministic rejection of a 65-level adversarial tree.
+- Launcher tests prove renewed replay acquires/spawns/releases exactly once and cleanup is idempotent.
+  Worker tests prove a successful process plus unusable state becomes a failed receipt. Scheduler tests
+  prove same-key VPS serialization, schema V4 migration, expiry retry on the bound host and no migration
+  to i9. Fixed-job tests prove source timestamps survive the private workspace copy.
+- The first complete review of product hash
+  `0445f7fa0d718eb7b2bdb076a72347cfc0bad56b02b54aea6a3e1dee76310b53` identified a theoretical
+  path-based usage-walk TOCTOU. Although normal cleanup runs after the only writer stops, the root-side
+  walker was hardened instead of relying on that timing assumption. Its path stack was replaced with
+  the fd-relative no-follow traversal above and a deterministic path-replacement regression.
+- Hash `7211b2140585ff30ef8034bab2958d3430a3849861988dbf5fd1d0d8a662ace3` passed bare `bin/ci` and a
+  fresh review returned SAFE. Subsequent self-review invalidated it before closeout: the fd-safe walker
+  retained one pending directory descriptor per wide sibling, which could conflict with the installed
+  launcher fd limit. The final depth-first traversal processes siblings immediately and caps recursive
+  depth so both width and depth are bounded.
+- A fresh `git checkout-index` export of final product hash
+  `9d424f47108c30e47ed4765c7a2d9736b83d65d4d6092ffa4e9847a267b3ad43` passed bare `bin/ci`:
+  formatting, Clippy with warnings denied, 234 active library tests with two credentialed live-provider
+  tests ignored, every binary/integration/socket/scheduler/worker suite, both schema checks, 8 browser
+  contracts and the optimized release build. The release profile completed in 3 minutes 28 seconds.
+- `git diff --cached --check` passed. No live filesystem/mount quota was created or probed, no unit/job
+  was installed or started, no repository job executed through the new launcher, and no VPS, i9,
+  provider, GitHub, push or deployment state changed.
+
+### Independent consultation and finding dispositions
+
+The consultation chain is retained because each material correction changed the exact frozen review
+boundary:
+
+1. Initial review (`consult-slice4f-deepseek`) inspected hash `0445f7fa...`: route/model
+   `deepseek-free` / `opencode/deepseek-v4-flash-free`; `ANSWERED`, one attempt, CLI `1.18.3`, 203
+   seconds; state fingerprint `0d1221e4be794b658b751f4bc740dcaf57d71eb20aa5aa32c27da369b9b10791`;
+   brief SHA-256 `9a9d1640544d0f7c9e55ef69a53e58d91d1780a50c498a542262e1964a97a201`;
+   response SHA-256 `3eb4232a7b8ebbf23aef7f8f029e7db27cc118965bffba0a57102910cf446827`.
+   Its path-walk observation was fixed; its acquire-before-spawn observation was traced and retained as
+   fail-safe ordering because early release would permit reuse while a process stop remained uncertain.
+2. First post-fix review (`consult-slice4f-deepseek-final`) inspected hash `7211b214...` and returned
+   SAFE with no P0-P2: `ANSWERED`, two attempts, 398 seconds; state fingerprint
+   `82453e46f1832bd17fc2e6e0303629b7254bf3b3634e220de392549cc9d712c7`; brief SHA-256
+   `85d7b3810f4b2266d2d57b8b0351848df044665b1adc2de3026cf6f394757455`; response SHA-256
+   `b73154d2b130d3004328e867f1126382fec2c93fa77fcb0a5961d656a294ce48`. It was invalidated only by
+   the later pending-fd self-review correction.
+3. The first current-hash response (`consult-slice4f-deepseek-final2`) independently verified
+   `9d424f47...` and reached SAFE with no P0-P2, but dispatcher status was `PARTIAL` because the model
+   included a progress/next-move block before its final verdict. It is supporting audit evidence, not
+   acceptance: one attempt, 249 seconds; state fingerprint
+   `f8212a004f29fa93c93c3b0b110eb448cf5542e2e9fbe87d16bc0571f94569fb`; brief SHA-256
+   `137019f1d25f025b16a752cba50fe2024a09b4f2e9216c093a9771f6e67ac119`; response SHA-256
+   `35e7afdfbfbc7dd5e9c1a781ea7124027ebdd5b4e2aa3e7ed890f846593846be`.
+4. The final acceptance review (`consult-slice4f-deepseek-final3`) re-evaluated the unchanged exact
+   `9d424f47...` product hash and returned `ANSWERED`, `VERDICT: SAFE`, `OPEN QUESTIONS: NONE`, with no
+   P0-P2 finding: one attempt, 76 seconds; state fingerprint
+   `f8212a004f29fa93c93c3b0b110eb448cf5542e2e9fbe87d16bc0571f94569fb`; brief SHA-256
+   `90ac1fd92696446426ba61c66f7d08c639de7caf01c6c23e18537a20e92cc870`; response SHA-256
+   `dfa0fdcae1db4037adcbc20d81ffba307d1b537114280aef62ccc0b14ee072e7`.
+
+The remaining P3 observations need no product correction:
+
+- terminal replay may report zero historical usage when the exact older release record is no longer the
+  record's `last_release`; normal launcher cleanup has already journaled the accurate original release,
+  and the value cannot change disposition, cleanup or authorization;
+- `CAP_DAC_OVERRIDE` is deliberately broad at the Linux capability level, but the trusted fixed launcher
+  has no caller-selected path and its systemd mount namespace makes only the launcher journal and exact
+  operation root writable;
+- Rust 1.96 `remove_dir_all` does not follow internal symlinks, while state creation also denies mount/
+  namespace capability to repository code.
+
+### Verdict
+
+Slice 4f is production-worthy as an inactive local operation-owned compiled-state boundary and may be
+committed. It does not create the dedicated filesystem, install/start the launcher, activate a project,
+run a shadow job, assemble an OCI candidate, mutate the VPS/i9, contact GitHub/providers, push or deploy.
+Rootless integration/OCI adapters, the authorized live systemd/filesystem/quota/concurrency proof and
+the first `rimg` shadow candidate remain pending.

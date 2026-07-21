@@ -127,9 +127,13 @@ fn malformed_protocol_inputs_fail_validation() {
     assert!(service.contains("User=root\nGroup=rdashboard-worker"));
     assert!(service.contains("PrivateNetwork=yes"));
     assert!(service.contains("RestrictAddressFamilies=AF_UNIX"));
-    assert!(service.contains("CapabilityBoundingSet=CAP_DAC_READ_SEARCH"));
+    assert!(
+        service.contains("CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH")
+    );
+    assert!(service.contains("/var/lib/rdashboard-build/operations"));
     assert!(service.contains("InaccessiblePaths="));
     assert!(!service.contains("ReadWritePaths=/run/docker.sock"));
     let tmpfiles = include_str!("../deploy/systemd/rdashboard-tmpfiles.conf");
     assert!(tmpfiles.contains("d /var/lib/rdashboard-workflow-launcher/jobs 0700 root root -"));
+    assert!(tmpfiles.contains("d /var/lib/rdashboard-build/operations 0700 root root -"));
 }

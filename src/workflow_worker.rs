@@ -1111,16 +1111,26 @@ impl WorkflowWorkerRuntimeV1 {
         if completed_at_ms >= lease.expires_at_ms {
             return Err(WorkflowWorkerError::LeaseLost);
         }
-        let outcome = if terminal.succeeded {
+        let operation_state_reusable = cleanup
+            .operation_state
+            .as_ref()
+            .map_or(lease.operation_state.is_none(), |release| release.reusable);
+        let succeeded = terminal.succeeded && operation_state_reusable;
+        let outcome = if succeeded {
             WorkflowNodeOutcomeV1::Succeeded
         } else {
             WorkflowNodeOutcomeV1::Failed
         };
+        let execution_digest = if terminal.succeeded && !operation_state_reusable {
+            worker_failure_digest(&lease, "operation_state_unusable")?
+        } else {
+            terminal.evidence_digest.clone()
+        };
         let receipt = WorkflowNodeReceiptV1::new(
             &lease,
             outcome,
-            terminal.succeeded.then(|| terminal.evidence_digest.clone()),
-            terminal.evidence_digest,
+            succeeded.then(|| terminal.evidence_digest.clone()),
+            execution_digest,
             cleanup.evidence_digest,
             WorkflowCleanupResultV1::Complete,
             completed_at_ms,
@@ -1891,6 +1901,7 @@ mod tests {
     use crate::{
         build_source::{SourceArchiveInputV1, SourceArchivePublisherV1},
         domain::{GitCommitId, InstalledPolicyIdentity, ProjectManifestV2, WorkflowLeaseInputV1},
+        operation_state::{WorkflowOperationStateDispositionV1, WorkflowOperationStateReleaseV1},
         preparation::{PreparationObjectKindV1, open_test_preparation_store},
         scheduler::WorkflowCleanupReasonV1,
         worker_socket::WorkflowWorkerRejectionCodeV1,
@@ -2358,6 +2369,42 @@ mod tests {
         }
     }
 
+    struct UnusableOperationStateLauncher;
+
+    impl WorkflowWorkerLauncherClientV1 for UnusableOperationStateLauncher {
+        fn launch(
+            &self,
+            lease: WorkflowLeaseV1,
+            _execution_grant: String,
+        ) -> BoxFuture<'_, Result<WorkflowLaunchStatusV1, WorkflowLauncherClientError>> {
+            Box::pin(
+                async move { Ok(test_launch_status(&lease, WorkflowLaunchStateV1::Succeeded)) },
+            )
+        }
+
+        fn observe(
+            &self,
+            _lease_id: Uuid,
+            _lease_generation: u32,
+        ) -> BoxFuture<'_, Result<Option<WorkflowLaunchStatusV1>, WorkflowLauncherClientError>>
+        {
+            Box::pin(async { panic!("immediate terminal launch must not require observation") })
+        }
+
+        fn cleanup(
+            &self,
+            lease: WorkflowLeaseV1,
+        ) -> BoxFuture<'_, Result<WorkflowLaunchStatusV1, WorkflowLauncherClientError>> {
+            Box::pin(async move {
+                Ok(test_launch_status_with_state_reuse(
+                    &lease,
+                    WorkflowLaunchStateV1::Cleaned,
+                    false,
+                ))
+            })
+        }
+    }
+
     struct RunningLauncher {
         cleanup_calls: AtomicUsize,
         launched: Notify,
@@ -2434,6 +2481,14 @@ mod tests {
         lease: &WorkflowLeaseV1,
         state: WorkflowLaunchStateV1,
     ) -> WorkflowLaunchStatusV1 {
+        test_launch_status_with_state_reuse(lease, state, true)
+    }
+
+    fn test_launch_status_with_state_reuse(
+        lease: &WorkflowLeaseV1,
+        state: WorkflowLaunchStateV1,
+        operation_state_reusable: bool,
+    ) -> WorkflowLaunchStatusV1 {
         let completed_at_ms = current_time_ms().expect("test time");
         let terminal = matches!(
             state,
@@ -2448,10 +2503,30 @@ mod tests {
             completed_at_ms,
             evidence_digest: EvidenceDigest::sha256("test terminal evidence"),
         });
-        let cleanup = (state == WorkflowLaunchStateV1::Cleaned).then(|| WorkflowLaunchCleanupV1 {
-            unit_was_loaded: true,
-            completed_at_ms,
-            evidence_digest: EvidenceDigest::sha256("test cleanup evidence"),
+        let cleanup = (state == WorkflowLaunchStateV1::Cleaned).then(|| {
+            let operation_state = lease.operation_state.as_ref().map(|_| {
+                let disposition = if operation_state_reusable {
+                    WorkflowOperationStateDispositionV1::RemovedAfterSuccess
+                } else {
+                    WorkflowOperationStateDispositionV1::RemovedAfterLimit
+                };
+                WorkflowOperationStateReleaseV1::from_manager(
+                    lease,
+                    disposition,
+                    operation_state_reusable,
+                    0,
+                    0,
+                    completed_at_ms,
+                    Some(EvidenceDigest::sha256("test operation release")),
+                )
+                .expect("test operation release")
+            });
+            WorkflowLaunchCleanupV1 {
+                unit_was_loaded: true,
+                operation_state,
+                completed_at_ms,
+                evidence_digest: EvidenceDigest::sha256("test cleanup evidence"),
+            }
         });
         WorkflowLaunchStatusV1 {
             lease_digest: lease.lease_digest.clone(),
@@ -3002,6 +3077,61 @@ mod tests {
                 .store()
                 .unpin_if_present(verification_lease.lease_id, &prepared.prepared_run_key)
                 .expect("verify pin was released")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn successful_process_with_unusable_operation_state_commits_failure() {
+        let now_ms = current_time_ms().expect("test clock");
+        let fixture = preparation_fixture(now_ms, now_ms + 15_000);
+        let (verification_lease, _prepared) =
+            prepare_verification_lease(&fixture, now_ms, now_ms + 15_000);
+        let operation_state = crate::domain::WorkflowOperationStateV1::new(
+            verification_lease.attempt_id,
+            &verification_lease.project_id,
+            &verification_lease.source_sha,
+            &verification_lease.workflow_policy_digest,
+            &verification_lease.preparation_key,
+            &verification_lease.worker_id,
+            &verification_lease.host_id,
+            vec![verification_lease.node_id.clone()],
+            1024 * 1024,
+            4_096,
+        )
+        .expect("operation state");
+        let verification_lease = verification_lease
+            .with_operation_state(operation_state)
+            .expect("state-bound verification lease");
+        let gateway = Arc::new(FakeGateway::with_assignment(
+            WorkflowWorkerAssignmentV1::Lease {
+                lease: Box::new(verification_lease.clone()),
+                execution_grant: "signed-execution-grant".to_owned(),
+            },
+        ));
+        let runtime = WorkflowWorkerRuntimeV1::new(
+            registration(&verification_lease),
+            gateway.clone(),
+            Arc::new(UnusableOperationStateLauncher),
+            Arc::new(fixture.preparer),
+            test_runtime_config(),
+        )
+        .expect("build generic worker runtime");
+        let completion = gateway.clone();
+        runtime
+            .run_until(async move {
+                completion.completed.notified().await;
+            })
+            .await
+            .expect("run state-limit assignment");
+
+        let receipts = gateway.node_receipts.lock().expect("node receipt lock");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].outcome, WorkflowNodeOutcomeV1::Failed);
+        assert!(receipts[0].output_digest.is_none());
+        assert_eq!(
+            receipts[0].execution_receipt_digest,
+            worker_failure_digest(&verification_lease, "operation_state_unusable")
+                .expect("operation-state failure evidence")
         );
     }
 

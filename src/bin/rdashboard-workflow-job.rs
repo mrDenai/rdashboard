@@ -13,6 +13,10 @@ use rdashboard::cargo_prefetch::{
     CARGO_DEPENDENCY_MANIFEST_FILE, CARGO_VENDOR_DIRECTORY, CargoDependencyManifestV1,
     CargoPrefetchError,
 };
+use rustix::{
+    fs::{Timestamps, futimens},
+    time::Timespec,
+};
 
 const PREPARED_ROOT: &str = "/prepared";
 const PREPARED_SOURCE_ROOT: &str = "/prepared/source";
@@ -20,6 +24,7 @@ const DEPENDENCY_ROOT: &str = "/dependencies";
 #[cfg(test)]
 const PREPARED_RUN_COMPOSITION_FILE: &str = ".rdashboard-prepared-run.jcs";
 const JOB_ROOT: &str = "/job";
+const OPERATION_ROOT: &str = "/operation";
 const WORKSPACE_ROOT: &str = "/job/workspace";
 const CARGO_HOME_ROOT: &str = "/job/cargo-home";
 const CARGO_VENDOR_CONFIG: &[u8] = b"[source.crates-io]\nreplace-with = \"rdashboard_vendor\"\n\n[source.rdashboard_vendor]\ndirectory = \"/dependencies/vendor\"\n\n[net]\noffline = true\n";
@@ -38,18 +43,15 @@ fn main() -> Result<(), WorkflowJobError> {
         return Err(WorkflowJobError::InvalidInvocation);
     }
     validate_job_root(Path::new(JOB_ROOT))?;
+    validate_job_root(Path::new(OPERATION_ROOT))?;
     validate_read_only_root(Path::new(PREPARED_ROOT))?;
     validate_read_only_root(Path::new(PREPARED_SOURCE_ROOT))?;
     validate_read_only_root(Path::new(DEPENDENCY_ROOT))?;
-    for directory in [
-        "tmp",
-        "target",
-        "cargo-home",
-        "ccache",
-        "ccache-tmp",
-        "workspace",
-    ] {
+    for directory in ["tmp", "cargo-home", "ccache-tmp", "workspace"] {
         create_private_job_directory(&Path::new(JOB_ROOT).join(directory))?;
+    }
+    for directory in ["target", "ccache"] {
+        create_private_job_directory(&Path::new(OPERATION_ROOT).join(directory))?;
     }
     copy_prepared_workspace(Path::new(PREPARED_SOURCE_ROOT), Path::new(WORKSPACE_ROOT))?;
     let cargo_vendor =
@@ -136,9 +138,18 @@ fn copy_prepared_workspace(source: &Path, destination: &Path) -> Result<(), Work
         return Err(WorkflowJobError::UnsafeJobDirectory);
     }
     let mut pending = vec![(source.to_owned(), destination.to_owned())];
+    let mut copied_directories = Vec::new();
     let mut copied_entries = 0_u64;
     let mut copied_bytes = 0_u64;
     while let Some((source_directory, destination_directory)) = pending.pop() {
+        let source_metadata = fs::symlink_metadata(&source_directory)?;
+        if source_metadata.file_type().is_symlink()
+            || !source_metadata.file_type().is_dir()
+            || source_metadata.permissions().mode() & 0o7777 != 0o555
+        {
+            return Err(WorkflowJobError::UnsupportedPreparedEntry(source_directory));
+        }
+        copied_directories.push((destination_directory.clone(), source_metadata));
         let mut entries = fs::read_dir(&source_directory)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
@@ -177,6 +188,10 @@ fn copy_prepared_workspace(source: &Path, destination: &Path) -> Result<(), Work
             copy_regular_file(&source_path, &destination_path, &before)?;
         }
     }
+    for (directory, source_metadata) in copied_directories.into_iter().rev() {
+        let output = File::open(directory)?;
+        preserve_timestamps(&output, &source_metadata)?;
+    }
     Ok(())
 }
 
@@ -205,6 +220,25 @@ fn copy_regular_file(
             0o700
         },
     ))?;
+    preserve_timestamps(&output, before)?;
+    Ok(())
+}
+
+fn preserve_timestamps(file: &File, source: &fs::Metadata) -> Result<(), WorkflowJobError> {
+    futimens(
+        file,
+        &Timestamps {
+            last_access: Timespec {
+                tv_sec: source.atime(),
+                tv_nsec: source.atime_nsec(),
+            },
+            last_modification: Timespec {
+                tv_sec: source.mtime(),
+                tv_nsec: source.mtime_nsec(),
+            },
+        },
+    )
+    .map_err(io::Error::from)?;
     Ok(())
 }
 
@@ -216,6 +250,8 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.mode() == right.mode()
         && left.nlink() == right.nlink()
         && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
 }
 
 fn validate_job_root(path: &Path) -> Result<(), WorkflowJobError> {
@@ -338,6 +374,28 @@ mod tests {
         .expect("seal internal composition");
         fs::set_permissions(&prepared, fs::Permissions::from_mode(0o555))
             .expect("seal prepared root");
+        let stable_times = Timestamps {
+            last_access: Timespec {
+                tv_sec: 1_700_000_000,
+                tv_nsec: 123_456_789,
+            },
+            last_modification: Timespec {
+                tv_sec: 1_700_000_000,
+                tv_nsec: 123_456_789,
+            },
+        };
+        for path in [
+            source.join("Cargo.lock"),
+            source.join("bin/ci"),
+            source.join("bin"),
+            source.clone(),
+        ] {
+            futimens(
+                File::open(path).expect("open sealed timestamp path"),
+                &stable_times,
+            )
+            .expect("fix sealed timestamp");
+        }
         fs::create_dir(&destination).expect("create destination");
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
             .expect("protect destination");
@@ -366,6 +424,20 @@ mod tests {
                 & 0o7777,
             0o700
         );
+        for (sealed, copied) in [
+            (source.clone(), destination.clone()),
+            (source.join("bin"), destination.join("bin")),
+            (source.join("Cargo.lock"), destination.join("Cargo.lock")),
+            (source.join("bin/ci"), destination.join("bin/ci")),
+        ] {
+            let sealed = fs::metadata(sealed).expect("sealed timestamp");
+            let copied = fs::metadata(copied).expect("copied timestamp");
+            assert_eq!(
+                (copied.mtime(), copied.mtime_nsec()),
+                (sealed.mtime(), sealed.mtime_nsec()),
+                "workspace timestamps must remain stable so Cargo can reuse the shared target"
+            );
+        }
         assert!(!destination.join(PREPARED_RUN_COMPOSITION_FILE).exists());
     }
 

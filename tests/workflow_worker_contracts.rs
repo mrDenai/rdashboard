@@ -32,6 +32,7 @@ fn generic_worker_service_is_shared_non_root_and_storage_bounded() {
     assert!(service.contains("rdashboard-dependency-fetcher.service"));
     assert!(service.contains("/run/docker.sock"));
     assert!(service.contains("/run/containerd"));
+    assert!(!service.contains("ReadWritePaths=/var/lib/rdashboard-build/operations"));
     assert!(!service.contains("ralert-worker"));
     assert!(!service.contains("rimg-worker"));
 

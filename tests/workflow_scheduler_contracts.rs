@@ -464,12 +464,147 @@ fn optional_accelerator_can_verify_but_cannot_own_required_preparation_or_releas
 
     let verification = claim(&scheduler, &accelerator_worker(), 30);
     assert_eq!(verification.node_kind, WorkflowNodeKindV1::Verification);
+    let accelerator_state = verification
+        .operation_state
+        .as_ref()
+        .unwrap_or_else(|| panic!("accelerator verification has host-local state"));
+    assert_eq!(
+        accelerator_state.consumer_nodes,
+        vec![verification.node_id.clone()]
+    );
     assert!(
         scheduler
             .claim_next(&accelerator_worker(), 40, 1_000)
             .unwrap_or_else(|error| panic!("accelerator second claim: {error}"))
             .is_none(),
         "VPS-required release build must not be leased to intermittent i9 capacity"
+    );
+    let release = claim(&scheduler, &build_worker(), 41);
+    assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+    let release_state = release
+        .operation_state
+        .as_ref()
+        .unwrap_or_else(|| panic!("VPS release has operation-local state"));
+    assert_eq!(release_state.consumer_nodes, vec![release.node_id.clone()]);
+    assert_ne!(release_state.state_key, accelerator_state.state_key);
+}
+
+#[test]
+fn vps_serializes_compiled_consumers_and_reuses_the_same_state_key() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("rimg", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '7',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "rimg-vps-state",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    commit_success(&scheduler, &prepare, "prepare-state");
+
+    let first = claim(&scheduler, &worker, 30);
+    assert!(matches!(
+        first.node_kind,
+        WorkflowNodeKindV1::Verification | WorkflowNodeKindV1::ReleaseBuild
+    ));
+    let first_state = first
+        .operation_state
+        .as_ref()
+        .unwrap_or_else(|| panic!("first compiled node state"));
+    assert_eq!(first_state.consumer_nodes.len(), 2);
+    assert!(
+        scheduler
+            .claim_next(&worker, 31, 1_000)
+            .unwrap_or_else(|error| panic!("parallel VPS claim: {error}"))
+            .is_none(),
+        "one host must not mutate the same operation target from two slots"
+    );
+    commit_success(&scheduler, &first, "first-compiled");
+
+    let second = claim(&scheduler, &worker, 50);
+    assert_ne!(second.node_kind, first.node_kind);
+    let second_state = second
+        .operation_state
+        .as_ref()
+        .unwrap_or_else(|| panic!("second compiled node state"));
+    assert_eq!(second_state.state_key, first_state.state_key);
+    assert_eq!(second_state.consumer_nodes, first_state.consumer_nodes);
+}
+
+#[test]
+fn vps_operation_binding_survives_expiry_and_cannot_migrate_to_accelerator() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("rimg", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '8',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "rimg-vps-state-expiry",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    commit_success(&scheduler, &prepare, "prepare-expiry-state");
+
+    let expired = claim(&scheduler, &worker, 30);
+    let state_key = expired
+        .operation_state
+        .as_ref()
+        .unwrap_or_else(|| panic!("compiled state"))
+        .state_key
+        .clone();
+    assert_eq!(
+        scheduler
+            .expire_leases(expired.expires_at_ms)
+            .unwrap_or_else(|error| panic!("expire compiled lease: {error}")),
+        1
+    );
+    let cleanup = WorkflowCleanupReceiptV1::new(
+        &expired,
+        None,
+        digest("compiled-expiry-cleanup"),
+        expired.expires_at_ms + 1,
+    )
+    .unwrap_or_else(|error| panic!("cleanup receipt: {error}"));
+    scheduler
+        .commit_cleanup_receipt(&cleanup, cleanup.completed_at_ms + 1)
+        .unwrap_or_else(|error| panic!("commit cleanup: {error}"));
+
+    assert!(
+        scheduler
+            .claim_next(&accelerator_worker(), expired.expires_at_ms + 3, 1_000)
+            .unwrap_or_else(|error| panic!("accelerator retry claim: {error}"))
+            .is_none(),
+        "an existing VPS state must never split across an intermittent host"
+    );
+    let retry = claim(&scheduler, &worker, expired.expires_at_ms + 4);
+    assert_eq!(retry.node_id, expired.node_id);
+    assert_eq!(retry.lease_generation, expired.lease_generation + 1);
+    assert_eq!(
+        retry
+            .operation_state
+            .as_ref()
+            .unwrap_or_else(|| panic!("retry state"))
+            .state_key,
+        state_key
     );
 }
 

@@ -103,7 +103,7 @@ Implementation progress:
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker remains step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
-| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4e locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition and fixed Cargo.lock/crates.io dependency preparation. Operation-owned COW/compiled state and the live systemd/dedicated-filesystem/quota/concurrency proof remain; no activation is implied. |
+| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4f locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation and bounded operation-owned compiled state. Rootless integration/OCI adapters plus the live systemd/dedicated-filesystem/quota/concurrency proof remain; no activation is implied. |
 | 5-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -401,6 +401,38 @@ Implementation ledger:
   SSRF/peer authentication, CAS cleanup, offline Cargo behavior and systemd confinement. Slice 4e is
   therefore complete locally. No service was installed or started, no crate/provider was contacted by
   the implementation path, and no VPS, push or deployment state was mutated.
+- Slice 4f adds a canonical operation-state contract bound to the exact attempt, project, source,
+  workflow policy, prepared input, worker/host, sorted compiled consumers and hard byte/inode ceilings.
+  Schema V4 persists one VPS binding per attempt; matching verification/release nodes serialize on that
+  host and reuse one state key across leases. Once bound, expiry cannot migrate work to the optional i9.
+  An available i9 receives only independent one-node local state and neither transfers compiled output
+  nor blocks the complete VPS path.
+- The root launcher exclusively owns `/var/lib/rdashboard-build/operations`. Startup fails unless it is
+  the exact root-owned 6-8 GiB/100,000-1,000,000-inode mount; every operation is additionally capped at
+  6 GiB/500,000 inodes. Canonical records, a singleton lock, two-phase `data_removal_pending`, directory
+  fsyncs and deletion tombstones make create/release/unlink/prune replayable. Success retains target/
+  ccache only until every declared consumer succeeds; failure, uncertainty, limit breach and one-hour
+  abandonment strip data. Terminal metadata is bounded to the newest 512 of at most 1,024 records.
+- Transient jobs see only their exact state at `/operation`; per-node workspace/config/temp remains in
+  bounded `/job` tmpfs and sealed source/dependencies remain read-only. The fixed job preserves source
+  file/directory mtimes at stable `/job/workspace`, so Cargo can reuse operation-local target output
+  without cross-attempt sharing. Process success is reduced to workflow success only when cleanup says
+  the operation state is reusable; otherwise deterministic `operation_state_unusable` evidence is
+  committed.
+- Independent review prompted two material filesystem hardenings before closeout. Path-based accounting
+  was replaced by fd-relative `O_PATH|O_NOFOLLOW` traversal that cannot be redirected by rename/symlink
+  substitution. Self-review then replaced a pending-sibling fd stack with immediate depth-first
+  traversal and a 64-level cap, bounding peak traversal descriptors to about 129 under the installed
+  `LimitNOFILE=256`. Deterministic tests cover both path substitution and 65-level rejection.
+- The final exact 19-path product/config/test diff contains 3,291 insertions and 55 deletions with
+  SHA-256 `9d424f47108c30e47ed4765c7a2d9736b83d65d4d6092ffa4e9847a267b3ad43`. A fresh exact-index export
+  passed bare `bin/ci`: formatting, strict Clippy, 234 active library tests with two credentialed live-
+  provider tests ignored, every binary/integration/socket/scheduler/worker suite, both schema checks,
+  8 browser contracts and the optimized release build in 3 minutes 28 seconds. The final fresh
+  `deepseek-free` acceptance review returned `ANSWERED`, `VERDICT: SAFE` and no P0-P2 finding or open
+  question after rechecking descriptor bounds, crash cleanup, lease replay, VPS/i9 binding, systemd
+  confinement and Cargo reuse. No mount/unit was installed or started and no VPS, i9, provider, push or
+  deployment state was mutated.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

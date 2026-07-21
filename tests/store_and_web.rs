@@ -247,7 +247,7 @@ fn control_store_rejects_unknown_schema_versions_at_open() {
         ControlStore::open(&path),
         Err(StoreError::UnsupportedControlSchemaVersion {
             actual: 99,
-            supported: 3
+            supported: 4
         })
     ));
 }
@@ -264,7 +264,8 @@ fn control_store_migrates_v1_to_the_durable_workflow_journal() {
         .unwrap_or_else(|error| panic!("open simulated v1 store: {error}"));
     legacy
         .execute_batch(
-            "DROP TABLE workflow_reductions;
+            "DROP TABLE workflow_operation_state_bindings;
+             DROP TABLE workflow_reductions;
              DROP TABLE workflow_cleanup_receipts;
              DROP TABLE workflow_node_receipts;
              DROP TABLE workflow_lease_journal;
@@ -294,14 +295,14 @@ fn control_store_migrates_v1_to_the_durable_workflow_journal() {
             |row| row.get(0),
         )
         .unwrap_or_else(|error| panic!("read migrated version: {error}"));
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let scheduler_tables: i64 = inspected
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
              WHERE type = 'table' AND name IN (
                 'workflow_requests', 'workflow_attempts', 'workflow_nodes',
                 'workflow_lease_journal', 'workflow_node_receipts',
-                'workflow_cleanup_receipts',
+                'workflow_cleanup_receipts', 'workflow_operation_state_bindings',
                 'workflow_reductions', 'workflow_mutation_locks',
                 'workflow_transitions', 'workflow_scheduler_cursor'
              )",
@@ -309,7 +310,7 @@ fn control_store_migrates_v1_to_the_durable_workflow_journal() {
             |row| row.get(0),
         )
         .unwrap_or_else(|error| panic!("count migrated scheduler tables: {error}"));
-    assert_eq!(scheduler_tables, 10);
+    assert_eq!(scheduler_tables, 11);
 }
 
 #[test]
@@ -324,7 +325,8 @@ fn control_store_migrates_v2_cleanup_debt_atomically() {
         .unwrap_or_else(|error| panic!("open simulated v2 store: {error}"));
     legacy
         .execute_batch(
-            "DROP TABLE workflow_cleanup_receipts;
+            "DROP TABLE workflow_operation_state_bindings;
+             DROP TABLE workflow_cleanup_receipts;
              UPDATE controller_meta SET integer_value = 2 WHERE key = 'schema_version';",
         )
         .unwrap_or_else(|error| panic!("downgrade fixture to v2: {error}"));
@@ -342,7 +344,7 @@ fn control_store_migrates_v2_cleanup_debt_atomically() {
             |row| row.get(0),
         )
         .unwrap_or_else(|error| panic!("read migrated version: {error}"));
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let cleanup_table: i64 = inspected
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
@@ -352,6 +354,43 @@ fn control_store_migrates_v2_cleanup_debt_atomically() {
         )
         .unwrap_or_else(|error| panic!("inspect cleanup table: {error}"));
     assert_eq!(cleanup_table, 1);
+}
+
+#[test]
+fn control_store_migrates_v3_operation_state_binding_atomically() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("v3-control.sqlite");
+    let store =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("create control store: {error}"));
+    drop(store);
+
+    let legacy = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("open simulated v3 store: {error}"));
+    legacy
+        .execute_batch(
+            "DROP TABLE workflow_operation_state_bindings;
+             UPDATE controller_meta SET integer_value = 3 WHERE key = 'schema_version';",
+        )
+        .unwrap_or_else(|error| panic!("downgrade fixture to v3: {error}"));
+    drop(legacy);
+
+    let migrated =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("migrate v3 store: {error}"));
+    drop(migrated);
+    let inspected = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("inspect migrated store: {error}"));
+    let (version, binding_table): (i64, i64) = inspected
+        .query_row(
+            "SELECT
+                (SELECT integer_value FROM controller_meta WHERE key = 'schema_version'),
+                (SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'workflow_operation_state_bindings')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or_else(|error| panic!("inspect operation-state migration: {error}"));
+    assert_eq!(version, 4);
+    assert_eq!(binding_table, 1);
 }
 
 #[test]

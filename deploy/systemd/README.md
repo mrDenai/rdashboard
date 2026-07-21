@@ -108,19 +108,34 @@ under `/var/lib/rdashboard-workflow-launcher/jobs`. A renewed lease for the same
 authorization record but never starts a second unit. A launcher restart converts any accepted/running
 record into explicit `needs_reconcile` state, so an uncertain launch is stopped and cleaned rather than
 silently replayed. Cleanup is itself journaled before `systemctl stop`; exact repeats return the same
-evidence. Per-job writable state is an isolated tmpfs with the lease byte and inode ceilings. The
-sealed composition is mounted read-only at `/prepared`, its dependency snapshot at `/dependencies`,
-and the fixed job copies only `/prepared/source` once into `/job/workspace`; the internal composition
-document never changes the repository-visible tree. The fixed `rdashboard-workflow-job` maps only the
-three installed adapter IDs to fixed script paths and receives an empty, reconstructed environment.
-Source mutations, Cargo state, targets, compiler cache and temporary files live only below `/job`;
-the launcher forces Cargo offline so a verification job cannot turn a cache miss into undeclared
-network access. No writable repository, target or dependency cache persists after the transient unit.
+evidence. Per-node workspace, Cargo configuration, logs and temporary files remain in an isolated
+tmpfs with the lease byte and inode ceilings. The sealed composition is mounted read-only at
+`/prepared`, its dependency snapshot at `/dependencies`, and the fixed job copies only
+`/prepared/source` once into `/job/workspace`; the internal composition document never changes the
+repository-visible tree. A separate exact operation-owned directory is mounted at `/operation` and
+holds only the target and compiler cache. Matching verification/release consumers on the VPS execute
+serially against that directory, so the release reuses the gate's compiled artifacts; different
+attempts and hosts never share writable state. An optional build-only host gets a one-node local state
+and neither blocks the VPS nor causes its files to be transferred. Each per-node source copy preserves
+the sealed tree's modification times and stable `/job/workspace` path, which lets Cargo reuse the
+operation target instead of invalidating it merely because the tmpfs workspace was recreated.
+
+The fixed `rdashboard-workflow-job` maps only the three installed adapter IDs to fixed script paths and
+receives an empty, reconstructed environment. The launcher forces Cargo offline so a verification job
+cannot turn a cache miss into undeclared network access. Failed or uncertain execution removes the
+partial operation data; all declared successful consumers remove it after the last use. The retained
+root-owned canonical tombstone and per-node launcher journal make cleanup replayable without retaining
+repository-writable bytes. Operation records have a hard cap of 1,024; startup and capacity admission
+prune terminal tombstones back to the newest 512. A non-active partial operation that receives no next
+consumer for one hour is failed and stripped on the next admission before capacity is checked, so a
+superseded attempt cannot pin a multi-gigabyte target indefinitely.
 
 The launcher deliberately has no network namespace, Docker/containerd socket, controller/executor/
-source socket, production volume or credential access. Its only retained capability is read-only DAC
-traversal so it can revalidate the worker-owned mode-`0700` preparation-store root; transient jobs have
-an empty capability set. Installing the binary, policy and unit does not enable or start it, activate a
+source socket, production volume or credential access. Its DAC/chown capabilities are constrained by
+the service mount namespace to the launcher journal and exact operation-state mount: they let it create
+build-owned state and remove hostile or partial build output after the transient unit stops. Transient
+jobs have an empty capability set and see only their exact `/operation` bind, while the host operation
+root is inaccessible. Installing the binary, policy and unit does not enable or start it, activate a
 worker, change `auto_deploy`, or run a shadow job.
 
 ## Generic workflow worker and preparation store
@@ -169,6 +184,14 @@ the host root filesystem. The worker refuses startup when this path is not the e
 filesystem is too small, ownership/mode is wrong, the store exceeds either cap, or the root reserve is
 missing. The tmpfiles entry creates the mode-`0700` mountpoint, but it does not create or mount the
 filesystem; installation must provide and persist that hard boundary first.
+
+Mount a second dedicated filesystem at `/var/lib/rdashboard-build/operations` before starting the
+launcher. It must be an exact 6-8 GiB mount with 100,000-1,000,000 total inodes, owned by root and mode
+`0700`; startup fails closed outside those byte/inode bounds. This is the hard fallback fence when
+project quotas are unavailable: repository code can exhaust only this small operation domain, never
+the VPS root filesystem. Each operation contract additionally limits accounted target/cache bytes and
+inodes to at most 6 GiB/500,000, and the launcher rechecks that bound before reuse and after exit. The
+tmpfiles entry creates only the mountpoint and does not format or mount storage.
 
 `source_tree_v1` remains deliberately offline and is valid only for a dependency-free repository or
 one whose complete gate dependencies are already vendored in the source tree. The additional

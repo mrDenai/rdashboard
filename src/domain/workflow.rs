@@ -16,6 +16,7 @@ pub const WORKFLOW_NODE_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_CLEANUP_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_REDUCTION_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_HOST_PREPARATION_SCHEMA_VERSION: u16 = 1;
+pub const WORKFLOW_OPERATION_STATE_SCHEMA_VERSION: u16 = 1;
 
 const MAX_WORKFLOW_NODES: usize = 64;
 const MAX_WORKFLOW_PROFILES: usize = 32;
@@ -24,6 +25,8 @@ const MIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_OPERATION_STATE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_OPERATION_STATE_INODES: u64 = 1_000_000;
 
 macro_rules! workflow_token {
     ($name:ident, $error:literal) => {
@@ -692,6 +695,141 @@ impl WorkflowSourceIdentityV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct WorkflowOperationStateV1 {
+    pub schema_version: u16,
+    pub state_key: EvidenceDigest,
+    pub consumer_nodes: Vec<WorkflowNodeId>,
+    pub max_bytes: u64,
+    pub max_inodes: u64,
+}
+
+#[derive(Serialize)]
+struct WorkflowOperationStateKeyPayload<'a> {
+    purpose: &'static str,
+    schema_version: u16,
+    attempt_id: Uuid,
+    project_id: &'a ProjectId,
+    source_sha: &'a GitCommitId,
+    workflow_policy_digest: &'a EvidenceDigest,
+    preparation_key: &'a EvidenceDigest,
+    worker_id: &'a str,
+    host_id: &'a str,
+    consumer_nodes: &'a [WorkflowNodeId],
+    max_bytes: u64,
+    max_inodes: u64,
+}
+
+impl WorkflowOperationStateV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        attempt_id: Uuid,
+        project_id: &ProjectId,
+        source_sha: &GitCommitId,
+        workflow_policy_digest: &EvidenceDigest,
+        preparation_key: &EvidenceDigest,
+        worker_id: &str,
+        host_id: &str,
+        mut consumer_nodes: Vec<WorkflowNodeId>,
+        max_bytes: u64,
+        max_inodes: u64,
+    ) -> Result<Self, WorkflowContractError> {
+        consumer_nodes.sort();
+        let mut state = Self {
+            schema_version: WORKFLOW_OPERATION_STATE_SCHEMA_VERSION,
+            state_key: EvidenceDigest::sha256([]),
+            consumer_nodes,
+            max_bytes,
+            max_inodes,
+        };
+        state.state_key = state.calculate_key(
+            attempt_id,
+            project_id,
+            source_sha,
+            workflow_policy_digest,
+            preparation_key,
+            worker_id,
+            host_id,
+        )?;
+        state.validate_for(
+            attempt_id,
+            project_id,
+            source_sha,
+            workflow_policy_digest,
+            preparation_key,
+            worker_id,
+            host_id,
+        )?;
+        Ok(state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_for(
+        &self,
+        attempt_id: Uuid,
+        project_id: &ProjectId,
+        source_sha: &GitCommitId,
+        workflow_policy_digest: &EvidenceDigest,
+        preparation_key: &EvidenceDigest,
+        worker_id: &str,
+        host_id: &str,
+    ) -> Result<(), WorkflowContractError> {
+        if self.schema_version != WORKFLOW_OPERATION_STATE_SCHEMA_VERSION
+            || attempt_id.is_nil()
+            || !valid_workflow_identity(worker_id)
+            || !valid_workflow_identity(host_id)
+            || self.consumer_nodes.is_empty()
+            || self.consumer_nodes.len() > MAX_WORKFLOW_NODES
+            || !strictly_sorted_unique(&self.consumer_nodes)
+            || !(1024 * 1024..=MAX_OPERATION_STATE_BYTES).contains(&self.max_bytes)
+            || !(1_024..=MAX_OPERATION_STATE_INODES).contains(&self.max_inodes)
+            || self.state_key
+                != self.calculate_key(
+                    attempt_id,
+                    project_id,
+                    source_sha,
+                    workflow_policy_digest,
+                    preparation_key,
+                    worker_id,
+                    host_id,
+                )?
+        {
+            return Err(WorkflowContractError::InvalidOperationState);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn calculate_key(
+        &self,
+        attempt_id: Uuid,
+        project_id: &ProjectId,
+        source_sha: &GitCommitId,
+        workflow_policy_digest: &EvidenceDigest,
+        preparation_key: &EvidenceDigest,
+        worker_id: &str,
+        host_id: &str,
+    ) -> Result<EvidenceDigest, WorkflowContractError> {
+        Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
+            &WorkflowOperationStateKeyPayload {
+                purpose: "rdashboard.workflow-operation-state.v1",
+                schema_version: self.schema_version,
+                attempt_id,
+                project_id,
+                source_sha,
+                workflow_policy_digest,
+                preparation_key,
+                worker_id,
+                host_id,
+                consumer_nodes: &self.consumer_nodes,
+                max_bytes: self.max_bytes,
+                max_inodes: self.max_inodes,
+            },
+        )?))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowLeaseV1 {
     pub schema_version: u16,
     pub lease_id: Uuid,
@@ -715,6 +853,8 @@ pub struct WorkflowLeaseV1 {
     pub resources: Option<WorkflowResourceEnvelopeV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_preparation: Option<WorkflowHostPreparationPolicyV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_state: Option<WorkflowOperationStateV1>,
     pub input_contracts: Vec<WorkflowArtifactKindV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_artifacts: Vec<WorkflowLeaseInputV1>,
@@ -752,6 +892,8 @@ struct WorkflowLeaseDigestPayload<'a> {
     resources: &'a Option<WorkflowResourceEnvelopeV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_preparation: &'a Option<WorkflowHostPreparationPolicyV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_state: &'a Option<WorkflowOperationStateV1>,
     input_contracts: &'a [WorkflowArtifactKindV1],
     #[serde(skip_serializing_if = "<[WorkflowLeaseInputV1]>::is_empty")]
     input_artifacts: &'a [WorkflowLeaseInputV1],
@@ -810,6 +952,7 @@ impl WorkflowLeaseV1 {
             timeout_ms: profile.timeout_ms,
             resources: profile.resources.clone(),
             host_preparation,
+            operation_state: None,
             input_contracts: node.input_contracts.clone(),
             input_artifacts,
             output_contract: node.output_contract,
@@ -857,6 +1000,24 @@ impl WorkflowLeaseV1 {
                 self.node_kind != WorkflowNodeKindV1::HostPrepare
                     || policy.validate().is_err()
                     || self.network_class != policy.required_network_class()
+            })
+            || self.operation_state.as_ref().is_some_and(|state| {
+                !matches!(
+                    self.node_kind,
+                    WorkflowNodeKindV1::Verification | WorkflowNodeKindV1::ReleaseBuild
+                ) || self.cache_class != WorkflowCacheClassV1::PreparedRun
+                    || !state.consumer_nodes.contains(&self.node_id)
+                    || state
+                        .validate_for(
+                            self.attempt_id,
+                            &self.project_id,
+                            &self.source_sha,
+                            &self.workflow_policy_digest,
+                            &self.preparation_key,
+                            &self.worker_id,
+                            &self.host_id,
+                        )
+                        .is_err()
             })
             || !strictly_sorted_unique(&self.input_contracts)
             || !strictly_sorted_unique(&self.input_artifacts)
@@ -928,6 +1089,16 @@ impl WorkflowLeaseV1 {
         Ok(renewed)
     }
 
+    pub fn with_operation_state(
+        mut self,
+        operation_state: WorkflowOperationStateV1,
+    ) -> Result<Self, WorkflowContractError> {
+        self.operation_state = Some(operation_state);
+        self.lease_digest = self.calculate_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn same_execution_as(&self, other: &Self) -> Result<bool, WorkflowContractError> {
         self.validate()?;
         other.validate()?;
@@ -961,6 +1132,7 @@ impl WorkflowLeaseV1 {
                 timeout_ms: self.timeout_ms,
                 resources: &self.resources,
                 host_preparation: &self.host_preparation,
+                operation_state: &self.operation_state,
                 input_contracts: &self.input_contracts,
                 input_artifacts: &self.input_artifacts,
                 output_contract: self.output_contract,
@@ -1458,6 +1630,8 @@ pub enum WorkflowContractError {
     InvalidResourceEnvelope,
     #[error("workflow host-preparation policy is invalid")]
     InvalidHostPreparationPolicy,
+    #[error("workflow operation-owned state contract is invalid")]
+    InvalidOperationState,
     #[error("workflow lease is structurally invalid or has a mismatched digest")]
     InvalidLease,
     #[error("legacy workflow lease has no exact source identity and cannot start new work")]
@@ -1538,6 +1712,7 @@ mod tests {
         );
         assert!(!String::from_utf8_lossy(&canonical).contains("input_artifacts"));
         assert!(!String::from_utf8_lossy(&canonical).contains("host_preparation"));
+        assert!(!String::from_utf8_lossy(&canonical).contains("operation_state"));
         let decoded = WorkflowLeaseV1::decode_canonical(&canonical).expect("decode legacy lease");
         assert_eq!(decoded, lease);
         assert!(matches!(

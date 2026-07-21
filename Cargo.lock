@@ -1459,6 +1459,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "rustix",
  "schemars",
  "serde",
  "serde_jcs",

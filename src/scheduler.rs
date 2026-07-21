@@ -10,9 +10,10 @@ use uuid::Uuid;
 use crate::{
     domain::{
         EvidenceDigest, GitCommitId, OperationKind, ProjectId, ProjectManifestV2,
-        WorkflowCleanupReceiptV1, WorkflowCleanupResultV1, WorkflowExecutionProfileV1,
-        WorkflowLeaseInputV1, WorkflowLeaseV1, WorkflowNodeActivationV1, WorkflowNodeId,
-        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowProfileId,
+        WorkflowCacheClassV1, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
+        WorkflowExecutionProfileV1, WorkflowLeaseInputV1, WorkflowLeaseV1,
+        WorkflowNodeActivationV1, WorkflowNodeId, WorkflowNodeKindV1, WorkflowNodeOutcomeV1,
+        WorkflowNodeReceiptV1, WorkflowOperationStateV1, WorkflowProfileId,
         WorkflowReductionInputV1, WorkflowReductionReceiptV1, WorkflowWorkerPoolV1,
         valid_workflow_identity,
     },
@@ -21,6 +22,8 @@ use crate::{
 
 const MIN_LEASE_MS: i64 = 1_000;
 const MAX_LEASE_MS: i64 = 15 * 60 * 1_000;
+const MAX_OPERATION_STATE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const MAX_OPERATION_STATE_INODES: u64 = 500_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1245,6 +1248,12 @@ fn claim_next_transaction(
         {
             continue;
         }
+        let operation_state =
+            match operation_state_for_candidate(transaction, &candidate, worker, now_ms)? {
+                OperationStateSelection::NotUsed => None,
+                OperationStateSelection::Ready(state) => Some(state),
+                OperationStateSelection::Busy => continue,
+            };
         let (expected_input_digest, input_artifacts) =
             expected_input_digest(transaction, &candidate)?;
         let generation = candidate
@@ -1257,7 +1266,7 @@ fn claim_next_transaction(
             lease_duration_ms,
             candidate.profile.timeout_ms,
         )?;
-        let lease = WorkflowLeaseV1::new(
+        let mut lease = WorkflowLeaseV1::new(
             Uuid::new_v4(),
             generation,
             candidate.request_id,
@@ -1282,6 +1291,9 @@ fn claim_next_transaction(
             now_ms,
             expires_at_ms,
         )?;
+        if let Some(operation_state) = operation_state {
+            lease = lease.with_operation_state(operation_state)?;
+        }
         persist_active_lease(transaction, &lease, candidate.lease_generation, now_ms)?;
         update_fairness_cursor(
             transaction,
@@ -1292,6 +1304,234 @@ fn claim_next_transaction(
         return Ok(Some(lease));
     }
     Ok(None)
+}
+
+enum OperationStateSelection {
+    NotUsed,
+    Ready(WorkflowOperationStateV1),
+    Busy,
+}
+
+fn operation_state_for_candidate(
+    transaction: &Transaction<'_>,
+    candidate: &ReadyCandidate<'_>,
+    worker: &WorkflowWorkerRegistrationV1,
+    now_ms: i64,
+) -> Result<OperationStateSelection, StoreError> {
+    if !matches!(
+        candidate.node.kind,
+        WorkflowNodeKindV1::Verification | WorkflowNodeKindV1::ReleaseBuild
+    ) || candidate.profile.cache_class != WorkflowCacheClassV1::PreparedRun
+    {
+        return Ok(OperationStateSelection::NotUsed);
+    }
+
+    let binding = transaction
+        .query_row(
+            "SELECT worker_id, host_id, state_json
+             FROM workflow_operation_state_bindings WHERE attempt_id = ?1",
+            [candidate.attempt_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let vps_capable = worker.pools.contains(&WorkflowWorkerPoolV1::VpsRequired);
+
+    if let Some((bound_worker, bound_host, state_json)) = binding.as_ref() {
+        if bound_worker == &worker.worker_id && bound_host == &worker.host_id {
+            let state = decode_bound_operation_state(candidate, worker, state_json)?;
+            if !state.consumer_nodes.contains(&candidate.node.node_id) {
+                return Err(StoreError::CorruptWorkflowJournal(
+                    "operation-state consumer not bound",
+                ));
+            }
+            return if active_operation_state_on_host(
+                transaction,
+                candidate.attempt_id,
+                &worker.worker_id,
+                &worker.host_id,
+            )? {
+                Ok(OperationStateSelection::Busy)
+            } else {
+                Ok(OperationStateSelection::Ready(state))
+            };
+        }
+        // Once the always-available VPS owns the compiled state, every consumer in that
+        // attempt must stay on the same host. Letting an optional accelerator retry one
+        // consumer would leave the VPS record waiting for files that were never transferred.
+        return Ok(OperationStateSelection::Busy);
+    }
+
+    if vps_capable
+        && active_operation_state_on_host(
+            transaction,
+            candidate.attempt_id,
+            &worker.worker_id,
+            &worker.host_id,
+        )?
+    {
+        return Ok(OperationStateSelection::Busy);
+    }
+
+    let consumers = if vps_capable {
+        remaining_operation_state_consumers(transaction, candidate, worker)?
+    } else {
+        vec![candidate.node.node_id.clone()]
+    };
+    let state = operation_state_contract(candidate, worker, consumers)?;
+    if vps_capable && binding.is_none() {
+        let state_json = canonical_string(&serde_jcs::to_vec(&state)?)?;
+        transaction.execute(
+            "INSERT INTO workflow_operation_state_bindings(
+                attempt_id, worker_id, host_id, state_key, state_json, bound_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                candidate.attempt_id.to_string(),
+                worker.worker_id,
+                worker.host_id,
+                state.state_key.as_str(),
+                state_json,
+                now_ms,
+            ],
+        )?;
+    }
+    Ok(OperationStateSelection::Ready(state))
+}
+
+fn remaining_operation_state_consumers(
+    transaction: &Transaction<'_>,
+    candidate: &ReadyCandidate<'_>,
+    worker: &WorkflowWorkerRegistrationV1,
+) -> Result<Vec<WorkflowNodeId>, StoreError> {
+    let mut consumers = Vec::new();
+    for node in &candidate.manifest.workflow.nodes {
+        if !matches!(
+            node.kind,
+            WorkflowNodeKindV1::Verification | WorkflowNodeKindV1::ReleaseBuild
+        ) {
+            continue;
+        }
+        let profile = candidate
+            .manifest
+            .workflow
+            .profile(&node.profile_id)
+            .ok_or(StoreError::CorruptWorkflowJournal(
+                "operation-state profile absent",
+            ))?;
+        if profile.cache_class != WorkflowCacheClassV1::PreparedRun
+            || !worker.pools.contains(&profile.worker_pool)
+        {
+            continue;
+        }
+        let state = transaction.query_row(
+            "SELECT state FROM workflow_nodes WHERE attempt_id = ?1 AND node_id = ?2",
+            params![candidate.attempt_id.to_string(), node.node_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )?;
+        if matches!(state.as_str(), "blocked" | "ready") {
+            consumers.push(node.node_id.clone());
+        }
+    }
+    if !consumers.contains(&candidate.node.node_id) {
+        return Err(StoreError::CorruptWorkflowJournal(
+            "operation-state candidate absent",
+        ));
+    }
+    consumers.sort();
+    Ok(consumers)
+}
+
+fn operation_state_contract(
+    candidate: &ReadyCandidate<'_>,
+    worker: &WorkflowWorkerRegistrationV1,
+    consumers: Vec<WorkflowNodeId>,
+) -> Result<WorkflowOperationStateV1, StoreError> {
+    let mut max_bytes = 0;
+    let mut max_inodes = 0;
+    for consumer in &consumers {
+        let node = candidate.manifest.workflow.node(consumer).ok_or(
+            StoreError::CorruptWorkflowJournal("operation-state consumer absent"),
+        )?;
+        let resources = candidate
+            .manifest
+            .workflow
+            .profile(&node.profile_id)
+            .and_then(|profile| profile.resources.as_ref())
+            .ok_or(StoreError::CorruptWorkflowJournal(
+                "operation-state resources absent",
+            ))?;
+        max_bytes = max_bytes.max(resources.scratch_max_bytes);
+        max_inodes = max_inodes.max(resources.scratch_max_inodes);
+    }
+    WorkflowOperationStateV1::new(
+        candidate.attempt_id,
+        &candidate.project_id,
+        &candidate.source_sha,
+        &candidate.workflow_policy_digest,
+        &candidate.preparation_key,
+        &worker.worker_id,
+        &worker.host_id,
+        consumers,
+        max_bytes.min(MAX_OPERATION_STATE_BYTES),
+        max_inodes.min(MAX_OPERATION_STATE_INODES),
+    )
+    .map_err(StoreError::from)
+}
+
+fn decode_bound_operation_state(
+    candidate: &ReadyCandidate<'_>,
+    worker: &WorkflowWorkerRegistrationV1,
+    state_json: &str,
+) -> Result<WorkflowOperationStateV1, StoreError> {
+    let state: WorkflowOperationStateV1 = serde_json::from_str(state_json)?;
+    if serde_jcs::to_vec(&state)? != state_json.as_bytes()
+        || state
+            .validate_for(
+                candidate.attempt_id,
+                &candidate.project_id,
+                &candidate.source_sha,
+                &candidate.workflow_policy_digest,
+                &candidate.preparation_key,
+                &worker.worker_id,
+                &worker.host_id,
+            )
+            .is_err()
+    {
+        return Err(StoreError::CorruptWorkflowJournal(
+            "operation-state binding",
+        ));
+    }
+    Ok(state)
+}
+
+fn active_operation_state_on_host(
+    transaction: &Transaction<'_>,
+    attempt_id: Uuid,
+    worker_id: &str,
+    host_id: &str,
+) -> Result<bool, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT lease_json FROM workflow_lease_journal
+         WHERE attempt_id = ?1 AND worker_id = ?2 AND host_id = ?3 AND state = 'active'",
+    )?;
+    let leases = statement
+        .query_map(params![attempt_id.to_string(), worker_id, host_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for lease_json in leases {
+        let lease = WorkflowLeaseV1::decode_canonical(lease_json.as_bytes())?;
+        if lease.operation_state.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn bounded_lease_expiry(

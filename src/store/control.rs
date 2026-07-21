@@ -11,7 +11,7 @@ use crate::domain::{DashboardEvent, EVENT_PROTOCOL_VERSION, EventEnvelope};
 use super::{StoreError, lock_connection, verify_sqlite_version};
 
 const EVENT_HISTORY_LIMIT: i64 = 512;
-const CONTROL_SCHEMA_VERSION: i64 = 3;
+const CONTROL_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct ControlStore {
@@ -268,6 +268,15 @@ impl ControlStore {
                 committed_at_ms INTEGER NOT NULL CHECK(committed_at_ms >= 0),
                 FOREIGN KEY(attempt_id, node_id)
                     REFERENCES workflow_nodes(attempt_id, node_id)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS workflow_operation_state_bindings (
+                attempt_id TEXT PRIMARY KEY REFERENCES workflow_attempts(attempt_id),
+                worker_id TEXT NOT NULL,
+                host_id TEXT NOT NULL,
+                state_key TEXT NOT NULL UNIQUE,
+                state_json TEXT NOT NULL,
+                bound_at_ms INTEGER NOT NULL CHECK(bound_at_ms >= 0)
             ) STRICT;
 
             CREATE TABLE IF NOT EXISTS workflow_reductions (
@@ -607,7 +616,7 @@ fn initialize_control_schema_version(transaction: &Transaction<'_>) -> Result<()
         .optional()?;
     match version {
         Some(CONTROL_SCHEMA_VERSION) => Ok(()),
-        Some(1 | 2) => {
+        Some(1..=3) => {
             transaction.execute(
                 "UPDATE controller_meta SET integer_value = ?1 WHERE key = 'schema_version'",
                 [CONTROL_SCHEMA_VERSION],
@@ -649,6 +658,7 @@ fn validate_control_schema(transaction: &Transaction<'_>) -> Result<(), StoreErr
         "workflow_lease_journal",
         "workflow_node_receipts",
         "workflow_cleanup_receipts",
+        "workflow_operation_state_bindings",
         "workflow_reductions",
         "workflow_mutation_locks",
         "workflow_transitions",
@@ -677,6 +687,7 @@ fn validate_control_schema(transaction: &Transaction<'_>) -> Result<(), StoreErr
         ("workflow_lease_journal", "lease_json"),
         ("workflow_node_receipts", "receipt_json"),
         ("workflow_cleanup_receipts", "receipt_json"),
+        ("workflow_operation_state_bindings", "state_json"),
         ("workflow_reductions", "receipt_json"),
         ("workflow_mutation_locks", "state"),
         ("workflow_transitions", "reason"),

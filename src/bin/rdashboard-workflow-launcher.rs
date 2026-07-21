@@ -6,6 +6,7 @@ use std::{
 };
 
 use rdashboard::{
+    operation_state::WorkflowOperationStateStoreV1,
     unix_time_ms,
     workflow_launcher::{
         SystemdWorkflowLaunchRuntimeV1, WORKFLOW_LAUNCHER_JOB_ROOT, WorkflowLaunchJournalV1,
@@ -37,10 +38,15 @@ async fn main() -> Result<(), DynError> {
         policy.max_journal_records,
         now_ms,
     )?;
+    let operation_states = Arc::new(WorkflowOperationStateStoreV1::open_installed(
+        policy.build_uid,
+        policy.build_gid,
+    )?);
     let supervisor = Arc::new(WorkflowLaunchSupervisorV1::new(
         policy.clone(),
         preparation_reader,
         journal,
+        operation_states,
         Arc::new(SystemdWorkflowLaunchRuntimeV1),
     )?);
     let handler = Arc::new(SupervisorWorkflowLauncherHandlerV1::system(supervisor));

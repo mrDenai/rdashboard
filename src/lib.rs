@@ -64,6 +64,8 @@ pub mod notifications;
 pub mod observer;
 #[cfg(unix)]
 pub mod oci_handoff;
+#[cfg(unix)]
+pub mod operation_state;
 pub mod phase6;
 pub mod policy;
 #[cfg(unix)]
