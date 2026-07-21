@@ -27,9 +27,10 @@ const DOCKER_HOST: &str = "unix:///var/run/docker.sock";
 const TIMEOUT: &str = "/usr/bin/timeout";
 // `docker stats --no-stream` waits for a second sample before it can calculate CPU.
 // A one-second process deadline therefore kills valid observations on production even
-// when the daemon is healthy. Keep the subprocess bounded below the four-second
-// request deadline while allowing that required sampling interval plus small overhead.
-const DOCKER_COMMAND_TIMEOUT: &str = "2s";
+// when the daemon is healthy. Production measurements take up to two seconds for
+// low-activity containers, so keep the subprocess bounded below the four-second
+// request deadline while allowing that required sampling interval plus real daemon overhead.
+const DOCKER_COMMAND_TIMEOUT: &str = "3s";
 const ALLOWED_UID_ENV: &str = "RDASHBOARD_OBSERVER_ALLOWED_UID";
 const MAX_DOCKER_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_CANDIDATES: usize = 8;
@@ -560,8 +561,8 @@ mod tests {
 
     #[test]
     fn fixed_docker_command_has_a_hard_subprocess_deadline() {
-        assert_eq!(DOCKER_COMMAND_TIMEOUT, "2s");
-        assert!(REQUEST_TIMEOUT > Duration::from_secs(2));
+        assert_eq!(DOCKER_COMMAND_TIMEOUT, "3s");
+        assert!(REQUEST_TIMEOUT > Duration::from_secs(3));
         let command = docker_command(&strings(&["ps", "--no-trunc"]));
         assert_eq!(command.get_program(), OsStr::new(TIMEOUT));
         assert_eq!(
