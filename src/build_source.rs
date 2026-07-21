@@ -226,6 +226,49 @@ impl SourceArchiveReaderV1 {
             }
         }
         let (manifest, manifest_path) = latest.ok_or(SourceArchiveError::NoPublication)?;
+        self.open_publication(&project_root, &manifest_path, manifest)
+    }
+
+    pub fn exact(
+        &self,
+        project_id: &ProjectId,
+        head: &GitCommitId,
+        sequence: u64,
+    ) -> Result<OpenedSourceArchiveV1, SourceArchiveError> {
+        if sequence == 0 {
+            return Err(SourceArchiveError::InvalidManifest);
+        }
+        self.validate_root()?;
+        let project_root = self.root.join(project_id.as_str());
+        validate_shared_directory(&project_root, self.source_uid, self.build_reader_gid, true)?;
+        let manifest_path = project_root.join(format!("{}.jcs", archive_stem(head, sequence)));
+        let manifest_file = inspect_shared_file(
+            &manifest_path,
+            self.source_uid,
+            self.build_reader_gid,
+            MAX_SOURCE_ARCHIVE_MANIFEST_BYTES,
+        )?;
+        let mut bytes = Vec::new();
+        manifest_file
+            .file
+            .take(manifest_file.length)
+            .read_to_end(&mut bytes)?;
+        let manifest = SourceArchiveManifestV1::decode_canonical(&bytes)?;
+        if manifest.project_id != *project_id
+            || manifest.head != *head
+            || manifest.sequence != sequence
+        {
+            return Err(SourceArchiveError::PublicationConflict);
+        }
+        self.open_publication(&project_root, &manifest_path, manifest)
+    }
+
+    fn open_publication(
+        &self,
+        project_root: &Path,
+        manifest_path: &Path,
+        manifest: SourceArchiveManifestV1,
+    ) -> Result<OpenedSourceArchiveV1, SourceArchiveError> {
         let archive_path = project_root.join(format!(
             "{}.tar",
             archive_stem(&manifest.head, manifest.sequence)
@@ -241,7 +284,7 @@ impl SourceArchiveReaderV1 {
         {
             return Err(SourceArchiveError::ArchiveDigestMismatch);
         }
-        let manifest_metadata = fs::symlink_metadata(&manifest_path)?;
+        let manifest_metadata = fs::symlink_metadata(manifest_path)?;
         let archive_metadata = archive.file.metadata()?;
         if manifest_metadata.uid() != archive_metadata.uid()
             || manifest_metadata.gid() != archive_metadata.gid()

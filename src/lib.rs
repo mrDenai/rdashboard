@@ -62,6 +62,8 @@ pub mod observer;
 pub mod oci_handoff;
 pub mod phase6;
 pub mod policy;
+#[cfg(unix)]
+pub mod preparation;
 pub mod projects;
 pub mod protocol;
 #[cfg(unix)]

@@ -614,3 +614,98 @@ It does not install or start services, expose the loopback route through a publi
 GitHub webhook, add credentials, enable auto-deploy, contact a provider, mutate the VPS, push or deploy.
 Forced-push ingress and the separately authorized live latency/recovery drill remain in plan step 3;
 the generic worker and sealed shared preparation store are the next local implementation step.
+
+## Slice 4a: exact workflow source binding and sealed preparation store
+
+### Reviewed scope
+
+Slice 4a completes the inactive preparation foundation needed by the repository-agnostic worker without
+executing repository code or installing a service:
+
+- New workflow leases digest-bind the admitted source sequence and attestation. Legacy leases without
+  this optional identity remain canonically decodable so persisted history survives the upgrade, but
+  `required_source_identity` refuses to start work from them. Claim and renewal contracts retain the
+  exact identity across scheduler restart.
+- `SourceArchiveReaderV1::exact` opens only the immutable project/head/sequence publication named by
+  the lease and verifies its manifest; the preparation API cannot substitute mutable `latest` source.
+- `PreparationStore` provides policy-bound typed keys for exact source snapshots, dependency snapshots
+  and prepared runs, same-key single-flight, atomic staging/rename/sealing, recursive checksum and
+  ownership validation on every open, durable bounded pins and cold LRU eviction.
+- Production admission requires the CAS root itself to be a dedicated mount, rejects work below a
+  12 GiB root-filesystem reserve and applies the initial 6 GiB/100,000-inode persistent ceiling.
+  Reservations include manifests, directory inventory and access sidecars; symlinks, hard links,
+  special files, unsafe paths, oversized files, excessive depth and entry counts fail closed.
+- Startup removes orphan staging, validates and seals an interrupted post-rename publication, finishes
+  durable journaled evictions, removes stale access records, recreates a missing sidecar for a complete
+  publication and cleans expired pins before admitting work.
+
+The exact staged product/test diff contains 6 paths, 3,230 insertions and 10 deletions. The shared dirty
+`src/lib.rs` was staged by hunk; unrelated notification implementation and its workflow artifacts remain
+unstaged and outside this review.
+
+### Verification
+
+- Targeted preparation regressions passed 10/10 after the crash-recovery correction. They cover typed
+  deterministic keys, same-key concurrency, producer failure, orphan staging, interrupted publication,
+  interrupted eviction after manifest removal, checksum tamper, unsafe links, pins/LRU, emergency
+  reserve enforcement and exact sequence selection while a newer source is `latest`.
+- Full-project Clippy passed with warnings denied after the correction.
+- A fresh `git checkout-index` export of the final staged state passed bare `bin/ci`: formatting,
+  Clippy, 182 active library tests with 2 credentialed live-provider tests ignored, every binary and
+  integration suite, 14 scheduler contracts, 8 browser contracts, schema checks and the optimized
+  release build in 2 minutes 58 seconds.
+- The first final-export attempt stopped only because its duplicate 4.3 GiB Cargo target exhausted the
+  `/tmp` quota. The two task-created temporary targets (17.2 GiB reported by `cargo clean`) were removed;
+  the rerun used the same exact source export with the existing Cargo target only as a dependency/build
+  cache and completed successfully. No tracked, application or user-owned state was removed.
+- `git diff --cached --check`: passed. Final exact staged product/test diff SHA-256:
+  `5b7aa36503b7347749e71f9cfb88764d63488f34640e52073a9c9720fbdaed74`.
+
+### Independent consultations and finding dispositions
+
+The first exact-staged review returned a complete `SAFE` response except for one high-confidence P2,
+although the dispatcher classified the response as `PARTIAL` after 200 seconds:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- state fingerprint: `70156753af3b5a55b7f28f4045b926bcd23deb0abbb89362404d562029350145`;
+- brief SHA-256: `5cf82435a9accc373972bdb7bc11c1456d4aaa1c55e66754d0161d2e80be1c0e`;
+- response: `consult-slice4a-deepseek/response.md`.
+
+The P2 was valid: recursive removal first changed the sealed entry root from 0555 to 0700. A crash after
+unlinking `manifest.jcs` could leave a partial 0700 tree which startup misclassified as an incomplete
+publication, making the whole store fail to reopen. Removing the manifest last would only move the crash
+window, so eviction now persists a kind/key marker by atomically moving the existing access sidecar into
+`evictions/` before any destructive change. Startup completes those idempotent evictions before examining
+incomplete publications. A regression reproduces the exact crash after manifest removal and proves reopen
+removes both the partial object and marker.
+
+The fresh post-fix review again produced a complete response with dispatcher status `PARTIAL` after
+195 seconds:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- state fingerprint: `490995c927b78f6be45d6060b3e4c769562b1648c8643ad99ac94d9d4474ed43`;
+- brief SHA-256: `14f80afbfc2982fa5d5032f79383d8151fac92fa863f05c150cb238942609c3a`;
+- response: `consult-slice4a-deepseek-final/response.md`;
+- verdict: `SAFE`, no P0-P2 correctness, security, concurrency, crash-safety, compatibility or resource-
+  accounting defect.
+
+Final P3/open-question dispositions:
+
+1. A crash between pin unlink and directory fsync can only retain the exact validated pin until its
+   already-bounded expiry; startup expiry cleanup and conservative eviction remain correct. No change.
+2. Rechecking pathname identity after reading intentionally converts concurrent pathname substitution
+   into a fail-closed `EntryChanged`; replacing it with only descriptor metadata would weaken that check.
+3. The comparator's invalid-base64 fallback is unreachable after strict manifest validation; changing
+   it to a panic would reduce robustness without fixing an observable path.
+4. An eviction marker replaces, rather than adds to, the counted access sidecar. Startup drains every
+   marker before usage scanning and the commit lock permits only one live marker; no capacity bypass.
+5. The scheduler columns questioned by the reviewer are not a missing migration: existing control schema
+   V2 already defines non-null `workflow_requests.source_sequence` and
+   `workflow_requests.source_attestation_digest`, and reopen integration passed in the exact gate.
+
+### Verdict
+
+Slice 4a is production-worthy as an inactive local foundation and may be committed. It does not execute
+repository commands, prefetch dependencies, create mutable build slots, install/start a worker, grant
+root authority, mutate the VPS, contact GitHub, push or deploy. The signed execution boundary, fixed root
+launcher and generic worker consumption of this exact CAS are the next local slice of plan step 4.

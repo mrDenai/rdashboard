@@ -103,7 +103,8 @@ Implementation progress:
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker and sealed preparation store remain step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
-| 4-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
+| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slice 4a locally completes exact source-to-lease binding and the host-local sealed CAS/storage-admission foundation. Worker execution and the fixed job launcher are the next local slice; no activation is implied. |
+| 5-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
 
@@ -257,6 +258,29 @@ Implementation ledger:
   remote-visibility retry coverage; obsolete wake-ups are retired on project removal/rebinding.
 - Slice 3b remains inactive locally: `auto_deploy=false`; no webhook was registered, route exposed,
   service installed/restarted, provider contacted, repository pushed or production state changed.
+- Slice 4a owns the smallest safe preparation foundation rather than a disconnected worker shell.
+  New leases bind the exact source sequence and accepted attestation while legacy persisted leases
+  remain canonically decodable but cannot start new work; the source reader selects that exact
+  immutable export instead of a mutable latest publication.
+- Its dedicated-filesystem CAS uses typed policy-bound keys for exact source, dependency and prepared
+  run objects; one producer serves concurrent same-key callers; staging is atomically published and
+  recursively sealed; every open revalidates ownership, layout and content hashes; and symlinks,
+  hard links, special files and unsafe paths fail closed. Conservative byte/inode reservations,
+  a 6 GiB initial ceiling, 100,000-inode ceiling, 12 GiB root-filesystem emergency reserve, exact
+  mountpoint check, bounded durable pins and cold LRU enforce the storage fence.
+- Startup removes orphan staging, finishes interrupted publications, rebuilds missing access records
+  and resumes interrupted evictions from a durable journal. The eviction marker is persisted before
+  the first destructive unlink, so a crash after manifest removal is distinguished from an incomplete
+  publish and cannot make the store unreopenable. The actual worker will consume this contract in the
+  next slice instead of inventing another cache or checkout path.
+- The final exact staged export passed bare `bin/ci` with 182 active library tests, every binary and
+  integration suite, 14 scheduler contracts, 8 browser contracts, schema checks and the optimized
+  release build in 2 minutes 58 seconds. The final product/test diff hash is
+  `5b7aa36503b7347749e71f9cfb88764d63488f34640e52073a9c9720fbdaed74`.
+- The first `deepseek-free` review found one real P2 crash window during recursive eviction. Durable
+  eviction journaling and an exact restart regression close it. The fresh final review returned
+  `SAFE` with no open P0-P2 finding; its schema question was resolved against the existing V2 control
+  schema. No service, repository, provider, VPS or production state was mutated.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

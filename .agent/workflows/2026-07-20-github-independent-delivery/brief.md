@@ -2,7 +2,7 @@
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
 - Status: implementation in progress
-- Last updated: 2026-07-20
+- Last updated: 2026-07-21
 
 ## User input log
 
@@ -151,3 +151,17 @@ Normalized authorization and continuation:
   step-1 slice: Failure Capsule V2 and terminal workflow resource/cleanup receipts.
 - The existing U006 external-mutation boundaries remain unchanged; this message authorizes repository
   implementation, verification, review and a task-scoped local commit, not installation or deployment.
+
+### U008 — 2026-07-21
+
+Faithful English rendering:
+
+What is preventing you from continuing?
+
+Normalized instruction:
+
+- Do not stop merely to report the completion of an internal implementation slice while safe,
+  authorized local work remains in the accepted plan.
+- Continue autonomously from the completed GitHub source-ingress slice into the next coherent generic
+  worker/shared-preparation slice, preserving the existing verification, review, local-commit and
+  external-mutation boundaries from U006-U007.

@@ -362,6 +362,14 @@ fn fair_queue_and_lease_generation_survive_reopen() {
     let first = claim(&scheduler, &build_worker(), 10);
     assert_eq!(first.project_id.as_str(), "ralert");
     assert_eq!(first.lease_generation, 1);
+    let first_source = first
+        .required_source_identity()
+        .unwrap_or_else(|error| panic!("exact first source identity: {error}"));
+    assert_eq!(first_source.sequence, 1);
+    assert_eq!(
+        first_source.attestation_digest,
+        digest("attestation-ralert-1")
+    );
     drop(scheduler);
     drop(store);
 
@@ -370,6 +378,14 @@ fn fair_queue_and_lease_generation_survive_reopen() {
     let reopened = DurableWorkflowScheduler::new(reopened_store);
     let second = claim(&reopened, &build_worker(), 20);
     assert_eq!(second.project_id.as_str(), "rimg");
+    let second_source = second
+        .required_source_identity()
+        .unwrap_or_else(|error| panic!("exact second source identity: {error}"));
+    assert_eq!(second_source.sequence, 1);
+    assert_eq!(
+        second_source.attestation_digest,
+        digest("attestation-rimg-1")
+    );
 
     assert_eq!(
         reopened
@@ -397,6 +413,7 @@ fn fair_queue_and_lease_generation_survive_reopen() {
     assert_eq!(replayed.project_id.as_str(), "ralert");
     assert_eq!(replayed.node_id, first.node_id);
     assert_eq!(replayed.lease_generation, 2);
+    assert_eq!(replayed.source_identity, first.source_identity);
 }
 
 #[test]
