@@ -1,12 +1,17 @@
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
-    io,
+    io::{self, Write as _},
     os::unix::{
         fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
         process::CommandExt as _,
     },
     path::{Path, PathBuf},
     process::Command,
+};
+
+use rdashboard::cargo_prefetch::{
+    CARGO_DEPENDENCY_MANIFEST_FILE, CARGO_VENDOR_DIRECTORY, CargoDependencyManifestV1,
+    CargoPrefetchError,
 };
 
 const PREPARED_ROOT: &str = "/prepared";
@@ -16,6 +21,9 @@ const DEPENDENCY_ROOT: &str = "/dependencies";
 const PREPARED_RUN_COMPOSITION_FILE: &str = ".rdashboard-prepared-run.jcs";
 const JOB_ROOT: &str = "/job";
 const WORKSPACE_ROOT: &str = "/job/workspace";
+const CARGO_HOME_ROOT: &str = "/job/cargo-home";
+const CARGO_VENDOR_CONFIG: &[u8] = b"[source.crates-io]\nreplace-with = \"rdashboard_vendor\"\n\n[source.rdashboard_vendor]\ndirectory = \"/dependencies/vendor\"\n\n[net]\noffline = true\n";
+const MAX_DEPENDENCY_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_WORKSPACE_FILES: u64 = 100_000;
 const MAX_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -44,6 +52,8 @@ fn main() -> Result<(), WorkflowJobError> {
         create_private_job_directory(&Path::new(JOB_ROOT).join(directory))?;
     }
     copy_prepared_workspace(Path::new(PREPARED_SOURCE_ROOT), Path::new(WORKSPACE_ROOT))?;
+    let cargo_vendor =
+        configure_cargo_dependency(Path::new(DEPENDENCY_ROOT), Path::new(CARGO_HOME_ROOT))?;
     std::env::set_current_dir(WORKSPACE_ROOT)?;
     let script = match adapter.as_str() {
         "bare-bin-ci-v1" => Path::new(WORKSPACE_ROOT).join("bin/ci"),
@@ -52,11 +62,62 @@ fn main() -> Result<(), WorkflowJobError> {
         _ => return Err(WorkflowJobError::UnsupportedAdapter),
     };
     validate_fixed_script(&script)?;
-    let error = Command::new(&script).exec();
+    let mut command = Command::new(&script);
+    if cargo_vendor {
+        command
+            .env("CARGO_SOURCE_CRATES_IO_REPLACE_WITH", "rdashboard_vendor")
+            .env(
+                "CARGO_SOURCE_RDASHBOARD_VENDOR_DIRECTORY",
+                "/dependencies/vendor",
+            )
+            .env("CARGO_NET_OFFLINE", "true");
+    }
+    let error = command.exec();
     Err(WorkflowJobError::Exec {
         path: script,
         source: error,
     })
+}
+
+fn configure_cargo_dependency(
+    dependency_root: &Path,
+    cargo_home: &Path,
+) -> Result<bool, WorkflowJobError> {
+    let manifest_path = dependency_root.join(CARGO_DEPENDENCY_MANIFEST_FILE);
+    let vendor_path = dependency_root.join(CARGO_VENDOR_DIRECTORY);
+    let manifest_metadata = match fs::symlink_metadata(&manifest_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(&vendor_path).is_ok() {
+                return Err(WorkflowJobError::UnsafeDependencyInput);
+            }
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if manifest_metadata.file_type().is_symlink()
+        || !manifest_metadata.file_type().is_file()
+        || manifest_metadata.nlink() != 1
+        || manifest_metadata.permissions().mode() & 0o7777 != 0o444
+        || manifest_metadata.len() == 0
+        || manifest_metadata.len() > MAX_DEPENDENCY_MANIFEST_BYTES
+    {
+        return Err(WorkflowJobError::UnsafeDependencyInput);
+    }
+    let manifest_bytes = fs::read(&manifest_path)?;
+    if u64::try_from(manifest_bytes.len()).ok() != Some(manifest_metadata.len()) {
+        return Err(WorkflowJobError::UnsafeDependencyInput);
+    }
+    CargoDependencyManifestV1::decode_canonical(&manifest_bytes)?;
+    validate_read_only_root(&vendor_path).map_err(|_| WorkflowJobError::UnsafeDependencyInput)?;
+
+    let config_path = cargo_home.join("config.toml");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut config = options.open(config_path)?;
+    config.write_all(CARGO_VENDOR_CONFIG)?;
+    config.flush()?;
+    Ok(true)
 }
 
 fn validate_read_only_root(path: &Path) -> Result<(), WorkflowJobError> {
@@ -225,6 +286,8 @@ enum WorkflowJobError {
     PreparedInputChanged(PathBuf),
     #[error("workflow job writable workspace exceeds its fixed source boundary")]
     WorkspaceLimitExceeded,
+    #[error("workflow job sealed dependency input is unsafe")]
+    UnsafeDependencyInput,
     #[error("workflow job script {0} is unsafe")]
     UnsafeScript(PathBuf),
     #[error("workflow job script {path} could not be inspected: {source}")]
@@ -233,6 +296,8 @@ enum WorkflowJobError {
     Exec { path: PathBuf, source: io::Error },
     #[error("workflow job filesystem operation failed: {0}")]
     Io(#[from] io::Error),
+    #[error("workflow job Cargo dependency manifest failed: {0}")]
+    CargoDependency(#[from] CargoPrefetchError),
 }
 
 #[cfg(test)]
@@ -339,6 +404,57 @@ mod tests {
         assert!(matches!(
             copy_prepared_workspace(&clean_source, &destination),
             Err(WorkflowJobError::UnsafeJobDirectory)
+        ));
+    }
+
+    #[test]
+    fn cargo_dependency_config_requires_a_canonical_manifest_and_sealed_vendor() {
+        let directory = tempdir().expect("temporary directory");
+        let dependency = directory.path().join("dependency");
+        let cargo_home = directory.path().join("cargo-home");
+        fs::create_dir(&dependency).expect("create dependency root");
+        fs::create_dir(&cargo_home).expect("create Cargo home");
+        let lock = b"version = 4\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n";
+        let plan = rdashboard::cargo_prefetch::CargoLockPlanV1::parse(lock).expect("lock plan");
+        let manifest = CargoDependencyManifestV1::new(
+            &plan,
+            rdashboard::domain::EvidenceDigest::sha256("workflow policy"),
+        )
+        .expect("dependency manifest");
+        fs::write(
+            dependency.join(CARGO_DEPENDENCY_MANIFEST_FILE),
+            manifest.canonical_bytes().expect("canonical manifest"),
+        )
+        .expect("write manifest");
+        fs::create_dir(dependency.join(CARGO_VENDOR_DIRECTORY)).expect("create vendor");
+        fs::set_permissions(
+            dependency.join(CARGO_DEPENDENCY_MANIFEST_FILE),
+            fs::Permissions::from_mode(0o444),
+        )
+        .expect("seal manifest");
+        fs::set_permissions(
+            dependency.join(CARGO_VENDOR_DIRECTORY),
+            fs::Permissions::from_mode(0o555),
+        )
+        .expect("seal vendor");
+
+        assert!(
+            configure_cargo_dependency(&dependency, &cargo_home).expect("configure vendored Cargo")
+        );
+        assert_eq!(
+            fs::read(cargo_home.join("config.toml")).expect("Cargo config"),
+            CARGO_VENDOR_CONFIG
+        );
+
+        let invalid_dependency = directory.path().join("invalid-dependency");
+        let other_cargo_home = directory.path().join("other-cargo-home");
+        fs::create_dir(&invalid_dependency).expect("create invalid dependency");
+        fs::create_dir(invalid_dependency.join(CARGO_VENDOR_DIRECTORY))
+            .expect("create unbound vendor");
+        fs::create_dir(&other_cargo_home).expect("create other Cargo home");
+        assert!(matches!(
+            configure_cargo_dependency(&invalid_dependency, &other_cargo_home),
+            Err(WorkflowJobError::UnsafeDependencyInput)
         ));
     }
 }

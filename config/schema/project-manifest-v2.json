@@ -336,6 +336,7 @@
     "WorkflowHostPreparationAdapterV1": {
       "type": "string",
       "enum": [
+        "cargo_crates_io_v1",
         "source_tree_v1"
       ]
     },

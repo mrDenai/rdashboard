@@ -18,7 +18,11 @@ pub mod backup_driver;
 pub mod build;
 pub mod build_attestation;
 pub mod build_source;
+#[cfg(unix)]
+pub mod cargo_prefetch;
 pub mod controller;
+#[cfg(unix)]
+pub mod dependency_fetch;
 #[cfg(unix)]
 pub mod deploy_driver;
 pub mod domain;

@@ -136,8 +136,11 @@ root launcher to run only the installed fixed adapter, then cleans the transient
 pin before committing the terminal receipt. Restart cleanup obligations are served before new work by
 the gateway and are idempotent at the launcher and store boundaries.
 
-Create the non-login `rdashboard-worker` user/group and add that user to the existing
-`rdashboard-build-readers` group. Install these non-secret values in root-owned
+Create the non-login `rdashboard-worker` user/group, the separate non-login
+`rdashboard-dependency-fetcher` user and a shared `rdashboard-dependency-fetch` group. Add the worker
+to both `rdashboard-build-readers` and `rdashboard-dependency-fetch`; the fetcher belongs only to
+`rdashboard-dependency-fetch`, so it cannot connect to the worker gateway or launcher sockets. Install
+these non-secret values in root-owned
 `/etc/rdashboard/workflow-worker.env`, mode `0644` or stricter:
 
 ```sh
@@ -147,6 +150,8 @@ RDASHBOARD_WORKER_HOST_ID=production-vps
 RDASHBOARD_WORKER_SLOTS=2
 RDASHBOARD_SOURCE_UID=993
 RDASHBOARD_BUILD_READER_GID=994
+RDASHBOARD_DEPENDENCY_FETCHER_UID=991
+RDASHBOARD_DEPENDENCY_FETCH_GID=995
 ```
 
 All numeric IDs are examples and must match the installed accounts. `RDASHBOARD_WORKER_UID`, worker
@@ -165,13 +170,23 @@ filesystem is too small, ownership/mode is wrong, the store exceeds either cap, 
 missing. The tmpfiles entry creates the mode-`0700` mountpoint, but it does not create or mount the
 filesystem; installation must provide and persist that hard boundary first.
 
-The only implemented host-preparation policy is `source_tree_v1`. It is deliberately offline and is
-valid only for a dependency-free repository or one whose complete gate dependencies are already
-vendored in the source tree. It publishes a typed no-external-dependency marker, not a populated Cargo,
-Ruby, npm or system-package cache. Networked lockfile prefetch remains a separate future fixed adapter
-with registry allowlists and integrity checks. The catalog `ralert` manifest remains inactive and must
-not be installed until that repository satisfies the source-tree contract or the appropriate
-dependency adapter exists.
+`source_tree_v1` remains deliberately offline and is valid only for a dependency-free repository or
+one whose complete gate dependencies are already vendored in the source tree. The additional
+`cargo_crates_io_v1` adapter accepts only a bounded version-4 `Cargo.lock`: local workspace packages
+plus SHA-256-pinned packages from the two canonical crates.io index identities. Git dependencies,
+alternate registries, missing checksums and repository-selected URLs are rejected before any network
+request.
+
+`rdashboard-dependency-fetcher.service` is the only networked component in that path. Its binary
+constructs one fixed `https://static.crates.io/crates/{name}/{name}-{version}.crate` URL, disables
+redirects and proxy environment use, filters DNS answers to public addresses, and returns bytes only
+to the exact worker UID over its mode-`0660` Unix socket. It cannot read source exports, the preparation
+CAS, controller/launcher state, credentials or container sockets. The worker verifies every archive
+checksum again, rejects links and unsafe archive paths, generates Cargo directory-source checksums and
+publishes one immutable `DependencySnapshot`; matching requests therefore fetch and unpack once per
+host. Verification jobs remain networkless and receive the sealed vendor directory read-only through
+Cargo's fixed offline source replacement. Installing these files does not enable either service or
+activate a manifest. The catalog `ralert` manifest remains inactive under `source_tree_v1`.
 
 Installing the binary, service, environment file or mount does not enable or start shadow work,
 change `auto_deploy`, or grant production mutation authority. Before activation, verify the mount and

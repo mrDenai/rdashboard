@@ -233,6 +233,7 @@ pub enum WorkflowCacheClassV1 {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowHostPreparationAdapterV1 {
+    CargoCratesIoV1,
     SourceTreeV1,
 }
 
@@ -261,6 +262,9 @@ impl WorkflowHostPreparationPolicyV1 {
 
     pub const fn required_network_class(&self) -> WorkflowNetworkClassV1 {
         match self.adapter_id {
+            WorkflowHostPreparationAdapterV1::CargoCratesIoV1 => {
+                WorkflowNetworkClassV1::DependencyEgress
+            }
             WorkflowHostPreparationAdapterV1::SourceTreeV1 => WorkflowNetworkClassV1::Offline,
         }
     }
@@ -1593,5 +1597,42 @@ mod tests {
         );
 
         assert!(matches!(lease, Err(WorkflowContractError::InvalidLease)));
+    }
+
+    #[test]
+    fn cargo_host_preparation_requires_dependency_egress_only_on_the_prepare_node() {
+        let mut manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../../config/project-manifests/ralert.json"))
+                .expect("decode project manifest");
+        let prepare_profile_id = manifest
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+            .expect("host prepare node")
+            .profile_id
+            .clone();
+        let policy = manifest
+            .host_preparation
+            .as_mut()
+            .expect("host preparation policy");
+        policy.adapter_id = WorkflowHostPreparationAdapterV1::CargoCratesIoV1;
+        assert_eq!(
+            policy.required_network_class(),
+            WorkflowNetworkClassV1::DependencyEgress
+        );
+        assert!(manifest.validate().is_err());
+        manifest
+            .workflow
+            .execution_profiles
+            .iter_mut()
+            .find(|profile| profile.profile_id == prepare_profile_id)
+            .expect("host prepare profile")
+            .network_class = WorkflowNetworkClassV1::DependencyEgress;
+        manifest.validate().expect("Cargo preparation manifest");
+        assert!(manifest.workflow.execution_profiles.iter().all(|profile| {
+            profile.profile_id == prepare_profile_id
+                || profile.network_class != WorkflowNetworkClassV1::DependencyEgress
+        }));
     }
 }

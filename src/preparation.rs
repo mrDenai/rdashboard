@@ -672,6 +672,14 @@ impl PreparationStore {
         )
     }
 
+    pub const fn maximum_generated_payload_bytes(&self) -> u64 {
+        self.policy.max_bytes
+    }
+
+    pub const fn maximum_generated_payload_inodes(&self) -> u64 {
+        self.policy.max_inodes.saturating_sub(4)
+    }
+
     fn open_with_policy(
         root: PathBuf,
         expected_owner_uid: u32,

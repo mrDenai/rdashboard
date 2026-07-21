@@ -1,14 +1,15 @@
 # GitHub-independent delivery implementation review
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
-- Status: slices 1a-4c complete locally; dependency preparation, COW state and separately authorized live gates remain pending
+- Status: slices 1a-4e complete locally; COW/compiled state and separately authorized live gates remain pending
 - Review date: 2026-07-21
 - Baseline HEAD: `d20cf342dac204c51d30a32009eeb9c58097c8aa`
 - Local implementation commits: `64e64f2` (`Add persistent resource observer`), `581a432`
   (`Add adapter execution receipts`), `25dff26` (`Add durable workflow scheduler`), `8b72141`
   (`Add authenticated workflow gateway`), `2973847` (`Add workflow dashboard projection`),
   `9598582` (`Add durable source delivery`), `1a076e8` (`Add durable GitHub source ingress`),
-  `bfb887b` (`Add sealed workflow preparation store`) and `a44b279` (`Add signed workflow launch boundary`)
+  `bfb887b` (`Add sealed workflow preparation store`), `a44b279` (`Add signed workflow launch boundary`),
+  `d306521` (`Add generic workflow worker`) and `3a3e426` (`Add sealed workflow input composition`)
 - Slice 1a staged diff SHA-256: `ca9712b8517e0a7c42c6672d81abed2e8c74165337306dca0ded2bc5c36e6432`
 
 ## Reviewed scope
@@ -974,3 +975,103 @@ manager adapter, provide filesystem-level COW layers, run a real repository shad
 unit, mutate the VPS, contact GitHub/providers, push or deploy. The next local Slice 4e is the reviewed-
 lockfile dependency-prefetch boundary, starting with the measured Cargo/native requirements needed by
 `rimg` without making i9 availability authoritative.
+
+## Slice 4e: fixed Cargo.lock dependency preparation
+
+### Reviewed scope
+
+Slice 4e completes the first strict external-dependency boundary without giving the generic worker or
+repository code network authority:
+
+- `cargo_crates_io_v1` parses a bounded version-4 Cargo.lock and accepts only local workspace packages
+  plus checksum-pinned packages from the two canonical crates.io index identities. Git inputs,
+  alternate registries, missing checksums, duplicate package identities, malformed names/versions and
+  more than 4096 registry packages fail before fetch.
+- The exact raw lock digest, canonical sorted package-plan digest, installed workflow policy, platform
+  and versioned vendor layout bind both the shared DependencySnapshot key and canonical manifest.
+- A separate non-root `rdashboard-dependency-fetcher` accepts only validated name/version/checksum
+  tuples from the exact worker UID over a bounded Unix protocol. It derives the sole static.crates.io
+  HTTPS path, disables redirects and proxies, filters DNS answers to public routes, enforces request and
+  archive limits, and verifies the Cargo.lock checksum before returning bytes. Its systemd unit cannot
+  read source, CAS, controller, launcher, credential or container-runtime state.
+- The networkless worker verifies every digest again, rejects unsafe or ambiguous gzip/tar input and
+  writes Cargo's exact directory-source checksum documents into one sealed, byte/inode-bounded vendor
+  snapshot. Matching keys single-flight and warm replay does not call the fetcher.
+- Source and dependency snapshots remain temporarily pinned until PreparedRun publication, preventing
+  pressure eviction between atomic commits. Lease loss and shutdown cancel fetch, inventory,
+  extraction and hashing; producer failure removes staging and cannot emit a success receipt.
+- The fixed networkless job validates the canonical dependency manifest, uses a private Cargo home,
+  fixed highest-precedence vendor replacement and offline mode, and sees shared inputs only through
+  read-only mounts. Per-job source, target and tool state remains inside the bounded transient job.
+- `source_tree_v1` remains compatible without a fetcher. Missing fetcher, unsupported preparation and
+  all preparation failures terminate with explicit failure evidence and complete cleanup.
+
+The final exact staged product/config/test diff contains 17 paths, 3653 insertions and 73 deletions.
+Only the task-owned systemd README hunks and task-owned `src/lib.rs` module exports are staged; the
+shared notification worktree and its workflow artifacts remain outside the reviewed diff.
+
+### Verification and self-review corrections
+
+- A first full gate exposed a real dispatch regression: a synchronously rejected host-preparation
+  adapter returned from the assignment task before `fail_without_runtime`, so the controller waited
+  without a failed receipt. The dispatch now routes that error into a deterministic failed receipt with
+  complete cleanup; its regression completes in 0.01 seconds instead of expiring.
+- The initial corrected product fingerprint
+  `ef9fee21059f9611e724f3818613e502899632c2eb28267e245402051170f789` passed bare `bin/ci` and received
+  an independent `SAFE`, but that review was explicitly invalidated after further self-review found two
+  archive-boundary defects. Literal backslashes could alias slash-separated Cargo checksum keys, and a
+  checksum-valid compressed archive could force excessive trailing tar decompression before the final
+  payload inventory failed.
+- The final materializer rejects literal backslashes before filesystem/checksum conversion and rejects
+  duplicate checksum-map insertion. A checked `BoundedReader` limits the gzip-expanded tar stream to
+  remaining payload plus per-inode tar/path overhead, declared bytes/inodes fail during inventory, each
+  entry is explicitly drained through a bounded buffer, and cancellation is checked throughout both
+  passes and hashing. Focused regressions cover path aliasing, a 2 MiB expanded tail against a 64 KiB/
+  16-inode envelope, and cancellation before manifest publication.
+- A `git checkout-index` export of the final exact staged state passed bare `bin/ci`: formatting,
+  Clippy with warnings denied, 223 active library tests with two credentialed live-provider tests
+  ignored, every binary/integration/socket/scheduler/worker suite, both schema checks, 8 browser
+  contracts and the optimized release build. The final release phase completed in 3 minutes 20 seconds.
+- `git diff --cached --check` passed. The final exact 17-path product/config/test binary diff SHA-256 is
+  `e1b9d99cc5fc1c6e1583b270c36cf530faae34b89fde67292d56f3ca51e8bb13`.
+- A separate networkless compatibility probe materialized 276 real checksum-pinned `.crate` archives
+  already present in the local Cargo cache through the final implementation. Five lock-plan archives
+  absent from that local cache, primarily foreign-target packages, were reported as absent rather than
+  fabricated. The 314 MiB temporary vendor trees and validator were removed after the check.
+- Early isolated exact-gate attempts demonstrated 17.5 GiB of duplicate per-copy Cargo target output.
+  Only those disposable targets were removed; the successful gates reused one shared local Cargo target.
+  This confirms the next compiled-state/cache slice is necessary and avoided hiding the resource issue.
+
+### Independent consultation and finding disposition
+
+The first complete review is retained only as audit evidence and is not the acceptance review:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 233 seconds;
+- state fingerprint: `ef9038d95742d0303bd731921e54e8a1ab3672a529a2b7153caf801106b1cd0b`;
+- brief SHA-256: `70b3ae869e9ba3894ba7c60407914c4d4571bda70ab8b315c07d72223d78447c`;
+- response SHA-256: `b0ca7daf23680ea78bdd052ad33b234e6fc1c8f734ca1622d5ce3c2b992b9152`;
+- response: `consult-slice4e-deepseek/response.md`;
+- disposition: its `SAFE` applied to the superseded `ef9fee...` product diff and was invalidated before
+  closeout by the two self-review corrections above.
+
+A fresh final review independently verified the new 17-path manifest and exact `e1b9d99c...` hash,
+inspected the full critical implementation and returned `SAFE` with no finding or open question:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 213 seconds;
+- state fingerprint: `ff8f326a198ba044f80f142c829a0e99cf2bfd9d3aa7e13afe576fa10473e22c`;
+- brief SHA-256: `66c3a4765bceb626b1a2d7d255a05e52830806edcbc81182627dde6ac9c664b0`;
+- response SHA-256: `e2c8b3c5726bab7f6353952dab8be15250826d379f22194c9bb053bee8e724bd`;
+- response: `consult-slice4e-deepseek-final/response.md`;
+- verdict: no P0-P3 finding and no open question. The reviewer explicitly rechecked integer bounds,
+  tar overhead, exact-limit EOF, cancellation into `spawn_blocking`, path/checksum alias prevention,
+  DNS/peer boundaries, staging cleanup, offline Cargo behavior and systemd confinement.
+
+### Verdict
+
+Slice 4e is production-worthy as an inactive local Cargo dependency-preparation boundary and may be
+committed. It does not activate a project manifest, install or start either unit, fetch a live crate,
+run repository code, mutate the VPS, contact GitHub/providers, push or deploy. Whole-lock vendor source
+deduplication across different lock plans, operation-owned COW/compiled state, dedicated-filesystem/
+quota/concurrency proof and the first separately authorized `rimg` shadow remain pending.

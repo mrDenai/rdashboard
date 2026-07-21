@@ -22,6 +22,11 @@ use uuid::Uuid;
 
 use crate::{
     build_source::SourceArchiveReaderV1,
+    cargo_prefetch::{
+        CARGO_LOCK_MAX_BYTES, CargoLockPlanV1, CargoPrefetchError, CargoRegistryPackageV1,
+        cargo_vendor_layout_digest, materialize_cargo_dependency_cancellable,
+    },
+    dependency_fetch::{DependencyFetchClientError, DependencyFetchClientV1},
     domain::{
         EvidenceDigest, WorkflowAdapterIdV1, WorkflowArtifactKindV1, WorkflowCleanupReceiptV1,
         WorkflowCleanupResultV1, WorkflowHostPreparationAdapterV1, WorkflowLeaseV1,
@@ -30,7 +35,7 @@ use crate::{
     preparation::{
         MAX_PREPARATION_STORE_BYTES, MAX_PREPARATION_STORE_INODES, PREPARED_RUN_COMPOSITION_FILE,
         PREPARED_RUN_SOURCE_DIRECTORY, PreparationKeyMaterialV1, PreparationStore,
-        PreparationStoreError, PreparedRunCompositionV1,
+        PreparationStoreError, PreparedEntryV1, PreparedRunCompositionV1,
     },
     scheduler::{WorkflowCleanupObligationV1, WorkflowWorkerRegistrationV1},
     unix_time_ms,
@@ -46,11 +51,15 @@ const MAX_SOURCE_PATH_BYTES: usize = 4_096;
 const DEPENDENCY_MARKER_FILE: &str = "source-tree.jcs";
 const DEPENDENCY_MARKER_PURPOSE: &str = "rdashboard.source-tree-dependency.v1";
 const PREPARED_SOURCE_INPUT_PURPOSE: &str = "rdashboard.prepared-source-input.v1";
+const PREPARED_CARGO_INPUT_PURPOSE: &str = "rdashboard.prepared-cargo-input.v1";
 const PREPARATION_EVIDENCE_PURPOSE: &str = "rdashboard.host-preparation-evidence.v1";
 const PREPARATION_CLEANUP_PURPOSE: &str = "rdashboard.host-preparation-cleanup.v1";
 const WORKER_FAILURE_PURPOSE: &str = "rdashboard.workflow-worker-failure.v1";
 const WORKER_PENDING_CLEANUP_PURPOSE: &str = "rdashboard.workflow-worker-pending-cleanup.v1";
 const MAX_WORKER_SLOTS: usize = 16;
+const CARGO_VENDOR_INODES_PER_PACKAGE: u64 = 512;
+type HostPreparationTask =
+    tokio::task::JoinHandle<Result<WorkflowHostPreparationResultV1, WorkflowWorkerError>>;
 
 #[derive(Clone)]
 pub struct WorkflowHostPreparerV1 {
@@ -75,44 +84,21 @@ impl WorkflowHostPreparerV1 {
         lease: &WorkflowLeaseV1,
         now_ms: i64,
     ) -> Result<WorkflowHostPreparationResultV1, WorkflowWorkerError> {
-        validate_host_preparation_lease(lease)?;
-        let policy = lease
-            .host_preparation
-            .as_ref()
-            .ok_or(WorkflowWorkerError::UnsupportedHostPreparation)?;
-        if policy.adapter_id != WorkflowHostPreparationAdapterV1::SourceTreeV1 {
-            return Err(WorkflowWorkerError::UnsupportedHostPreparation);
-        }
-        let resources = lease
-            .resources
-            .as_ref()
-            .ok_or(WorkflowWorkerError::InvalidLease)?;
-        let maximum_payload_bytes = resources.output_max_bytes.min(MAX_PREPARATION_STORE_BYTES);
-        let maximum_payload_inodes = resources
-            .scratch_max_inodes
-            .min(MAX_PREPARATION_STORE_INODES.saturating_sub(4));
-
-        let source = self
-            .store
-            .publish_source_snapshot(&self.source_reader, lease, now_ms)?;
-        let source_archive = source.payload_path().join("source.tar");
-        let inventory = SourceTarInventoryV1::inspect(
-            &source_archive,
-            maximum_payload_bytes,
-            maximum_payload_inodes,
+        let context = self.source_context(
+            lease,
+            now_ms,
+            WorkflowHostPreparationAdapterV1::SourceTreeV1,
         )?;
-
-        let policy_digest = policy.digest()?;
         let dependency_material = PreparationKeyMaterialV1::DependencySnapshot {
             toolchain_digest: EvidenceDigest::sha256("rdashboard.source-tree.no-toolchain.v1"),
             lockfile_digest: EvidenceDigest::sha256("rdashboard.source-tree.no-lockfile.v1"),
-            platform: policy.platform.clone(),
+            platform: context.platform.clone(),
             workflow_policy_digest: lease.workflow_policy_digest.clone(),
         };
         let marker = SourceTreeDependencyMarkerV1 {
             purpose: DEPENDENCY_MARKER_PURPOSE,
             schema_version: 1,
-            host_preparation_policy_digest: policy_digest.clone(),
+            host_preparation_policy_digest: context.policy_digest.clone(),
         };
         let marker_bytes = serde_jcs::to_vec(&marker)?;
         let marker_length = u64::try_from(marker_bytes.len())
@@ -129,10 +115,184 @@ impl WorkflowHostPreparerV1 {
             EvidenceDigest::sha256(serde_jcs::to_vec(&PreparedSourceInputV1 {
                 purpose: PREPARED_SOURCE_INPUT_PURPOSE,
                 schema_version: 1,
-                host_preparation_policy_digest: policy_digest,
+                host_preparation_policy_digest: context.policy_digest.clone(),
             })?);
+        self.finish_prepared_run(lease, now_ms, context, &dependency, generated_input_digest)
+    }
+
+    pub fn prepare_cargo_crates_io<F, E>(
+        &self,
+        lease: &WorkflowLeaseV1,
+        now_ms: i64,
+        fetch: F,
+    ) -> Result<WorkflowHostPreparationResultV1, WorkflowWorkerError>
+    where
+        F: FnMut(&CargoRegistryPackageV1) -> Result<Vec<u8>, E>,
+        E: std::fmt::Display,
+    {
+        self.prepare_cargo_crates_io_cancellable(lease, now_ms, fetch, || false)
+    }
+
+    pub fn prepare_cargo_crates_io_cancellable<F, E, C>(
+        &self,
+        lease: &WorkflowLeaseV1,
+        now_ms: i64,
+        mut fetch: F,
+        cancelled: C,
+    ) -> Result<WorkflowHostPreparationResultV1, WorkflowWorkerError>
+    where
+        F: FnMut(&CargoRegistryPackageV1) -> Result<Vec<u8>, E>,
+        E: std::fmt::Display,
+        C: FnMut() -> bool,
+    {
+        let context = self.source_context(
+            lease,
+            now_ms,
+            WorkflowHostPreparationAdapterV1::CargoCratesIoV1,
+        )?;
+        let lockfile = context.inventory.read_regular_file(
+            &context.source_archive,
+            Path::new("Cargo.lock"),
+            CARGO_LOCK_MAX_BYTES,
+        )?;
+        let plan = CargoLockPlanV1::parse(&lockfile)?;
+        let package_count = u64::try_from(plan.packages().len())
+            .map_err(|_| WorkflowWorkerError::SourcePayloadTooLarge)?;
+        let maximum_dependency_inodes = package_count
+            .checked_mul(CARGO_VENDOR_INODES_PER_PACKAGE)
+            .and_then(|inodes| inodes.checked_add(2))
+            .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?
+            .min(context.maximum_payload_inodes.saturating_mul(4) / 5);
+        if maximum_dependency_inodes < 3 {
+            return Err(WorkflowWorkerError::SourcePayloadTooLarge);
+        }
+        let dependency_material = PreparationKeyMaterialV1::DependencySnapshot {
+            toolchain_digest: cargo_vendor_layout_digest(),
+            lockfile_digest: plan.lockfile_digest().clone(),
+            platform: context.platform.clone(),
+            workflow_policy_digest: lease.workflow_policy_digest.clone(),
+        };
+        let dependency = self.store.get_or_prepare_bounded_directory(
+            &dependency_material,
+            context.maximum_payload_bytes,
+            maximum_dependency_inodes,
+            now_ms,
+            |payload| {
+                materialize_cargo_dependency_cancellable(
+                    payload,
+                    &plan,
+                    context.policy_digest.clone(),
+                    context.maximum_payload_bytes,
+                    maximum_dependency_inodes,
+                    |package| fetch(package),
+                    cancelled,
+                )
+            },
+        )?;
+        let generated_input_digest =
+            EvidenceDigest::sha256(serde_jcs::to_vec(&PreparedCargoInputV1 {
+                purpose: PREPARED_CARGO_INPUT_PURPOSE,
+                schema_version: 1,
+                host_preparation_policy_digest: context.policy_digest.clone(),
+                lockfile_digest: plan.lockfile_digest().clone(),
+                package_plan_digest: plan.package_plan_digest().clone(),
+            })?);
+        self.finish_prepared_run(lease, now_ms, context, &dependency, generated_input_digest)
+    }
+
+    fn source_context(
+        &self,
+        lease: &WorkflowLeaseV1,
+        now_ms: i64,
+        expected_adapter: WorkflowHostPreparationAdapterV1,
+    ) -> Result<SourcePreparationContextV1, WorkflowWorkerError> {
+        validate_host_preparation_lease(lease)?;
+        let policy = lease
+            .host_preparation
+            .as_ref()
+            .ok_or(WorkflowWorkerError::UnsupportedHostPreparation)?;
+        if policy.adapter_id != expected_adapter {
+            return Err(WorkflowWorkerError::UnsupportedHostPreparation);
+        }
+        let resources = lease
+            .resources
+            .as_ref()
+            .ok_or(WorkflowWorkerError::InvalidLease)?;
+        let maximum_payload_bytes = resources
+            .output_max_bytes
+            .min(MAX_PREPARATION_STORE_BYTES)
+            .min(self.store.maximum_generated_payload_bytes());
+        let maximum_payload_inodes = resources
+            .scratch_max_inodes
+            .min(MAX_PREPARATION_STORE_INODES.saturating_sub(4))
+            .min(self.store.maximum_generated_payload_inodes());
+        let source = self
+            .store
+            .publish_source_snapshot(&self.source_reader, lease, now_ms)?;
+        let source_pin_id = Uuid::new_v4();
+        let pin_expires_at_ms = now_ms
+            .checked_add(
+                i64::try_from(lease.timeout_ms).map_err(|_| WorkflowWorkerError::InvalidLease)?,
+            )
+            .ok_or(WorkflowWorkerError::InvalidLease)?;
+        let source = self.store.open_pinned(
+            crate::preparation::PreparationObjectKindV1::SourceSnapshot,
+            &source.manifest.key,
+            source_pin_id,
+            pin_expires_at_ms,
+            now_ms,
+        )?;
+        let source_pin = PreparationPinGuardV1 {
+            store: self.store.clone(),
+            pin_id: source_pin_id,
+            key: source.manifest.key.clone(),
+        };
+        let source_archive = source.payload_path().join("source.tar");
+        let inventory = SourceTarInventoryV1::inspect(
+            &source_archive,
+            maximum_payload_bytes,
+            maximum_payload_inodes,
+        )?;
+        Ok(SourcePreparationContextV1 {
+            source,
+            source_archive,
+            inventory,
+            maximum_payload_bytes,
+            maximum_payload_inodes,
+            policy_digest: policy.digest()?,
+            platform: policy.platform.clone(),
+            _source_pin: source_pin,
+        })
+    }
+
+    fn finish_prepared_run(
+        &self,
+        lease: &WorkflowLeaseV1,
+        now_ms: i64,
+        context: SourcePreparationContextV1,
+        dependency: &PreparedEntryV1,
+        generated_input_digest: EvidenceDigest,
+    ) -> Result<WorkflowHostPreparationResultV1, WorkflowWorkerError> {
+        let dependency_pin_id = Uuid::new_v4();
+        let pin_expires_at_ms = now_ms
+            .checked_add(
+                i64::try_from(lease.timeout_ms).map_err(|_| WorkflowWorkerError::InvalidLease)?,
+            )
+            .ok_or(WorkflowWorkerError::InvalidLease)?;
+        let dependency = self.store.open_pinned(
+            crate::preparation::PreparationObjectKindV1::DependencySnapshot,
+            &dependency.manifest.key,
+            dependency_pin_id,
+            pin_expires_at_ms,
+            now_ms,
+        )?;
+        let _dependency_pin = PreparationPinGuardV1 {
+            store: self.store.clone(),
+            pin_id: dependency_pin_id,
+            key: dependency.manifest.key.clone(),
+        };
         let prepared_material = PreparationKeyMaterialV1::PreparedRun {
-            source_snapshot_key: source.manifest.key.clone(),
+            source_snapshot_key: context.source.manifest.key.clone(),
             dependency_snapshot_key: dependency.manifest.key.clone(),
             workflow_policy_digest: lease.workflow_policy_digest.clone(),
             generated_input_digest,
@@ -141,16 +301,18 @@ impl WorkflowHostPreparerV1 {
             PreparedRunCompositionV1::new(&prepared_material)?.canonical_bytes()?;
         let composition_length = u64::try_from(composition_bytes.len())
             .map_err(|_| WorkflowWorkerError::SourcePayloadTooLarge)?;
-        let prepared_payload_bytes = inventory
+        let prepared_payload_bytes = context
+            .inventory
             .payload_bytes
             .checked_add(composition_length)
             .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?;
-        let prepared_payload_inodes = inventory
+        let prepared_payload_inodes = context
+            .inventory
             .payload_inodes
             .checked_add(2)
             .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?;
-        if prepared_payload_bytes > maximum_payload_bytes
-            || prepared_payload_inodes > maximum_payload_inodes
+        if prepared_payload_bytes > context.maximum_payload_bytes
+            || prepared_payload_inodes > context.maximum_payload_inodes
         {
             return Err(WorkflowWorkerError::SourcePayloadTooLarge);
         }
@@ -164,7 +326,9 @@ impl WorkflowHostPreparerV1 {
                 let mut builder = DirBuilder::new();
                 builder.mode(0o700);
                 builder.create(&source)?;
-                inventory.extract(&source_archive, &source)?;
+                context
+                    .inventory
+                    .extract(&context.source_archive, &source)?;
                 write_new_file(
                     &payload.join(PREPARED_RUN_COMPOSITION_FILE),
                     &composition_bytes,
@@ -173,11 +337,34 @@ impl WorkflowHostPreparerV1 {
             },
         )?;
         Ok(WorkflowHostPreparationResultV1 {
-            source_snapshot_key: source.manifest.key,
+            source_snapshot_key: context.source.manifest.key,
             dependency_snapshot_key: dependency.manifest.key,
             prepared_run_key: prepared.manifest.key,
             prepared_run_manifest_digest: prepared.manifest.document_digest,
         })
+    }
+}
+
+struct SourcePreparationContextV1 {
+    source: PreparedEntryV1,
+    source_archive: PathBuf,
+    inventory: SourceTarInventoryV1,
+    maximum_payload_bytes: u64,
+    maximum_payload_inodes: u64,
+    policy_digest: EvidenceDigest,
+    platform: String,
+    _source_pin: PreparationPinGuardV1,
+}
+
+struct PreparationPinGuardV1 {
+    store: PreparationStore,
+    pin_id: Uuid,
+    key: EvidenceDigest,
+}
+
+impl Drop for PreparationPinGuardV1 {
+    fn drop(&mut self) {
+        let _ = self.store.unpin_if_present(self.pin_id, &self.key);
     }
 }
 
@@ -216,6 +403,15 @@ struct PreparedSourceInputV1 {
     purpose: &'static str,
     schema_version: u16,
     host_preparation_policy_digest: EvidenceDigest,
+}
+
+#[derive(Serialize)]
+struct PreparedCargoInputV1 {
+    purpose: &'static str,
+    schema_version: u16,
+    host_preparation_policy_digest: EvidenceDigest,
+    lockfile_digest: EvidenceDigest,
+    package_plan_digest: EvidenceDigest,
 }
 
 #[derive(Serialize)]
@@ -373,6 +569,22 @@ impl WorkflowWorkerLauncherClientV1 for WorkflowLauncherClientV1 {
     }
 }
 
+pub trait WorkflowDependencyFetcherV1: Send + Sync {
+    fn fetch<'a>(
+        &'a self,
+        package: &'a CargoRegistryPackageV1,
+    ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>>;
+}
+
+impl WorkflowDependencyFetcherV1 for DependencyFetchClientV1 {
+    fn fetch<'a>(
+        &'a self,
+        package: &'a CargoRegistryPackageV1,
+    ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>> {
+        Box::pin(self.fetch_crate(package))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkflowWorkerRuntimeConfigV1 {
     pub slots: usize,
@@ -415,6 +627,7 @@ pub struct WorkflowWorkerRuntimeV1 {
     gateway: Arc<dyn WorkflowWorkerGatewayClientV1>,
     launcher: Arc<dyn WorkflowWorkerLauncherClientV1>,
     preparer: Arc<WorkflowHostPreparerV1>,
+    dependency_fetcher: Option<Arc<dyn WorkflowDependencyFetcherV1>>,
     config: WorkflowWorkerRuntimeConfigV1,
 }
 
@@ -435,8 +648,18 @@ impl WorkflowWorkerRuntimeV1 {
             gateway,
             launcher,
             preparer,
+            dependency_fetcher: None,
             config,
         })
+    }
+
+    #[must_use]
+    pub fn with_dependency_fetcher(
+        mut self,
+        fetcher: Arc<dyn WorkflowDependencyFetcherV1>,
+    ) -> Self {
+        self.dependency_fetcher = Some(fetcher);
+        self
     }
 
     pub async fn run_until<F>(self, shutdown: F) -> Result<(), WorkflowWorkerError>
@@ -578,26 +801,92 @@ impl WorkflowWorkerRuntimeV1 {
         Ok(())
     }
 
+    fn spawn_host_preparation(
+        &self,
+        lease: WorkflowLeaseV1,
+        prepared_at_ms: i64,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Option<HostPreparationTask>, WorkflowWorkerError> {
+        let adapter = lease
+            .host_preparation
+            .as_ref()
+            .ok_or(WorkflowWorkerError::UnsupportedHostPreparation)?
+            .adapter_id;
+        let preparer = Arc::clone(&self.preparer);
+        Ok(match adapter {
+            WorkflowHostPreparationAdapterV1::SourceTreeV1 => {
+                Some(tokio::task::spawn_blocking(move || {
+                    preparer.prepare_source_tree(&lease, prepared_at_ms)
+                }))
+            }
+            WorkflowHostPreparationAdapterV1::CargoCratesIoV1 => {
+                let fetcher = self.dependency_fetcher.as_ref().map(Arc::clone);
+                fetcher.map(|fetcher| {
+                    let runtime = tokio::runtime::Handle::current();
+                    let mut fetch_cancel = cancel.clone();
+                    tokio::task::spawn_blocking(move || {
+                        preparer.prepare_cargo_crates_io_cancellable(
+                            &lease,
+                            prepared_at_ms,
+                            |package| {
+                                runtime.block_on(async {
+                                    tokio::select! {
+                                        result = fetcher.fetch(package) => {
+                                            result.map_err(WorkflowDependencyFetchError::Client)
+                                        }
+                                        changed = fetch_cancel.changed() => {
+                                            let _ = changed;
+                                            Err(WorkflowDependencyFetchError::Cancelled)
+                                        }
+                                    }
+                                })
+                            },
+                            || *cancel.borrow(),
+                        )
+                    })
+                })
+            }
+        })
+    }
+
     async fn execute_host_preparation(
         &self,
         lease: WorkflowLeaseV1,
-        _shutdown: watch::Receiver<bool>,
+        mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), WorkflowWorkerError> {
         let mut current = lease;
-        let preparation_lease = current.clone();
-        let source_preparer = Arc::clone(&self.preparer);
         let prepared_at_ms = current_time_ms()?;
-        let mut task = tokio::task::spawn_blocking(move || {
-            source_preparer.prepare_source_tree(&preparation_lease, prepared_at_ms)
-        });
+        let (cancel_sender, cancel_receiver) = watch::channel(false);
+        let mut task =
+            match self.spawn_host_preparation(current.clone(), prepared_at_ms, cancel_receiver) {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    return self
+                        .fail_without_runtime(current, "dependency_fetcher_unavailable")
+                        .await;
+                }
+                Err(preparation_error) => {
+                    return self
+                        .fail_without_runtime(current, preparation_error.reason_code())
+                        .await;
+                }
+            };
         let preparation = loop {
             tokio::select! {
                 joined = &mut task => break joined?,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        let _ = cancel_sender.send(true);
+                        let _ = task.await;
+                        return Err(WorkflowWorkerError::WorkerStopping);
+                    }
+                }
                 () = tokio::time::sleep(self.config.operation_poll_interval) => {
                     if self.lease_needs_renewal(&current)? {
                         match self.renew_lease(current).await {
                             Ok(renewed) => current = renewed.lease,
                             Err(renewal_error) => {
+                                let _ = cancel_sender.send(true);
                                 let _ = task.await;
                                 return Err(renewal_error);
                             }
@@ -616,7 +905,7 @@ impl WorkflowWorkerRuntimeV1 {
                     lease_id = %current.lease_id,
                     reason_code,
                     error = %preparation_error,
-                    "exact source preparation failed"
+                    "exact host preparation failed"
                 );
                 return self.fail_without_runtime(current, reason_code).await;
             }
@@ -642,7 +931,7 @@ impl WorkflowWorkerRuntimeV1 {
             source_sha = %current.source_sha,
             lease_id = %current.lease_id,
             prepared_run_key = %preparation_result.prepared_run_key,
-            "exact source tree prepared in shared CAS"
+            "exact source and dependency input prepared in shared CAS"
         );
         Ok(())
     }
@@ -1084,6 +1373,14 @@ impl WorkflowWorkerRuntimeV1 {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum WorkflowDependencyFetchError {
+    #[error("dependency fetch client failed: {0}")]
+    Client(DependencyFetchClientError),
+    #[error("dependency fetch was cancelled after lease loss or worker shutdown")]
+    Cancelled,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct WorkflowAssignmentIdentityV1 {
     lease_id: Uuid,
@@ -1306,6 +1603,70 @@ impl SourceTarInventoryV1 {
         })
     }
 
+    fn read_regular_file(
+        &self,
+        archive_path: &Path,
+        relative_path: &Path,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, WorkflowWorkerError> {
+        let expected = self
+            .files
+            .get(relative_path)
+            .ok_or(WorkflowWorkerError::RequiredSourceFileMissing)?;
+        if expected.bytes == 0
+            || usize::try_from(expected.bytes)
+                .ok()
+                .is_none_or(|bytes| bytes > maximum_bytes)
+        {
+            return Err(WorkflowWorkerError::RequiredSourceFileInvalid);
+        }
+        let mut archive = Archive::new(File::open(archive_path)?);
+        let mut seen = BTreeSet::new();
+        let mut selected = None;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let entry_type = entry.header().entry_type();
+            let relative = decode_tar_path(
+                entry.path_bytes().as_ref(),
+                entry_type == EntryType::Directory,
+            )?;
+            if entry_type == EntryType::Directory {
+                if !self.directories.contains(&relative) || entry.header().size()? != 0 {
+                    return Err(WorkflowWorkerError::SourceArchiveChanged);
+                }
+                continue;
+            }
+            let expected_entry = self
+                .files
+                .get(&relative)
+                .ok_or(WorkflowWorkerError::SourceArchiveChanged)?;
+            if !entry_type.is_file()
+                || entry.header().size()? != expected_entry.bytes
+                || (entry.header().mode()? & 0o111 != 0) != expected_entry.executable
+                || !seen.insert(relative.clone())
+            {
+                return Err(WorkflowWorkerError::SourceArchiveChanged);
+            }
+            if relative == relative_path {
+                let capacity = usize::try_from(expected_entry.bytes)
+                    .map_err(|_| WorkflowWorkerError::RequiredSourceFileInvalid)?;
+                let mut bytes = Vec::with_capacity(capacity);
+                entry
+                    .by_ref()
+                    .take(expected_entry.bytes.saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() != capacity {
+                    return Err(WorkflowWorkerError::SourceArchiveChanged);
+                }
+                selected = Some(bytes);
+            }
+        }
+        if seen.len() != self.files.len() {
+            return Err(WorkflowWorkerError::SourceArchiveChanged);
+        }
+        selected.ok_or(WorkflowWorkerError::RequiredSourceFileMissing)
+    }
+
     fn extract(&self, archive_path: &Path, destination: &Path) -> Result<(), WorkflowWorkerError> {
         for relative in &self.directories {
             let path = destination.join(relative);
@@ -1440,6 +1801,12 @@ pub enum WorkflowWorkerError {
     SourcePayloadTooLarge,
     #[error("source archive changed between validation and extraction")]
     SourceArchiveChanged,
+    #[error("required source file is missing")]
+    RequiredSourceFileMissing,
+    #[error("required source file is invalid")]
+    RequiredSourceFileInvalid,
+    #[error("Cargo dependency preparation failed: {0}")]
+    CargoPrefetch(#[from] CargoPrefetchError),
     #[error("workflow launch status does not match the active lease")]
     InvalidLaunchStatus,
     #[error("workflow launch status disappeared before terminal evidence")]
@@ -1482,6 +1849,9 @@ impl WorkflowWorkerError {
             Self::UnsupportedSourceEntry => "unsupported_source_entry",
             Self::SourcePayloadTooLarge => "source_payload_too_large",
             Self::SourceArchiveChanged => "source_archive_changed",
+            Self::RequiredSourceFileMissing => "required_source_file_missing",
+            Self::RequiredSourceFileInvalid => "required_source_file_invalid",
+            Self::CargoPrefetch(_) => "cargo_dependency_preparation_failed",
             Self::InvalidLaunchStatus => "invalid_launch_status",
             Self::LaunchStatusLost => "launch_status_lost",
             Self::CleanupStatusLost => "cleanup_status_lost",
@@ -1513,6 +1883,7 @@ mod tests {
         },
     };
 
+    use flate2::{Compression, write::GzEncoder};
     use tempfile::{TempDir, tempdir};
     use tokio::sync::Notify;
 
@@ -1532,9 +1903,51 @@ mod tests {
         directory: TempDir,
         preparer: WorkflowHostPreparerV1,
         lease: WorkflowLeaseV1,
+        cargo_archive: Option<Vec<u8>>,
     }
 
     fn preparation_fixture(leased_at_ms: i64, expires_at_ms: i64) -> PreparationFixture {
+        preparation_fixture_for_adapter(
+            leased_at_ms,
+            expires_at_ms,
+            WorkflowHostPreparationAdapterV1::SourceTreeV1,
+        )
+    }
+
+    fn manifest_for_adapter(adapter: WorkflowHostPreparationAdapterV1) -> ProjectManifestV2 {
+        let mut manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
+                .expect("decode project manifest");
+        let preparation_profile_id = manifest
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+            .expect("host preparation node")
+            .profile_id
+            .clone();
+        let policy = manifest
+            .host_preparation
+            .as_mut()
+            .expect("host preparation policy");
+        policy.adapter_id = adapter;
+        let network_class = policy.required_network_class();
+        manifest
+            .workflow
+            .execution_profiles
+            .iter_mut()
+            .find(|profile| profile.profile_id == preparation_profile_id)
+            .expect("host preparation profile")
+            .network_class = network_class;
+        manifest.validate().expect("adapted project manifest");
+        manifest
+    }
+
+    fn preparation_fixture_for_adapter(
+        leased_at_ms: i64,
+        expires_at_ms: i64,
+        adapter: WorkflowHostPreparationAdapterV1,
+    ) -> PreparationFixture {
         let directory = tempdir().expect("temp directory");
         let store_root = directory.path().join("preparation");
         fs::create_dir(&store_root).expect("create preparation root");
@@ -1542,7 +1955,7 @@ mod tests {
             .expect("protect preparation root");
         let store_metadata = fs::metadata(&store_root).expect("preparation root metadata");
         let store =
-            open_test_preparation_store(&store_root, store_metadata.uid(), 64 * 1024 * 1024)
+            open_test_preparation_store(&store_root, store_metadata.uid(), 2 * 1024 * 1024 * 1024)
                 .expect("open test preparation store");
 
         let source_root = directory.path().join("source-exports");
@@ -1556,12 +1969,12 @@ mod tests {
             source_metadata.gid(),
         )
         .expect("open source publisher");
-        let manifest: ProjectManifestV2 =
-            serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
-                .expect("decode project manifest");
+        let manifest = manifest_for_adapter(adapter);
         let workflow_policy_digest = manifest.workflow_policy_digest().expect("workflow digest");
         let source_sha = GitCommitId::from_str(&"a".repeat(40)).expect("source SHA");
         let source_attestation_digest = EvidenceDigest::sha256("source attestation");
+        let cargo_archive = (adapter == WorkflowHostPreparationAdapterV1::CargoCratesIoV1)
+            .then(test_cargo_crate_archive);
         publisher
             .publish(
                 SourceArchiveInputV1 {
@@ -1576,7 +1989,7 @@ mod tests {
                     repository_identity: EvidenceDigest::sha256("repository identity"),
                     exported_at_ms: 100,
                 },
-                write_source_tar,
+                |output| write_source_tar(output, cargo_archive.as_deref()),
             )
             .expect("publish exact source archive");
         let source_reader =
@@ -1622,14 +2035,25 @@ mod tests {
             directory,
             preparer: WorkflowHostPreparerV1::new(store, source_reader),
             lease,
+            cargo_archive,
         }
     }
 
-    fn write_source_tar(output: &mut File) -> Result<(), io::Error> {
+    fn write_source_tar(output: &mut File, cargo_archive: Option<&[u8]>) -> Result<(), io::Error> {
         let mut archive = tar::Builder::new(output);
         append_tar_directory(&mut archive, "bin/", 0o755)?;
         append_tar_file(&mut archive, "bin/ci", b"#!/bin/sh\nexit 0\n", 0o755)?;
-        append_tar_file(&mut archive, "Cargo.lock", b"version = 4\n", 0o644)?;
+        let cargo_lock = cargo_archive.map_or_else(
+            || b"version = 4\n".to_vec(),
+            |bytes| {
+                format!(
+                    "version = 4\n[[package]]\nname = \"demo-crate\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n",
+                    EvidenceDigest::sha256(bytes)
+                )
+                .into_bytes()
+            },
+        );
+        append_tar_file(&mut archive, "Cargo.lock", &cargo_lock, 0o644)?;
         append_tar_file(
             &mut archive,
             PREPARED_RUN_COMPOSITION_FILE,
@@ -1637,6 +2061,31 @@ mod tests {
             0o644,
         )?;
         archive.finish()
+    }
+
+    fn test_cargo_crate_archive() -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        append_tar_directory(&mut archive, "demo-crate-1.2.3/", 0o755).expect("append crate root");
+        append_tar_file(
+            &mut archive,
+            "demo-crate-1.2.3/Cargo.toml",
+            b"[package]\nname = \"demo-crate\"\nversion = \"1.2.3\"\n",
+            0o644,
+        )
+        .expect("append crate manifest");
+        append_tar_file(
+            &mut archive,
+            "demo-crate-1.2.3/src/lib.rs",
+            b"pub fn exact() {}\n",
+            0o644,
+        )
+        .expect("append crate source");
+        archive
+            .into_inner()
+            .expect("finish crate tar")
+            .finish()
+            .expect("finish crate gzip")
     }
 
     fn append_tar_directory<W: Write>(
@@ -1809,6 +2258,34 @@ mod tests {
             _receipt: WorkflowCleanupReceiptV1,
         ) -> BoxFuture<'_, Result<(), WorkflowWorkerClientError>> {
             Box::pin(async { panic!("direct terminal test does not complete cleanup") })
+        }
+    }
+
+    struct BlockingDependencyFetcher {
+        started: Arc<Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct FetchDropSignal(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for FetchDropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl WorkflowDependencyFetcherV1 for BlockingDependencyFetcher {
+        fn fetch<'a>(
+            &'a self,
+            _package: &'a CargoRegistryPackageV1,
+        ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>> {
+            let started = Arc::clone(&self.started);
+            let dropped = Arc::clone(&self.dropped);
+            Box::pin(async move {
+                let _drop_signal = FetchDropSignal(dropped);
+                started.notify_one();
+                std::future::pending::<Result<Vec<u8>, DependencyFetchClientError>>().await
+            })
         }
     }
 
@@ -2146,6 +2623,70 @@ mod tests {
     }
 
     #[test]
+    fn cargo_preparation_fetches_once_and_publishes_one_sealed_vendor_snapshot() {
+        let fixture = preparation_fixture_for_adapter(
+            100,
+            15_100,
+            WorkflowHostPreparationAdapterV1::CargoCratesIoV1,
+        );
+        let archive = fixture
+            .cargo_archive
+            .clone()
+            .expect("Cargo fixture archive");
+        let fetches = AtomicUsize::new(0);
+        let first = fixture
+            .preparer
+            .prepare_cargo_crates_io(&fixture.lease, 200, |package| {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(package.name, "demo-crate");
+                assert_eq!(package.version, "1.2.3");
+                Ok::<_, io::Error>(archive.clone())
+            })
+            .expect("prepare Cargo dependencies");
+        let replayed = fixture
+            .preparer
+            .prepare_cargo_crates_io(&fixture.lease, 201, |_| {
+                Err::<Vec<u8>, _>(io::Error::other(
+                    "sealed dependency snapshot must bypass the network fetcher",
+                ))
+            })
+            .expect("replay Cargo dependencies");
+        assert_eq!(first, replayed);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        let dependency = fixture
+            .preparer
+            .store()
+            .open_pinned(
+                PreparationObjectKindV1::DependencySnapshot,
+                &first.dependency_snapshot_key,
+                Uuid::new_v4(),
+                1_000,
+                300,
+            )
+            .expect("open dependency snapshot");
+        let payload = dependency.payload_path();
+        assert!(
+            payload
+                .join(crate::cargo_prefetch::CARGO_DEPENDENCY_MANIFEST_FILE)
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(payload.join("vendor/demo-crate-1.2.3/src/lib.rs"))
+                .expect("vendored crate source"),
+            b"pub fn exact() {}\n"
+        );
+        assert_eq!(
+            fs::metadata(payload.join("vendor/demo-crate-1.2.3/src/lib.rs"))
+                .expect("vendored crate metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o444
+        );
+    }
+
+    #[test]
     fn matching_host_preparations_join_one_sealed_publication() {
         let fixture = preparation_fixture(100, 15_100);
         let barrier = Arc::new(std::sync::Barrier::new(3));
@@ -2222,6 +2763,60 @@ mod tests {
                 .lock()
                 .expect("cleanup receipt lock")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_shutdown_cancels_network_prefetch_and_removes_partial_staging() {
+        let now_ms = current_time_ms().expect("test clock");
+        let fixture = preparation_fixture_for_adapter(
+            now_ms,
+            now_ms + 15_000,
+            WorkflowHostPreparationAdapterV1::CargoCratesIoV1,
+        );
+        let gateway = Arc::new(FakeGateway::with_assignment(
+            WorkflowWorkerAssignmentV1::Lease {
+                lease: Box::new(fixture.lease.clone()),
+                execution_grant: "unused-host-preparation-grant".to_owned(),
+            },
+        ));
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fetcher = Arc::new(BlockingDependencyFetcher {
+            started: Arc::clone(&started),
+            dropped: Arc::clone(&dropped),
+        });
+        let runtime = WorkflowWorkerRuntimeV1::new(
+            registration(&fixture.lease),
+            gateway.clone(),
+            Arc::new(PanicLauncher),
+            Arc::new(fixture.preparer),
+            test_runtime_config(),
+        )
+        .expect("build generic worker runtime")
+        .with_dependency_fetcher(fetcher);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.run_until(started.notified()),
+        )
+        .await
+        .expect("worker shutdown deadline")
+        .expect("worker shutdown");
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            gateway
+                .node_receipts
+                .lock()
+                .expect("node receipt lock")
+                .is_empty()
+        );
+        let staging = fixture.directory.path().join("preparation/staging");
+        assert!(
+            fs::read_dir(staging)
+                .expect("read staging")
+                .next()
+                .is_none()
         );
     }
 
@@ -2659,7 +3254,7 @@ mod tests {
 
         let regular_path = directory.path().join("regular.tar");
         let mut output = File::create(&regular_path).expect("create regular tar");
-        write_source_tar(&mut output).expect("write regular tar");
+        write_source_tar(&mut output, None).expect("write regular tar");
         assert!(matches!(
             SourceTarInventoryV1::inspect(&regular_path, 1, 10),
             Err(WorkflowWorkerError::SourcePayloadTooLarge)

@@ -1,13 +1,14 @@
 [Unit]
 Description=rdashboard repository-agnostic workflow worker
-After=local-fs.target rdashboard-workflow-gateway.service rdashboard-workflow-launcher.service
+After=local-fs.target rdashboard-dependency-fetcher.service rdashboard-workflow-gateway.service rdashboard-workflow-launcher.service
 Requires=rdashboard-workflow-gateway.service rdashboard-workflow-launcher.service
+Wants=rdashboard-dependency-fetcher.service
 
 [Service]
 Type=simple
 User=rdashboard-worker
 Group=rdashboard-worker
-SupplementaryGroups=rdashboard-build-readers
+SupplementaryGroups=rdashboard-build-readers rdashboard-dependency-fetch
 ExecStart=/usr/libexec/rdashboard/rdashboard-worker
 EnvironmentFile=/etc/rdashboard/workflow-worker.env
 UMask=0077

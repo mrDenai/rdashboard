@@ -103,7 +103,7 @@ Implementation progress:
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker remains step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
-| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4c locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, and the unprivileged shared worker with offline source-tree preparation. Networked dependency preparation, operation-owned COW state, and the live systemd/dedicated-filesystem/quota/concurrency proof remain; no activation is implied. |
+| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4e locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition and fixed Cargo.lock/crates.io dependency preparation. Operation-owned COW/compiled state and the live systemd/dedicated-filesystem/quota/concurrency proof remain; no activation is implied. |
 | 5-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -359,8 +359,48 @@ Implementation ledger:
 - A fresh complete `deepseek-free` review returned `SAFE` with no open question or P0-P2 finding. Its
   sole P3 note confirms that direct/deserialized pin records fail closed unless constructor-established
   protected-key invariants hold; no change was required. No service or job was started, no dependency
-  was fetched, and no provider, VPS, push or deployment state was mutated. Networked lockfile prefetch
-  remains the next local Slice 4e boundary before any `rimg` shadow run.
+  was fetched, and no provider, VPS, push or deployment state was mutated.
+- Slice 4e adds the fixed `cargo_crates_io_v1` host-preparation adapter. It parses at most 8 MiB of
+  version-4 `Cargo.lock`, accepts only local workspace packages plus checksum-pinned packages from the
+  two canonical crates.io index identities, and rejects git dependencies, alternate registries,
+  missing checksums, duplicate name/version identities and repository-selected network inputs before
+  fetching. The exact raw lock digest, canonical sorted package-plan digest, installed workflow policy,
+  platform and versioned vendor-layout digest bind the shared `DependencySnapshot` key and manifest.
+- The separate non-root `rdashboard-dependency-fetcher` process receives only validated
+  `(name, version, SHA-256)` identities over a peer-UID-authenticated Unix socket. It constructs one
+  fixed static.crates.io HTTPS path, disables redirects and proxy environment use, filters DNS answers
+  to public addresses, bounds each archive at 64 MiB and cannot read source exports, CAS/controller/
+  launcher state, credentials or container sockets. The worker checks the archive digest again, rejects
+  links, special files, traversal, root substitution, duplicates and byte/inode overflow, then creates
+  Cargo's exact directory-source checksum documents directly in bounded CAS staging with no per-slot
+  clone or package cache.
+- Source and dependency snapshots are temporarily pinned across dependency and PreparedRun admission,
+  preventing pressure eviction between atomic publications. Matching keys join one producer and warm
+  preparation performs no network call. Lease loss or worker shutdown cancels an in-flight fetch,
+  removes partial staging and emits no success receipt. The fixed transient job remains networkless,
+  mounts the dependency snapshot read-only, validates its canonical Cargo manifest and selects the
+  sealed vendor directory through both fixed Cargo config and highest-precedence environment values.
+- Focused tests prove real `cargo metadata --offline --locked` consumption, current-repository lockfile
+  compatibility, malformed-source/checksum/archive/budget rejection, one-fetch replay, pressure-safe
+  preparation pins, cancellation cleanup, peer authentication, fixed URL construction, public-route
+  filtering and systemd privilege separation. A pre-gate self-review exposed and corrected a worker
+  regression where a synchronously rejected preparation adapter could bypass the required failed
+  receipt; the exact regression now completes with cleanup instead of expiring. An initial independent
+  review returned `SAFE`, but a subsequent self-review invalidated that frozen diff: literal backslashes
+  could alias slash-separated Cargo checksum keys, and the final payload budget did not bound the gzip-
+  expanded tar stream early enough. The corrected materializer rejects the alias, bounds declared files,
+  tar overhead and trailing decompressed input before publication, and checks cancellation throughout
+  inventory, extraction and hashing. The final exact staged export passed bare `bin/ci`: formatting,
+  strict Clippy, 223 active library tests with two credentialed live-provider tests ignored, every
+  binary/integration/socket/scheduler/worker suite, both schema checks, 8 browser contracts and the
+  optimized release build. The release phase completed in 3 minutes 20 seconds. The exact 17-path
+  product/config/test diff SHA-256 is
+  `e1b9d99cc5fc1c6e1583b270c36cf530faae34b89fde67292d56f3ca51e8bb13`. A fresh complete
+  `deepseek-free` review independently matched that manifest and fingerprint and returned `SAFE` with
+  no P0-P3 finding or open question after explicitly checking decompression/path bounds, cancellation,
+  SSRF/peer authentication, CAS cleanup, offline Cargo behavior and systemd confinement. Slice 4e is
+  therefore complete locally. No service was installed or started, no crate/provider was contacted by
+  the implementation path, and no VPS, push or deployment state was mutated.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

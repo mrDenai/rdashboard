@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, ffi::OsString, future::Future, io, sync::Arc, t
 
 use rdashboard::{
     build_source::{BUILD_SOURCE_EXPORT_ROOT, SourceArchiveReaderV1},
+    dependency_fetch::DependencyFetchClientV1,
     domain::WorkflowWorkerPoolV1,
     preparation::{PREPARATION_STORE_ROOT, PreparationStore},
     scheduler::WorkflowWorkerRegistrationV1,
@@ -20,8 +21,10 @@ const WORKER_HOST_ID_ENV: &str = "RDASHBOARD_WORKER_HOST_ID";
 const WORKER_SLOTS_ENV: &str = "RDASHBOARD_WORKER_SLOTS";
 const SOURCE_UID_ENV: &str = "RDASHBOARD_SOURCE_UID";
 const BUILD_READER_GID_ENV: &str = "RDASHBOARD_BUILD_READER_GID";
+const DEPENDENCY_FETCHER_UID_ENV: &str = "RDASHBOARD_DEPENDENCY_FETCHER_UID";
 const GATEWAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCHER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DEPENDENCY_FETCH_TIMEOUT: Duration = Duration::from_mins(1);
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
@@ -35,6 +38,10 @@ async fn main() -> Result<(), DynError> {
     let source_uid = configured_id(SOURCE_UID_ENV, std::env::var_os(SOURCE_UID_ENV))?;
     let build_reader_gid =
         configured_id(BUILD_READER_GID_ENV, std::env::var_os(BUILD_READER_GID_ENV))?;
+    let dependency_fetcher_uid = configured_optional_id(
+        DEPENDENCY_FETCHER_UID_ENV,
+        std::env::var_os(DEPENDENCY_FETCHER_UID_ENV),
+    )?;
     let registration = configured_registration(
         std::env::var_os(WORKER_ID_ENV),
         std::env::var_os(WORKER_HOST_ID_ENV),
@@ -54,18 +61,25 @@ async fn main() -> Result<(), DynError> {
         preparation_store,
         source_reader,
     ));
-    let runtime = WorkflowWorkerRuntimeV1::new(
+    let mut runtime = WorkflowWorkerRuntimeV1::new(
         registration.clone(),
         gateway,
         launcher,
         preparer,
         WorkflowWorkerRuntimeConfigV1::production(slots)?,
     )?;
+    if let Some(fetcher_uid) = dependency_fetcher_uid {
+        runtime = runtime.with_dependency_fetcher(Arc::new(DependencyFetchClientV1::installed(
+            fetcher_uid,
+            DEPENDENCY_FETCH_TIMEOUT,
+        )?));
+    }
     info!(
         worker_id = %registration.worker_id,
         host_id = %registration.host_id,
         worker_uid,
         slots,
+        dependency_fetcher_configured = dependency_fetcher_uid.is_some(),
         preparation_root = PREPARATION_STORE_ROOT,
         "generic workflow worker started"
     );
@@ -109,6 +123,15 @@ fn configured_id(name: &'static str, value: Option<OsString>) -> Result<u32, Wor
         return Err(WorkerServiceError::InvalidEnvironment(name));
     }
     Ok(parsed)
+}
+
+fn configured_optional_id(
+    name: &'static str,
+    value: Option<OsString>,
+) -> Result<Option<u32>, WorkerServiceError> {
+    value
+        .map(|value| configured_id(name, Some(value)))
+        .transpose()
 }
 
 fn configured_slots(value: Option<OsString>) -> Result<usize, WorkerServiceError> {
@@ -162,6 +185,14 @@ mod tests {
             assert!(configured_id(WORKER_UID_ENV, invalid).is_err());
         }
         assert!(configured_id(WORKER_UID_ENV, Some(OsString::from(u32::MAX.to_string()))).is_err());
+        assert_eq!(
+            configured_optional_id(DEPENDENCY_FETCHER_UID_ENV, None),
+            Ok(None)
+        );
+        assert_eq!(
+            configured_optional_id(DEPENDENCY_FETCHER_UID_ENV, Some(OsString::from("991"))),
+            Ok(Some(991))
+        );
     }
 
     #[test]
