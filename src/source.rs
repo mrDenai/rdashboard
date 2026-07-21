@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
+use zeroize::Zeroize as _;
 
 use crate::{
     controller::{
@@ -33,13 +34,19 @@ pub use git_repository::{GitSourceProjectConfig, GitSourceRepository, GitSshTran
 
 pub const ACCEPTED_HEAD_SCHEMA_VERSION: u16 = 1;
 pub const SOURCE_OUTBOX_SCHEMA_VERSION: u16 = 1;
-const SOURCE_SCHEMA_VERSION: i64 = 3;
-const PREVIOUS_SOURCE_SCHEMA_VERSION: i64 = 2;
-const LEGACY_SOURCE_SCHEMA_VERSION: i64 = 1;
+pub const SOURCE_WEBHOOK_WAKEUP_SCHEMA_VERSION: u16 = 1;
+const SOURCE_SCHEMA_VERSION: i64 = 4;
+const PREVIOUS_SOURCE_SCHEMA_VERSION: i64 = 3;
+const LEGACY_SOURCE_SCHEMA_VERSION: i64 = 2;
+const OLDEST_SOURCE_SCHEMA_VERSION: i64 = 1;
 const MAX_DELIVERY_ID_BYTES: usize = 128;
 const MAX_WEBHOOK_BODY_BYTES: usize = 1_048_576;
 const MAX_OUTBOX_BATCH: usize = 64;
 const SETTLED_OUTBOX_RETENTION: i64 = 2_048;
+const MAX_PENDING_WEBHOOKS: i64 = 2_048;
+const MAX_PENDING_WEBHOOKS_PER_PROJECT: i64 = 128;
+pub const SOURCE_GITHUB_WEBHOOK_BATCH_MAX: usize = 128;
+const SETTLED_WEBHOOK_RETENTION: i64 = 2_048;
 const ACCEPTED_HEAD_DOMAIN: &[u8] = b"rdashboard.accepted-head.v1\0";
 const SOURCE_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS source_meta (
@@ -47,7 +54,7 @@ const SOURCE_SCHEMA_SQL: &str = "
         integer_value INTEGER NOT NULL
     ) STRICT;
     INSERT OR IGNORE INTO source_meta(key, integer_value)
-        VALUES ('schema_version', 3);
+        VALUES ('schema_version', 4);
 
     CREATE TABLE IF NOT EXISTS source_projects (
         project_id TEXT PRIMARY KEY,
@@ -152,6 +159,26 @@ const SOURCE_SCHEMA_SQL: &str = "
 
     CREATE INDEX IF NOT EXISTS source_outbox_pending_sequence
         ON source_outbox(status, outbox_sequence);
+
+    CREATE TABLE IF NOT EXISTS source_github_wakeups (
+        wakeup_sequence INTEGER PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        delivery_id TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        announced_head TEXT NOT NULL,
+        repository_full_name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'completed')),
+        received_at_ms INTEGER NOT NULL,
+        completed_at_ms INTEGER,
+        outcome_json TEXT,
+        UNIQUE(project_id, delivery_id),
+        CHECK((status = 'pending' AND completed_at_ms IS NULL AND outcome_json IS NULL)
+            OR (status = 'completed' AND completed_at_ms IS NOT NULL
+                AND outcome_json IS NOT NULL))
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS source_github_wakeups_pending_sequence
+        ON source_github_wakeups(status, project_id, wakeup_sequence);
 ";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -464,6 +491,20 @@ fn migrate_source_schema_v3(connection: &mut Connection) -> Result<(), SourceErr
     Ok(())
 }
 
+fn migrate_source_schema_v4(connection: &mut Connection) -> Result<(), SourceError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE source_meta SET integer_value = 4
+         WHERE key = 'schema_version' AND integer_value = 3",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(SourceError::CorruptLedger("source schema migration"));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 impl SourceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SourceError> {
         let database_path = path.as_ref().to_path_buf();
@@ -480,10 +521,15 @@ impl SourceStore {
         )?;
         match version {
             SOURCE_SCHEMA_VERSION => {}
-            PREVIOUS_SOURCE_SCHEMA_VERSION => migrate_source_schema_v3(&mut connection)?,
+            PREVIOUS_SOURCE_SCHEMA_VERSION => migrate_source_schema_v4(&mut connection)?,
             LEGACY_SOURCE_SCHEMA_VERSION => {
+                migrate_source_schema_v3(&mut connection)?;
+                migrate_source_schema_v4(&mut connection)?;
+            }
+            OLDEST_SOURCE_SCHEMA_VERSION => {
                 migrate_source_schema_v2(&mut connection)?;
                 migrate_source_schema_v3(&mut connection)?;
+                migrate_source_schema_v4(&mut connection)?;
             }
             _ => return Err(SourceError::UnsupportedSchemaVersion(version)),
         }
@@ -585,6 +631,260 @@ impl SourceStore {
         } else {
             Err(SourceError::BrokerLeaseSuperseded)
         }
+    }
+
+    fn enqueue_github_wakeup(
+        &self,
+        project_id: &ProjectId,
+        delivery_id: &str,
+        payload_digest: &EvidenceDigest,
+        announced_head: &GitCommitId,
+        repository_full_name: &str,
+        received_at_ms: i64,
+    ) -> Result<GithubWebhookAdmissionV1, SourceError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.require_bound_broker_epoch(&transaction)?;
+        if let Some((sequence, stored_digest, stored_head, stored_repository, status)) = transaction
+            .query_row(
+                "SELECT wakeup_sequence, payload_digest, announced_head,
+                        repository_full_name, status
+                 FROM source_github_wakeups
+                 WHERE project_id = ?1 AND delivery_id = ?2",
+                params![project_id.as_str(), delivery_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if stored_digest != payload_digest.as_str()
+                || stored_head != announced_head.as_str()
+                || stored_repository != repository_full_name
+            {
+                return Err(SourceError::DeliveryConflict);
+            }
+            let completed = match status.as_str() {
+                "pending" => false,
+                "completed" => true,
+                _ => return Err(SourceError::CorruptLedger("GitHub webhook status")),
+            };
+            transaction.commit()?;
+            return Ok(GithubWebhookAdmissionV1::Duplicate {
+                wakeup_sequence: u64::try_from(sequence)
+                    .map_err(|_| SourceError::CorruptLedger("GitHub webhook sequence"))?,
+                completed,
+            });
+        }
+
+        if let Some((stored_digest, status)) = transaction
+            .query_row(
+                "SELECT payload_digest, status FROM source_deliveries
+                 WHERE project_id = ?1 AND channel = ?2 AND delivery_id = ?3",
+                params![
+                    project_id.as_str(),
+                    SourceChannel::GithubWebhook.as_str(),
+                    delivery_id
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_digest != payload_digest.as_str() {
+                return Err(SourceError::DeliveryConflict);
+            }
+            if !matches!(status.as_str(), "processing" | "recoverable" | "completed") {
+                return Err(SourceError::CorruptLedger("delivery status"));
+            }
+        }
+
+        let global_pending: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM source_github_wakeups WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        let project_pending: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM source_github_wakeups
+             WHERE status = 'pending' AND project_id = ?1",
+            [project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if global_pending >= MAX_PENDING_WEBHOOKS
+            || project_pending >= MAX_PENDING_WEBHOOKS_PER_PROJECT
+        {
+            return Err(SourceError::WebhookQueueFull);
+        }
+        transaction.execute(
+            "INSERT INTO source_github_wakeups(
+                project_id, delivery_id, payload_digest, announced_head,
+                repository_full_name, status, received_at_ms,
+                completed_at_ms, outcome_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL, NULL)",
+            params![
+                project_id.as_str(),
+                delivery_id,
+                payload_digest.as_str(),
+                announced_head.as_str(),
+                repository_full_name,
+                received_at_ms
+            ],
+        )?;
+        let wakeup_sequence = u64::try_from(transaction.last_insert_rowid())
+            .map_err(|_| SourceError::SequenceRange)?;
+        prune_settled_github_wakeups(&transaction)?;
+        transaction.commit()?;
+        Ok(GithubWebhookAdmissionV1::Queued { wakeup_sequence })
+    }
+
+    fn pending_github_wakeups(
+        &self,
+        project_id: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<GithubWebhookWakeupV1>, SourceError> {
+        if !(1..=SOURCE_GITHUB_WEBHOOK_BATCH_MAX).contains(&limit) {
+            return Err(SourceError::InvalidWebhookBatchLimit);
+        }
+        let query_limit =
+            i64::try_from(limit).map_err(|_| SourceError::InvalidWebhookBatchLimit)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        self.require_bound_broker_epoch(&transaction)?;
+        let mut statement = transaction.prepare(
+            "SELECT wakeup_sequence, project_id, delivery_id, payload_digest,
+                    announced_head, repository_full_name, received_at_ms
+             FROM source_github_wakeups
+             WHERE status = 'pending' AND project_id = ?1
+             ORDER BY wakeup_sequence ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![project_id.as_str(), query_limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction.commit()?;
+        rows.iter().map(decode_github_wakeup_row).collect()
+    }
+
+    fn complete_github_wakeup(
+        &self,
+        wakeup: &GithubWebhookWakeupV1,
+        outcome: &SourceIngressOutcome,
+        completed_at_ms: i64,
+    ) -> Result<(), SourceError> {
+        wakeup.validate()?;
+        if completed_at_ms < wakeup.received_at_ms {
+            return Err(SourceError::TimeRange);
+        }
+        let sequence =
+            i64::try_from(wakeup.wakeup_sequence).map_err(|_| SourceError::SequenceRange)?;
+        let outcome_json = serde_json::to_string(outcome)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.require_bound_broker_epoch(&transaction)?;
+        let stored = transaction
+            .query_row(
+                "SELECT project_id, delivery_id, payload_digest, status, outcome_json
+                 FROM source_github_wakeups WHERE wakeup_sequence = ?1",
+                [sequence],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(SourceError::WebhookWakeupMissing)?;
+        if stored.0 != wakeup.project_id.as_str()
+            || stored.1 != wakeup.delivery_id
+            || stored.2 != wakeup.payload_digest.as_str()
+        {
+            return Err(SourceError::WebhookWakeupConflict);
+        }
+        match stored.3.as_str() {
+            "pending" => {
+                let changed = transaction.execute(
+                    "UPDATE source_github_wakeups
+                     SET status = 'completed', completed_at_ms = ?3, outcome_json = ?4
+                     WHERE wakeup_sequence = ?1 AND payload_digest = ?2
+                       AND status = 'pending' AND received_at_ms <= ?3",
+                    params![
+                        sequence,
+                        wakeup.payload_digest.as_str(),
+                        completed_at_ms,
+                        outcome_json
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(SourceError::WebhookWakeupConflict);
+                }
+            }
+            "completed" if stored.4.as_deref() == Some(outcome_json.as_str()) => {}
+            "completed" => return Err(SourceError::WebhookWakeupConflict),
+            _ => return Err(SourceError::CorruptLedger("GitHub webhook status")),
+        }
+        prune_settled_github_wakeups(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn reconcile_github_wakeup_policy(
+        &self,
+        installed_repositories: &BTreeMap<String, String>,
+    ) -> Result<usize, SourceError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.require_bound_broker_epoch(&transaction)?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT wakeup_sequence, project_id, repository_full_name
+                 FROM source_github_wakeups",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut retired = 0;
+        for (sequence, project_id, repository_full_name) in rows {
+            let current = installed_repositories.get(&project_id);
+            if current
+                .is_some_and(|repository| repository.eq_ignore_ascii_case(&repository_full_name))
+            {
+                continue;
+            }
+            retired += transaction.execute(
+                "DELETE FROM source_github_wakeups WHERE wakeup_sequence = ?1",
+                [sequence],
+            )?;
+        }
+        prune_settled_github_wakeups(&transaction)?;
+        transaction.commit()?;
+        Ok(retired)
     }
 
     fn reserve_delivery(
@@ -1624,6 +1924,41 @@ fn prune_settled_outbox(transaction: &Transaction<'_>) -> Result<(), SourceError
     Ok(())
 }
 
+fn prune_settled_github_wakeups(transaction: &Transaction<'_>) -> Result<(), SourceError> {
+    transaction.execute(
+        "DELETE FROM source_github_wakeups
+         WHERE status = 'completed' AND wakeup_sequence NOT IN (
+             SELECT wakeup_sequence FROM source_github_wakeups
+             WHERE status = 'completed'
+             ORDER BY wakeup_sequence DESC
+             LIMIT ?1
+         )",
+        [SETTLED_WEBHOOK_RETENTION],
+    )?;
+    Ok(())
+}
+
+fn decode_github_wakeup_row(
+    row: &(i64, String, String, String, String, String, i64),
+) -> Result<GithubWebhookWakeupV1, SourceError> {
+    let wakeup = GithubWebhookWakeupV1 {
+        schema_version: SOURCE_WEBHOOK_WAKEUP_SCHEMA_VERSION,
+        wakeup_sequence: u64::try_from(row.0)
+            .map_err(|_| SourceError::CorruptLedger("GitHub webhook sequence"))?,
+        project_id: ProjectId::from_str(&row.1)
+            .map_err(|_| SourceError::CorruptLedger("GitHub webhook project"))?,
+        delivery_id: row.2.clone(),
+        payload_digest: EvidenceDigest::from_str(&row.3)
+            .map_err(|_| SourceError::CorruptLedger("GitHub webhook payload digest"))?,
+        announced_head: GitCommitId::from_str(&row.4)
+            .map_err(|_| SourceError::CorruptLedger("GitHub webhook announced head"))?,
+        repository_full_name: row.5.clone(),
+        received_at_ms: row.6,
+    };
+    wakeup.validate()?;
+    Ok(wakeup)
+}
+
 fn decode_outbox_row(
     row: &(i64, String, i64, String, String, i64),
 ) -> Result<SourceOutboxEntryV1, SourceError> {
@@ -1767,6 +2102,21 @@ pub trait SourceRepository: Send + Sync + std::fmt::Debug {
     fn repository_identity(&self, project_id: &ProjectId) -> Result<EvidenceDigest, SourceError>;
 
     fn fetch_remote_main(&self, project_id: &ProjectId) -> Result<GitCommitId, SourceError>;
+
+    fn fetch_remote_main_reconciliation(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<GitCommitId, SourceError> {
+        self.fetch_remote_main(project_id)
+    }
+
+    fn notify_priority_fetch(&self, _project_id: &ProjectId) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    fn clear_priority_fetch(&self, _project_id: &ProjectId) -> Result<(), SourceError> {
+        Ok(())
+    }
 
     fn contains_commit(
         &self,
@@ -2012,6 +2362,52 @@ pub enum SourceIngressOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome", content = "details")]
+pub enum GithubWebhookAdmissionV1 {
+    Queued {
+        wakeup_sequence: u64,
+    },
+    Duplicate {
+        wakeup_sequence: u64,
+        completed: bool,
+    },
+    IgnoredRef,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubWebhookWakeupV1 {
+    pub schema_version: u16,
+    pub wakeup_sequence: u64,
+    pub project_id: ProjectId,
+    pub delivery_id: String,
+    pub payload_digest: EvidenceDigest,
+    pub announced_head: GitCommitId,
+    pub repository_full_name: String,
+    pub received_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GithubWebhookDrainOutcomeV1 {
+    pub completed: usize,
+    pub deferred_until_remote_catches_up: bool,
+}
+
+impl GithubWebhookWakeupV1 {
+    pub fn validate(&self) -> Result<(), SourceError> {
+        if self.schema_version != SOURCE_WEBHOOK_WAKEUP_SCHEMA_VERSION
+            || self.wakeup_sequence == 0
+            || self.received_at_ms < 0
+            || validate_delivery_id(&self.delivery_id).is_err()
+            || !valid_github_repository_full_name(&self.repository_full_name)
+        {
+            return Err(SourceError::CorruptLedger("GitHub webhook wake-up"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceOutboxEntryV1 {
     pub schema_version: u16,
@@ -2085,6 +2481,7 @@ pub struct DurableSourceBroker<R> {
 pub struct InstalledSourceProjectPolicy {
     pub project_id: ProjectId,
     pub repository_identity: EvidenceDigest,
+    pub github_repository: String,
     pub installed_policy: InstalledPolicyIdentity,
     pub auto_deploy: bool,
     pub maximum_attempts: u32,
@@ -2093,7 +2490,10 @@ pub struct InstalledSourceProjectPolicy {
 
 impl InstalledSourceProjectPolicy {
     fn validate(&self) -> Result<(), SourceError> {
-        if self.installed_policy.version == 0 || !(1..=10).contains(&self.maximum_attempts) {
+        if self.installed_policy.version == 0
+            || !(1..=10).contains(&self.maximum_attempts)
+            || !valid_github_repository_full_name(&self.github_repository)
+        {
             return Err(SourceError::InvalidInstalledPolicy);
         }
         if self.release_class == ReleaseClass::Rollback {
@@ -2101,6 +2501,21 @@ impl InstalledSourceProjectPolicy {
         }
         Ok(())
     }
+}
+
+fn valid_github_repository_full_name(value: &str) -> bool {
+    let mut parts = value.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repository = parts.next().unwrap_or_default();
+    !owner.is_empty()
+        && !repository.is_empty()
+        && parts.next().is_none()
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && repository
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 impl<R: SourceRepository> DurableSourceBroker<R> {
@@ -2157,6 +2572,30 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             policies,
         };
         broker.recover_source_state(started_at_ms)?;
+        let installed_repositories = broker
+            .policies
+            .values()
+            .map(|policy| {
+                (
+                    policy.project_id.to_string(),
+                    policy.github_repository.clone(),
+                )
+            })
+            .collect();
+        broker
+            .store
+            .reconcile_github_wakeup_policy(&installed_repositories)?;
+        for policy in broker.policies.values() {
+            if !broker
+                .store
+                .pending_github_wakeups(&policy.project_id, 1)?
+                .is_empty()
+            {
+                broker
+                    .repository
+                    .notify_priority_fetch(&policy.project_id)?;
+            }
+        }
         let enabled_projects = broker
             .policies
             .values()
@@ -2487,6 +2926,152 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
         )
     }
 
+    pub fn enqueue_github_push(
+        &self,
+        project_id: &ProjectId,
+        delivery_id: &str,
+        signature_header: &str,
+        webhook_secret: &[u8],
+        raw_body: &[u8],
+        received_at_ms: i64,
+    ) -> Result<GithubWebhookAdmissionV1, SourceError> {
+        self.require_current_lease()?;
+        validate_delivery_id(delivery_id)?;
+        if received_at_ms < 0 {
+            return Err(SourceError::TimeRange);
+        }
+        if raw_body.len() > MAX_WEBHOOK_BODY_BYTES {
+            return Err(SourceError::WebhookBodyTooLarge);
+        }
+        verify_github_hmac(signature_header, webhook_secret, raw_body)?;
+        let installed_policy = self.policy(project_id)?;
+        let Some(announced_head) =
+            decode_github_push(raw_body, &installed_policy.github_repository)?
+        else {
+            return Ok(GithubWebhookAdmissionV1::IgnoredRef);
+        };
+        let payload_digest = EvidenceDigest::sha256(raw_body);
+        let admission = self.store.enqueue_github_wakeup(
+            project_id,
+            delivery_id,
+            &payload_digest,
+            &announced_head,
+            &installed_policy.github_repository,
+            received_at_ms,
+        )?;
+        if matches!(
+            admission,
+            GithubWebhookAdmissionV1::Queued { .. }
+                | GithubWebhookAdmissionV1::Duplicate {
+                    completed: false,
+                    ..
+                }
+        ) {
+            self.repository.notify_priority_fetch(project_id)?;
+        }
+        Ok(admission)
+    }
+
+    pub fn pending_github_wakeups(
+        &self,
+        project_id: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<GithubWebhookWakeupV1>, SourceError> {
+        self.require_current_lease()?;
+        self.policy(project_id)?;
+        self.store.pending_github_wakeups(project_id, limit)
+    }
+
+    pub fn process_pending_github_pushes(
+        &self,
+        project_id: &ProjectId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<GithubWebhookDrainOutcomeV1, SourceError> {
+        if now_ms < 0 {
+            return Err(SourceError::TimeRange);
+        }
+        let _coordination = self.lock_coordination(project_id)?;
+        let installed_policy = self.policy(project_id)?;
+        let wakeups = self.store.pending_github_wakeups(project_id, limit)?;
+        if wakeups.is_empty() {
+            self.reconcile_priority_fetch_signal(project_id)?;
+            return Ok(GithubWebhookDrainOutcomeV1::default());
+        }
+        let fetched_head = self.repository.fetch_remote_main(project_id)?;
+        let mut completed = 0;
+        for wakeup in wakeups {
+            if wakeup.project_id != *project_id
+                || wakeup.repository_full_name != installed_policy.github_repository
+            {
+                return Err(SourceError::CorruptLedger("GitHub webhook policy binding"));
+            }
+            let delivery_claim = match self.store.reserve_delivery(
+                project_id,
+                SourceChannel::GithubWebhook,
+                &wakeup.delivery_id,
+                &wakeup.payload_digest,
+                wakeup.received_at_ms,
+            )? {
+                DeliveryReservation::Completed(outcome) => {
+                    self.store
+                        .complete_github_wakeup(&wakeup, &outcome, now_ms)?;
+                    completed += 1;
+                    continue;
+                }
+                DeliveryReservation::Claimed(claim) => claim,
+            };
+            let candidate = CandidateIngress {
+                project_id: &wakeup.project_id,
+                candidate: fetched_head.clone(),
+                announced_previous_head: None,
+                channel: SourceChannel::GithubWebhook,
+                delivery_id: &wakeup.delivery_id,
+                payload_digest: wakeup.payload_digest.clone(),
+                installed_policy,
+                now_ms,
+            };
+            let result = self.process_github_candidate(&candidate, &wakeup.announced_head);
+            let outcome = match result {
+                Ok(outcome) => self.store.finish_delivery(
+                    &delivery_claim,
+                    &outcome,
+                    installed_policy.auto_deploy,
+                    now_ms,
+                )?,
+                Err(SourceError::RemoteHeadBehindWebhook) => {
+                    self.store.abandon_delivery(&delivery_claim, now_ms)?;
+                    return Ok(GithubWebhookDrainOutcomeV1 {
+                        completed,
+                        deferred_until_remote_catches_up: true,
+                    });
+                }
+                Err(error) => {
+                    self.store.abandon_delivery(&delivery_claim, now_ms)?;
+                    return Err(error);
+                }
+            };
+            self.store
+                .complete_github_wakeup(&wakeup, &outcome, now_ms)?;
+            completed += 1;
+        }
+        self.reconcile_priority_fetch_signal(project_id)?;
+        Ok(GithubWebhookDrainOutcomeV1 {
+            completed,
+            deferred_until_remote_catches_up: false,
+        })
+    }
+
+    fn reconcile_priority_fetch_signal(&self, project_id: &ProjectId) -> Result<(), SourceError> {
+        // Clear before re-reading the durable queue. An enqueue racing before the clear is
+        // rediscovered and re-signalled; one racing after it sets the signal itself.
+        self.repository.clear_priority_fetch(project_id)?;
+        if !self.store.pending_github_wakeups(project_id, 1)?.is_empty() {
+            self.repository.notify_priority_fetch(project_id)?;
+        }
+        Ok(())
+    }
+
     pub fn process_github_push(
         &self,
         project_id: &ProjectId,
@@ -2503,8 +3088,8 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
         }
         verify_github_hmac(signature_header, webhook_secret, raw_body)?;
         let payload_digest = EvidenceDigest::sha256(raw_body);
-        let payload: GithubPushPayload = serde_json::from_slice(raw_body)?;
         let installed_policy = self.policy(project_id)?;
+        let announced_head = decode_github_push(raw_body, &installed_policy.github_repository)?;
         let delivery_claim = match self.store.reserve_delivery(
             project_id,
             SourceChannel::GithubWebhook,
@@ -2516,38 +3101,11 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             DeliveryReservation::Claimed(claim) => claim,
         };
         let result = (|| {
-            if payload.git_ref != "refs/heads/main" {
+            let Some(announced_head) = announced_head else {
                 return Ok(SourceIngressOutcome::IgnoredRef);
-            }
-            let announced_head = GitCommitId::from_str(&payload.after)
-                .map_err(|_| SourceError::InvalidWebhookPayload)?;
+            };
             let fetched_head = self.repository.fetch_remote_main(project_id)?;
-            if announced_head != fetched_head {
-                return match self.repository.relationship(
-                    project_id,
-                    &announced_head,
-                    &fetched_head,
-                )? {
-                    CommitRelationship::FastForward => {
-                        Ok(SourceIngressOutcome::StaleNoop { announced_head })
-                    }
-                    CommitRelationship::Same => unreachable!("different commits cannot be same"),
-                    CommitRelationship::Rewind | CommitRelationship::Diverged => {
-                        let evidence = EvidenceDigest::sha256(format!(
-                            "github-mismatch\n{announced_head}\n{fetched_head}"
-                        ));
-                        self.store.mark_diverged(
-                            project_id,
-                            &fetched_head,
-                            SourceChannel::GithubWebhook,
-                            &evidence,
-                            now_ms,
-                        )?;
-                        Ok(SourceIngressOutcome::SourceDivergedNeedsOwner)
-                    }
-                };
-            }
-            self.process_candidate(&CandidateIngress {
+            let candidate = CandidateIngress {
                 project_id,
                 candidate: fetched_head,
                 announced_previous_head: None,
@@ -2556,7 +3114,8 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
                 payload_digest: payload_digest.clone(),
                 installed_policy,
                 now_ms,
-            })
+            };
+            self.process_github_candidate(&candidate, &announced_head)
         })();
         match result {
             Ok(outcome) => self.store.finish_delivery(
@@ -2572,6 +3131,41 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
         }
     }
 
+    fn process_github_candidate(
+        &self,
+        candidate: &CandidateIngress<'_>,
+        announced_head: &GitCommitId,
+    ) -> Result<SourceIngressOutcome, SourceError> {
+        if *announced_head != candidate.candidate {
+            match self.repository.relationship(
+                candidate.project_id,
+                announced_head,
+                &candidate.candidate,
+            )? {
+                CommitRelationship::FastForward => {}
+                CommitRelationship::Rewind => {
+                    return Err(SourceError::RemoteHeadBehindWebhook);
+                }
+                CommitRelationship::Same => unreachable!("different commits cannot be same"),
+                CommitRelationship::Diverged => {
+                    let fetched_head = &candidate.candidate;
+                    let evidence = EvidenceDigest::sha256(format!(
+                        "github-mismatch\n{announced_head}\n{fetched_head}"
+                    ));
+                    self.store.mark_diverged(
+                        candidate.project_id,
+                        fetched_head,
+                        SourceChannel::GithubWebhook,
+                        &evidence,
+                        candidate.now_ms,
+                    )?;
+                    return Ok(SourceIngressOutcome::SourceDivergedNeedsOwner);
+                }
+            }
+        }
+        self.process_candidate(candidate)
+    }
+
     pub fn reconcile_remote_main(
         &self,
         project_id: &ProjectId,
@@ -2579,7 +3173,9 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
     ) -> Result<SourceIngressOutcome, SourceError> {
         let _coordination = self.lock_coordination(project_id)?;
         let installed_policy = self.policy(project_id)?;
-        let fetched_head = self.repository.fetch_remote_main(project_id)?;
+        let fetched_head = self
+            .repository
+            .fetch_remote_main_reconciliation(project_id)?;
         let snapshot = self.store.snapshot(project_id)?;
         let pause_active = snapshot
             .reconcile_paused_until_ms
@@ -3254,6 +3850,33 @@ struct GithubPushPayload {
     #[serde(rename = "ref")]
     git_ref: String,
     after: String,
+    repository: GithubRepositoryPayload,
+}
+
+#[derive(Deserialize)]
+struct GithubRepositoryPayload {
+    full_name: String,
+}
+
+fn decode_github_push(
+    raw_body: &[u8],
+    expected_repository: &str,
+) -> Result<Option<GitCommitId>, SourceError> {
+    let payload: GithubPushPayload =
+        serde_json::from_slice(raw_body).map_err(|_| SourceError::InvalidWebhookPayload)?;
+    if !payload
+        .repository
+        .full_name
+        .eq_ignore_ascii_case(expected_repository)
+    {
+        return Err(SourceError::GithubRepositoryMismatch);
+    }
+    if payload.git_ref != "refs/heads/main" {
+        return Ok(None);
+    }
+    GitCommitId::from_str(&payload.after)
+        .map(Some)
+        .map_err(|_| SourceError::InvalidWebhookPayload)
 }
 
 pub fn verify_github_hmac(
@@ -3296,11 +3919,16 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut inner = Sha256::new();
     inner.update(inner_pad);
     inner.update(message);
-    let inner_digest = inner.finalize();
+    let mut inner_digest = inner.finalize();
     let mut outer = Sha256::new();
     outer.update(outer_pad);
     outer.update(inner_digest);
-    outer.finalize().into()
+    let output = outer.finalize().into();
+    normalized.zeroize();
+    inner_pad.zeroize();
+    outer_pad.zeroize();
+    inner_digest.zeroize();
+    output
 }
 
 fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
@@ -3546,6 +4174,20 @@ pub enum SourceError {
     WebhookBodyTooLarge,
     #[error("GitHub webhook payload is invalid")]
     InvalidWebhookPayload,
+    #[error("GitHub webhook repository does not match the installed project")]
+    GithubRepositoryMismatch,
+    #[error("GitHub webhook durable wake-up queue is full")]
+    WebhookQueueFull,
+    #[error("GitHub webhook wake-up batch limit is invalid")]
+    InvalidWebhookBatchLimit,
+    #[error("GitHub webhook wake-up does not exist")]
+    WebhookWakeupMissing,
+    #[error("GitHub webhook wake-up conflicts with durable state")]
+    WebhookWakeupConflict,
+    #[error("fetched GitHub main has not reached the signed webhook head yet")]
+    RemoteHeadBehindWebhook,
+    #[error("background source reconciliation yielded to priority source work")]
+    ReconciliationDeferred,
     #[error("source repository operation failed: {0}")]
     Repository(String),
     #[error("installed source policy does not match the configured canonical repository")]

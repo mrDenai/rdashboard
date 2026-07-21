@@ -149,123 +149,149 @@ separately authorized installation. Missing, malformed, oversized, timed-out or 
 output fails closed. The controller keeps a last-known sample as stale for display but does not roll
 repeated stale values into resource history. It never receives Docker socket access.
 
-The dedicated source broker runs as `rdashboard-source` from
-`/usr/libexec/rdashboard/rdashboard-source`. Install `rdashboard-source.service` and
-`rdashboard-source-dispatcher.service`, create the matching source system user/group plus the
-`rdashboard-build-readers` group, and apply `rdashboard-tmpfiles.conf`.
-Its StateDirectory and repository root are owned only by that account; the controller and executor
-never receive write access to the canonical Git object store. The source process receives the build
-reader group only so its setgid export directory can publish immutable archives to the non-root
-builder; it receives no access to candidate signing credentials or builder-owned output paths.
-`ProtectSystem=strict` remains enabled; the unit's external writable paths are the immutable build
-export store and its dedicated delivery runtime directory. Its private `StateDirectory` is managed
-separately by systemd. It is not a member of the controller's `rdashboard` group.
+The source path has three deliberately separate identities. `rdashboard-source` owns the canonical
+Git repositories, source ledger, webhook HMAC secrets and attestation key.
+`rdashboard-source-ingress` owns only the bounded loopback HTTP front door. The existing
+`rdashboard` controller identity runs the signed-outbox dispatcher. Create those non-login users and
+groups plus `rdashboard-build-readers`, install `rdashboard-source.service`,
+`rdashboard-source-ingress.service`, both `rdashboard-source-ingress-bridge` units and
+`rdashboard-source-dispatcher.service`, then apply `rdashboard-tmpfiles.conf`. Repository checkout
+alone installs or enables nothing.
 
-The source runtime directory is the narrow transport exception: systemd creates
-`/run/rdashboard-source` as `rdashboard-source:rdashboard-source` mode `0750`, and the broker creates
-`source.sock` as the same owner/group mode `0660`. The capability-free executor receives the
-`rdashboard-source` supplementary group only with the mutation-authority drop-in. The protocol
-still authenticates every connection as peer UID 0, so group membership grants transport access,
-not source authority. The controller must not be a member of `rdashboard-source`.
+The source StateDirectory and repository root are owner-only. Neither the controller, ingress nor
+executor can write the canonical Git object store. The source identity receives the build-reader
+group only so it can publish immutable source archives; it receives no candidate signing credential
+or builder-owned output path. `ProtectSystem=strict` leaves only the build-source export store and
+the two dedicated runtime transports writable outside its private StateDirectory.
 
-The second transport is deliberately separate. `rdashboard-tmpfiles.conf` creates
-`/run/rdashboard-source-delivery` as `rdashboard-source:rdashboard`, mode `2750`; the source owner
-creates `delivery.sock` mode `0660` and accepts only the installed controller UID. The client verifies
-the source UID before writing any frame. `rdashboard-source-dispatcher` runs as `rdashboard`, has no
-network or source credential, and can write only the controller StateDirectory. It verifies every
-signed accepted-head record against the installed source and workflow policies before idempotently
-admitting it to `control.sqlite`. The source ledger and scheduler journal are never opened by the
-other process.
+The three Unix transports do not share authority:
 
-Install one canonical-JCS `/etc/rdashboard/source.json`, root-owned mode `0644`. It contains public
-policy metadata and credential identities, never credential bytes, and must not be writable by any
-service identity. `InstalledSourceConfigV1` schema v4 binds both fixed sockets, database, repository
-and build-source export paths, the numeric source/controller UIDs, controller/build-reader GIDs, root
-executor peer UID, connection/time limits, reconcile interval, attestation key identity and public
-key, and each project's exact
-remote-derived repository identity and owner-policy identity. Its `document_digest` covers the
-complete document. Each project using an `ssh://` remote also requires its own exact installed
-credential names and SHA-256 identities for a read-only SSH private key and pinned known-hosts file.
-HTTPS projects forbid an SSH credential binding. The service refuses path overrides, incomplete Git SSH
-credentials, duplicate projects, mutable policy versions, rollback release classes, key
-substitution and a remote URL whose derived repository identity differs from the installed value.
+- `/run/rdashboard-source/source.sock` is source-owned and accepts only peer UID 0. The root executor
+  gets transport group membership only with mutation authority; the controller never joins it.
+- `/run/rdashboard-source-delivery/delivery.sock` is source-to-controller only. The broker accepts
+  the installed controller UID and the dispatcher verifies the source UID, signed head, installed
+  source policy and workflow manifest before writing `control.sqlite`.
+- `/run/rdashboard-source-ingress/ingress.sock` is created mode `0660` below the protected setgid
+  `rdashboard-source:rdashboard-source-ingress` directory. The broker accepts only the installed
+  ingress UID and the ingress verifies the source UID. The HTTP process has no credential, Git
+  directory, source database, controller database or writable filesystem path; it can submit only a
+  versioned, length-bounded GitHub push frame.
 
-Install the corresponding 32-byte Ed25519 seed at
-`/etc/rdashboard/credentials/source-attestation-seed`; systemd exposes it only as the fixed
-`source-attestation-seed` service credential. The broker checks file type, ownership, mode, inode,
-exact size and derived non-weak Ed25519 public key, and zeroizes the raw seed buffer after
-constructing the signer.
+Install the canonical workflow manifest catalog first at
+`/etc/rdashboard/project-manifests`. The directory must be `root:rdashboard` mode `0750`; every
+`<project>.jcs` must be canonical JCS, `root:rdashboard` mode `0640`. Repository checkout JSON is not
+read directly in production. The source generator and dispatcher both require the exact installed
+catalog, preventing their repository and workflow-policy identities from drifting apart.
 
-For a private SSH remote, install an unencrypted, repository-read-only OpenSSH key at
-`/etc/rdashboard/credentials/source-git-<project>-private-key` and the provider's reviewed host key
-lines at `/etc/rdashboard/credentials/source-git-<project>-known-hosts`; both must be root-owned mode
-`0600`. Record their exact credential names and SHA-256 digests in that project's `source.json`
-entry, then add the same two credential names to
-`rdashboard-source-git-ssh.conf` as the service's `git-ssh.conf` systemd drop-in. The base source
-unit does not request Git credentials, so an HTTPS-only installation does not depend on absent SSH
-files. The drop-in exposes only credential copies at the two fixed
-`/run/credentials/rdashboard-source.service/` paths. Startup rejects symlinks, wrong
-owners/modes, oversized files, non-OpenSSH private-key framing, malformed host-key lines, a missing
-pin for any configured SSH hostname or any digest change. Git runs with no ambient environment,
-HOME, credential helper, agent, password, keyboard-interactive prompt, mutable host-key update or
-global known-hosts fallback; each SSH project uses only its own exact identity and pinned file.
-Adding a future repository requires its own deploy key plus an explicit installed unit/config
-change rather than silently borrowing an operator account or reusing another project's authority.
+Review the repository candidate `config/source-projects.json`, render it as canonical JCS, then install it as
+`/etc/rdashboard/source-projects.jcs`, root-owned mode `0600`. It must cover the workflow catalog
+exactly and contains only owner-controlled deployment values:
 
-Install `rdashboard-source-config` at `/usr/libexec/rdashboard/rdashboard-source-config`. After the
-three rimg credential files exist, generate the canonical document without placing any secret in
-argv or stdout:
+```json
+{"projects":[{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":3,"project_id":"ralert","release_class":"stateful_compatible"}],"purpose":"rdashboard.source-project-controls.v1","schema_version":1}
+```
+
+Render the reviewed candidate without accepting trailing whitespace or noncanonical installed bytes:
 
 ```sh
-/usr/libexec/rdashboard/rdashboard-source-config \
-  SOURCE_UID CONTROLLER_UID CONTROLLER_GID BUILD_READER_GID \
-  INSTALLED_POLICY_SHA256 INSTALLED_POLICY_VERSION \
+/usr/libexec/rdashboard/rdashboard-source-config canonicalize-controls \
+  < config/source-projects.json > /etc/rdashboard/source-projects.jcs.new
+```
+
+Atomically install the result as `/etc/rdashboard/source-projects.jcs` with the ownership and mode
+above before running the source-document build command.
+
+Keep `auto_deploy=false` until the complete worker/build/deploy path for that project has passed its
+activation review. Each project gets its remote URL and workflow-policy digest from the installed
+manifest, so adding or removing a repository is one exact catalog-and-controls change, not a new
+worker implementation.
+
+Install these root-owned mode-`0600` credentials under `/etc/rdashboard/credentials`:
+
+- `source-attestation-seed`, exactly 32 random Ed25519 seed bytes;
+- `source-webhook-<project>-secret`, a distinct random GitHub webhook secret of 16-4096 bytes for
+  every project;
+- for each `ssh://` remote only, `source-git-<project>-private-key` containing an unencrypted,
+  repository-read-only OpenSSH deploy key and `source-git-<project>-known-hosts` containing the
+  reviewed provider host key.
+
+HTTPS remotes forbid SSH bindings. Startup rejects symlinks, wrong ownership or mode, size changes,
+credential digest changes, reused project secrets or SSH private keys, malformed key material, a
+missing hostname pin and any remote not bound to the exact GitHub `owner/repository`. Git runs with
+no ambient environment, HOME, credential helper, agent, password prompt, mutable host-key update or
+global known-hosts fallback.
+
+Install `rdashboard-source-config` at `/usr/libexec/rdashboard/rdashboard-source-config`. Generate
+the public, digest-covered schema-v5 source document without putting a secret in argv or stdout:
+
+```sh
+/usr/libexec/rdashboard/rdashboard-source-config build \
+  SOURCE_UID INGRESS_UID INGRESS_GID CONTROLLER_UID CONTROLLER_GID BUILD_READER_GID \
   > /etc/rdashboard/source.json.new
 ```
 
-The tool has a fixed `rimg` project/remote and fixed root credential paths. It derives the
-attestation public key, project-specific credential digests and key ID, emits only canonical JCS,
-sets `auto_deploy=false`, and never serializes private bytes. Validate and atomically install the
-new document as `root:root` mode `0644`; do not generate it until the exact installed owner-policy
-identity is known. Future multi-project generation should extend this typed builder rather than
-hand-editing digest-covered JSON.
+Validate and atomically install it as `/etc/rdashboard/source.json`, `root:root` mode `0644`. It
+binds all fixed paths and peer identities, the exact project set, repository and policy identities,
+per-project credential names and digests, the attestation public key, connection/deadline bounds and
+the 30-second reconciliation interval. It contains no private bytes. Then generate the complete
+systemd credential drop-in from that installed document:
 
-Install the canonical workflow manifest catalog at `/etc/rdashboard/project-manifests`: the
-directory must be `root:rdashboard` mode `0750`, and each `<project>.jcs` must be canonical JCS,
-`root:rdashboard` mode `0640`. The dispatcher rejects unexpected entries, filename/project
-mismatches, noncanonical manifests, unsafe ownership or modes, and any auto-deploy source project
-whose repository or workflow-policy digest does not match this catalog. Repository checkout JSON is
-not read directly in production; install its canonical encoding under the `.jcs` name.
+```sh
+/usr/libexec/rdashboard/rdashboard-source-config systemd-credentials \
+  > /etc/systemd/system/rdashboard-source.service.d/credentials.conf.new
+```
 
-Initialize each canonical bare repository below
-`/var/lib/rdashboard-source/repositories/<project>.git` as the `rdashboard-source` account using the
-reviewed `files` ref backend and owner-only modes before starting the service. Startup validates the
-repository identity/configuration and durable source ledger before serving root-only requests on
-`/run/rdashboard-source/source.sock`.
+Atomically install the drop-in as `root:root` mode `0644`. The base unit intentionally has no
+`LoadCredential=` line; this generated file is the single exact list for the attestation seed, every
+webhook secret and only the SSH credentials required by the current project catalog. Regenerate it
+whenever the installed project set changes.
 
-The broker must complete a bounded remote-main reconciliation for every configured project before
-it binds the socket and sends systemd `READY=1` through the fixed `/usr/bin/systemd-notify`; an
-unavailable or divergent startup source therefore fails closed under systemd restart rather than
-serving a stale local head or releasing ordered dependents early. After each successful ready-head
-reconciliation it also runs a fixed `git archive` itself and atomically publishes a source-owned,
-reader-group `0440` tar plus canonical manifest below
+Initialize every canonical bare repository at
+`/var/lib/rdashboard-source/repositories/<project>.git` as `rdashboard-source`, using the reviewed
+`files` ref backend and owner-only modes. Before sending systemd `READY=1`, the broker recovers its
+durable webhook/delivery journals and completes a bounded remote-main reconciliation for every
+project. An unavailable or divergent startup source therefore fails closed under systemd restart.
+
+`rdashboard-source-ingress` listens only on `127.0.0.1:3201`. The socket-activated bridge exposes
+only `172.19.0.1:3201` to the private `kamal` Docker network; verify that gateway before enabling the
+socket. Add a dedicated TLS host or an exact `/github/<project>` Kamal Proxy route to that bridge.
+Do not put Cloudflare Access browser authentication in front of this GitHub callback route: the
+per-project HMAC is its authentication boundary. Configure each GitHub repository with content type
+`application/json`, the exact URL `https://<webhook-host>/github/<project>`, push events only and its
+matching project secret. Expose no other ingress route; `/health` returns only `204` for local proxy
+health checks.
+
+The HTTP boundary accepts at most eight concurrent requests, 32 headers/16 KiB of header data and a
+1 MiB body. It requires the exact GitHub event, delivery and SHA-256 signature headers. The source
+broker verifies HMAC and repository binding, then commits only delivery ID, payload digest,
+announced head and repository identity to a SQLite `FULL`-synchronous queue before returning `202`.
+Raw webhook bytes and signatures are never persisted or logged. Duplicate deliveries are
+content-bound; conflicting reuse is rejected. The queue is bounded to 2048 pending globally and 128
+per project, so overload returns a retryable response instead of growing disk without limit.
+
+Webhook acknowledgement does not wait for Git fetch, archive export or a project already reconciling.
+A per-project coordinator prioritizes the durable wake-up, shares one fetch across its batch and
+retries remote-visibility lag from 250 ms up to five seconds. While any project has durable webhook
+work, periodic fetches cannot enter the shared fetch slot; a newly committed wake-up interrupts an
+active periodic network fetch, and periodic work never queues ahead of a waiting webhook fetch.
+Periodic fetches have a two-second network bound, while webhook fetches retain the full one-minute
+provider bound. Once pack promotion starts it completes instead of leaving an ambiguous canonical
+object state. A missed webhook is recovered by the 30-second reconciliation loop with at most five
+seconds of deterministic startup jitter, keeping the fallback below one minute without synchronized
+fetch bursts. On restart, wake-ups for a removed project or a project rebound to a different GitHub
+repository are retired before ingress binds; accepted-source and completed-delivery audit history is
+retained. Rewinds or divergence cannot bypass the existing accepted-head guard and enter
+`source_diverged_needs_owner`; a direct-push SSH front door is not installed by this slice.
+
+After each accepted ready head, the broker runs fixed `git archive` itself and atomically publishes
+a source-owned, reader-group mode-`0440` tar plus canonical manifest below
 `/var/lib/rdashboard-build/source-exports/<project>`. The manifest binds the exact head, sequence,
-source attestation, repository and installed policy to the archive byte count and SHA-256. The
-broker rejects symlinks, hard links, special Git entries and `.gitattributes` archive rewriting;
-the build identity never sees the private bare repository. It then repeats reconciliation at the
-installed interval. Shutdown waits for an already-running bounded Git fetch/export before dropping
-the owned socket, keeping process and socket lifecycle aligned. Its Unix protocol is
-length-bounded, versioned, request-bound and restricted to UID 0 by peer credentials. Synchronous
-broker work runs outside the async reactor, while the full read/handle/write exchange remains
-subject to the configured deadline. It exposes only the current signed snapshot and exact
-live-ticket check/complete/abort operations; it does not expose Git paths or arbitrary commands.
-Accepted deployable heads are committed atomically with a bounded signed outbox. A newer source head
-supersedes older pending delivery, while lost acknowledgements replay the same scheduler identity.
-The dispatcher polls locally at 250 ms, backs off boundedly on transport or policy failures, and
-acknowledges only after the scheduler admission is durable. Periodic reconciliation refreshes an
-expired current-head attestation, so a prolonged controller outage does not lose that head.
-Webhook and forced-push ingress are not yet routed by this unit and remain disabled until their
-dedicated HTTP/SSH front doors are installed and tested.
+source attestation, repository and installed policy to archive size and SHA-256. Symlinks, hard links,
+special Git entries and `.gitattributes` archive rewriting are rejected; the build identity never
+sees the private repository. Accepted deployable heads enter a bounded signed outbox atomically. The
+dispatcher polls locally at 250 ms, retries lost acknowledgements with the same scheduler identity
+and acknowledges only after scheduler admission is durable. A newer head supersedes older pending
+delivery, while periodic reconciliation refreshes an expired current-head attestation.
 
 The executor always serves the bounded observation protocol and can optionally enable the admitted
 backup and installed-deployment mutation paths described below. Install the binary at

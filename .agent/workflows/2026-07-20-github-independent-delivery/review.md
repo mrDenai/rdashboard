@@ -524,3 +524,93 @@ Slice 3a is production-worthy as an inactive local source-to-scheduler delivery 
 committed. It does not install/start either service, enable auto-deploy, expose HTTP webhook or
 forced-push ingress, generalize the fixed rimg config generator, run a VPS timing drill, execute a
 workflow, contact GitHub/providers, push or deploy. Those remain explicit later parts of plan step 3.
+
+## Slice 3b: durable multi-project GitHub webhook ingress
+
+### Reviewed scope
+
+Slice 3b completes the local GitHub push-ingress portion of implementation-plan step 3 without
+activating it:
+
+- Installed source schema V5 is generated from every exact project in the installed workflow catalog.
+  It binds the GitHub repository, webhook-secret digest, optional project-scoped read-only SSH
+  credential digests, source controls and distinct source/ingress/controller/build identities. Secret
+  bytes are loaded into zeroizing buffers and never serialized into the generated catalog.
+- A generated systemd credential drop-in replaces the fixed rimg-only SSH wiring. The example catalog
+  contains only inactive `ralert`; adding another repository is a root-owned installation action, not
+  a code or worker-topology fork.
+- A separate loopback-only HTTP ingress validates exact project routes, media type, GitHub event,
+  delivery ID and bounded raw body before forwarding the unchanged body over a versioned,
+  peer-UID-authenticated AF_UNIX protocol. It has no webhook secret, source database, Git, Docker,
+  controller, executor or production-volume authority.
+- The source broker verifies GitHub HMAC, repository identity and main-ref binding before committing a
+  content-bound, idempotent and secret-free SQLite wake-up. The queue is capped at 2,048 rows globally
+  and 128 per project; restart recovery re-signals retained work and retires wake-ups for removed or
+  rebound projects.
+- Project coordinators drain the full pending batch after one foreground fetch, retry delayed remote
+  visibility from 250 ms to five seconds and preserve the accepted delivery until resolution.
+  Webhook priority is durable and project-aware: it interrupts active periodic network work, prevents
+  new periodic work from queuing ahead of it and retries deferred periodic work without starving other
+  projects. Periodic network fetches retain a two-second ceiling.
+
+The exact final staged product/config/test diff excludes workflow artifacts and contains 21 paths,
+4,768 insertions and 406 deletions, with SHA-256
+`5b2808f5e304074cced07397d5600c2b554d7c7af87e652fddcf4310ee5a62d3`. Shared dirty `src/lib.rs`
+and `deploy/systemd/README.md` were staged by hunk; all pre-existing notification code, notification
+workflow artifacts and earlier untracked consultation logs remain unstaged and outside this review.
+
+### Verification
+
+An exact `git checkout-index` export of the staged product state passed bare `bin/ci`:
+
+- formatting and Clippy with warnings denied;
+- 171 active library tests, with two credentialed provider tests ignored;
+- every binary and integration suite, including 8 source-ingress, 7 source-delivery, 29 store/web,
+  14 scheduler and 8 browser contracts;
+- both manifest schema checks and the optimized release build, which completed in 3 minutes 41 seconds
+  from the cold isolated export;
+- `git diff --cached --check`: passed.
+
+Focused real-Git coverage also passed all 34 repository tests; the ingress protocol suite passed all
+8 contracts outside the filesystem sandbox; and the source config/HTTP binaries passed their 0/4/2
+unit-test sets. A full live-worktree library run passed 188 active tests with two ignored, but includes
+unrelated unstaged notification work and is not used as the exact-slice gate.
+
+### Independent consultations and dispositions
+
+The first exact-staged review returned a complete `SAFE` response with no P0-P2 defect or open
+question, although the dispatcher classified the attempt as `PARTIAL` after 150 seconds:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- state fingerprint: `245a840cf011310a7b7709949a153c389ee403a5d4b3b479a91e676f0cd0d6a4`;
+- brief SHA-256: `d6d8913435b21ffa7a27a5f86da0f7cab90d6c0d3f41eff2d87b89cdd23e93a2`;
+- response: `consult-slice3b-deepseek/response.md`.
+
+That response contained five P3 observations. Its first was factually invalid: the cited
+`enqueue_github_wakeup` query already scopes duplicate delivery IDs by `project_id`,
+`SourceChannel::GithubWebhook` and `delivery_id`. The remaining four describe a deliberate 503 on a
+failed socket negotiation, bounded staging work discarded by fetch preemption, harmless interval
+drift after deferred work and a documented clear/re-read race whose concurrent ingress signal prevents
+loss. None changes correctness or requires code churn in this slice.
+
+A concise fresh final review independently rechecked the staged source and returned `ANSWERED` and
+`SAFE — no P0-P2 defect found`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- one successful attempt, CLI `1.18.3`, 395 seconds;
+- state fingerprint: `245a840cf011310a7b7709949a153c389ee403a5d4b3b479a91e676f0cd0d6a4`;
+- brief SHA-256: `c2112573b923b7b5ee108ff9a9ad42b37fcedc70a09b4c1bbd54281089c0bbe3`;
+- response: `consult-slice3b-deepseek-final/response.md`.
+
+The final reviewer explicitly confirmed the earlier P3 #1 was invalid and traced the loopback and
+peer-auth boundaries, HMAC/repository verification, bounded idempotent queue, cross-project
+preemption, two-second periodic ceiling, one-fetch batch drain, restart/remap recovery, V5 secret-free
+configuration and absence of project-specific worker topology.
+
+### Verdict
+
+Slice 3b is production-worthy as an inactive local GitHub source-ingress boundary and may be committed.
+It does not install or start services, expose the loopback route through a public proxy, register a
+GitHub webhook, add credentials, enable auto-deploy, contact a provider, mutate the VPS, push or deploy.
+Forced-push ingress and the separately authorized live latency/recovery drill remain in plan step 3;
+the generic worker and sealed shared preparation store are the next local implementation step.

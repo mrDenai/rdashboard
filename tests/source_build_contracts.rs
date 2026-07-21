@@ -67,6 +67,7 @@ fn source_policy(version: u64) -> InstalledSourceProjectPolicy {
     InstalledSourceProjectPolicy {
         project_id: project(),
         repository_identity: digest("canonical repository"),
+        github_repository: "mrDenai/rimg".to_owned(),
         installed_policy: InstalledPolicyIdentity {
             digest: digest(&format!("source policy v{version}")),
             version,

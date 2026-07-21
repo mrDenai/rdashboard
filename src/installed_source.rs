@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Read as _,
     os::unix::fs::{MetadataExt as _, PermissionsExt as _},
@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use url::Url;
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
     build_source::BUILD_SOURCE_EXPORT_ROOT,
@@ -23,6 +23,7 @@ use crate::{
         SourceAttestationError, SourceAttestationVerifier, SourceProjectState, SourceSnapshot,
     },
     source_delivery_socket::{SOURCE_DELIVERY_SOCKET_PATH, SourceDeliveryServerConfigV1},
+    source_ingress_socket::SourceIngressServerConfigV1,
     source_socket::{SOURCE_SOCKET_PATH, SourceServerConfigV1},
 };
 
@@ -30,13 +31,16 @@ pub const SOURCE_CONFIG_PATH: &str = "/etc/rdashboard/source.json";
 pub const SOURCE_STATE_DIRECTORY: &str = "/var/lib/rdashboard-source";
 pub const SOURCE_REPOSITORY_ROOT: &str = "/var/lib/rdashboard-source/repositories";
 pub const SOURCE_DATABASE_PATH: &str = "/var/lib/rdashboard-source/source.sqlite";
+pub const SOURCE_INGRESS_SOCKET_PATH: &str = "/run/rdashboard-source-ingress/ingress.sock";
 pub const SOURCE_ATTESTATION_CREDENTIAL_PATH: &str =
     "/run/credentials/rdashboard-source.service/source-attestation-seed";
-pub const SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY: &str = "/run/credentials/rdashboard-source.service";
+pub const SOURCE_CREDENTIAL_DIRECTORY: &str = "/run/credentials/rdashboard-source.service";
 
-const SOURCE_CONFIG_SCHEMA_VERSION: u16 = 4;
+const SOURCE_CONFIG_SCHEMA_VERSION: u16 = 5;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-const MAX_GIT_SSH_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_SOURCE_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_WEBHOOK_SECRET_BYTES: u64 = 4 * 1024;
+const MIN_WEBHOOK_SECRET_BYTES: usize = 16;
 const MIN_RECONCILE_INTERVAL_MS: u64 = 10_000;
 const MAX_RECONCILE_INTERVAL_MS: u64 = 10 * 60 * 1_000;
 const MIN_ATTESTATION_TTL_MS: u64 = 10_000;
@@ -76,11 +80,52 @@ impl InstalledSourceGitSshV1 {
 
     fn transport(&self) -> GitSshTransportConfig {
         GitSshTransportConfig {
-            private_key_path: Path::new(SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY)
+            private_key_path: Path::new(SOURCE_CREDENTIAL_DIRECTORY)
                 .join(&self.private_key_credential),
-            known_hosts_path: Path::new(SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY)
+            known_hosts_path: Path::new(SOURCE_CREDENTIAL_DIRECTORY)
                 .join(&self.known_hosts_credential),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledSourceGithubWebhookV1 {
+    pub repository_full_name: String,
+    pub secret_credential: String,
+    pub secret_sha256: EvidenceDigest,
+}
+
+impl InstalledSourceGithubWebhookV1 {
+    pub fn new(
+        project_id: &ProjectId,
+        remote_url: &RemoteUrl,
+        secret_sha256: EvidenceDigest,
+    ) -> Result<Self, InstalledSourceError> {
+        let webhook = Self {
+            repository_full_name: github_repository_full_name(remote_url)?,
+            secret_credential: format!("source-webhook-{project_id}-secret"),
+            secret_sha256,
+        };
+        webhook.validate(project_id, remote_url)?;
+        Ok(webhook)
+    }
+
+    fn validate(
+        &self,
+        project_id: &ProjectId,
+        remote_url: &RemoteUrl,
+    ) -> Result<(), InstalledSourceError> {
+        if self.secret_credential != format!("source-webhook-{project_id}-secret")
+            || self.repository_full_name != github_repository_full_name(remote_url)?
+        {
+            return Err(InstalledSourceError::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    pub fn credential_path(&self) -> PathBuf {
+        Path::new(SOURCE_CREDENTIAL_DIRECTORY).join(&self.secret_credential)
     }
 }
 
@@ -91,6 +136,19 @@ pub struct InstalledSourceProjectV1 {
     pub remote_url: RemoteUrl,
     pub repository_identity: EvidenceDigest,
     pub git_ssh: Option<InstalledSourceGitSshV1>,
+    pub github_webhook: InstalledSourceGithubWebhookV1,
+    pub installed_policy: InstalledPolicyIdentity,
+    pub auto_deploy: bool,
+    pub maximum_attempts: u32,
+    pub release_class: ReleaseClass,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledSourceProjectInputV1 {
+    pub project_id: ProjectId,
+    pub remote_url: RemoteUrl,
+    pub git_ssh: Option<InstalledSourceGitSshV1>,
+    pub github_webhook: InstalledSourceGithubWebhookV1,
     pub installed_policy: InstalledPolicyIdentity,
     pub auto_deploy: bool,
     pub maximum_attempts: u32,
@@ -98,30 +156,23 @@ pub struct InstalledSourceProjectV1 {
 }
 
 impl InstalledSourceProjectV1 {
-    pub fn new(
-        project_id: ProjectId,
-        remote_url: RemoteUrl,
-        git_ssh: Option<InstalledSourceGitSshV1>,
-        installed_policy: InstalledPolicyIdentity,
-        auto_deploy: bool,
-        maximum_attempts: u32,
-        release_class: ReleaseClass,
-    ) -> Result<Self, InstalledSourceError> {
+    pub fn new(input: InstalledSourceProjectInputV1) -> Result<Self, InstalledSourceError> {
         let repository_identity = GitSourceProjectConfig {
-            project_id: project_id.clone(),
-            remote_url: remote_url.clone(),
+            project_id: input.project_id.clone(),
+            remote_url: input.remote_url.clone(),
             ssh_transport: None,
         }
         .repository_identity();
         let project = Self {
-            project_id,
-            remote_url,
+            project_id: input.project_id,
+            remote_url: input.remote_url,
             repository_identity,
-            git_ssh,
-            installed_policy,
-            auto_deploy,
-            maximum_attempts,
-            release_class,
+            git_ssh: input.git_ssh,
+            github_webhook: input.github_webhook,
+            installed_policy: input.installed_policy,
+            auto_deploy: input.auto_deploy,
+            maximum_attempts: input.maximum_attempts,
+            release_class: input.release_class,
         };
         project.validate()?;
         Ok(project)
@@ -139,6 +190,10 @@ impl InstalledSourceProjectV1 {
                 .git_ssh
                 .as_ref()
                 .is_some_and(|git_ssh| git_ssh.validate(&self.project_id).is_err())
+            || self
+                .github_webhook
+                .validate(&self.project_id, &self.remote_url)
+                .is_err()
             || self.installed_policy.version == 0
             || !(1..=10).contains(&self.maximum_attempts)
             || self.release_class == ReleaseClass::Rollback
@@ -163,6 +218,7 @@ impl InstalledSourceProjectV1 {
         InstalledSourceProjectPolicy {
             project_id: self.project_id.clone(),
             repository_identity: self.repository_identity.clone(),
+            github_repository: self.github_webhook.repository_full_name.clone(),
             installed_policy: self.installed_policy.clone(),
             auto_deploy: self.auto_deploy,
             maximum_attempts: self.maximum_attempts,
@@ -177,11 +233,14 @@ pub struct InstalledSourceConfigV1 {
     pub purpose: String,
     pub schema_version: u16,
     pub source_uid: u32,
+    pub ingress_uid: u32,
+    pub ingress_gid: u32,
     pub controller_uid: u32,
     pub controller_gid: u32,
     pub build_reader_gid: u32,
     pub executor_uid: u32,
     pub socket_path: PathBuf,
+    pub ingress_socket_path: PathBuf,
     pub delivery_socket_path: PathBuf,
     pub state_directory: PathBuf,
     pub repository_root: PathBuf,
@@ -200,6 +259,8 @@ pub struct InstalledSourceConfigV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledSourceConfigInputV1 {
     pub source_uid: u32,
+    pub ingress_uid: u32,
+    pub ingress_gid: u32,
     pub controller_uid: u32,
     pub controller_gid: u32,
     pub build_reader_gid: u32,
@@ -229,11 +290,14 @@ struct InstalledSourceConfigPayload<'a> {
     purpose: &'static str,
     schema_version: u16,
     source_uid: u32,
+    ingress_uid: u32,
+    ingress_gid: u32,
     controller_uid: u32,
     controller_gid: u32,
     build_reader_gid: u32,
     executor_uid: u32,
     socket_path: &'a Path,
+    ingress_socket_path: &'a Path,
     delivery_socket_path: &'a Path,
     state_directory: &'a Path,
     repository_root: &'a Path,
@@ -251,14 +315,17 @@ struct InstalledSourceConfigPayload<'a> {
 impl InstalledSourceConfigV1 {
     pub fn new(input: InstalledSourceConfigInputV1) -> Result<Self, InstalledSourceError> {
         let mut config = Self {
-            purpose: "rdashboard.installed-source-config.v4".to_owned(),
+            purpose: "rdashboard.installed-source-config.v5".to_owned(),
             schema_version: SOURCE_CONFIG_SCHEMA_VERSION,
             source_uid: input.source_uid,
+            ingress_uid: input.ingress_uid,
+            ingress_gid: input.ingress_gid,
             controller_uid: input.controller_uid,
             controller_gid: input.controller_gid,
             build_reader_gid: input.build_reader_gid,
             executor_uid: 0,
             socket_path: PathBuf::from(SOURCE_SOCKET_PATH),
+            ingress_socket_path: PathBuf::from(SOURCE_INGRESS_SOCKET_PATH),
             delivery_socket_path: PathBuf::from(SOURCE_DELIVERY_SOCKET_PATH),
             state_directory: PathBuf::from(SOURCE_STATE_DIRECTORY),
             repository_root: PathBuf::from(SOURCE_REPOSITORY_ROOT),
@@ -279,10 +346,14 @@ impl InstalledSourceConfigV1 {
     }
 
     pub fn validate(&self) -> Result<(), InstalledSourceError> {
-        if self.purpose != "rdashboard.installed-source-config.v4"
+        if self.purpose != "rdashboard.installed-source-config.v5"
             || self.schema_version != SOURCE_CONFIG_SCHEMA_VERSION
             || self.source_uid == 0
             || self.source_uid == u32::MAX
+            || self.ingress_uid == 0
+            || self.ingress_uid == u32::MAX
+            || self.ingress_gid == 0
+            || self.ingress_gid == u32::MAX
             || self.controller_uid == 0
             || self.controller_uid == u32::MAX
             || self.controller_gid == 0
@@ -291,6 +362,7 @@ impl InstalledSourceConfigV1 {
             || self.build_reader_gid == u32::MAX
             || self.executor_uid != 0
             || self.socket_path != Path::new(SOURCE_SOCKET_PATH)
+            || self.ingress_socket_path != Path::new(SOURCE_INGRESS_SOCKET_PATH)
             || self.delivery_socket_path != Path::new(SOURCE_DELIVERY_SOCKET_PATH)
             || self.state_directory != Path::new(SOURCE_STATE_DIRECTORY)
             || self.repository_root != Path::new(SOURCE_REPOSITORY_ROOT)
@@ -304,14 +376,28 @@ impl InstalledSourceConfigV1 {
             || !valid_key_id(&self.attestation_key_id)
             || decode_public_key(&self.attestation_public_key).is_err()
             || self.projects.is_empty()
+            || self.source_uid == self.ingress_uid
+            || self.source_uid == self.controller_uid
+            || self.ingress_uid == self.controller_uid
             || self.document_digest != self.calculate_digest()?
         {
             return Err(InstalledSourceError::InvalidConfig);
         }
         let mut projects = BTreeSet::new();
+        let mut webhook_credentials = BTreeSet::new();
+        let mut webhook_secret_digests = BTreeSet::new();
+        let mut git_private_key_credentials = BTreeSet::new();
+        let mut git_private_key_digests = BTreeSet::new();
         for project in &self.projects {
             project.validate()?;
-            if !projects.insert(project.project_id.to_string()) {
+            if !projects.insert(project.project_id.to_string())
+                || !webhook_credentials.insert(project.github_webhook.secret_credential.clone())
+                || !webhook_secret_digests.insert(project.github_webhook.secret_sha256.to_string())
+                || project.git_ssh.as_ref().is_some_and(|git_ssh| {
+                    !git_private_key_credentials.insert(git_ssh.private_key_credential.clone())
+                        || !git_private_key_digests.insert(git_ssh.private_key_sha256.to_string())
+                })
+            {
                 return Err(InstalledSourceError::InvalidConfig);
             }
         }
@@ -321,14 +407,17 @@ impl InstalledSourceConfigV1 {
     fn calculate_digest(&self) -> Result<EvidenceDigest, InstalledSourceError> {
         Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
             &InstalledSourceConfigPayload {
-                purpose: "rdashboard.installed-source-config.v4",
+                purpose: "rdashboard.installed-source-config.v5",
                 schema_version: SOURCE_CONFIG_SCHEMA_VERSION,
                 source_uid: self.source_uid,
+                ingress_uid: self.ingress_uid,
+                ingress_gid: self.ingress_gid,
                 controller_uid: self.controller_uid,
                 controller_gid: self.controller_gid,
                 build_reader_gid: self.build_reader_gid,
                 executor_uid: self.executor_uid,
                 socket_path: &self.socket_path,
+                ingress_socket_path: &self.ingress_socket_path,
                 delivery_socket_path: &self.delivery_socket_path,
                 state_directory: &self.state_directory,
                 repository_root: &self.repository_root,
@@ -360,6 +449,17 @@ impl InstalledSourceConfigV1 {
         self.validate()?;
         Ok(SourceDeliveryServerConfigV1::new(
             self.controller_uid,
+            usize::from(self.max_connections),
+            Duration::from_millis(self.request_timeout_ms),
+        )?)
+    }
+
+    pub fn ingress_server_config(
+        &self,
+    ) -> Result<SourceIngressServerConfigV1, InstalledSourceError> {
+        self.validate()?;
+        Ok(SourceIngressServerConfigV1::new(
+            self.ingress_uid,
             usize::from(self.max_connections),
             Duration::from_millis(self.request_timeout_ms),
         )?)
@@ -520,7 +620,10 @@ pub(crate) fn load_source_signing_key_from(
         return Err(InstalledSourceError::UnsafeCredential);
     }
     let mut seed = Vec::with_capacity(32);
-    file.take(33).read_to_end(&mut seed)?;
+    if let Err(error) = file.take(33).read_to_end(&mut seed) {
+        seed.zeroize();
+        return Err(error.into());
+    }
     let final_metadata = fs::symlink_metadata(path)?;
     if seed.len() != 32
         || final_metadata.dev() != opened_metadata.dev()
@@ -544,7 +647,7 @@ pub(crate) fn load_source_signing_key_from(
 pub fn validate_source_git_ssh_credentials(
     config: &InstalledSourceConfigV1,
 ) -> Result<(), InstalledSourceError> {
-    validate_source_git_ssh_credentials_from(config, Path::new(SOURCE_GIT_SSH_CREDENTIAL_DIRECTORY))
+    validate_source_git_ssh_credentials_from(config, Path::new(SOURCE_CREDENTIAL_DIRECTORY))
 }
 
 fn validate_source_git_ssh_credentials_from(
@@ -559,13 +662,20 @@ fn validate_source_git_ssh_credentials_from(
         let expected_hosts = BTreeSet::from([ssh_known_host(&project.remote_url)?]);
         let private_key_path = credential_directory.join(&git_ssh.private_key_credential);
         let known_hosts_path = credential_directory.join(&git_ssh.known_hosts_credential);
-        let mut private_key = read_stable_git_credential(&private_key_path, config.source_uid)?;
-        let known_hosts = read_stable_git_credential(&known_hosts_path, config.source_uid)?;
-        let valid = EvidenceDigest::sha256(&private_key) == git_ssh.private_key_sha256
+        let private_key = Zeroizing::new(read_stable_source_credential(
+            &private_key_path,
+            config.source_uid,
+            MAX_SOURCE_CREDENTIAL_BYTES,
+        )?);
+        let known_hosts = read_stable_source_credential(
+            &known_hosts_path,
+            config.source_uid,
+            MAX_SOURCE_CREDENTIAL_BYTES,
+        )?;
+        let valid = EvidenceDigest::sha256(private_key.as_slice()) == git_ssh.private_key_sha256
             && EvidenceDigest::sha256(&known_hosts) == git_ssh.known_hosts_sha256
             && valid_openssh_private_key(&private_key)
             && valid_known_hosts(&known_hosts, &expected_hosts);
-        private_key.zeroize();
         if !valid {
             return Err(InstalledSourceError::GitCredentialMismatch);
         }
@@ -573,9 +683,10 @@ fn validate_source_git_ssh_credentials_from(
     Ok(())
 }
 
-fn read_stable_git_credential(
+fn read_stable_source_credential(
     path: &Path,
     source_uid: u32,
+    maximum_bytes: u64,
 ) -> Result<Vec<u8>, InstalledSourceError> {
     let path_metadata = fs::symlink_metadata(path)?;
     let credential_uid = path_metadata.uid();
@@ -584,7 +695,7 @@ fn read_stable_git_credential(
         || credential_uid != 0 && credential_uid != source_uid
         || path_metadata.permissions().mode() & 0o077 != 0
         || path_metadata.len() == 0
-        || path_metadata.len() > MAX_GIT_SSH_CREDENTIAL_BYTES
+        || path_metadata.len() > maximum_bytes
     {
         return Err(InstalledSourceError::UnsafeGitCredential);
     }
@@ -597,8 +708,13 @@ fn read_stable_git_credential(
         return Err(InstalledSourceError::UnsafeGitCredential);
     }
     let mut bytes = Vec::with_capacity(usize::try_from(opened_metadata.len()).unwrap_or(0));
-    file.take(MAX_GIT_SSH_CREDENTIAL_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    if let Err(error) = file
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        bytes.zeroize();
+        return Err(error.into());
+    }
     let final_metadata = fs::symlink_metadata(path)?;
     if final_metadata.dev() != opened_metadata.dev()
         || final_metadata.ino() != opened_metadata.ino()
@@ -609,6 +725,93 @@ fn read_stable_git_credential(
         return Err(InstalledSourceError::UnsafeGitCredential);
     }
     Ok(bytes)
+}
+
+pub struct SourceWebhookSecretsV1 {
+    secrets: BTreeMap<ProjectId, Zeroizing<Vec<u8>>>,
+}
+
+impl SourceWebhookSecretsV1 {
+    pub fn from_project_secrets(
+        config: &InstalledSourceConfigV1,
+        mut secrets: BTreeMap<ProjectId, Vec<u8>>,
+    ) -> Result<Self, InstalledSourceError> {
+        if let Err(error) = config.validate() {
+            zeroize_secret_map(&mut secrets);
+            return Err(error);
+        }
+        if secrets.len() != config.projects.len() {
+            zeroize_secret_map(&mut secrets);
+            return Err(InstalledSourceError::WebhookCredentialMismatch);
+        }
+        let mut verified = BTreeMap::new();
+        for project in &config.projects {
+            let Some(mut secret) = secrets.remove(&project.project_id) else {
+                zeroize_secret_map(&mut secrets);
+                return Err(InstalledSourceError::WebhookCredentialMismatch);
+            };
+            if secret.len() < MIN_WEBHOOK_SECRET_BYTES
+                || secret.len() > usize::try_from(MAX_WEBHOOK_SECRET_BYTES).unwrap_or(usize::MAX)
+                || EvidenceDigest::sha256(&secret) != project.github_webhook.secret_sha256
+            {
+                secret.zeroize();
+                zeroize_secret_map(&mut secrets);
+                return Err(InstalledSourceError::WebhookCredentialMismatch);
+            }
+            verified.insert(project.project_id.clone(), Zeroizing::new(secret));
+        }
+        Ok(Self { secrets: verified })
+    }
+
+    pub fn secret(&self, project_id: &ProjectId) -> Option<&[u8]> {
+        self.secrets.get(project_id).map(AsRef::as_ref)
+    }
+
+    pub fn len(&self) -> usize {
+        self.secrets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+}
+
+fn zeroize_secret_map(secrets: &mut BTreeMap<ProjectId, Vec<u8>>) {
+    for secret in secrets.values_mut() {
+        secret.zeroize();
+    }
+}
+
+pub fn load_source_webhook_secrets(
+    config: &InstalledSourceConfigV1,
+) -> Result<SourceWebhookSecretsV1, InstalledSourceError> {
+    load_source_webhook_secrets_from(config, Path::new(SOURCE_CREDENTIAL_DIRECTORY))
+}
+
+fn load_source_webhook_secrets_from(
+    config: &InstalledSourceConfigV1,
+    credential_directory: &Path,
+) -> Result<SourceWebhookSecretsV1, InstalledSourceError> {
+    config.validate()?;
+    let mut secrets = BTreeMap::new();
+    for project in &config.projects {
+        let path = credential_directory.join(&project.github_webhook.secret_credential);
+        let secret =
+            match read_stable_source_credential(&path, config.source_uid, MAX_WEBHOOK_SECRET_BYTES)
+            {
+                Ok(secret) => secret,
+                Err(InstalledSourceError::UnsafeGitCredential) => {
+                    zeroize_secret_map(&mut secrets);
+                    return Err(InstalledSourceError::UnsafeWebhookCredential);
+                }
+                Err(error) => {
+                    zeroize_secret_map(&mut secrets);
+                    return Err(error);
+                }
+            };
+        secrets.insert(project.project_id.clone(), secret);
+    }
+    SourceWebhookSecretsV1::from_project_secrets(config, secrets)
 }
 
 fn valid_openssh_private_key(bytes: &[u8]) -> bool {
@@ -662,6 +865,31 @@ fn valid_known_hosts(bytes: &[u8], expected_hosts: &BTreeSet<String>) -> bool {
         present_hosts.extend(fields[0].split(',').map(str::to_owned));
     }
     !present_hosts.is_empty() && expected_hosts.is_subset(&present_hosts)
+}
+
+fn github_repository_full_name(remote: &RemoteUrl) -> Result<String, InstalledSourceError> {
+    let url = Url::parse(remote.as_str()).map_err(|_| InstalledSourceError::InvalidConfig)?;
+    if url.host_str() != Some("github.com") {
+        return Err(InstalledSourceError::InvalidConfig);
+    }
+    let path = url.path().trim_start_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repository = parts.next().unwrap_or_default();
+    if owner.is_empty()
+        || repository.is_empty()
+        || parts.next().is_some()
+        || !owner.bytes().all(valid_github_name_byte)
+        || !repository.bytes().all(valid_github_name_byte)
+    {
+        return Err(InstalledSourceError::InvalidConfig);
+    }
+    Ok(format!("{owner}/{repository}"))
+}
+
+const fn valid_github_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
 fn remote_uses_ssh(remote: &RemoteUrl) -> bool {
@@ -758,6 +986,10 @@ pub enum InstalledSourceError {
     UnsafeGitCredential,
     #[error("source Git SSH key or pinned host file does not match installed configuration")]
     GitCredentialMismatch,
+    #[error("source GitHub webhook secret does not match installed configuration")]
+    WebhookCredentialMismatch,
+    #[error("source GitHub webhook secret is not a safe exact private file")]
+    UnsafeWebhookCredential,
     #[error("source snapshot is not a current installed-policy-bound accepted head")]
     InvalidSourceSnapshot,
     #[error(transparent)]
@@ -768,6 +1000,8 @@ pub enum InstalledSourceError {
     Socket(#[from] crate::source_socket::SourceSocketError),
     #[error(transparent)]
     DeliverySocket(#[from] crate::source_delivery_socket::SourceDeliveryServerConfigError),
+    #[error(transparent)]
+    IngressSocket(#[from] crate::source_ingress_socket::SourceIngressServerConfigError),
     #[error(transparent)]
     Attestation(#[from] SourceAttestationError),
 }
@@ -793,21 +1027,31 @@ mod tests {
         git_ssh: Option<InstalledSourceGitSshV1>,
     ) -> InstalledSourceConfigV1 {
         let project_id = ProjectId::from_str("rimg").expect("project");
-        let project = InstalledSourceProjectV1::new(
+        let remote_url = RemoteUrl::from_str(remote_url).expect("remote");
+        let webhook = InstalledSourceGithubWebhookV1::new(
+            &project_id,
+            &remote_url,
+            EvidenceDigest::sha256("rimg webhook secret"),
+        )
+        .expect("webhook binding");
+        let project = InstalledSourceProjectV1::new(InstalledSourceProjectInputV1 {
             project_id,
-            RemoteUrl::from_str(remote_url).expect("remote"),
+            remote_url,
             git_ssh,
-            InstalledPolicyIdentity {
+            github_webhook: webhook,
+            installed_policy: InstalledPolicyIdentity {
                 digest: EvidenceDigest::sha256("owner policy"),
                 version: 7,
             },
-            true,
-            3,
-            ReleaseClass::StatefulCompatible,
-        )
+            auto_deploy: true,
+            maximum_attempts: 3,
+            release_class: ReleaseClass::StatefulCompatible,
+        })
         .expect("source project");
         InstalledSourceConfigV1::new(InstalledSourceConfigInputV1 {
             source_uid,
+            ingress_uid: 76,
+            ingress_gid: 76,
             controller_uid: 78,
             controller_gid: 78,
             build_reader_gid: 77,
@@ -845,7 +1089,7 @@ mod tests {
         let uid = fs::metadata(directory.path()).expect("metadata").uid();
         let signing_key = SigningKey::from_bytes(&[17_u8; 32]);
         let installed = config(uid, &signing_key);
-        assert_eq!(installed.purpose, "rdashboard.installed-source-config.v4");
+        assert_eq!(installed.purpose, "rdashboard.installed-source-config.v5");
         assert_eq!(
             installed.delivery_socket_path,
             Path::new(SOURCE_DELIVERY_SOCKET_PATH)
@@ -899,6 +1143,37 @@ mod tests {
         assert!(matches!(
             load_source_signing_key_from(&credential, &mismatched),
             Err(InstalledSourceError::CredentialKeyMismatch)
+        ));
+    }
+
+    #[test]
+    fn source_webhook_secret_is_exact_private_and_project_bound() {
+        let directory = tempdir().expect("tempdir");
+        let uid = fs::metadata(directory.path()).expect("metadata").uid();
+        let signing_key = SigningKey::from_bytes(&[31_u8; 32]);
+        let installed = config(uid, &signing_key);
+        let credential = directory.path().join("source-webhook-rimg-secret");
+        fs::write(&credential, b"rimg webhook secret").expect("write webhook secret");
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o600))
+            .expect("webhook secret permissions");
+
+        let secrets = load_source_webhook_secrets_from(&installed, directory.path())
+            .expect("load webhook secret");
+        assert_eq!(
+            secrets.secret(&ProjectId::from_str("rimg").expect("project")),
+            Some(b"rimg webhook secret".as_slice())
+        );
+
+        fs::write(&credential, b"other webhook secret").expect("replace webhook secret");
+        assert!(matches!(
+            load_source_webhook_secrets_from(&installed, directory.path()),
+            Err(InstalledSourceError::WebhookCredentialMismatch)
+        ));
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o640))
+            .expect("make webhook secret unsafe");
+        assert!(matches!(
+            load_source_webhook_secrets_from(&installed, directory.path()),
+            Err(InstalledSourceError::UnsafeWebhookCredential)
         ));
     }
 
@@ -964,19 +1239,27 @@ mod tests {
             ("ssh://git@github.com/mrDenai/rimg.git", None),
             ("https://github.com/mrDenai/rimg.git", Some(git_ssh.clone())),
         ] {
+            let remote = RemoteUrl::from_str(remote).expect("remote");
+            let webhook = InstalledSourceGithubWebhookV1::new(
+                &project_id,
+                &remote,
+                EvidenceDigest::sha256("rimg webhook secret"),
+            )
+            .expect("webhook binding");
             assert!(matches!(
-                InstalledSourceProjectV1::new(
-                    project_id.clone(),
-                    RemoteUrl::from_str(remote).expect("remote"),
-                    transport,
-                    InstalledPolicyIdentity {
+                InstalledSourceProjectV1::new(InstalledSourceProjectInputV1 {
+                    project_id: project_id.clone(),
+                    remote_url: remote,
+                    git_ssh: transport,
+                    github_webhook: webhook,
+                    installed_policy: InstalledPolicyIdentity {
                         digest: EvidenceDigest::sha256("owner policy"),
                         version: 7,
                     },
-                    true,
-                    3,
-                    ReleaseClass::StatefulCompatible,
-                ),
+                    auto_deploy: true,
+                    maximum_attempts: 3,
+                    release_class: ReleaseClass::StatefulCompatible,
+                }),
                 Err(InstalledSourceError::InvalidConfig)
             ));
         }
@@ -999,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn source_service_can_write_only_its_external_export_store() {
+    fn source_and_ingress_services_keep_credentials_network_and_writes_separated() {
         let unit = include_str!("../deploy/systemd/rdashboard-source.service");
         assert!(unit.lines().any(|line| line == "ProtectSystem=strict"));
         assert_eq!(
@@ -1007,7 +1290,7 @@ mod tests {
                 .filter(|line| line.starts_with("ReadWritePaths="))
                 .collect::<Vec<_>>(),
             [
-                "ReadWritePaths=/var/lib/rdashboard-build/source-exports /run/rdashboard-source-delivery"
+                "ReadWritePaths=/var/lib/rdashboard-build/source-exports /run/rdashboard-source-ingress /run/rdashboard-source-delivery"
             ]
         );
         assert!(
@@ -1019,24 +1302,51 @@ mod tests {
                 .lines()
                 .any(|line| { line == "SupplementaryGroups=rdashboard rdashboard-build-readers" })
         );
-        assert_eq!(
-            unit.lines()
-                .filter(|line| line.starts_with("LoadCredential="))
-                .collect::<Vec<_>>(),
-            [
-                "LoadCredential=source-attestation-seed:/etc/rdashboard/credentials/source-attestation-seed"
-            ]
+        assert!(
+            !unit.lines().any(|line| line.starts_with("LoadCredential=")),
+            "the complete per-project credential set is generated as one installed drop-in"
         );
-        let git_ssh_drop_in = include_str!("../deploy/systemd/rdashboard-source-git-ssh.conf");
-        assert_eq!(
-            git_ssh_drop_in
+        let ingress = include_str!("../deploy/systemd/rdashboard-source-ingress.service");
+        assert!(
+            ingress
                 .lines()
-                .filter(|line| line.starts_with("LoadCredential="))
-                .collect::<Vec<_>>(),
-            [
-                "LoadCredential=source-git-rimg-private-key:/etc/rdashboard/credentials/source-git-rimg-private-key",
-                "LoadCredential=source-git-rimg-known-hosts:/etc/rdashboard/credentials/source-git-rimg-known-hosts",
-            ]
+                .any(|line| line == "User=rdashboard-source-ingress")
+        );
+        assert!(
+            ingress
+                .lines()
+                .any(|line| line == "IPAddressAllow=localhost")
+        );
+        assert!(
+            !ingress
+                .lines()
+                .any(|line| line.starts_with("LoadCredential="))
+        );
+        assert!(
+            !ingress
+                .lines()
+                .any(|line| line.starts_with("ReadWritePaths="))
+        );
+        let bridge = include_str!("../deploy/systemd/rdashboard-source-ingress-bridge.service");
+        assert!(
+            bridge
+                .lines()
+                .any(|line| line == "User=rdashboard-source-ingress")
+        );
+        assert!(
+            bridge
+                .lines()
+                .any(|line| line == "IPAddressAllow=localhost")
+        );
+        assert!(bridge.lines().any(|line| {
+            line == "ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:3201"
+        }));
+        let bridge_socket =
+            include_str!("../deploy/systemd/rdashboard-source-ingress-bridge.socket");
+        assert!(
+            bridge_socket
+                .lines()
+                .any(|line| line == "ListenStream=172.19.0.1:3201")
         );
     }
 
@@ -1075,6 +1385,9 @@ mod tests {
             let expected = format!("d {path} 2750 rdashboard-build rdashboard-build-readers -");
             assert!(tmpfiles.lines().any(|line| line == expected));
         }
+        assert!(tmpfiles.lines().any(|line| {
+            line == "d /run/rdashboard-source-ingress 2750 rdashboard-source rdashboard-source-ingress -"
+        }));
         assert!(tmpfiles.lines().any(|line| {
             line == "d /run/rdashboard-source-delivery 2750 rdashboard-source rdashboard -"
         }));

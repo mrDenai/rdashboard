@@ -1,0 +1,34 @@
+[Unit]
+Description=Forward the private Kamal listener to rdashboard source ingress
+Requires=rdashboard-source-ingress.service
+After=rdashboard-source-ingress.service
+
+[Service]
+User=rdashboard-source-ingress
+Group=rdashboard-source-ingress
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:3201
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+IPAddressDeny=any
+IPAddressAllow=localhost
+TasksMax=64
+LimitNOFILE=1024
+MemoryMax=32M

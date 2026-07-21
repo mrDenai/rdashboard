@@ -102,7 +102,7 @@ Implementation progress:
 | --- | --- | --- |
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker and sealed preparation store remain step 4. |
-| 3. Multi-project source ingress and durable controller delivery | In progress | Slice 3a locally implements the signed accepted-source outbox and isolated source-to-controller dispatcher. HTTP webhook ingress, forced-push ingress, multi-project config generation and the authorized timing drill remain in this step. |
+| 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
 | 4-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -241,6 +241,22 @@ Implementation ledger:
   `0c5f01a1d2c32dc261e586cc8bac0d000275daf18cf7538eaa6ea4cc318c54a8`, all delivery/policy/epoch/socket
   invariants and no open P0-P2 finding. No service was installed, enabled or restarted and no source,
   scheduler, GitHub, provider or production state was mutated.
+- Slice 3b upgrades the installed source catalog and ledger for every installed workflow project.
+  Root-generated configuration binds each exact GitHub repository, webhook-secret digest, optional
+  project-scoped read-only SSH credentials, source controls and peer identities without serializing
+  private bytes. A generated systemd credential drop-in replaces the fixed `rimg` credential list.
+- A separate loopback-only HTTP process accepts only exact configured push routes and bounded GitHub
+  headers/body, then forwards the unchanged body through a peer-UID-authenticated AF_UNIX protocol.
+  The source broker verifies HMAC and repository binding before committing a bounded SQLite wake-up;
+  raw bodies and signatures are neither logged nor persisted. Duplicate delivery IDs are content-bound,
+  and 128 events for one project share one remote fetch.
+- Durable webhook priority is project-aware and survives until the corresponding queue is drained.
+  Periodic work uses a non-queuing two-second fetch admission, yields an active network child within the
+  guard interval when a webhook commits, and cannot claim the shared fetch slot while any durable
+  priority project remains. The full webhook batch is processed by a foreground fetch with restart and
+  remote-visibility retry coverage; obsolete wake-ups are retired on project removal/rebinding.
+- Slice 3b remains inactive locally: `auto_deploy=false`; no webhook was registered, route exposed,
+  service installed/restarted, provider contacted, repository pushed or production state changed.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

@@ -360,6 +360,7 @@ fn source_broker_with_repository(
         vec![InstalledSourceProjectPolicy {
             project_id: operation.project_id.clone(),
             repository_identity: digest("executor repository identity"),
+            github_repository: "mrDenai/rimg".to_owned(),
             installed_policy: operation.installed_policy.clone(),
             auto_deploy: true,
             maximum_attempts: 3,
@@ -1761,6 +1762,7 @@ fn retry_after_ticket_only_crash_aborts_when_the_installed_policy_changed() {
         vec![InstalledSourceProjectPolicy {
             project_id: operation.project_id.clone(),
             repository_identity: digest("executor repository identity"),
+            github_repository: "mrDenai/rimg".to_owned(),
             installed_policy: InstalledPolicyIdentity {
                 digest: digest("changed installed policy"),
                 version: 2,

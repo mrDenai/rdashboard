@@ -95,6 +95,7 @@ fn source_broker(
         vec![InstalledSourceProjectPolicy {
             project_id: operation.project_id.clone(),
             repository_identity: digest("repository identity"),
+            github_repository: "mrDenai/rimg".to_owned(),
             installed_policy: operation.installed_policy.clone(),
             auto_deploy: true,
             maximum_attempts,
@@ -718,6 +719,7 @@ fn automation_retry_budget_comes_only_from_installed_source_policy() {
         vec![InstalledSourceProjectPolicy {
             project_id: operation.project_id.clone(),
             repository_identity: digest("repository identity"),
+            github_repository: "mrDenai/rimg".to_owned(),
             installed_policy: operation.installed_policy.clone(),
             auto_deploy: true,
             maximum_attempts: 2,

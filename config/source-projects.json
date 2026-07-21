@@ -1,0 +1,13 @@
+{
+  "purpose": "rdashboard.source-project-controls.v1",
+  "schema_version": 1,
+  "projects": [
+    {
+      "project_id": "ralert",
+      "installed_policy_version": 1,
+      "auto_deploy": false,
+      "maximum_attempts": 3,
+      "release_class": "stateful_compatible"
+    }
+  ]
+}

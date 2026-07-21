@@ -16,7 +16,8 @@ use rdashboard::{
         EvidenceDigest, GitCommitId, InstalledPolicyIdentity, ProjectManifestV2, ReleaseClass,
     },
     installed_source::{
-        InstalledSourceConfigInputV1, InstalledSourceConfigV1, InstalledSourceProjectV1,
+        InstalledSourceConfigInputV1, InstalledSourceConfigV1, InstalledSourceProjectInputV1,
+        InstalledSourceProjectV1,
     },
     installed_workflow::InstalledWorkflowCatalogV1,
     scheduler::DurableWorkflowScheduler,
@@ -57,24 +58,33 @@ fn source_config(
     let workflow_policy_digest = manifest
         .workflow_policy_digest()
         .unwrap_or_else(|error| panic!("workflow policy digest: {error}"));
-    let project = InstalledSourceProjectV1::new(
-        manifest.project_id.clone(),
-        manifest.source.remote_url.clone(),
-        None,
-        InstalledPolicyIdentity {
+    let webhook = rdashboard::installed_source::InstalledSourceGithubWebhookV1::new(
+        &manifest.project_id,
+        &manifest.source.remote_url,
+        EvidenceDigest::sha256("ralert webhook secret"),
+    )
+    .unwrap_or_else(|error| panic!("webhook binding: {error}"));
+    let project = InstalledSourceProjectV1::new(InstalledSourceProjectInputV1 {
+        project_id: manifest.project_id.clone(),
+        remote_url: manifest.source.remote_url.clone(),
+        git_ssh: None,
+        github_webhook: webhook,
+        installed_policy: InstalledPolicyIdentity {
             digest: workflow_policy_digest,
             version: 1,
         },
         auto_deploy,
-        3,
-        ReleaseClass::StatefulCompatible,
-    )
+        maximum_attempts: 3,
+        release_class: ReleaseClass::StatefulCompatible,
+    })
     .unwrap_or_else(|error| panic!("installed source project: {error}"));
     InstalledSourceConfigV1::new(InstalledSourceConfigInputV1 {
         source_uid: 991,
-        controller_uid: 992,
-        controller_gid: 992,
-        build_reader_gid: 993,
+        ingress_uid: 992,
+        ingress_gid: 992,
+        controller_uid: 993,
+        controller_gid: 993,
+        build_reader_gid: 994,
         max_connections: 8,
         request_timeout_ms: 2_000,
         reconcile_interval_ms: 30_000,
@@ -506,7 +516,7 @@ fn scheduler_admission_rejects_signature_policy_and_repository_substitution() {
 }
 
 #[test]
-fn source_schema_v2_reopens_with_an_empty_v3_outbox() {
+fn source_schema_v2_reopens_with_empty_v4_outbox_and_webhook_queue() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
     let path = directory.path().join("source.sqlite");
     drop(SourceStore::open(&path).unwrap_or_else(|error| panic!("new source store: {error}")));
@@ -533,8 +543,14 @@ fn source_schema_v2_reopens_with_an_empty_v3_outbox() {
     let outbox_rows: i64 = connection
         .query_row("SELECT COUNT(*) FROM source_outbox", [], |row| row.get(0))
         .unwrap_or_else(|error| panic!("source outbox count: {error}"));
-    assert_eq!(version, 3);
+    let webhook_rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM source_github_wakeups", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|error| panic!("source webhook wake-up count: {error}"));
+    assert_eq!(version, 4);
     assert_eq!(outbox_rows, 0);
+    assert_eq!(webhook_rows, 0);
 }
 
 #[tokio::test]

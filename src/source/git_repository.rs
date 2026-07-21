@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, TryLockError,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +31,7 @@ const ACCEPTED_REF: &str = "refs/heads/rdashboard-accepted/main";
 const FETCHED_MAIN_REF: &str = "refs/remotes/rdashboard/main";
 const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const FETCH_TIMEOUT: Duration = Duration::from_mins(1);
+const RECONCILIATION_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_LIMIT: usize = 64 * 1024;
 const MAX_EXPORT_TREE_ENTRIES: usize = 100_000;
 const MAX_EXPORT_TREE_ENTRY_BYTES: usize = 64 * 1024;
@@ -180,6 +184,10 @@ pub struct GitSourceRepository {
     git_version: GitVersion,
     projects: Arc<BTreeMap<String, InstalledGitProject>>,
     fetch_lock: Arc<Mutex<()>>,
+    foreground_fetch_waiters: Arc<AtomicUsize>,
+    priority_fetch_projects: Arc<BTreeMap<String, Arc<AtomicBool>>>,
+    priority_fetch_project_count: Arc<AtomicUsize>,
+    fetch_priority_generation: Arc<AtomicU64>,
     fetch_limits: FetchLimits,
 }
 
@@ -367,11 +375,19 @@ impl GitSourceRepository {
         if installed.is_empty() {
             return Err(SourceError::InvalidInstalledPolicy);
         }
+        let priority_fetch_projects = installed
+            .keys()
+            .map(|project_id| (project_id.clone(), Arc::new(AtomicBool::new(false))))
+            .collect();
         let repository = Self {
             git_executable,
             git_version,
             projects: Arc::new(installed),
             fetch_lock: Arc::new(Mutex::new(())),
+            foreground_fetch_waiters: Arc::new(AtomicUsize::new(0)),
+            priority_fetch_projects: Arc::new(priority_fetch_projects),
+            priority_fetch_project_count: Arc::new(AtomicUsize::new(0)),
+            fetch_priority_generation: Arc::new(AtomicU64::new(0)),
             fetch_limits,
         };
         repository.verify_bare_repositories()?;
@@ -812,6 +828,7 @@ impl GitSourceRepository {
         project: &InstalledGitProject,
         staging_path: &Path,
         disk_guard: &CommandDiskGuard<'_>,
+        fetch_timeout: Duration,
     ) -> Result<GitCommitId, SourceError> {
         self.seed_staging_negotiation_refs(project, staging_path, disk_guard)?;
         let output = self.run_staging_git(
@@ -846,7 +863,7 @@ impl GitSourceRepository {
                 project.remote.argument(),
                 OsString::from(format!("+refs/heads/main:{STAGED_MAIN_REF}")),
             ],
-            FETCH_TIMEOUT,
+            fetch_timeout,
             Some(disk_guard),
         )?;
         require_success("fetch bounded remote main", &output)?;
@@ -916,6 +933,9 @@ impl GitSourceRepository {
             staging_path: None,
             staging_identity: None,
             fetch_limits: self.fetch_limits,
+            foreground_fetch_waiters: None,
+            priority_fetch_project_count: None,
+            fetch_priority_generation: None,
         };
         let keep_message = promoted_pack_keep_message(project, candidate);
         let mut command = Command::new(&self.git_executable);
@@ -1124,28 +1144,26 @@ impl GitSourceRepository {
         }
         Ok(())
     }
-}
 
-impl SourceRepository for GitSourceRepository {
-    fn repository_identity(&self, project_id: &ProjectId) -> Result<EvidenceDigest, SourceError> {
-        Ok(self.project(project_id)?.repository_identity.clone())
-    }
-
-    fn fetch_remote_main(&self, project_id: &ProjectId) -> Result<GitCommitId, SourceError> {
-        let project = self.project(project_id)?;
-        let _fetch_guard = self
-            .fetch_lock
-            .lock()
-            .map_err(|_| SourceError::LockPoisoned)?;
+    fn fetch_remote_main_locked(
+        &self,
+        project_id: &ProjectId,
+        project: &InstalledGitProject,
+        fetch_timeout: Duration,
+        background_generation: Option<u64>,
+    ) -> Result<GitCommitId, SourceError> {
         let _guard = project
             .command_lock
             .lock()
             .map_err(|_| SourceError::LockPoisoned)?;
+        self.require_current_background_priority(background_generation)?;
         validate_installed_repository(project)?;
         let staging_root = prepare_staging_root(project)?;
         self.reconcile_stale_staging_directories(project, &staging_root)?;
+        self.require_current_background_priority(background_generation)?;
         self.reconcile_orphaned_promoted_pack_guards(project)?;
         cleanup_canonical_pack_temporaries(project)?;
+        self.require_current_background_priority(background_generation)?;
         let emergency_reserve_bytes = self
             .fetch_limits
             .emergency_reserve_bytes(&project.repository_root)?;
@@ -1169,8 +1187,15 @@ impl SourceRepository for GitSourceRepository {
                 staging_path: Some(&staging_path),
                 staging_identity: Some(staging_identity),
                 fetch_limits: self.fetch_limits,
+                foreground_fetch_waiters: background_generation
+                    .map(|_| self.foreground_fetch_waiters.as_ref()),
+                priority_fetch_project_count: background_generation
+                    .map(|_| self.priority_fetch_project_count.as_ref()),
+                fetch_priority_generation: background_generation
+                    .map(|generation| (self.fetch_priority_generation.as_ref(), generation)),
             };
-            let candidate = self.fetch_staged_main(project, &staging_path, &staging_guard)?;
+            let candidate =
+                self.fetch_staged_main(project, &staging_path, &staging_guard, fetch_timeout)?;
             promotion_started = true;
             let promoted_pack_guard = self.promote_staged_pack(
                 project,
@@ -1193,6 +1218,96 @@ impl SourceRepository for GitSourceRepository {
         }
         remove_staging_directory(project, &staging_path)?;
         Ok(candidate)
+    }
+
+    fn require_current_background_priority(
+        &self,
+        expected_generation: Option<u64>,
+    ) -> Result<(), SourceError> {
+        let Some(expected_generation) = expected_generation else {
+            return Ok(());
+        };
+        if self.foreground_fetch_waiters.load(Ordering::Acquire) > 0
+            || self.priority_fetch_project_count.load(Ordering::Acquire) > 0
+            || self.fetch_priority_generation.load(Ordering::Acquire) != expected_generation
+        {
+            return Err(SourceError::ReconciliationDeferred);
+        }
+        Ok(())
+    }
+
+    fn priority_fetch_project(&self, project_id: &ProjectId) -> Result<&AtomicBool, SourceError> {
+        self.priority_fetch_projects
+            .get(project_id.as_str())
+            .map(Arc::as_ref)
+            .ok_or_else(|| SourceError::UnknownProject(project_id.to_string()))
+    }
+}
+
+impl SourceRepository for GitSourceRepository {
+    fn repository_identity(&self, project_id: &ProjectId) -> Result<EvidenceDigest, SourceError> {
+        Ok(self.project(project_id)?.repository_identity.clone())
+    }
+
+    fn fetch_remote_main(&self, project_id: &ProjectId) -> Result<GitCommitId, SourceError> {
+        let project = self.project(project_id)?;
+        self.foreground_fetch_waiters.fetch_add(1, Ordering::AcqRel);
+        let fetch_guard = self.fetch_lock.lock();
+        self.foreground_fetch_waiters.fetch_sub(1, Ordering::AcqRel);
+        let _fetch_guard = fetch_guard.map_err(|_| SourceError::LockPoisoned)?;
+        self.fetch_remote_main_locked(project_id, project, FETCH_TIMEOUT, None)
+    }
+
+    fn fetch_remote_main_reconciliation(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<GitCommitId, SourceError> {
+        let priority_generation = self.fetch_priority_generation.load(Ordering::Acquire);
+        if self.foreground_fetch_waiters.load(Ordering::Acquire) > 0
+            || self.priority_fetch_project_count.load(Ordering::Acquire) > 0
+        {
+            return Err(SourceError::ReconciliationDeferred);
+        }
+        let _fetch_guard = match self.fetch_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Err(SourceError::ReconciliationDeferred),
+            Err(TryLockError::Poisoned(_)) => return Err(SourceError::LockPoisoned),
+        };
+        if self.foreground_fetch_waiters.load(Ordering::Acquire) > 0
+            || self.priority_fetch_project_count.load(Ordering::Acquire) > 0
+        {
+            return Err(SourceError::ReconciliationDeferred);
+        }
+        if self.fetch_priority_generation.load(Ordering::Acquire) != priority_generation {
+            return Err(SourceError::ReconciliationDeferred);
+        }
+        let project = self.project(project_id)?;
+        self.fetch_remote_main_locked(
+            project_id,
+            project,
+            RECONCILIATION_FETCH_TIMEOUT,
+            Some(priority_generation),
+        )
+    }
+
+    fn notify_priority_fetch(&self, project_id: &ProjectId) -> Result<(), SourceError> {
+        let priority = self.priority_fetch_project(project_id)?;
+        if !priority.swap(true, Ordering::AcqRel) {
+            self.priority_fetch_project_count
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        self.fetch_priority_generation
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn clear_priority_fetch(&self, project_id: &ProjectId) -> Result<(), SourceError> {
+        let priority = self.priority_fetch_project(project_id)?;
+        if priority.swap(false, Ordering::AcqRel) {
+            self.priority_fetch_project_count
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        Ok(())
     }
 
     fn contains_commit(
@@ -1709,10 +1824,27 @@ struct CommandDiskGuard<'a> {
     staging_path: Option<&'a Path>,
     staging_identity: Option<StagingFilesystemIdentity>,
     fetch_limits: FetchLimits,
+    foreground_fetch_waiters: Option<&'a AtomicUsize>,
+    priority_fetch_project_count: Option<&'a AtomicUsize>,
+    fetch_priority_generation: Option<(&'a AtomicU64, u64)>,
 }
 
 impl CommandDiskGuard<'_> {
     fn check(&self) -> Result<(), SourceError> {
+        if self
+            .foreground_fetch_waiters
+            .is_some_and(|waiters| waiters.load(Ordering::Acquire) > 0)
+            || self
+                .priority_fetch_project_count
+                .is_some_and(|pending| pending.load(Ordering::Acquire) > 0)
+            || self
+                .fetch_priority_generation
+                .is_some_and(|(generation, expected)| {
+                    generation.load(Ordering::Acquire) != expected
+                })
+        {
+            return Err(SourceError::ReconciliationDeferred);
+        }
         require_available_bytes(
             self.free_space_path,
             self.minimum_available_bytes,
@@ -4413,6 +4545,137 @@ mod tests {
             .unwrap_or_else(|_| panic!("join project lock worker"));
     }
 
+    #[test]
+    fn background_fetch_does_not_queue_ahead_of_waiting_webhook_work() {
+        let fixture = git_fixture();
+        let held_fetch = fixture
+            .repository
+            .fetch_lock
+            .lock()
+            .unwrap_or_else(|_| panic!("hold global fetch lock"));
+        let foreground_repository = fixture.repository.clone();
+        let foreground_project = fixture.project_id.clone();
+        let foreground =
+            thread::spawn(move || foreground_repository.fetch_remote_main(&foreground_project));
+        for _ in 0..100 {
+            if fixture
+                .repository
+                .foreground_fetch_waiters
+                .load(Ordering::Acquire)
+                == 1
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fixture
+                .repository
+                .foreground_fetch_waiters
+                .load(Ordering::Acquire),
+            1,
+            "foreground webhook fetch did not register its priority"
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            fixture
+                .repository
+                .fetch_remote_main_reconciliation(&fixture.project_id),
+            Err(SourceError::ReconciliationDeferred)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        drop(held_fetch);
+        let _ = foreground
+            .join()
+            .unwrap_or_else(|_| panic!("join foreground fetch"));
+    }
+
+    #[test]
+    fn durable_priority_signal_blocks_background_fetch_until_cleared() {
+        let fixture = git_fixture();
+        fixture
+            .repository
+            .notify_priority_fetch(&fixture.project_id)
+            .unwrap_or_else(|error| panic!("signal priority fetch: {error}"));
+        fixture
+            .repository
+            .notify_priority_fetch(&fixture.project_id)
+            .unwrap_or_else(|error| panic!("repeat priority signal: {error}"));
+        assert_eq!(
+            fixture
+                .repository
+                .priority_fetch_project_count
+                .load(Ordering::Acquire),
+            1,
+            "duplicate delivery wake-ups must not inflate the pending-project count"
+        );
+        assert!(matches!(
+            fixture
+                .repository
+                .fetch_remote_main_reconciliation(&fixture.project_id),
+            Err(SourceError::ReconciliationDeferred)
+        ));
+
+        fixture
+            .repository
+            .clear_priority_fetch(&fixture.project_id)
+            .unwrap_or_else(|error| panic!("clear priority fetch: {error}"));
+        assert_eq!(
+            fixture
+                .repository
+                .priority_fetch_project_count
+                .load(Ordering::Acquire),
+            0
+        );
+        let result = fixture
+            .repository
+            .fetch_remote_main_reconciliation(&fixture.project_id);
+        assert!(
+            !matches!(result, Err(SourceError::ReconciliationDeferred)),
+            "clearing the durable priority signal must re-enable background fetch admission"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_webhook_signal_interrupts_an_active_background_fetch_command() {
+        let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let priority_generation = Arc::new(AtomicU64::new(0));
+        let guard = CommandDiskGuard {
+            free_space_path: directory.path(),
+            minimum_available_bytes: 0,
+            staging_path: None,
+            staging_identity: None,
+            fetch_limits: FetchLimits::TEST,
+            foreground_fetch_waiters: None,
+            priority_fetch_project_count: None,
+            fetch_priority_generation: Some((priority_generation.as_ref(), 0)),
+        };
+        let signal = Arc::clone(&priority_generation);
+        let notifier = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            signal.fetch_add(1, Ordering::AcqRel);
+        });
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 3 & wait"]);
+        let started = Instant::now();
+        assert!(matches!(
+            run_command_guarded(
+                command,
+                "test background fetch priority",
+                CommandInput::Null,
+                Duration::from_secs(3),
+                Some(&guard),
+            ),
+            Err(SourceError::ReconciliationDeferred)
+        ));
+        notifier
+            .join()
+            .unwrap_or_else(|_| panic!("join foreground notifier"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[cfg(unix)]
     #[test]
     fn command_deadline_terminates_descendants_and_drains_their_output_pipes() {
@@ -4505,10 +4768,13 @@ mod tests {
             staging_path: Some(&staging_path),
             staging_identity: Some(staging_identity),
             fetch_limits: fixture.repository.fetch_limits,
+            foreground_fetch_waiters: None,
+            priority_fetch_project_count: None,
+            fetch_priority_generation: None,
         };
         let staged_candidate = fixture
             .repository
-            .fetch_staged_main(project, &staging_path, &staging_guard)
+            .fetch_staged_main(project, &staging_path, &staging_guard, FETCH_TIMEOUT)
             .unwrap_or_else(|error| panic!("stage interrupted fetch: {error}"));
         assert!(
             !fixture

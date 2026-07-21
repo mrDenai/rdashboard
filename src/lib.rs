@@ -77,6 +77,8 @@ pub mod source_delivery;
 #[cfg(unix)]
 pub mod source_delivery_socket;
 #[cfg(unix)]
+pub mod source_ingress_socket;
+#[cfg(unix)]
 pub mod source_socket;
 pub mod store;
 pub mod web;

@@ -1,0 +1,45 @@
+[Unit]
+Description=rdashboard bounded GitHub source webhook ingress
+Requires=rdashboard-source.service
+After=network-online.target rdashboard-source.service
+Before=rdashboard-source-ingress-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rdashboard-source-ingress
+Group=rdashboard-source-ingress
+ExecStart=/usr/libexec/rdashboard/rdashboard-source-ingress
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+IPAddressDeny=any
+IPAddressAllow=localhost
+TasksMax=64
+LimitNOFILE=512
+MemoryMax=64M
+TimeoutStartSec=10s
+TimeoutStopSec=10s
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
