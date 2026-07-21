@@ -1,0 +1,42 @@
+[Unit]
+Description=rdashboard persistent A/B self-update supervisor
+After=local-fs.target
+Before=rdashboard-source.service rdashboard-observer.service rdashboard-executor.service rdashboard-workflow-launcher.service rdashboard-workflow-gateway.service rdashboard-dependency-fetcher.service rdashboard-buildkit.service rdashboard-worker.service rdashboard-source-dispatcher.service rdashboard-source-ingress.service rdashboard-source-ingress-bridge.service rdashboard.service
+RequiresMountsFor=/var/lib/rdashboard-bootstrap /var/lib/rdashboard-build/self-releases
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/libexec/rdashboard/rdashboard-bootstrap
+EnvironmentFile=/etc/rdashboard/self-update.env
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rdashboard-bootstrap /var/lib/rdashboard /var/lib/rdashboard-executor /var/lib/rdashboard-source
+RestrictAddressFamilies=AF_UNIX AF_INET
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=
+TasksMax=64
+LimitNOFILE=1024
+MemoryMax=128M
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

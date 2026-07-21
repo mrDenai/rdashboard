@@ -83,6 +83,10 @@ pub mod rootless_oci;
 #[cfg(unix)]
 pub mod rootless_oci_build;
 pub mod scheduler;
+#[cfg(unix)]
+pub mod self_update;
+#[cfg(unix)]
+pub mod self_update_runtime;
 pub mod source;
 #[cfg(unix)]
 pub mod source_delivery;
