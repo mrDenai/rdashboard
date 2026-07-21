@@ -80,6 +80,8 @@ pub mod root_adapter_runtime;
 pub mod root_fence_runtime;
 #[cfg(unix)]
 pub mod rootless_oci;
+#[cfg(unix)]
+pub mod rootless_oci_build;
 pub mod scheduler;
 pub mod source;
 #[cfg(unix)]

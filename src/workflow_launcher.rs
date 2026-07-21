@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read as _, Write as _},
@@ -33,6 +34,11 @@ use crate::{
         PreparationStoreReaderV1,
     },
     rootless_oci::RootlessOciRuntimePolicyV1,
+    rootless_oci_build::{
+        ROOTLESS_OCI_BUILD_EXECUTABLE, ROOTLESS_OCI_BUILD_REQUEST_PATH,
+        ROOTLESS_OCI_BUILD_SOCKET_PATH, RootlessOciBuildError, RootlessOciBuildPolicyV1,
+        RootlessOciBuildRequestV1, RootlessOciBuildResultV1, RootlessOciResultStoreV1,
+    },
     workflow_execution_grant::{
         VerifiedWorkflowExecutionGrantV1, WorkflowExecutionGrantError,
         WorkflowExecutionGrantVerificationKeyV1, WorkflowExecutionGrantVerifierV1,
@@ -80,6 +86,8 @@ pub struct WorkflowLauncherPolicyV1 {
     pub allowed_adapters: Vec<WorkflowAdapterIdV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootless_oci: Option<RootlessOciRuntimePolicyV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rootless_oci_builds: Vec<RootlessOciBuildPolicyV1>,
     pub max_concurrent_jobs: u16,
     pub max_journal_records: u32,
 }
@@ -152,7 +160,7 @@ impl WorkflowLauncherPolicyV1 {
             || !valid_workflow_identity(&self.host_id)
             || !(1..=MAX_KEYS).contains(&self.grant_verification_keys.len())
             || self.allowed_adapters.is_empty()
-            || self.allowed_adapters.len() > 3
+            || self.allowed_adapters.len() > 2
             || !self
                 .allowed_adapters
                 .windows(2)
@@ -161,14 +169,26 @@ impl WorkflowLauncherPolicyV1 {
                 !matches!(
                     adapter,
                     WorkflowAdapterIdV1::WorkerBareBinCiV1
-                        | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
                         | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
                 )
             })
+            || self.rootless_oci_builds.len() > 64
+            || !self
+                .rootless_oci_builds
+                .windows(2)
+                .all(|pair| pair[0].project_id < pair[1].project_id)
+            || self
+                .rootless_oci_builds
+                .iter()
+                .any(|build| build.validate().is_err())
             || self
                 .allowed_adapters
                 .contains(&WorkflowAdapterIdV1::WorkerOciReleaseBuildV1)
                 != self.rootless_oci.is_some()
+            || self
+                .allowed_adapters
+                .contains(&WorkflowAdapterIdV1::WorkerOciReleaseBuildV1)
+                == self.rootless_oci_builds.is_empty()
             || self
                 .rootless_oci
                 .as_ref()
@@ -182,6 +202,17 @@ impl WorkflowLauncherPolicyV1 {
         }
         let _ = self.grant_verifier()?;
         Ok(())
+    }
+
+    fn rootless_oci_build(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<&RootlessOciBuildPolicyV1, WorkflowLauncherError> {
+        self.rootless_oci_builds
+            .binary_search_by(|build| build.project_id.cmp(project_id))
+            .ok()
+            .map(|index| &self.rootless_oci_builds[index])
+            .ok_or(WorkflowLauncherError::UnsupportedLease)
     }
 
     fn grant_verifier(&self) -> Result<WorkflowExecutionGrantVerifierV1, WorkflowLauncherError> {
@@ -218,6 +249,7 @@ pub struct AuthorizedWorkflowLaunchV1 {
     pub prepared_run_path: PathBuf,
     pub dependency_snapshot_path: PathBuf,
     pub operation_state_path: Option<PathBuf>,
+    pub oci_build_request: Option<RootlessOciBuildRequestV1>,
     pub executable: &'static str,
     pub arguments: Vec<String>,
 }
@@ -256,6 +288,15 @@ impl AuthorizedWorkflowLaunchV1 {
                 .join(state.state_key.as_str())
                 .join("data")
         });
+        let oci_build_request = if lease.adapter_id == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+        {
+            Some(RootlessOciBuildRequestV1::from_policy(
+                lease,
+                policy.rootless_oci_build(&lease.project_id)?,
+            )?)
+        } else {
+            None
+        };
         let arguments = transient_unit_arguments(
             policy,
             lease,
@@ -263,6 +304,7 @@ impl AuthorizedWorkflowLaunchV1 {
             &prepared_run_path,
             &dependency_snapshot_path,
             operation_state_path.as_deref(),
+            oci_build_request.as_ref(),
         )?;
         Ok(Self {
             lease: lease.clone(),
@@ -272,6 +314,7 @@ impl AuthorizedWorkflowLaunchV1 {
             prepared_run_path,
             dependency_snapshot_path,
             operation_state_path,
+            oci_build_request,
             executable: SYSTEMD_RUN_EXECUTABLE,
             arguments,
         })
@@ -321,6 +364,8 @@ pub struct WorkflowLaunchTerminalV1 {
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub failure_digest: Option<EvidenceDigest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_digest: Option<EvidenceDigest>,
     pub completed_at_ms: i64,
     pub evidence_digest: EvidenceDigest,
 }
@@ -336,6 +381,8 @@ struct WorkflowLaunchTerminalPayload<'a> {
     exit_code: Option<i32>,
     signal: Option<i32>,
     failure_digest: &'a Option<EvidenceDigest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_digest: &'a Option<EvidenceDigest>,
     completed_at_ms: i64,
 }
 
@@ -353,7 +400,8 @@ impl WorkflowLaunchTerminalV1 {
             succeeded,
             exit_code: exit.exit_code,
             signal: exit.signal,
-            failure_digest: None,
+            failure_digest: exit.failure_digest,
+            output_digest: exit.output_digest,
             completed_at_ms,
             evidence_digest: EvidenceDigest::sha256([]),
         };
@@ -376,6 +424,7 @@ impl WorkflowLaunchTerminalV1 {
             exit_code: None,
             signal: None,
             failure_digest: Some(failure_digest),
+            output_digest: None,
             completed_at_ms,
             evidence_digest: EvidenceDigest::sha256([]),
         };
@@ -393,15 +442,21 @@ impl WorkflowLaunchTerminalV1 {
     ) -> Result<(), WorkflowLaunchJournalError> {
         let shape_is_valid = match self.kind {
             WorkflowLaunchTerminalKindV1::ProcessExit => {
-                self.failure_digest.is_none()
-                    && self.exit_code.is_some() != self.signal.is_some()
+                self.exit_code.is_some() != self.signal.is_some()
                     && self.succeeded == (self.exit_code == Some(0) && self.signal.is_none())
+                    && (!self.succeeded || self.failure_digest.is_none())
+                    && if lease.adapter_id == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 {
+                        self.succeeded == self.output_digest.is_some()
+                    } else {
+                        self.output_digest.is_none()
+                    }
             }
             WorkflowLaunchTerminalKindV1::SpawnRejected => {
                 !self.succeeded
                     && self.exit_code.is_none()
                     && self.signal.is_none()
                     && self.failure_digest.is_some()
+                    && self.output_digest.is_none()
             }
         };
         if !shape_is_valid
@@ -432,6 +487,7 @@ impl WorkflowLaunchTerminalV1 {
                 exit_code: self.exit_code,
                 signal: self.signal,
                 failure_digest: &self.failure_digest,
+                output_digest: &self.output_digest,
                 completed_at_ms: self.completed_at_ms,
             },
         )?))
@@ -1291,10 +1347,12 @@ impl WorkflowLaunchJournalV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowProcessExitV1 {
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+    pub failure_digest: Option<EvidenceDigest>,
+    pub output_digest: Option<EvidenceDigest>,
 }
 
 pub trait WorkflowLaunchProcessV1: Send {
@@ -1312,20 +1370,179 @@ pub trait WorkflowLaunchRuntimeV1: Send + Sync {
     fn terminate(&self, unit_name: &str) -> Result<bool, WorkflowLaunchRuntimeError>;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemdWorkflowLaunchRuntimeV1;
+#[derive(Clone, Default)]
+pub struct SystemdWorkflowLaunchRuntimeV1 {
+    oci_results: Option<Arc<RootlessOciResultStoreV1>>,
+    active_oci_results: Arc<Mutex<BTreeMap<String, RootlessOciBuildRequestV1>>>,
+}
+
+impl SystemdWorkflowLaunchRuntimeV1 {
+    pub fn new(oci_results: Option<Arc<RootlessOciResultStoreV1>>) -> Self {
+        Self {
+            oci_results,
+            active_oci_results: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn prepare_oci_result(
+        &self,
+        unit_name: &str,
+        request: &RootlessOciBuildRequestV1,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        let store = self
+            .oci_results
+            .as_ref()
+            .ok_or(WorkflowLaunchRuntimeError::MissingOciResultStore)?;
+        {
+            let mut active = self
+                .active_oci_results
+                .lock()
+                .map_err(|_| WorkflowLaunchRuntimeError::OciResultLifecycleLockPoisoned)?;
+            if active.contains_key(unit_name) {
+                return Err(WorkflowLaunchRuntimeError::OciResultLifecycleConflict);
+            }
+            active.insert(unit_name.to_owned(), request.clone());
+        }
+        if let Err(error) = store.prepare(request) {
+            let _ = self.clear_active_oci_result(unit_name, request);
+            return Err(error.into());
+        }
+        if let Err(error) = self.validate_active_oci_result(unit_name, request, false) {
+            let _ = store.discard(request);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn promote_oci_result(
+        &self,
+        unit_name: &str,
+        request: &RootlessOciBuildRequestV1,
+    ) -> Result<RootlessOciBuildResultV1, WorkflowLaunchRuntimeError> {
+        self.validate_active_oci_result(unit_name, request, false)?;
+        let result = self
+            .oci_results
+            .as_ref()
+            .ok_or(WorkflowLaunchRuntimeError::MissingOciResultStore)?
+            .promote(request)?;
+        self.clear_active_oci_result(unit_name, request)?;
+        Ok(result)
+    }
+
+    fn discard_oci_result(
+        &self,
+        unit_name: &str,
+        request: &RootlessOciBuildRequestV1,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        self.validate_active_oci_result(unit_name, request, true)?;
+        self.oci_results
+            .as_ref()
+            .ok_or(WorkflowLaunchRuntimeError::MissingOciResultStore)?
+            .discard(request)?;
+        self.clear_active_oci_result(unit_name, request)
+    }
+
+    fn discard_oci_result_for_unit(
+        &self,
+        unit_name: &str,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        let request = self
+            .active_oci_results
+            .lock()
+            .map_err(|_| WorkflowLaunchRuntimeError::OciResultLifecycleLockPoisoned)?
+            .get(unit_name)
+            .cloned();
+        if let Some(request) = request {
+            self.discard_oci_result(unit_name, &request)?;
+        }
+        Ok(())
+    }
+
+    fn validate_active_oci_result(
+        &self,
+        unit_name: &str,
+        request: &RootlessOciBuildRequestV1,
+        allow_missing: bool,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        let active = self
+            .active_oci_results
+            .lock()
+            .map_err(|_| WorkflowLaunchRuntimeError::OciResultLifecycleLockPoisoned)?;
+        match active.get(unit_name) {
+            Some(active_request) if active_request == request => Ok(()),
+            None if allow_missing => Ok(()),
+            Some(_) | None => Err(WorkflowLaunchRuntimeError::OciResultLifecycleConflict),
+        }
+    }
+
+    fn clear_active_oci_result(
+        &self,
+        unit_name: &str,
+        request: &RootlessOciBuildRequestV1,
+    ) -> Result<(), WorkflowLaunchRuntimeError> {
+        let mut active = self
+            .active_oci_results
+            .lock()
+            .map_err(|_| WorkflowLaunchRuntimeError::OciResultLifecycleLockPoisoned)?;
+        match active.get(unit_name) {
+            Some(active_request) if active_request == request => {
+                active.remove(unit_name);
+                Ok(())
+            }
+            Some(_) => Err(WorkflowLaunchRuntimeError::OciResultLifecycleConflict),
+            None => Ok(()),
+        }
+    }
+}
 
 struct SystemdWorkflowLaunchProcessV1 {
     child: Child,
+    unit_name: String,
+    oci_request: Option<RootlessOciBuildRequestV1>,
+    runtime: SystemdWorkflowLaunchRuntimeV1,
 }
 
 impl WorkflowLaunchProcessV1 for SystemdWorkflowLaunchProcessV1 {
     fn wait(mut self: Box<Self>) -> Result<WorkflowProcessExitV1, WorkflowLaunchRuntimeError> {
-        let status = self
-            .child
-            .wait()
-            .map_err(WorkflowLaunchRuntimeError::Wait)?;
-        Ok(process_exit(status))
+        let status = self.child.wait().map_err(|error| {
+            let reason_code = if self.oci_request.is_some() {
+                "rootless_oci_process_wait_uncertain"
+            } else {
+                "workflow_process_wait_uncertain"
+            };
+            tracing::error!(
+                reason_code,
+                unit_name = %self.unit_name,
+                summary = %error,
+                "workflow process wait became uncertain"
+            );
+            WorkflowLaunchRuntimeError::Wait(error)
+        })?;
+        let mut exit = process_exit(status);
+        if exit.exit_code == Some(0)
+            && exit.signal.is_none()
+            && let Some(request) = &self.oci_request
+        {
+            match self.runtime.promote_oci_result(&self.unit_name, request) {
+                Ok(result) => exit.output_digest = Some(result.result_digest),
+                Err(error) => {
+                    exit.exit_code = Some(1);
+                    let failure_digest = error.evidence_digest();
+                    tracing::error!(
+                        reason_code = "rootless_oci_result_promotion_failed",
+                        unit_name = %self.unit_name,
+                        evidence_digest = %failure_digest,
+                        summary = %error,
+                        "rootless OCI result promotion failed"
+                    );
+                    exit.failure_digest = Some(failure_digest);
+                    self.discard_oci_result_with_log(request);
+                }
+            }
+        } else if let Some(request) = &self.oci_request {
+            self.discard_oci_result_with_log(request);
+        }
+        Ok(exit)
     }
 
     fn abort(mut self: Box<Self>) -> Result<(), WorkflowLaunchRuntimeError> {
@@ -1342,7 +1559,24 @@ impl WorkflowLaunchProcessV1 for SystemdWorkflowLaunchProcessV1 {
         self.child
             .wait()
             .map_err(WorkflowLaunchRuntimeError::AbortWait)?;
+        if let Some(request) = &self.oci_request {
+            self.runtime.discard_oci_result(&self.unit_name, request)?;
+        }
         Ok(())
+    }
+}
+
+impl SystemdWorkflowLaunchProcessV1 {
+    fn discard_oci_result_with_log(&self, request: &RootlessOciBuildRequestV1) {
+        if let Err(error) = self.runtime.discard_oci_result(&self.unit_name, request) {
+            tracing::error!(
+                reason_code = "rootless_oci_result_cleanup_failed",
+                unit_name = %self.unit_name,
+                evidence_digest = %error.evidence_digest(),
+                summary = %error,
+                "rootless OCI result cleanup failed"
+            );
+        }
     }
 }
 
@@ -1351,14 +1585,47 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
         &self,
         launch: &AuthorizedWorkflowLaunchV1,
     ) -> Result<Box<dyn WorkflowLaunchProcessV1>, WorkflowLaunchRuntimeError> {
-        let child = Command::new(launch.executable)
+        if let Some(request) = &launch.oci_build_request
+            && let Err(error) = self.prepare_oci_result(&launch.unit_name, request)
+        {
+            tracing::error!(
+                reason_code = "rootless_oci_result_prepare_failed",
+                unit_name = %launch.unit_name,
+                evidence_digest = %error.evidence_digest(),
+                summary = %error,
+                "rootless OCI result preparation failed"
+            );
+            return Err(error);
+        }
+        let child_result = Command::new(launch.executable)
             .args(&launch.arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(WorkflowLaunchRuntimeError::Spawn)?;
-        Ok(Box::new(SystemdWorkflowLaunchProcessV1 { child }))
+            .spawn();
+        let child = match child_result {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(request) = &launch.oci_build_request
+                    && let Err(cleanup_error) = self.discard_oci_result(&launch.unit_name, request)
+                {
+                    tracing::error!(
+                        reason_code = "rootless_oci_result_cleanup_failed",
+                        unit_name = %launch.unit_name,
+                        evidence_digest = %cleanup_error.evidence_digest(),
+                        summary = %cleanup_error,
+                        "rootless OCI result cleanup after spawn failure failed"
+                    );
+                }
+                return Err(WorkflowLaunchRuntimeError::Spawn(error));
+            }
+        };
+        Ok(Box::new(SystemdWorkflowLaunchProcessV1 {
+            child,
+            unit_name: launch.unit_name.clone(),
+            oci_request: launch.oci_build_request.clone(),
+            runtime: self.clone(),
+        }))
     }
 
     fn terminate(&self, unit_name: &str) -> Result<bool, WorkflowLaunchRuntimeError> {
@@ -1372,6 +1639,7 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
         if !stop.success() {
             let load_state = systemd_property(unit_name, "LoadState")?;
             if load_state == "not-found" {
+                self.discard_oci_result_for_unit(unit_name)?;
                 return Ok(false);
             }
             return Err(WorkflowLaunchRuntimeError::StopRejected);
@@ -1380,6 +1648,7 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
         if !matches!(active_state.as_str(), "inactive" | "failed") {
             return Err(WorkflowLaunchRuntimeError::UnitStillActive);
         }
+        self.discard_oci_result_for_unit(unit_name)?;
         let reset = Command::new("/usr/bin/systemctl")
             .args(["reset-failed", "--", unit_name])
             .stdin(Stdio::null())
@@ -1460,11 +1729,14 @@ impl WorkflowLaunchSupervisorV1 {
         if !is_new {
             return Ok(status);
         }
-        let operation_state = self.operation_states.acquire(lease, now_ms)?;
-        if launch.operation_state_path.as_ref() != Some(&operation_state.data_path)
-            || lease.operation_state.as_ref().map(|state| &state.state_key)
-                != Some(&operation_state.state_key)
-        {
+        if let Some(expected_state) = &lease.operation_state {
+            let operation_state = self.operation_states.acquire(lease, now_ms)?;
+            if launch.operation_state_path.as_ref() != Some(&operation_state.data_path)
+                || expected_state.state_key != operation_state.state_key
+            {
+                return Err(WorkflowLaunchSupervisorError::OperationStatePathMismatch);
+            }
+        } else if launch.operation_state_path.is_some() {
             return Err(WorkflowLaunchSupervisorError::OperationStatePathMismatch);
         }
         let (process_sender, process_receiver) =
@@ -1602,13 +1874,12 @@ fn validate_launcher_lease(
             WorkflowWorkerPoolV1::VpsRequired | WorkflowWorkerPoolV1::BuildCompute
         )
         || lease.network_class != WorkflowNetworkClassV1::Offline
-        || lease.operation_state.is_none()
+        || (lease.adapter_id == WorkflowAdapterIdV1::WorkerBareBinCiV1)
+            != lease.operation_state.is_some()
         || !policy.allowed_adapters.contains(&lease.adapter_id)
         || !matches!(
             lease.adapter_id,
-            WorkflowAdapterIdV1::WorkerBareBinCiV1
-                | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
-                | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+            WorkflowAdapterIdV1::WorkerBareBinCiV1 | WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
         )
     {
         return Err(WorkflowLauncherError::UnsupportedLease);
@@ -1693,6 +1964,8 @@ fn process_exit(status: ExitStatus) -> WorkflowProcessExitV1 {
     WorkflowProcessExitV1 {
         exit_code: status.code(),
         signal: status.signal(),
+        failure_digest: None,
+        output_digest: None,
     }
 }
 
@@ -1926,6 +2199,14 @@ pub enum WorkflowLaunchRuntimeError {
     ResetFailed(io::Error),
     #[error("workflow unit reset-failed was rejected")]
     ResetRejected,
+    #[error("rootless OCI result store is missing for an OCI launch")]
+    MissingOciResultStore,
+    #[error("rootless OCI result lifecycle conflicts with its workflow unit")]
+    OciResultLifecycleConflict,
+    #[error("rootless OCI result lifecycle lock is poisoned")]
+    OciResultLifecycleLockPoisoned,
+    #[error("rootless OCI result lifecycle failed: {0}")]
+    RootlessOciBuild(#[from] RootlessOciBuildError),
 }
 
 impl WorkflowLaunchRuntimeError {
@@ -1952,6 +2233,12 @@ impl WorkflowLaunchRuntimeError {
             Self::UnitStillActive => "unit-still-active".to_owned(),
             Self::QueryRejected => "query-rejected".to_owned(),
             Self::ResetRejected => "reset-rejected".to_owned(),
+            Self::MissingOciResultStore => "rootless-oci-result-store-missing".to_owned(),
+            Self::OciResultLifecycleConflict => "rootless-oci-result-lifecycle-conflict".to_owned(),
+            Self::OciResultLifecycleLockPoisoned => {
+                "rootless-oci-result-lifecycle-lock-poisoned".to_owned()
+            }
+            Self::RootlessOciBuild(error) => return error.evidence_digest(),
         };
         EvidenceDigest::sha256(stable)
     }
@@ -1973,6 +2260,7 @@ pub enum WorkflowLaunchSupervisorError {
     Runtime(#[from] WorkflowLaunchRuntimeError),
 }
 
+#[allow(clippy::too_many_lines)]
 fn transient_unit_arguments(
     policy: &WorkflowLauncherPolicyV1,
     lease: &WorkflowLeaseV1,
@@ -1980,15 +2268,17 @@ fn transient_unit_arguments(
     prepared_run_path: &Path,
     dependency_snapshot_path: &Path,
     operation_state_path: Option<&Path>,
+    oci_build_request: Option<&RootlessOciBuildRequestV1>,
 ) -> Result<Vec<String>, WorkflowLauncherError> {
     let resources = lease
         .resources
         .as_ref()
         .ok_or(WorkflowLauncherError::UnsupportedLease)?;
-    let adapter = adapter_argument(lease.adapter_id)?;
-    let operation_state_path =
-        operation_state_path.ok_or(WorkflowLauncherError::UnsupportedLease)?;
-    Ok(vec![
+    let is_oci = lease.adapter_id == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1;
+    if is_oci != oci_build_request.is_some() {
+        return Err(WorkflowLauncherError::UnsupportedLease);
+    }
+    let mut arguments = vec![
         "--no-ask-password".to_owned(),
         "--quiet".to_owned(),
         "--wait".to_owned(),
@@ -2051,41 +2341,75 @@ fn transient_unit_arguments(
             dependency_snapshot_path.display()
         ),
         format!(
-            "--property=BindPaths={}:/operation",
-            operation_state_path.display()
-        ),
-        format!(
             "--property=TemporaryFileSystem=/job:rw,nodev,nosuid,size={},nr_inodes={},mode=0700,uid={},gid={}",
             resources.scratch_max_bytes,
             resources.scratch_max_inodes,
             policy.build_uid,
             policy.build_gid,
         ),
-        "--property=ReadWritePaths=/job".to_owned(),
-        "--".to_owned(),
-        ENV_EXECUTABLE.to_owned(),
-        "-i".to_owned(),
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_owned(),
-        "HOME=/nonexistent".to_owned(),
-        "TMPDIR=/job/tmp".to_owned(),
-        "CARGO_HOME=/job/cargo-home".to_owned(),
-        "CARGO_NET_OFFLINE=true".to_owned(),
-        "CARGO_TARGET_DIR=/operation/target".to_owned(),
-        "CCACHE_DIR=/operation/ccache".to_owned(),
-        "CCACHE_TEMPDIR=/job/ccache-tmp".to_owned(),
-        "RDASHBOARD_PREPARED_ROOT=/prepared".to_owned(),
-        "RDASHBOARD_DEPENDENCY_ROOT=/dependencies".to_owned(),
-        "RDASHBOARD_OPERATION_ROOT=/operation".to_owned(),
-        WORKFLOW_JOB_EXECUTABLE.to_owned(),
-        adapter.to_owned(),
-    ])
+    ];
+    if let Some(request) = oci_build_request {
+        request.validate_for_lease(lease)?;
+        let request_path = RootlessOciResultStoreV1::request_path_for(request);
+        let staging_path = RootlessOciResultStoreV1::staging_path_for(request);
+        arguments.extend([
+            "--property=TemporaryFileSystem=/request:ro,nodev,nosuid,noexec,size=1M,mode=0555"
+                .to_owned(),
+            "--property=TemporaryFileSystem=/buildkit:ro,nodev,nosuid,noexec,size=1M,mode=0555"
+                .to_owned(),
+            format!(
+                "--property=BindReadOnlyPaths={}:{}",
+                request_path.display(),
+                ROOTLESS_OCI_BUILD_REQUEST_PATH
+            ),
+            format!(
+                "--property=BindReadOnlyPaths={}:{ROOTLESS_OCI_BUILD_SOCKET_PATH}",
+                crate::rootless_oci::BUILDKIT_SOCKET_PATH
+            ),
+            format!("--property=BindPaths={}:/output", staging_path.display()),
+            "--property=ReadWritePaths=/job /output".to_owned(),
+            "--".to_owned(),
+            ENV_EXECUTABLE.to_owned(),
+            "-i".to_owned(),
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_owned(),
+            "HOME=/nonexistent".to_owned(),
+            "TMPDIR=/job".to_owned(),
+            ROOTLESS_OCI_BUILD_EXECUTABLE.to_owned(),
+        ]);
+    } else {
+        let operation_state_path =
+            operation_state_path.ok_or(WorkflowLauncherError::UnsupportedLease)?;
+        let adapter = adapter_argument(lease.adapter_id)?;
+        arguments.extend([
+            "--property=ReadWritePaths=/job".to_owned(),
+            format!(
+                "--property=BindPaths={}:/operation",
+                operation_state_path.display()
+            ),
+            "--".to_owned(),
+            ENV_EXECUTABLE.to_owned(),
+            "-i".to_owned(),
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_owned(),
+            "HOME=/nonexistent".to_owned(),
+            "TMPDIR=/job/tmp".to_owned(),
+            "CARGO_HOME=/job/cargo-home".to_owned(),
+            "CARGO_NET_OFFLINE=true".to_owned(),
+            "CARGO_TARGET_DIR=/operation/target".to_owned(),
+            "CCACHE_DIR=/operation/ccache".to_owned(),
+            "CCACHE_TEMPDIR=/job/ccache-tmp".to_owned(),
+            "RDASHBOARD_PREPARED_ROOT=/prepared".to_owned(),
+            "RDASHBOARD_DEPENDENCY_ROOT=/dependencies".to_owned(),
+            "RDASHBOARD_OPERATION_ROOT=/operation".to_owned(),
+            WORKFLOW_JOB_EXECUTABLE.to_owned(),
+            adapter.to_owned(),
+        ]);
+    }
+    Ok(arguments)
 }
 
 fn adapter_argument(adapter: WorkflowAdapterIdV1) -> Result<&'static str, WorkflowLauncherError> {
     match adapter {
         WorkflowAdapterIdV1::WorkerBareBinCiV1 => Ok("bare-bin-ci-v1"),
-        WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 => Ok("native-release-build-v1"),
-        WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 => Ok("oci-release-build-v1"),
         _ => Err(WorkflowLauncherError::UnsupportedLease),
     }
 }
@@ -2151,6 +2475,8 @@ pub enum WorkflowLauncherError {
     Preparation(#[from] PreparationStoreError),
     #[error("workflow launcher prepared input does not match the installed workflow policy")]
     PreparedRunMismatch,
+    #[error("workflow launcher rootless OCI build contract failed: {0}")]
+    RootlessOciBuild(#[from] RootlessOciBuildError),
 }
 
 pub fn installed_preparation_reader(
@@ -2364,6 +2690,7 @@ mod tests {
             }],
             allowed_adapters: vec![WorkflowAdapterIdV1::WorkerBareBinCiV1],
             rootless_oci: None,
+            rootless_oci_builds: Vec::new(),
             max_concurrent_jobs: 1,
             max_journal_records: 64,
         };
@@ -2545,6 +2872,8 @@ mod tests {
             let _ = self.exit_sender.send(WorkflowProcessExitV1 {
                 exit_code: None,
                 signal: Some(15),
+                failure_digest: None,
+                output_digest: None,
             });
             Ok(true)
         }
@@ -2586,6 +2915,81 @@ mod tests {
         )
     }
 
+    fn configured_oci_policy(fixture: &LauncherFixture) -> WorkflowLauncherPolicyV1 {
+        let mut policy = fixture.policy.clone();
+        policy.allowed_adapters = vec![WorkflowAdapterIdV1::WorkerOciReleaseBuildV1];
+        policy.rootless_oci = Some(RootlessOciRuntimePolicyV1 {
+            schema_version: crate::rootless_oci::ROOTLESS_OCI_POLICY_SCHEMA_VERSION,
+            daemon_uid: fixture
+                .policy
+                .build_uid
+                .checked_add(1)
+                .expect("BuildKit UID"),
+            daemon_user: "rdashboard-buildkit".to_owned(),
+            buildkitd_sha256: EvidenceDigest::sha256("buildkitd"),
+            buildctl_sha256: EvidenceDigest::sha256("buildctl"),
+            rootlesskit_sha256: EvidenceDigest::sha256("rootlesskit"),
+            runtime_sha256: EvidenceDigest::sha256("runc"),
+            buildkit_config_sha256: EvidenceDigest::sha256("buildkitd.toml"),
+            max_parallelism: 1,
+        });
+        policy.rootless_oci_builds = vec![RootlessOciBuildPolicyV1 {
+            schema_version: crate::rootless_oci_build::ROOTLESS_OCI_BUILD_POLICY_SCHEMA_VERSION,
+            project_id: fixture.lease.project_id.clone(),
+            dockerfile_path: "Dockerfile".to_owned(),
+            target: None,
+            platform: "linux/amd64".to_owned(),
+            build_args: Vec::new(),
+            base_inputs: Vec::new(),
+            max_archive_bytes: 32 * 1024 * 1024,
+        }];
+        policy.validate().expect("configured OCI policy");
+        policy
+    }
+
+    fn oci_lease(fixture: &LauncherFixture) -> WorkflowLeaseV1 {
+        let manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
+                .expect("manifest");
+        let node = manifest
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .expect("release node");
+        let profile = manifest
+            .workflow
+            .profile(&node.profile_id)
+            .expect("release profile");
+        let source_identity = fixture
+            .lease
+            .source_identity
+            .as_ref()
+            .expect("source identity");
+        WorkflowLeaseV1::new(
+            Uuid::from_u128(31),
+            1,
+            Uuid::from_u128(32),
+            fixture.lease.attempt_id,
+            fixture.lease.project_id.clone(),
+            fixture.lease.source_sha.clone(),
+            source_identity.sequence,
+            source_identity.attestation_digest.clone(),
+            fixture.lease.workflow_policy_digest.clone(),
+            fixture.lease.preparation_key.clone(),
+            node,
+            profile,
+            None,
+            fixture.lease.input_artifacts.clone(),
+            fixture.lease.expected_input_digest.clone(),
+            fixture.lease.worker_id.clone(),
+            fixture.lease.host_id.clone(),
+            100,
+            15_100,
+        )
+        .expect("OCI lease")
+    }
+
     fn assert_rootless_oci_policy_coupling(fixture: &LauncherFixture) {
         let canonical_policy = fixture.policy.canonical_bytes().expect("canonical policy");
         assert_eq!(
@@ -2607,24 +3011,7 @@ mod tests {
             unproven_oci_policy.validate(),
             Err(WorkflowLauncherError::InvalidPolicy)
         ));
-        unproven_oci_policy.rootless_oci = Some(RootlessOciRuntimePolicyV1 {
-            schema_version: crate::rootless_oci::ROOTLESS_OCI_POLICY_SCHEMA_VERSION,
-            daemon_uid: fixture
-                .policy
-                .build_uid
-                .checked_add(1)
-                .expect("BuildKit UID"),
-            daemon_user: "rdashboard-buildkit".to_owned(),
-            buildkitd_sha256: EvidenceDigest::sha256("buildkitd"),
-            buildctl_sha256: EvidenceDigest::sha256("buildctl"),
-            rootlesskit_sha256: EvidenceDigest::sha256("rootlesskit"),
-            runtime_sha256: EvidenceDigest::sha256("runc"),
-            buildkit_config_sha256: EvidenceDigest::sha256("buildkitd.toml"),
-            max_parallelism: 1,
-        });
-        unproven_oci_policy
-            .validate()
-            .expect("OCI policy with an exact rootless runtime contract");
+        configured_oci_policy(fixture);
     }
 
     #[test]
@@ -2717,6 +3104,128 @@ mod tests {
             ),
             Err(WorkflowLauncherError::Workflow(_) | WorkflowLauncherError::UnsupportedLease)
         ));
+    }
+
+    #[test]
+    fn oci_authorization_uses_only_the_installed_client_and_typed_result_paths() {
+        let fixture = fixture();
+        let policy = configured_oci_policy(&fixture);
+        let lease = oci_lease(&fixture);
+        assert!(lease.operation_state.is_none());
+        let grant = fixture
+            .signer
+            .issue(&lease, 101, Uuid::from_u128(33))
+            .expect("execution grant");
+        let launch =
+            AuthorizedWorkflowLaunchV1::authorize(&policy, &fixture.reader, &lease, &grant, 101)
+                .expect("authorize OCI launch");
+        let request = launch.oci_build_request.as_ref().expect("OCI request");
+        assert_eq!(request.lease_digest, lease.lease_digest);
+        assert!(launch.operation_state_path.is_none());
+        assert!(launch.arguments.iter().any(|argument| {
+            argument
+                == &format!(
+                    "--property=BindReadOnlyPaths={}:{}",
+                    RootlessOciResultStoreV1::request_path_for(request).display(),
+                    ROOTLESS_OCI_BUILD_REQUEST_PATH
+                )
+        }));
+        assert!(launch.arguments.iter().any(|argument| {
+            argument
+                == &format!(
+                    "--property=BindPaths={}:/output",
+                    RootlessOciResultStoreV1::staging_path_for(request).display()
+                )
+        }));
+        let read_write_paths = launch
+            .arguments
+            .iter()
+            .filter(|argument| argument.starts_with("--property=ReadWritePaths="))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(read_write_paths, ["--property=ReadWritePaths=/job /output"]);
+        assert!(!launch.arguments.iter().any(|argument| {
+            argument.starts_with("--property=BindPaths=") && argument.ends_with(":/operation")
+        }));
+        assert!(
+            !launch
+                .arguments
+                .iter()
+                .any(|argument| argument == WORKFLOW_JOB_EXECUTABLE)
+        );
+        let separator = launch
+            .arguments
+            .iter()
+            .position(|argument| argument == "--")
+            .expect("systemd-run separator");
+        assert_eq!(
+            &launch.arguments[separator + 1..],
+            [
+                ENV_EXECUTABLE,
+                "-i",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+                "HOME=/nonexistent",
+                "TMPDIR=/job",
+                ROOTLESS_OCI_BUILD_EXECUTABLE,
+            ]
+        );
+    }
+
+    #[test]
+    fn oci_success_commits_a_typed_output_without_operation_state() {
+        let fixture = fixture();
+        let policy = configured_oci_policy(&fixture);
+        let lease = oci_lease(&fixture);
+        let journal = WorkflowLaunchJournalV1::open(
+            &fixture.journal_root,
+            fixture.owner_uid,
+            policy.max_journal_records,
+            100,
+        )
+        .expect("open journal");
+        let (runtime, exit_sender) = runtime();
+        let supervisor = WorkflowLaunchSupervisorV1::new(
+            policy,
+            fixture.reader.clone(),
+            journal,
+            fixture.operation_states.clone(),
+            runtime,
+        )
+        .expect("supervisor");
+        let grant = fixture
+            .signer
+            .issue(&lease, 101, Uuid::from_u128(34))
+            .expect("execution grant");
+        supervisor.launch(&lease, &grant, 101).expect("launch OCI");
+        let output_digest = EvidenceDigest::sha256("verified OCI build result");
+        exit_sender
+            .send(WorkflowProcessExitV1 {
+                exit_code: Some(0),
+                signal: None,
+                failure_digest: None,
+                output_digest: Some(output_digest.clone()),
+            })
+            .expect("finish OCI process");
+        let completed = wait_for_state(
+            &supervisor,
+            lease.lease_id,
+            lease.lease_generation,
+            WorkflowLaunchStateV1::Succeeded,
+        );
+        let terminal = completed.terminal.as_ref().expect("terminal evidence");
+        assert_eq!(terminal.output_digest.as_ref(), Some(&output_digest));
+        let cleaned = supervisor
+            .cleanup(&lease, terminal.completed_at_ms + 1)
+            .expect("cleanup OCI launch");
+        assert!(
+            cleaned
+                .cleanup
+                .as_ref()
+                .expect("cleanup evidence")
+                .operation_state
+                .is_none()
+        );
+        assert_eq!(fixture.operation_states.counts(), (0, 0));
     }
 
     #[test]
@@ -2881,6 +3390,8 @@ mod tests {
             .send(WorkflowProcessExitV1 {
                 exit_code: Some(0),
                 signal: None,
+                failure_digest: None,
+                output_digest: None,
             })
             .expect("finish process");
         let completed = wait_for_state(
@@ -2939,9 +3450,7 @@ mod tests {
     #[test]
     fn cleanup_remains_authorized_after_an_adapter_is_removed_from_launch_policy() {
         let fixture = fixture();
-        let mut rotated_policy = fixture.policy;
-        rotated_policy.allowed_adapters = vec![WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1];
-        rotated_policy.validate().expect("rotated launcher policy");
+        let rotated_policy = configured_oci_policy(&fixture);
 
         assert!(matches!(
             validate_launcher_lease(&rotated_policy, &fixture.lease),

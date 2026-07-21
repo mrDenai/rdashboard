@@ -217,7 +217,7 @@
         "profile_id": "oci-release-build",
         "depends_on": ["prepare"],
         "input_contracts": ["prepared_run"],
-        "output_contract": "release_bundle"
+        "output_contract": "release_build_result"
       },
       {
         "node_id": "reduce",
@@ -226,7 +226,7 @@
         "activation": "always",
         "profile_id": "reduce-controller",
         "depends_on": ["release-build", "verify"],
-        "input_contracts": ["verification_receipt", "release_bundle"],
+        "input_contracts": ["verification_receipt", "release_build_result"],
         "output_contract": "reduction_receipt"
       },
       {

@@ -128,4 +128,7 @@ fn rootless_buildkit_is_offline_separate_and_hard_bounded() {
     assert!(tmpfiles.lines().any(|line| {
         line == "d /var/lib/rdashboard-buildkit 0700 rdashboard-buildkit rdashboard-build -"
     }));
+    assert!(tmpfiles.lines().any(|line| {
+        line == "d /var/lib/rdashboard-workflow-launcher/oci-results 0700 root root -"
+    }));
 }

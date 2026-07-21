@@ -112,15 +112,18 @@ evidence. Per-node workspace, Cargo configuration, logs and temporary files rema
 tmpfs with the lease byte and inode ceilings. The sealed composition is mounted read-only at
 `/prepared`, its dependency snapshot at `/dependencies`, and the fixed job copies only
 `/prepared/source` once into `/job/workspace`; the internal composition document never changes the
-repository-visible tree. A separate exact operation-owned directory is mounted at `/operation` and
-holds only the target and compiler cache. Matching verification/release consumers on the VPS execute
-serially against that directory, so the release reuses the gate's compiled artifacts; different
-attempts and hosts never share writable state. An optional build-only host gets a one-node local state
-and neither blocks the VPS nor causes its files to be transferred. Each per-node source copy preserves
-the sealed tree's modification times and stable `/job/workspace` path, which lets Cargo reuse the
-operation target instead of invalidating it merely because the tmpfs workspace was recreated.
+repository-visible tree. A separate exact operation-owned directory is mounted at `/operation` only
+for adapters that consume the target and compiler cache. Matching compiled consumers on the VPS
+execute serially against that directory; different attempts and hosts never share writable state. The
+OCI adapter neither mounts nor allocates operation state, so its independently bounded build can run
+beside verification without duplicating the verification cache. An optional build-only host gets a
+one-node local verification state and neither blocks the VPS nor causes its files to be transferred.
+Each verification source copy preserves the sealed tree's modification times and stable
+`/job/workspace` path, which lets Cargo reuse the operation target instead of invalidating it merely
+because the tmpfs workspace was recreated.
 
-The fixed `rdashboard-workflow-job` maps only the three installed adapter IDs to fixed script paths and
+The fixed `rdashboard-workflow-job` maps only the verification adapter to repository `bin/ci`; the
+reserved native-release adapter is not admitted until it has a typed result implementation. The job
 receives an empty, reconstructed environment. The launcher forces Cargo offline so a verification job
 cannot turn a cache miss into undeclared network access. Failed or uncertain execution removes the
 partial operation data; all declared successful consumers remove it after the last use. The retained
@@ -130,13 +133,29 @@ prune terminal tombstones back to the newest 512. A non-active partial operation
 consumer for one hour is failed and stripped on the next admission before capacity is checked, so a
 superseded attempt cannot pin a multi-gigabyte target indefinitely.
 
-The launcher deliberately has no network namespace, Docker/containerd socket, controller/executor/
+The OCI adapter never executes a repository script. The launcher derives a canonical request from the
+signed lease and the root-owned per-project build policy, exposes only the sealed source, dependency
+snapshot, one BuildKit Unix socket and one lease-owned output directory, and starts the installed
+`rdashboard-workflow-oci-build` client directly. That client constructs fixed `buildctl` arguments,
+permits only policy-listed build arguments and local OCI-layout base inputs, and exports a local OCI
+archive with BuildKit metadata. Root re-hashes the archive, validates its OCI index, manifest, config
+and layer graph, then atomically retains one typed result per project. External `# syntax=` frontends
+are rejected before BuildKit starts because the daemon is intentionally offline. A root-owned
+mode-`0444` non-secret request is individually read-only-bound from the otherwise untraversable
+mode-`0700` result store, so the unrelated build UID can read it without gaining host-path or write
+authority. A root-owned unit-to-request lifecycle registry lets cleanup discard incomplete staging even
+after an ambiguous `systemd-run` wait. The result digest—not process exit evidence—is committed as the
+release-build node output. It is deliberately a
+`release_build_result`; CI evidence, reservation and deployment policy are still required before a
+later step can seal a `ReleaseBundle`.
+
+The launcher deliberately has no host network access, Docker/containerd socket, controller/executor/
 source socket, production volume or credential access. Its DAC/chown capabilities are constrained by
-the service mount namespace to the launcher journal and exact operation-state mount: they let it create
-build-owned state and remove hostile or partial build output after the transient unit stops. Transient
-jobs have an empty capability set and see only their exact `/operation` bind, while the host operation
-root is inaccessible. Installing the binary, policy and unit does not enable or start it, activate a
-worker, change `auto_deploy`, or run a shadow job.
+the service mount namespace to the launcher journal, OCI-result mount and exact operation-state mount:
+they let it create build-owned state and remove hostile or partial build output after the transient
+unit stops. Transient jobs have an empty capability set and see only the binds required by their exact
+adapter, while the host roots remain inaccessible. Installing the binary, policy and unit does not
+enable or start it, activate a worker, change `auto_deploy`, or run a shadow job.
 
 ## Generic workflow worker and preparation store
 

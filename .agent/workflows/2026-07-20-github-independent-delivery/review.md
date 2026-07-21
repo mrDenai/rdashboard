@@ -1292,3 +1292,148 @@ not install or start BuildKit, activate an OCI adapter/project, run an OCI build
 images, publish an OCI archive, mutate the VPS/i9, contact GitHub/providers, push or deploy. The next
 local dependency is the fixed OCI build/archive-result handoff; live systemd/filesystem/quota/
 concurrency proof and the first `rimg` shadow candidate remain separately authorized later gates.
+
+## Slice 4h local OCI build and typed result handoff review
+
+### Scope and outcome
+
+This slice implements the previously missing fixed rootless OCI invocation and pre-release result
+handoff without activating BuildKit or any project:
+
+- `ReleaseBuild` now outputs a distinct `ReleaseBuildResult`; it no longer claims to produce the final
+  `ReleaseBundle` before CI, reduction, resource reservation and deployment-policy evidence exist;
+- a canonical per-project root policy and signed-lease-derived request bind the exact Dockerfile,
+  target, `linux/amd64` platform, sorted build arguments, sealed OCI-layout base inputs and archive
+  ceiling;
+- the transient systemd unit invokes the installed OCI client directly with a reconstructed
+  environment, sealed read-only inputs, one peer-restricted BuildKit socket and one lease-owned output
+  directory. It never invokes a repository release script or exposes operation state;
+- the installed client constructs fixed `buildctl` arguments, rejects external Dockerfile frontends,
+  exports a local OCI archive, verifies BuildKit metadata plus the complete reachable OCI graph and
+  writes canonical request/result evidence;
+- root independently repeats archive, graph, ownership and lease-binding validation before atomic
+  promotion. The worker commits the typed result digest, never bare process-exit evidence;
+- one pre-release result per project is retained on a separate hard-bounded result filesystem. Failed,
+  aborted, ambiguous and restarted work has explicit bounded cleanup, while root-side failures log
+  stable reason codes and concise summaries.
+
+The reserved domain-level native release adapter remains available for a future design, but the fixed
+launcher no longer admits it or maps it to an optional `bin/build-release` script without a typed
+result implementation.
+
+### Resource and concurrency evidence
+
+- The result store requires an exact root-owned mode-`0700` 4-6 GiB filesystem with 10,000-100,000
+  inodes and refuses activation below the 12 GiB root recovery reserve. A project policy can admit at
+  most a 3 GiB archive and every spawn reserves the archive ceiling plus fixed headroom before the
+  build starts.
+- BuildKit state, verification operation state and OCI results have separate identities and hard
+  capacity boundaries. None of these maxima is eagerly allocated by this local implementation.
+- OCI leases neither allocate nor mount operation state. Scheduler coverage proves that independent OCI
+  assembly can run beside verification on the VPS while only verification owns the reusable compiled
+  state. Optional i9 verification remains independent and cannot own release output or block the VPS.
+- The root runtime tracks each live OCI `unit -> request` relationship. Promotion or successful discard
+  clears it; an uncertain process wait leaves it for cleanup after `systemctl stop`; launcher startup
+  reconciles any bounded staging/request/deletion debris left across process restart.
+
+### Self-review findings and dispositions
+
+- Discovery found that the old `rdashboard-workflow-job` path referenced a nonexistent
+  `bin/build-oci-release` and reduced successful builds to the process evidence digest. Both
+  placeholders were removed rather than hidden behind a fallback.
+- Discovery also found that `ReleaseBundleV1::seal` requires evidence unavailable at the parallel
+  release-build node. The graph and schema now use `release_build_result`, preserving `ReleaseBundle`
+  for the later sealing boundary.
+- The first implementation still allocated the shared 6-8 GiB operation-state contract to OCI even
+  though the OCI sandbox could not consume it. Scheduler, launcher and documentation now restrict that
+  state to actual compiled-cache adapters, which removes false serialization and unnecessary capacity
+  admission from OCI.
+- A failure-path audit found that an I/O error while waiting for `systemd-run` could leave staging until
+  launcher restart. The unit/request lifecycle registry now lets explicit cleanup retry after stopping
+  the uncertain unit; prepare/promote/discard failures are observable with stable log categories.
+- The offline daemon could otherwise waste time resolving a Dockerfile `# syntax=` frontend. The fixed
+  client now validates a stable sealed Dockerfile and rejects that directive before invoking BuildKit.
+- Malformed JSON inside an OCI tar initially escaped as a generic JSON category. Archive parsing now
+  maps all embedded layout/index/manifest failures to the stable archive-invalid reason code.
+- The first post-guard acceptance review found that a root-owned mode-`0400` request bind could not be
+  opened by the unrelated unprivileged build UID. The canonical non-secret request is now exact mode
+  `0444` inside the untraversable root-owned mode-`0700` result store and remains exposed only through an
+  individual read-only bind. All mutable/result output remains private mode `0400`; a filesystem
+  regression asserts both the sandbox-readable request bit and stable canonical bytes.
+
+### Verification
+
+- Focused verification passed all eight `rootless_oci_build` tests, all nine `workflow_launcher` tests,
+  all sixteen `workflow_scheduler_contracts` tests, formatting and strict Clippy across every target and
+  feature.
+- After the final request-permission correction, bare `bin/ci` passed again: 269 active library tests in the shared
+  worktree with two credentialed live-provider tests ignored by design, every binary/integration/
+  socket/scheduler/worker suite, both project-manifest schema checks, nine browser contracts and the
+  optimized release build. The final release phase took 3 minutes 50 seconds.
+- No live BuildKit binary, service, socket, filesystem or project policy exists as proof from this
+  development run. No OCI build or import was attempted. Live systemd/filesystem/quota/concurrency
+  proof remains a separately authorized activation gate and is not inferred from local tests.
+
+### Independent consultation
+
+The initial exact-staged-diff review inspected superseded full staged hash `adf65a56...`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 217 seconds;
+- state fingerprint: `76c6e5e68ff3b545c627752456b034d8c78cefbdf8d952d938f22bdf9735200a`;
+- brief SHA-256: `fe8bf61f78373a7ef26d566bb1d12640f1bd1f95f2ba2853db0fa0dff6507c25`;
+- retained response SHA-256 after whitespace-only repository normalization:
+  `67fdad044080789e0a3a78c4fb5e6d151d376e81b6528b5e31aa5a3bab7ca2b5`;
+- verdict: `SAFE`, no P0-P2 finding and `OPEN QUESTIONS: NONE`.
+
+Its three P3 observations were resolved explicitly:
+
+- concurrent wait/terminate cleanup deliberately fails closed under the lifecycle/store locks; the
+  losing path cannot publish unverified output, cleanup is idempotent and startup reconciliation removes
+  bounded debris;
+- the installed build client deliberately uses the transient unit's lease-bound `RuntimeMaxSec`,
+  `TimeoutStopSec` and process-group cleanup as its outer liveness boundary rather than a second client
+  timer;
+- the missing `#[cfg(unix)]` on `rootless_oci_build` was a real cross-platform consistency defect and is
+  fixed. The complete bare gate above passed after that correction.
+
+The first post-guard acceptance review inspected superseded product/config/test hash `220f049f...`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 372 seconds;
+- state fingerprint: `d81b54241c392b04d3df0009f7f19ce4daa5ffc93e30b8813bf2aad75479cde6`;
+- brief SHA-256: `cb2c241e251c759d2f23743b502569c0e9295cd8a6286a2fe414ad68174d81f2`;
+- response SHA-256: `c9585cf5031b8fc5b7723819adf5b524e242f3e9b292ddd21941747e124aafd2`;
+- verdict: `UNSAFE`, one P0 and no other P0-P2 finding, with `OPEN QUESTIONS: NONE`.
+
+That P0 correctly proved every live build would fail before BuildKit because the build UID could not
+open the root-owned mode-`0400` request. Product hash `9203b951...` applies the exact mode-`0444`
+read-only-bind correction described above and passed the complete post-fix gate.
+
+Final acceptance review of exact product/config/test hash
+`9203b951038298566b92ce6063cf72f8207836ac7ccae6f56461a19fdbe2f79e`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 218 seconds;
+- state fingerprint: `049d6763443bf51486487b39bdd613a9850451f62e12f8a7737def43335faabb`;
+- brief SHA-256: `0be0b2d3c432892b4ee6f9f0581958b7c65dec738f5d77819349cdb29e24a9a4`;
+- response SHA-256: `09cba5b9270ee074ab747e19f96adc856c9027852920b7a1d7f51577585504cf`;
+- verdict: `SAFE`, no P0-P2 finding and `OPEN QUESTIONS: NONE`.
+
+The final P3 observations need no product correction:
+
+- the domain-level native release variant remains intentionally decodable for rolling journal/cleanup
+  compatibility while policy, argv mapping and execution fail closed; removing it requires a dedicated
+  persisted-schema transition rather than deletion inside this slice;
+- the trusted-tree hardening re-scan occurs only after the transient build process has exited and while
+  the root store remains exclusively locked; a privileged root actor could already bypass the boundary;
+- unexpected device/socket/FIFO staging entries deliberately block cleanup with `InvalidStore` rather
+  than authorizing deletion of an unknown inode type. They cannot promote and require explicit operator
+  inspection, which is the safer recovery contract.
+
+### Verdict
+
+Slice 4h is production-worthy as an inactive local OCI build/result boundary and may be committed. It
+does not install or start BuildKit, create the dedicated result filesystem, prepare base layouts, enable
+a project policy, run an OCI build, mutate VPS/i9/provider state, push or deploy. Project-specific sealed
+base preparation, final release-bundle sealing and the authorized live shadow proof remain pending.

@@ -103,7 +103,7 @@ Implementation progress:
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker remains step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
-| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4g locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state and the inactive rootless BuildKit activation boundary. The fixed OCI build/archive handoff and live systemd/dedicated-filesystem/quota/concurrency proof remain; no activation is implied. |
+| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4h locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state, the inactive rootless BuildKit activation boundary and a verified typed OCI build-result handoff. Live systemd/dedicated-filesystem/quota/concurrency proof and the first project-specific sealed-base preparation remain; no activation is implied. |
 | 5-12 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 
 Implementation ledger:
@@ -402,11 +402,12 @@ Implementation ledger:
   therefore complete locally. No service was installed or started, no crate/provider was contacted by
   the implementation path, and no VPS, push or deployment state was mutated.
 - Slice 4f adds a canonical operation-state contract bound to the exact attempt, project, source,
-  workflow policy, prepared input, worker/host, sorted compiled consumers and hard byte/inode ceilings.
-  Schema V4 persists one VPS binding per attempt; matching verification/release nodes serialize on that
-  host and reuse one state key across leases. Once bound, expiry cannot migrate work to the optional i9.
-  An available i9 receives only independent one-node local state and neither transfers compiled output
-  nor blocks the complete VPS path.
+  workflow policy, prepared input, worker/host, sorted compiled-cache consumers and hard byte/inode
+  ceilings. Schema V4 persists one VPS binding per attempt; matching consumers serialize on that host
+  and reuse one state key across leases. Once bound, expiry cannot migrate work to the optional i9. An
+  available i9 receives only independent one-node local verification state and neither transfers
+  compiled output nor blocks the complete VPS path. Slice 4h later makes the independent OCI adapter
+  explicitly bypass this state instead of allocating an unused multi-gigabyte cache.
 - The root launcher exclusively owns `/var/lib/rdashboard-build/operations`. Startup fails unless it is
   the exact root-owned 6-8 GiB/100,000-1,000,000-inode mount; every operation is additionally capped at
   6 GiB/500,000 inodes. Canonical records, a singleton lock, two-phase `data_removal_pending`, directory
@@ -457,6 +458,43 @@ Implementation ledger:
   `deepseek-free` review returned `ANSWERED`, `VERDICT: SAFE`, no P0-P2 finding and no open question.
   No reviewed vendor binary exists on this development host, and no filesystem, unit, policy, build,
   VPS/i9/provider, push or deployment state was installed, started or mutated.
+- Slice 4h replaces the release-build process-evidence placeholder with a canonical
+  `ReleaseBuildResult`. The root-owned per-project policy binds the exact Dockerfile, platform, target,
+  sorted build arguments, sealed local OCI-layout bases and archive ceiling to the signed lease. The
+  transient unit invokes only the installed `rdashboard-workflow-oci-build` client and fixed `buildctl`
+  path; no repository build script, secret/SSH mount, entitlement, registry output, external cache or
+  network fetch is accepted. The reserved native-release adapter is no longer admitted by the launcher
+  until it has an equivalent typed output contract.
+- The client rejects external Dockerfile `# syntax=` frontends before the offline daemon starts,
+  exports one local OCI archive plus BuildKit metadata, hashes every tar entry and reachable OCI
+  descriptor/blob, and emits canonical request/result documents. Root repeats the complete validation
+  before promotion. Success is impossible without the typed result digest; the worker commits that
+  digest rather than the process terminal digest, and the workflow graph correctly keeps final
+  `ReleaseBundle` sealing after verification, reduction, reservation and deployment-policy evidence.
+- OCI staging and one promoted pre-release result per project live on a separate root-owned 4-6 GiB,
+  10,000-100,000-inode filesystem with a 12 GiB root reserve and a 3 GiB per-archive ceiling. Capacity
+  is checked before spawn, partial output is removed on failure/abort, startup reconciles bounded
+  debris, and a root-owned unit/request registry retries cleanup after an ambiguous process wait.
+  Root-side activation, prepare, promotion and cleanup failures log stable reason codes and concise
+  summaries suitable for operator or LLM diagnosis.
+- OCI leases do not allocate or mount operation-state data. Scheduler tests prove that the VPS can run
+  OCI assembly beside verification while only the verification path owns the shared compiled cache;
+  the optional i9 remains non-blocking and cannot own release output. Focused verification passed all
+  eight OCI build tests, nine launcher tests, sixteen scheduler contracts and strict Clippy. The initial
+  exact review returned `SAFE` with no P0-P2; its wait/terminate and client-timeout P3 observations are
+  covered by fail-closed cleanup and the transient unit/lease timeout, while its non-Unix compilation P3
+  produced the missing module guard. A post-guard acceptance review then found a real P0 operability
+  defect: the root-owned mode-`0400` request could not be opened by the unrelated sandbox UID. The exact
+  request is now mode `0444` only inside an otherwise root-only mode-`0700` store and is exposed solely as
+  an individual read-only bind; output remains mode `0400`. A filesystem regression covers the readable,
+  non-writable request contract. Post-fix bare `bin/ci` passed with 269 active library tests in the shared
+  worktree, two credentialed live-provider tests ignored, every binary/integration/socket/scheduler/worker
+  suite, both schema checks, nine browser contracts and the optimized release build in 3 minutes 50
+  seconds. A fresh review of exact product hash `9203b951...` returned `ANSWERED`, `VERDICT: SAFE`, no
+  P0-P2 finding and no open question. Its remaining P3s preserve rolling decode/cleanup compatibility,
+  accept a post-process locked re-scan, and deliberately fail closed on unexpected special filesystem
+  entries. No BuildKit service, mount, launcher policy, OCI build, VPS/i9/provider, push or deployment
+  state was activated or mutated.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

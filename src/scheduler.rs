@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     domain::{
         EvidenceDigest, GitCommitId, OperationKind, ProjectId, ProjectManifestV2,
-        WorkflowCacheClassV1, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
-        WorkflowExecutionProfileV1, WorkflowLeaseInputV1, WorkflowLeaseV1,
+        WorkflowAdapterIdV1, WorkflowCacheClassV1, WorkflowCleanupReceiptV1,
+        WorkflowCleanupResultV1, WorkflowExecutionProfileV1, WorkflowLeaseInputV1, WorkflowLeaseV1,
         WorkflowNodeActivationV1, WorkflowNodeId, WorkflowNodeKindV1, WorkflowNodeOutcomeV1,
         WorkflowNodeReceiptV1, WorkflowOperationStateV1, WorkflowProfileId,
         WorkflowReductionInputV1, WorkflowReductionReceiptV1, WorkflowWorkerPoolV1,
@@ -1318,10 +1318,8 @@ fn operation_state_for_candidate(
     worker: &WorkflowWorkerRegistrationV1,
     now_ms: i64,
 ) -> Result<OperationStateSelection, StoreError> {
-    if !matches!(
-        candidate.node.kind,
-        WorkflowNodeKindV1::Verification | WorkflowNodeKindV1::ReleaseBuild
-    ) || candidate.profile.cache_class != WorkflowCacheClassV1::PreparedRun
+    if !adapter_uses_operation_state(candidate.profile.adapter_id)
+        || candidate.profile.cache_class != WorkflowCacheClassV1::PreparedRun
     {
         return Ok(OperationStateSelection::NotUsed);
     }
@@ -1410,12 +1408,6 @@ fn remaining_operation_state_consumers(
 ) -> Result<Vec<WorkflowNodeId>, StoreError> {
     let mut consumers = Vec::new();
     for node in &candidate.manifest.workflow.nodes {
-        if !matches!(
-            node.kind,
-            WorkflowNodeKindV1::Verification | WorkflowNodeKindV1::ReleaseBuild
-        ) {
-            continue;
-        }
         let profile = candidate
             .manifest
             .workflow
@@ -1423,7 +1415,8 @@ fn remaining_operation_state_consumers(
             .ok_or(StoreError::CorruptWorkflowJournal(
                 "operation-state profile absent",
             ))?;
-        if profile.cache_class != WorkflowCacheClassV1::PreparedRun
+        if !adapter_uses_operation_state(profile.adapter_id)
+            || profile.cache_class != WorkflowCacheClassV1::PreparedRun
             || !worker.pools.contains(&profile.worker_pool)
         {
             continue;
@@ -1444,6 +1437,13 @@ fn remaining_operation_state_consumers(
     }
     consumers.sort();
     Ok(consumers)
+}
+
+fn adapter_uses_operation_state(adapter: WorkflowAdapterIdV1) -> bool {
+    matches!(
+        adapter,
+        WorkflowAdapterIdV1::WorkerBareBinCiV1 | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+    )
 }
 
 fn operation_state_contract(

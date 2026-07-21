@@ -1126,10 +1126,25 @@ impl WorkflowWorkerRuntimeV1 {
         } else {
             terminal.evidence_digest.clone()
         };
+        let output_digest = if !succeeded {
+            None
+        } else if lease.adapter_id == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 {
+            Some(
+                terminal
+                    .output_digest
+                    .clone()
+                    .ok_or(WorkflowWorkerError::InvalidLaunchStatus)?,
+            )
+        } else {
+            if terminal.output_digest.is_some() {
+                return Err(WorkflowWorkerError::InvalidLaunchStatus);
+            }
+            Some(terminal.evidence_digest.clone())
+        };
         let receipt = WorkflowNodeReceiptV1::new(
             &lease,
             outcome,
-            succeeded.then(|| terminal.evidence_digest.clone()),
+            output_digest,
             execution_digest,
             cleanup.evidence_digest,
             WorkflowCleanupResultV1::Complete,
@@ -2500,6 +2515,7 @@ mod tests {
             exit_code: Some(0),
             signal: None,
             failure_digest: None,
+            output_digest: None,
             completed_at_ms,
             evidence_digest: EvidenceDigest::sha256("test terminal evidence"),
         });

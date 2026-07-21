@@ -59,8 +59,6 @@ fn main() -> Result<(), WorkflowJobError> {
     std::env::set_current_dir(WORKSPACE_ROOT)?;
     let script = match adapter.as_str() {
         "bare-bin-ci-v1" => Path::new(WORKSPACE_ROOT).join("bin/ci"),
-        "native-release-build-v1" => Path::new(WORKSPACE_ROOT).join("bin/build-release"),
-        "oci-release-build-v1" => Path::new(WORKSPACE_ROOT).join("bin/build-oci-release"),
         _ => return Err(WorkflowJobError::UnsupportedAdapter),
     };
     validate_fixed_script(&script)?;

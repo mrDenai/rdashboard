@@ -1715,7 +1715,7 @@ mod tests {
             output_contract: if kind == WorkflowNodeKindV1::Verification {
                 WorkflowArtifactKindV1::VerificationReceipt
             } else {
-                WorkflowArtifactKindV1::ReleaseBundle
+                WorkflowArtifactKindV1::ReleaseBuildResult
             },
         };
         let profile = WorkflowExecutionProfileV1 {

@@ -481,16 +481,15 @@ fn optional_accelerator_can_verify_but_cannot_own_required_preparation_or_releas
     );
     let release = claim(&scheduler, &build_worker(), 41);
     assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
-    let release_state = release
-        .operation_state
-        .as_ref()
-        .unwrap_or_else(|| panic!("VPS release has operation-local state"));
-    assert_eq!(release_state.consumer_nodes, vec![release.node_id.clone()]);
-    assert_ne!(release_state.state_key, accelerator_state.state_key);
+    assert!(
+        release.operation_state.is_none(),
+        "OCI output is isolated by its result store and must not allocate compiled state"
+    );
+    assert_ne!(release.host_id, verification.host_id);
 }
 
 #[test]
-fn vps_serializes_compiled_consumers_and_reuses_the_same_state_key() {
+fn vps_can_build_oci_in_parallel_without_duplicating_compiled_state() {
     let store = ControlStore::open(":memory:")
         .unwrap_or_else(|error| panic!("open control store: {error}"));
     let scheduler = DurableWorkflowScheduler::new(store);
@@ -513,32 +512,30 @@ fn vps_serializes_compiled_consumers_and_reuses_the_same_state_key() {
     commit_success(&scheduler, &prepare, "prepare-state");
 
     let first = claim(&scheduler, &worker, 30);
-    assert!(matches!(
-        first.node_kind,
-        WorkflowNodeKindV1::Verification | WorkflowNodeKindV1::ReleaseBuild
-    ));
-    let first_state = first
+    let second = claim(&scheduler, &worker, 31);
+    assert_ne!(second.node_kind, first.node_kind);
+    let (verification, release) = if first.node_kind == WorkflowNodeKindV1::Verification {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+    assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+    assert!(release.operation_state.is_none());
+    let verification_state = verification
         .operation_state
         .as_ref()
-        .unwrap_or_else(|| panic!("first compiled node state"));
-    assert_eq!(first_state.consumer_nodes.len(), 2);
+        .unwrap_or_else(|| panic!("verification compiled state"));
+    assert_eq!(
+        verification_state.consumer_nodes,
+        vec![verification.node_id.clone()]
+    );
     assert!(
         scheduler
-            .claim_next(&worker, 31, 1_000)
-            .unwrap_or_else(|error| panic!("parallel VPS claim: {error}"))
+            .claim_next(&worker, 32, 1_000)
+            .unwrap_or_else(|error| panic!("third parallel VPS claim: {error}"))
             .is_none(),
-        "one host must not mutate the same operation target from two slots"
+        "only the independent verification and OCI build should be ready"
     );
-    commit_success(&scheduler, &first, "first-compiled");
-
-    let second = claim(&scheduler, &worker, 50);
-    assert_ne!(second.node_kind, first.node_kind);
-    let second_state = second
-        .operation_state
-        .as_ref()
-        .unwrap_or_else(|| panic!("second compiled node state"));
-    assert_eq!(second_state.state_key, first_state.state_key);
-    assert_eq!(second_state.consumer_nodes, first_state.consumer_nodes);
 }
 
 #[test]
@@ -564,7 +561,16 @@ fn vps_operation_binding_survives_expiry_and_cannot_migrate_to_accelerator() {
     let prepare = claim(&scheduler, &worker, 10);
     commit_success(&scheduler, &prepare, "prepare-expiry-state");
 
-    let expired = claim(&scheduler, &worker, 30);
+    let first = claim(&scheduler, &worker, 30);
+    let expired = if first.node_kind == WorkflowNodeKindV1::Verification {
+        first
+    } else {
+        assert_eq!(first.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+        assert!(first.operation_state.is_none());
+        commit_success(&scheduler, &first, "release-before-expiry-state");
+        claim(&scheduler, &worker, 50)
+    };
+    assert_eq!(expired.node_kind, WorkflowNodeKindV1::Verification);
     let state_key = expired
         .operation_state
         .as_ref()

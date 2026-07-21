@@ -7,6 +7,7 @@ use std::{
 
 use rdashboard::{
     operation_state::WorkflowOperationStateStoreV1,
+    rootless_oci_build::RootlessOciResultStoreV1,
     unix_time_ms,
     workflow_launcher::{
         SystemdWorkflowLaunchRuntimeV1, WORKFLOW_LAUNCHER_JOB_ROOT, WorkflowLaunchJournalV1,
@@ -55,12 +56,27 @@ async fn main() -> Result<(), DynError> {
         policy.build_uid,
         policy.build_gid,
     )?);
+    let oci_results = if policy.rootless_oci.is_some() {
+        match RootlessOciResultStoreV1::open_installed(policy.build_uid, policy.build_gid) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(store_error) => {
+                error!(
+                    reason_code = store_error.reason_code(),
+                    summary = %store_error,
+                    "rootless OCI result store activation failed"
+                );
+                return Err(store_error.into());
+            }
+        }
+    } else {
+        None
+    };
     let supervisor = Arc::new(WorkflowLaunchSupervisorV1::new(
         policy.clone(),
         preparation_reader,
         journal,
         operation_states,
-        Arc::new(SystemdWorkflowLaunchRuntimeV1),
+        Arc::new(SystemdWorkflowLaunchRuntimeV1::new(oci_results)),
     )?);
     let handler = Arc::new(SupervisorWorkflowLauncherHandlerV1::system(supervisor));
     let server_config =

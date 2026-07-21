@@ -270,6 +270,7 @@
         "source_snapshot",
         "prepared_run",
         "verification_receipt",
+        "release_build_result",
         "release_bundle",
         "reduction_receipt",
         "resource_reservation",
