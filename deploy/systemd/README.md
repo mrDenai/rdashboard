@@ -143,6 +143,13 @@ prune terminal tombstones back to the newest 512. A non-active partial operation
 consumer for one hour is failed and stripped on the next admission before capacity is checked, so a
 superseded attempt cannot pin a multi-gigabyte target indefinitely.
 
+Generate the native launcher addition and bootstrap policy as one digest-bound bundle with the stable
+`rdashboard-self-update-config`; never type their duplicated key, runtime or payload fields by hand.
+The same root-only tool initializes the first immutable slot from the exact fixed initial payload and
+publishes LKG before `current`, which removes the startup cycle created by moving the launcher itself
+below `current/bin`. The full inactive procedure and fixed paths are in `SELF_UPDATE.md`. Repository
+checkout, bundle generation and initial-plan generation do not install, reload, enable or start a unit.
+
 The OCI adapter never executes a repository script. The launcher derives a canonical request from the
 signed lease and the root-owned per-project build policy, exposes only the sealed source, dependency
 snapshot, one BuildKit Unix socket and one lease-owned output directory, and starts the installed

@@ -1782,3 +1782,83 @@ automatically requeued. The root recovery path must resolve the exact published 
 Slice 12d is production-worthy as an inactive local self-project workflow onboarding boundary and may
 be committed. Host-specific launcher/self-update policy generation, first-slot provisioning, failure
 drills and explicit production activation remain; this commit alone does not make pushes deploy.
+
+## Slice 12e generated policy pair and initial-slot provisioning review
+
+### Scope and outcome
+
+This slice closes the remaining local configuration/startup cycle without installing host state:
+
+- the stable `rdashboard-self-update-config` reads one canonical base launcher policy and the fixed
+  root-owned signing seed, then emits one digest-bound review bundle containing both the augmented
+  launcher policy and its exact bootstrap policy. The key ID/public key, compiled runtime-contract
+  digest, state schema, 128 MiB archive ceiling, 15-minute handoff validity, reader GID and sorted
+  15-binary payload cannot be typed or drifted independently;
+- the bundle extractor emits only the canonical launcher JCS, bootstrap JCS or exact environment line.
+  It rejects a pre-existing release authority instead of silently replacing or rotating a key;
+- the root-only initial-plan builder accepts bounded evidence JSON but no path. It hashes the fixed
+  root-owned initial payload and binds every exact path, byte count and SHA-256 to the source,
+  installed-workflow and verification identities;
+- the root-only initializer revalidates the installed launcher/bootstrap pair, signing seed, installed
+  `rdashboard` workflow digest, empty self-update journal and exact fixed payload before signing. It
+  stages one immutable release, writes LKG before `current`, and returns canonical single-line JSON;
+- runtime pointer initialization removes only structurally valid interrupted `.link-<uuid>` entries,
+  accepts only absent/absent, exact-LKG/absent or exact/exact states, and re-verifies both final links.
+
+The config/recovery tool stays outside the versioned application payload. No credential, bundle,
+policy, release directory, pointer, service, VPS/i9/provider setting, push or deployment was changed.
+`auto_deploy` remains false and a pushed commit still does not deploy before host drills and explicit
+activation.
+
+### Self-review findings and corrections
+
+- The first initializer draft rebuilt a signed descriptor after an LKG-only crash. Because signature
+  timestamps differ while the manifest digest remains the same, that could conflict with the already
+  staged descriptor. It now validates the existing LKG against the installed policy and exact initial
+  plan, then creates only the missing `current` pointer.
+- A crash could also occur after immutable staging but before either pointer. The retry now rebuilds
+  only to derive the deterministic manifest/file identity, detects the exact staged release, validates
+  its original signed descriptor and reuses it rather than attempting replacement. A regression builds
+  two timestamp-distinct descriptors for the same manifest and proves the first staged release wins.
+- The first plan bound source/workflow/verification evidence but not the copied executable bytes. The
+  root-only plan builder now records exact file inventory from the fixed payload, and initialization
+  re-hashes it. A post-plan copy, missing binary, extra entry, link, wrong mode or different binary is
+  rejected before signing or pointer publication.
+- Runtime-directory creation accepts only the root-owned mode-`0700` transitional state that this tool
+  can leave before promoting the two traversable roots to `0711`; initial-work cleanup removes only the
+  two bounded root/group-owned regular files and otherwise fails closed.
+
+### Verification
+
+- Final bare `bin/ci`: passed, exit code 0, after all three corrections above.
+- It covered formatting, strict Clippy, 299 active library tests with two credentialed live-provider
+  tests ignored by design, all binary/integration/socket/scheduler/worker/schema suites, six new config
+  tool contracts, nine browser tests and the optimized release build.
+- The final optimized release phase completed in 4 minutes 42 seconds.
+- Focused tests separately prove exact policy-pair generation, refusal to replace an authority,
+  payload inventory enforcement, timestamp-distinct staged-release reuse, LKG-first replay,
+  idempotence, interrupted link cleanup and rejection of a current pointer without an exact LKG.
+
+### Independent consultation
+
+The final review inspected whole staged SHA-256
+`a630d519e7581820dc1b7c992f1aa14cde3f4e70843ff3f5e41c11705cf5085a`; the exact
+product/documentation subset SHA-256 was
+`45e53b8a33ff471abd93b6971c7d7a54f7913e33accb9137a5a67cc08d8d7608`:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 195 seconds;
+- state fingerprint: `729c965d0c390950fe58f68b233b7914c6858776dc06d4b9d84693c4566bc0cf`;
+- brief SHA-256: `ed864832e8116984e7eced71bf5c0133d7c6d57747edac827380f5c697f95787`;
+- response SHA-256: `8ccfa0e6735c26ce5f6b161dd9c5895ccf8b4cad9822e2b36d4b70202f041e7d`;
+- verdict: `PASS`, no P0-P2 finding and no repository-unresolvable open question.
+
+It explicitly confirmed exact policy-pair coherence, staged-only/LKG-only/exact replay, LKG-first
+publication, interrupted-link cleanup, fixed payload/workflow binding, TOCTOU checks and the absence of
+activation side effects.
+
+### Verdict
+
+Slice 12e is production-worthy as an inactive local policy/initial-slot provisioning boundary and may
+be committed. Disposable-host kill/OOM/reboot drills and separately authorized production
+installation/activation remain outside this local slice; the commit alone does not make pushes deploy.

@@ -270,3 +270,19 @@ Normalized instruction:
   `rdashboard` project and policy onboarding.
 - Preserve `auto_deploy=false` and every host/provider mutation gate; the next local result must not
   imply that a push deploys before the separately authorized installation and activation drills.
+
+### U017 — 2026-07-21
+
+Faithful English rendering:
+
+Continue.
+
+Normalized instruction:
+
+- Continue local implementation past inactive project onboarding into the next real activation
+  prerequisite: coherent host-specific self-release policy generation and crash-safe first-slot
+  provisioning.
+- Keep the stable configuration/recovery tools outside the versioned application slot so the initial
+  release does not depend on an already initialized `current` pointer.
+- Do not install credentials, write VPS state, reload units or activate automatic deployment in this
+  local slice.

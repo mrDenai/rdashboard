@@ -17,7 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     domain::EvidenceDigest,
-    self_update::{SelfReleaseStoreV1, SelfUpdatePlatformFailureV1, SelfUpdatePlatformV1},
+    self_update::{
+        SelfReleaseStoreV1, SelfUpdatePlatformFailureV1, SelfUpdatePlatformV1,
+        VERSIONED_SELF_RELEASE_BINARIES,
+    },
 };
 
 pub const SELF_UPDATE_ROOT: &str = "/var/lib/rdashboard-bootstrap";
@@ -39,6 +42,8 @@ const HEALTH_ATTEMPTS: usize = 20;
 const HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const HEALTH_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_HEALTH_RESPONSE_BYTES: usize = 16 * 1024;
+const SELF_UPDATE_RUNTIME_CONTRACT_PURPOSE: &str = "rdashboard.self-update-runtime-contract.v1";
+const SELF_UPDATE_RUNTIME_CONTRACT_SCHEMA_VERSION: u16 = 1;
 
 pub const SELF_UPDATE_SERVICE_ORDER: &[&str] = &[
     "rdashboard-source.service",
@@ -113,6 +118,74 @@ pub fn installed_state_databases() -> Vec<SelfUpdateStateDatabaseV1> {
             .expect("compiled self-update database contract must be valid")
     })
     .collect()
+}
+
+#[derive(Serialize)]
+struct InstalledSelfUpdateRuntimeContractV1<'a> {
+    purpose: &'static str,
+    schema_version: u16,
+    root: &'static str,
+    releases: &'static str,
+    backups: &'static str,
+    journal: &'static str,
+    current: &'static str,
+    last_known_good: &'static str,
+    service_order: &'a [&'a str],
+    quiesce_only_services: &'a [&'a str],
+    health_address: &'static str,
+    health_attempts: usize,
+    health_connect_timeout_ms: u64,
+    health_retry_delay_ms: u64,
+    maximum_health_response_bytes: usize,
+    databases: Vec<InstalledSelfUpdateRuntimeDatabaseV1>,
+    versioned_binaries: &'a [&'a str],
+}
+
+#[derive(Serialize)]
+struct InstalledSelfUpdateRuntimeDatabaseV1 {
+    name: String,
+    path: String,
+    maximum_bytes: u64,
+}
+
+/// Returns the evidence digest for the complete compiled self-update runtime contract.
+///
+/// Policy generation uses this value directly so the launcher producer and stable bootstrap cannot
+/// be configured with independently typed runtime identities.
+pub fn installed_self_update_runtime_contract_digest() -> EvidenceDigest {
+    let databases = installed_state_databases()
+        .into_iter()
+        .map(|database| InstalledSelfUpdateRuntimeDatabaseV1 {
+            name: database.name,
+            path: database.path.display().to_string(),
+            maximum_bytes: database.maximum_bytes,
+        })
+        .collect();
+    let contract = InstalledSelfUpdateRuntimeContractV1 {
+        purpose: SELF_UPDATE_RUNTIME_CONTRACT_PURPOSE,
+        schema_version: SELF_UPDATE_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        root: SELF_UPDATE_ROOT,
+        releases: SELF_RELEASE_ROOT,
+        backups: SELF_UPDATE_BACKUP_ROOT,
+        journal: SELF_UPDATE_JOURNAL_ROOT,
+        current: SELF_UPDATE_CURRENT_LINK,
+        last_known_good: SELF_UPDATE_LKG_LINK,
+        service_order: SELF_UPDATE_SERVICE_ORDER,
+        quiesce_only_services: SELF_UPDATE_QUIESCE_ONLY_SERVICES,
+        health_address: HEALTH_ADDRESS,
+        health_attempts: HEALTH_ATTEMPTS,
+        health_connect_timeout_ms: u64::try_from(HEALTH_CONNECT_TIMEOUT.as_millis())
+            .expect("compiled health timeout must fit u64 milliseconds"),
+        health_retry_delay_ms: u64::try_from(HEALTH_RETRY_DELAY.as_millis())
+            .expect("compiled health retry delay must fit u64 milliseconds"),
+        maximum_health_response_bytes: MAX_HEALTH_RESPONSE_BYTES,
+        databases,
+        versioned_binaries: VERSIONED_SELF_RELEASE_BINARIES,
+    };
+    EvidenceDigest::sha256(
+        serde_jcs::to_vec(&contract)
+            .expect("the compiled self-update runtime contract must serialize"),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -611,6 +684,61 @@ pub fn read_last_known_good_release(
     )
 }
 
+/// Initializes both release pointers without ever making `current` visible before its rollback
+/// target. The operation is idempotent and resumes the only safe partial state: an exact LKG pointer
+/// exists while `current` is still absent.
+pub fn initialize_release_pointers(
+    paths: &SelfUpdateRuntimePathsV1,
+    owner_uid: u32,
+    store: &SelfReleaseStoreV1,
+    release_digest: &EvidenceDigest,
+) -> Result<(), SelfUpdateRuntimeError> {
+    paths.validate()?;
+    reconcile_release_link_temporaries(&paths.root, owner_uid)?;
+    store.verify_staged(release_digest)?;
+    let current =
+        read_optional_release_link(&paths.current_link, &paths.releases, owner_uid, store)?;
+    let last_known_good = read_optional_release_link(
+        &paths.last_known_good_link,
+        &paths.releases,
+        owner_uid,
+        store,
+    )?;
+    match (current.as_ref(), last_known_good.as_ref()) {
+        (None, None) => {
+            switch_release_link(
+                &paths.last_known_good_link,
+                &paths.releases,
+                release_digest,
+                owner_uid,
+            )?;
+            switch_release_link(
+                &paths.current_link,
+                &paths.releases,
+                release_digest,
+                owner_uid,
+            )?;
+        }
+        (None, Some(last_known_good)) if last_known_good == release_digest => {
+            switch_release_link(
+                &paths.current_link,
+                &paths.releases,
+                release_digest,
+                owner_uid,
+            )?;
+        }
+        (Some(current), Some(last_known_good))
+            if current == release_digest && last_known_good == release_digest => {}
+        _ => return Err(SelfUpdateRuntimeError::UnsafeReleasePointer),
+    }
+    if read_current_release(paths, owner_uid, store)? != *release_digest
+        || read_last_known_good_release(paths, owner_uid, store)? != *release_digest
+    {
+        return Err(SelfUpdateRuntimeError::UnsafeReleasePointer);
+    }
+    Ok(())
+}
+
 impl<R: SelfUpdateServiceRuntimeV1> SelfUpdatePlatformV1 for InstalledSelfUpdatePlatformV1<R> {
     fn active_release(&mut self) -> Result<EvidenceDigest, SelfUpdatePlatformFailureV1> {
         self.active_release_checked()
@@ -733,6 +861,19 @@ fn read_release_link(
     }
     store.verify_staged(&digest)?;
     Ok(digest)
+}
+
+fn read_optional_release_link(
+    link: &Path,
+    releases: &Path,
+    owner_uid: u32,
+    store: &SelfReleaseStoreV1,
+) -> Result<Option<EvidenceDigest>, SelfUpdateRuntimeError> {
+    match fs::symlink_metadata(link) {
+        Ok(_) => read_release_link(link, releases, owner_uid, store).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn switch_release_link(
@@ -1420,6 +1561,86 @@ mod tests {
 
     fn digest(value: &str) -> EvidenceDigest {
         EvidenceDigest::sha256(value)
+    }
+
+    #[test]
+    fn initial_release_publishes_both_exact_pointers_idempotently() {
+        let fixture = RuntimeFixture::new();
+        fs::remove_file(&fixture.paths.current_link).expect("remove existing current pointer");
+        let stale_link = fixture.paths.root.join(format!(".link-{}", Uuid::new_v4()));
+        symlink(
+            Path::new("releases").join(fixture.candidate.as_str()),
+            &stale_link,
+        )
+        .expect("create interrupted link publication");
+        let store = SelfReleaseStoreV1::open(
+            &fixture.paths.releases,
+            fixture.uid,
+            fixture.uid,
+            fixture.gid,
+        )
+        .expect("open release store");
+
+        initialize_release_pointers(&fixture.paths, fixture.uid, &store, &fixture.candidate)
+            .expect("initialize release pointers");
+        initialize_release_pointers(&fixture.paths, fixture.uid, &store, &fixture.candidate)
+            .expect("repeat initialization");
+
+        assert!(!stale_link.exists());
+        assert_eq!(
+            read_current_release(&fixture.paths, fixture.uid, &store).expect("current release"),
+            fixture.candidate
+        );
+        assert_eq!(
+            read_last_known_good_release(&fixture.paths, fixture.uid, &store)
+                .expect("last-known-good release"),
+            fixture.candidate
+        );
+    }
+
+    #[test]
+    fn initial_release_resumes_only_the_safe_lkg_first_partial_state() {
+        let fixture = RuntimeFixture::new();
+        fs::remove_file(&fixture.paths.current_link).expect("remove existing current pointer");
+        switch_release_link(
+            &fixture.paths.last_known_good_link,
+            &fixture.paths.releases,
+            &fixture.candidate,
+            fixture.uid,
+        )
+        .expect("publish LKG first");
+        let store = SelfReleaseStoreV1::open(
+            &fixture.paths.releases,
+            fixture.uid,
+            fixture.uid,
+            fixture.gid,
+        )
+        .expect("open release store");
+
+        initialize_release_pointers(&fixture.paths, fixture.uid, &store, &fixture.candidate)
+            .expect("resume initialization");
+
+        assert_eq!(
+            read_current_release(&fixture.paths, fixture.uid, &store).expect("current release"),
+            fixture.candidate
+        );
+    }
+
+    #[test]
+    fn initial_release_rejects_current_without_an_exact_lkg() {
+        let fixture = RuntimeFixture::new();
+        let store = SelfReleaseStoreV1::open(
+            &fixture.paths.releases,
+            fixture.uid,
+            fixture.uid,
+            fixture.gid,
+        )
+        .expect("open release store");
+
+        assert!(matches!(
+            initialize_release_pointers(&fixture.paths, fixture.uid, &store, &fixture.previous,),
+            Err(SelfUpdateRuntimeError::UnsafeReleasePointer)
+        ));
     }
 
     #[test]

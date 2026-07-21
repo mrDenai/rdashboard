@@ -105,7 +105,7 @@ Implementation progress:
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
 | 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4h locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state, the inactive rootless BuildKit activation boundary and a verified typed OCI build-result handoff. Live systemd/dedicated-filesystem/quota/concurrency proof and the first project-specific sealed-base preparation remain; no activation is implied. |
 | 5-11 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
-| 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Slice 12c migrates the complete application payload to one atomic `current/bin` slot and adds the stable root recovery CLI. Slice 12d adds the inactive exact `rdashboard` source/workflow catalog and a terminal self-update handoff graph that cannot also enter the generic executor mutation path. Host-specific launcher/self-update policy generation, initial-slot provisioning, failure drills and explicit activation remain. |
+| 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Slice 12c migrates the complete application payload to one atomic `current/bin` slot and adds the stable root recovery CLI. Slice 12d adds the inactive exact `rdashboard` source/workflow catalog and a terminal self-update handoff graph that cannot also enter the generic executor mutation path. Slice 12e is implementing one generated launcher/bootstrap policy bundle plus crash-safe first-slot provisioning. Failure drills and explicit activation remain. |
 
 Implementation ledger:
 
@@ -531,6 +531,13 @@ Implementation ledger:
   publication becomes durable reconcile debt rather than letting a newer push overtake a potentially
   visible handoff. A strict canonicalization command provides the exact
   JSON-to-installed-JCS path without weakening installed canonical-byte checks.
+- Slice 12e keeps policy and initial-slot configuration outside the versioned application. One stable
+  generator derives the self-release public key from the fixed root credential and binds it to the
+  compiled runtime contract, exact 15-binary payload, archive/schema limits, reader GID and augmented
+  launcher policy in a single canonical review bundle. The root-only initializer accepts no paths,
+  verifies the installed workflow identity and the plan-bound path/size/SHA-256 inventory of the exact
+  fixed payload, stages one signed release and publishes LKG before `current`; both a staged-only crash
+  and the safe LKG-only crash state resume without replacing or re-signing the existing release.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

@@ -3118,5 +3118,6 @@ mod tests {
         );
         assert!(!VERSIONED_SELF_RELEASE_BINARIES.contains(&"rdashboard-bootstrap"));
         assert!(!VERSIONED_SELF_RELEASE_BINARIES.contains(&"rdashboard-recovery"));
+        assert!(!VERSIONED_SELF_RELEASE_BINARIES.contains(&"rdashboard-self-update-config"));
     }
 }
