@@ -197,15 +197,25 @@ impl RimgHealthCollector {
 }
 
 #[derive(Clone, Debug)]
-pub struct RimgResourceCollector {
+pub struct ProjectResourceCollector {
     project_id: ProjectId,
     #[cfg(unix)]
     client: Option<ObserverClientV1>,
     last_success: Option<ProjectResourceTelemetry>,
 }
 
-impl RimgResourceCollector {
+impl ProjectResourceCollector {
     pub fn from_optional_socket_path(
+        socket_path: Option<&Path>,
+        timeout: Duration,
+    ) -> Result<Self, RimgConfigError> {
+        let project_id = ProjectId::from_str(PROJECT_ID)
+            .map_err(|_| RimgConfigError::InvalidInternalProjectId)?;
+        Self::for_project(project_id, socket_path, timeout)
+    }
+
+    pub fn for_project(
+        project_id: ProjectId,
         socket_path: Option<&Path>,
         timeout: Duration,
     ) -> Result<Self, RimgConfigError> {
@@ -221,8 +231,7 @@ impl RimgResourceCollector {
             .transpose()
             .map_err(|_| RimgConfigError::InvalidResourceObserverClient)?;
         Ok(Self {
-            project_id: ProjectId::from_str(PROJECT_ID)
-                .map_err(|_| RimgConfigError::InvalidInternalProjectId)?,
+            project_id,
             #[cfg(unix)]
             client,
             last_success: None,
@@ -286,6 +295,8 @@ impl RimgResourceCollector {
         }
     }
 }
+
+pub type RimgResourceCollector = ProjectResourceCollector;
 
 fn unavailable_resources(
     status: ObservationStatus,

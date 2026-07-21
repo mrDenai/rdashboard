@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use axum::{
     Extension, Json, Router,
@@ -10,6 +14,7 @@ use axum::{
 };
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::RwLock;
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -46,6 +51,15 @@ const INDEX_HTML: &str = include_str!("../../web/index.html");
 const APP_CSS: &str = include_str!("../../web/app.css");
 const APP_JS: &str = include_str!("../../web/app.js");
 const STATUS_JS: &str = include_str!("../../web/status.js");
+static ASSET_VERSION: LazyLock<String> = LazyLock::new(|| {
+    let mut hasher = Sha256::new();
+    hasher.update(APP_CSS.as_bytes());
+    hasher.update(APP_JS.as_bytes());
+    hasher.update(STATUS_JS.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_owned()
+});
+static VERSIONED_INDEX_HTML: LazyLock<String> =
+    LazyLock::new(|| INDEX_HTML.replace("__ASSET_VERSION__", asset_version()));
 const TAB_LEASE_TTL_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
@@ -142,6 +156,9 @@ pub fn router_with_access(
         .route("/assets/app.css", get(stylesheet))
         .route("/assets/app.js", get(script))
         .route("/assets/status.js", get(status_script))
+        .route("/assets/{version}/app.css", get(versioned_stylesheet))
+        .route("/assets/{version}/app.js", get(versioned_script))
+        .route("/assets/{version}/status.js", get(versioned_status_script))
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/host-history", get(host_history))
         .route(
@@ -224,7 +241,10 @@ pub fn router_with_access(
 }
 
 async fn index() -> impl IntoResponse {
-    ([(header::CACHE_CONTROL, "no-store")], Html(INDEX_HTML))
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Html(VERSIONED_INDEX_HTML.as_str()),
+    )
 }
 
 async fn stylesheet() -> impl IntoResponse {
@@ -255,6 +275,37 @@ async fn status_script() -> impl IntoResponse {
         ],
         STATUS_JS,
     )
+}
+
+async fn versioned_stylesheet(AxumPath(version): AxumPath<String>) -> Response {
+    versioned_asset(&version, "text/css; charset=utf-8", APP_CSS)
+}
+
+async fn versioned_script(AxumPath(version): AxumPath<String>) -> Response {
+    versioned_asset(&version, "text/javascript; charset=utf-8", APP_JS)
+}
+
+async fn versioned_status_script(AxumPath(version): AxumPath<String>) -> Response {
+    versioned_asset(&version, "text/javascript; charset=utf-8", STATUS_JS)
+}
+
+fn versioned_asset(version: &str, content_type: &'static str, body: &'static str) -> Response {
+    if version != asset_version() {
+        return ApiProblem::response(StatusCode::NOT_FOUND, "not_found", "Asset not found.")
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn asset_version() -> &'static str {
+    ASSET_VERSION.as_str()
 }
 
 async fn snapshot(State(state): State<DashboardState>) -> Response {

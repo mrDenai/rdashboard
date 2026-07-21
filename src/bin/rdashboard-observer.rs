@@ -30,15 +30,37 @@ const TIMEOUT: &str = "/usr/bin/timeout";
 // when the daemon is healthy. Keep the subprocess bounded below the four-second
 // request deadline while allowing that required sampling interval plus small overhead.
 const DOCKER_COMMAND_TIMEOUT: &str = "2s";
-const PROJECT_ID: &str = "rimg";
 const ALLOWED_UID_ENV: &str = "RDASHBOARD_OBSERVER_ALLOWED_UID";
 const MAX_DOCKER_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_CANDIDATES: usize = 8;
 const MAX_CONNECTIONS: usize = 4;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
-const INSPECT_FORMAT: &str = "{{.Id}}|{{.Created}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}|{{with index .NetworkSettings.Networks \"kamal\"}}{{.IPAddress}}{{end}}|{{index .Config.Labels \"service\"}}|{{index .Config.Labels \"role\"}}";
+const INSPECT_FORMAT: &str = "{{.Id}}|{{.Created}}|{{.State.Running}}|{{with index .State \"Health\"}}{{.Status}}{{else}}missing{{end}}|{{with index .NetworkSettings.Networks \"kamal\"}}{{.IPAddress}}{{end}}|{{index .Config.Labels \"service\"}}|{{index .Config.Labels \"role\"}}";
 const STATS_FORMAT: &str = "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.BlockIO}}";
 type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProjectProfile {
+    project_id: &'static str,
+    service: &'static str,
+    role: &'static str,
+    require_docker_health: bool,
+}
+
+const PROJECT_PROFILES: &[ProjectProfile] = &[
+    ProjectProfile {
+        project_id: "rimg",
+        service: "rimg",
+        role: "web",
+        require_docker_health: true,
+    },
+    ProjectProfile {
+        project_id: "telegram-gateway",
+        service: "telegram-gateway",
+        role: "web",
+        require_docker_health: false,
+    },
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Candidate {
@@ -48,17 +70,17 @@ struct Candidate {
 }
 
 #[derive(Debug)]
-struct InstalledObserver {
-    project_id: rdashboard::domain::ProjectId,
-}
+struct InstalledObserver;
 
 impl InstalledObserver {
     fn new() -> Result<Self, ObserverError> {
-        Ok(Self {
-            project_id: PROJECT_ID
-                .parse()
-                .map_err(|_| ObserverError::InvalidInternalProjectId)?,
-        })
+        for profile in PROJECT_PROFILES {
+            profile
+                .project_id
+                .parse::<rdashboard::domain::ProjectId>()
+                .map_err(|_| ObserverError::InvalidInternalProjectId)?;
+        }
+        Ok(Self)
     }
 }
 
@@ -67,10 +89,9 @@ impl ObserverRequestHandlerV1 for InstalledObserver {
         &self,
         project_id: &rdashboard::domain::ProjectId,
     ) -> Result<ProjectResourceSnapshotV1, ObserverRejectionCodeV1> {
-        if project_id != &self.project_id {
-            return Err(ObserverRejectionCodeV1::ProjectNotConfigured);
-        }
-        let measurements = collect_resources(&DockerCli).map_err(|error| {
+        let profile =
+            project_profile(project_id).ok_or(ObserverRejectionCodeV1::ProjectNotConfigured)?;
+        let measurements = collect_resources(&DockerCli, profile).map_err(|error| {
             warn!(error = %error, project_id = %project_id, "project resource collection failed");
             ObserverRejectionCodeV1::CollectionUnavailable
         })?;
@@ -90,6 +111,12 @@ impl ObserverRequestHandlerV1 for InstalledObserver {
             block_write_bytes: measurements.block_write_bytes,
         })
     }
+}
+
+fn project_profile(project_id: &rdashboard::domain::ProjectId) -> Option<&'static ProjectProfile> {
+    PROJECT_PROFILES
+        .iter()
+        .find(|profile| profile.project_id == project_id.as_str())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -163,8 +190,11 @@ fn docker_command(arguments: &[String]) -> Command {
     command
 }
 
-fn collect_resources(client: &impl DockerClient) -> Result<ResourceMeasurements, ObserverError> {
-    let candidate = discover_target(client)?;
+fn collect_resources(
+    client: &impl DockerClient,
+    profile: &ProjectProfile,
+) -> Result<ResourceMeasurements, ObserverError> {
+    let candidate = discover_target(client, profile)?;
     let output = checked_docker_output(
         client,
         &strings(&[
@@ -178,16 +208,21 @@ fn collect_resources(client: &impl DockerClient) -> Result<ResourceMeasurements,
     parse_resource_stats(&output.stdout)
 }
 
-fn discover_target(client: &impl DockerClient) -> Result<Candidate, ObserverError> {
+fn discover_target(
+    client: &impl DockerClient,
+    profile: &ProjectProfile,
+) -> Result<Candidate, ObserverError> {
+    let service_filter = format!("label=service={}", profile.service);
+    let role_filter = format!("label=role={}", profile.role);
     let output = checked_docker_output(
         client,
         &strings(&[
             "ps",
             "--no-trunc",
             "--filter",
-            "label=service=rimg",
+            &service_filter,
             "--filter",
-            "label=role=web",
+            &role_filter,
             "--filter",
             "status=running",
             "--format",
@@ -201,7 +236,7 @@ fn discover_target(client: &impl DockerClient) -> Result<Candidate, ObserverErro
     let mut arguments = strings(&["inspect", "--format", INSPECT_FORMAT]);
     arguments.extend(identifiers.iter().cloned());
     let inspections = checked_docker_output(client, &arguments)?;
-    let candidates = parse_inspections(&identifiers, &inspections.stdout)?;
+    let candidates = parse_inspections(profile, &identifiers, &inspections.stdout)?;
     newest_candidate(candidates).ok_or(ObserverError::NoHealthyContainer)
 }
 
@@ -246,6 +281,7 @@ fn valid_container_id(value: &str) -> bool {
 }
 
 fn parse_inspections(
+    profile: &ProjectProfile,
     expected_identifiers: &[String],
     stdout: &[u8],
 ) -> Result<Vec<Candidate>, ObserverError> {
@@ -266,10 +302,12 @@ fn parse_inspections(
         {
             return Err(ObserverError::InvalidDockerOutput);
         }
+        let health_matches =
+            fields[3] == "healthy" || (!profile.require_docker_health && fields[3] == "missing");
         if fields[2] != "true"
-            || fields[3] != "healthy"
-            || fields[5] != "rimg"
-            || fields[6] != "web"
+            || !health_matches
+            || fields[5] != profile.service
+            || fields[6] != profile.role
         {
             continue;
         }
@@ -430,13 +468,13 @@ enum ObserverError {
     DockerFailure,
     #[error("Docker returned more output than the bounded observer contract permits")]
     DockerOutputTooLarge,
-    #[error("Docker returned malformed or ambiguous rimg container metadata")]
+    #[error("Docker returned malformed or ambiguous project container metadata")]
     InvalidDockerOutput,
-    #[error("more rimg containers matched than the bounded observer contract permits")]
+    #[error("more project containers matched than the bounded observer contract permits")]
     TooManyCandidates,
-    #[error("no running healthy rimg web container is attached to the kamal network")]
+    #[error("no eligible running project container is attached to the kamal network")]
     NoHealthyContainer,
-    #[error("the selected rimg container address is not private: {0}")]
+    #[error("the selected project container address is not private: {0}")]
     NonPrivateContainerAddress(Ipv4Addr),
 }
 
@@ -454,6 +492,20 @@ mod tests {
 
     const FIRST_ID: &str = "a111111111111111111111111111111111111111111111111111111111111111";
     const SECOND_ID: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn rimg_profile() -> &'static ProjectProfile {
+        PROJECT_PROFILES
+            .iter()
+            .find(|profile| profile.project_id == "rimg")
+            .expect("rimg profile")
+    }
+
+    fn gateway_profile() -> &'static ProjectProfile {
+        PROJECT_PROFILES
+            .iter()
+            .find(|profile| profile.project_id == "telegram-gateway")
+            .expect("gateway profile")
+    }
 
     struct ScriptedDocker {
         steps: RefCell<VecDeque<(Vec<String>, Output)>>,
@@ -555,7 +607,7 @@ mod tests {
             ),
         ]);
 
-        let resources = collect_resources(&docker).expect("resource evidence");
+        let resources = collect_resources(&docker, rimg_profile()).expect("resource evidence");
         assert!((resources.cpu_percent - 0.25).abs() < f64::EPSILON);
         assert_eq!(resources.memory_used_bytes, 22_083_011);
         assert_eq!(resources.memory_limit_bytes, 16_761_109_873);
@@ -568,6 +620,7 @@ mod tests {
     fn inspection_requires_exact_ids_health_labels_and_private_addresses() {
         assert!(
             parse_inspections(
+                rimg_profile(),
                 &[FIRST_ID.to_owned()],
                 format!("{FIRST_ID}|2026-07-17T00:00:00Z|true|healthy|172.19.0.7|rimg|web\n")
                     .as_bytes(),
@@ -581,8 +634,51 @@ mod tests {
                 "{FIRST_ID}|2026-07-17T00:00:00Z|true|healthy|172.19.0.7|rimg|web\n{FIRST_ID}|2026-07-17T00:00:00Z|true|healthy|172.19.0.7|rimg|web\n"
             ),
         ] {
-            assert!(parse_inspections(&[FIRST_ID.to_owned()], invalid.as_bytes()).is_err());
+            assert!(
+                parse_inspections(rimg_profile(), &[FIRST_ID.to_owned()], invalid.as_bytes())
+                    .is_err()
+            );
         }
+    }
+
+    #[test]
+    fn gateway_profile_accepts_missing_docker_health_but_not_wrong_labels() {
+        let valid = format!(
+            "{FIRST_ID}|2026-07-17T00:00:00Z|true|missing|172.19.0.7|telegram-gateway|web\n"
+        );
+        assert_eq!(
+            parse_inspections(gateway_profile(), &[FIRST_ID.to_owned()], valid.as_bytes())
+                .expect("gateway inspection")
+                .len(),
+            1
+        );
+        assert!(
+            parse_inspections(rimg_profile(), &[FIRST_ID.to_owned()], valid.as_bytes(),)
+                .expect("well-formed but ineligible")
+                .is_empty()
+        );
+        let wrong_role = format!(
+            "{FIRST_ID}|2026-07-17T00:00:00Z|true|missing|172.19.0.7|telegram-gateway|worker\n"
+        );
+        assert!(
+            parse_inspections(
+                gateway_profile(),
+                &[FIRST_ID.to_owned()],
+                wrong_role.as_bytes(),
+            )
+            .expect("well-formed but ineligible")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn installed_observer_rejects_unknown_projects_before_docker_discovery() {
+        let observer = InstalledObserver::new().expect("installed observer");
+        let unknown = "ralert".parse().expect("valid unknown project ID");
+        assert_eq!(
+            observer.observe_project_resources(&unknown),
+            Err(ObserverRejectionCodeV1::ProjectNotConfigured)
+        );
     }
 
     #[test]
@@ -613,6 +709,10 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/deploy/systemd/rdashboard-rimg-health.env"
         ));
+        let gateway_environment = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/deploy/systemd/rdashboard-telegram-gateway.env"
+        ));
         assert!(
             observer.contains(
                 "ExecStart=/var/lib/rdashboard-bootstrap/current/bin/rdashboard-observer"
@@ -628,5 +728,12 @@ mod tests {
         assert!(fixed_environment.contains(&format!(
             "RDASHBOARD_RIMG_RESOURCE_SOCKET={OBSERVER_SOCKET_PATH}"
         )));
+        assert!(controller.contains("rdashboard-telegram-gateway.env"));
+        assert!(gateway_environment.contains(&format!(
+            "RDASHBOARD_TELEGRAM_GATEWAY_RESOURCE_SOCKET={OBSERVER_SOCKET_PATH}"
+        )));
+        assert!(
+            gateway_environment.contains("RDASHBOARD_TELEGRAM_GATEWAY_BASE_URL=https://tg.4u.ge")
+        );
     }
 }

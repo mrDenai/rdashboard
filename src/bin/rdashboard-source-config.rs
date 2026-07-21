@@ -489,8 +489,13 @@ mod tests {
             "../../config/project-manifests/rdashboard.json"
         ))
         .expect("rdashboard manifest");
-        let workflows = InstalledWorkflowCatalogV1::from_manifests([ralert, rdashboard])
-            .expect("workflow catalog");
+        let telegram_gateway: ProjectManifestV2 = serde_json::from_str(include_str!(
+            "../../config/project-manifests/telegram-gateway.json"
+        ))
+        .expect("telegram-gateway manifest");
+        let workflows =
+            InstalledWorkflowCatalogV1::from_manifests([ralert, rdashboard, telegram_gateway])
+                .expect("workflow catalog");
         let config =
             build_config(
                 &arguments(),
@@ -502,13 +507,24 @@ mod tests {
                     Some("source-webhook-rdashboard-secret") => {
                         Ok(b"rdashboard webhook secret".to_vec())
                     }
+                    Some("source-webhook-telegram-gateway-secret") => {
+                        Ok(b"telegram gateway webhook secret".to_vec())
+                    }
+                    Some("source-git-telegram-gateway-private-key") => {
+                        Ok(b"private telegram gateway key bytes".to_vec())
+                    }
+                    Some("source-git-telegram-gateway-known-hosts") => {
+                        Ok(b"github.com ssh-ed25519 aG9zdGtleQ==\n".to_vec())
+                    }
                     other => panic!("unexpected repository credential {other:?}"),
                 },
             )
             .expect("source config from repository controls");
-        assert_eq!(config.projects.len(), 2);
+        assert_eq!(config.projects.len(), 3);
         assert_eq!(config.projects[0].project_id.as_str(), "ralert");
         assert_eq!(config.projects[1].project_id.as_str(), "rdashboard");
+        assert_eq!(config.projects[2].project_id.as_str(), "telegram-gateway");
+        assert!(config.projects[2].git_ssh.is_some());
         assert!(config.projects.iter().all(|project| !project.auto_deploy));
     }
 

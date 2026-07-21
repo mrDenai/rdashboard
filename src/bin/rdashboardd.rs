@@ -15,7 +15,10 @@ use rdashboard::{
     integration_collectors::ProjectIntegrationCollectors,
     metrics::HostCollector,
     notifier_socket::{NOTIFIER_SOCKET_PATH, NotifierClientV1},
-    projects::{RimgConfigError, RimgHealthCollector, RimgResourceCollector},
+    projects::{
+        HttpHealthCollector, HttpHealthConfigError, ProjectResourceCollector, RimgConfigError,
+        RimgHealthCollector,
+    },
     store::{
         ControlStore, IntegrationStore, MetricsStore, PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS,
         RepositorySampleWrite,
@@ -41,6 +44,8 @@ const EXECUTOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const RAW_RETENTION: Duration = Duration::from_hours(24);
 const MINUTE_ROLLUP_RETENTION: Duration = Duration::from_hours(720);
 const PROJECT_ID_RIMG: &str = "rimg";
+const PROJECT_ID_TELEGRAM_GATEWAY: &str = "telegram-gateway";
+const TELEGRAM_GATEWAY_DISPLAY_NAME: &str = "Telegram gateway";
 const PROJECT_REPOSITORY_ERROR_MAX_BYTES: usize = 512;
 const PROJECT_REPOSITORY_FAILURE_RETRY: Duration = Duration::from_mins(5);
 const PROJECT_INTEGRATION_INTERVAL: Duration = Duration::from_mins(5);
@@ -91,8 +96,7 @@ async fn main() -> Result<(), DynError> {
         },
         HostObservationSource::Executor,
     );
-    let project_collector = Arc::new(Mutex::new(config.rimg_collector.clone()));
-    let project_resource_collector = Arc::new(Mutex::new(config.rimg_resource_collector.clone()));
+    let project_collectors = shared_project_collectors(&config.project_collectors);
 
     let first_started_at = unix_time_ms()?;
     let recovered = control_store.recover_interrupted_observations(first_started_at)?;
@@ -107,8 +111,7 @@ async fn main() -> Result<(), DynError> {
         &state,
         &metrics_store,
         &host_source,
-        &project_collector,
-        &project_resource_collector,
+        &project_collectors,
         first_operation,
     ))
     .await
@@ -133,8 +136,7 @@ async fn main() -> Result<(), DynError> {
         state.clone(),
         metrics_store,
         host_source,
-        project_collector,
-        project_resource_collector,
+        project_collectors,
     );
     spawn_project_repository_collection(state.clone(), executor_client);
     if let Some(client) = notifier_client.as_ref() {
@@ -152,6 +154,19 @@ async fn main() -> Result<(), DynError> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+fn shared_project_collectors(
+    configured: &[MonitoredProjectCollector],
+) -> Arc<Vec<Arc<Mutex<MonitoredProjectCollector>>>> {
+    Arc::new(
+        configured
+            .iter()
+            .cloned()
+            .map(Mutex::new)
+            .map(Arc::new)
+            .collect(),
+    )
 }
 
 fn configured_notifier(
@@ -194,22 +209,19 @@ async fn collect_and_publish(
     state: &DashboardState,
     metrics_store: &MetricsStore,
     host_source: &HostObservationSource,
-    project_collector: &Mutex<RimgHealthCollector>,
-    project_resource_collector: &Mutex<RimgResourceCollector>,
+    project_collectors: &[Arc<Mutex<MonitoredProjectCollector>>],
     observation_operation_id: Uuid,
 ) -> Result<(), DynError> {
     let now = unix_time_ms()?;
-    let (host, mut project, resources) = tokio::join!(
+    let (host, projects) = tokio::join!(
         host_source.collect(now),
-        async { project_collector.lock().await.collect(now).await },
-        async { project_resource_collector.lock().await.collect(now).await },
+        collect_projects(project_collectors, now),
     );
-    project.resources = resources;
-    metrics_store.record_collection(&host, std::slice::from_ref(&project))?;
+    metrics_store.record_collection(&host, &projects)?;
     let snapshot = DashboardSnapshot {
         generated_at_ms: now,
         host,
-        projects: vec![project],
+        projects,
         control: ControlSummary {
             sqlite_version: rusqlite::version().to_owned(),
             observation_operation_id,
@@ -222,6 +234,50 @@ async fn collect_and_publish(
     *state.latest_snapshot.write().await = Some(snapshot);
     *state.collection_error.write().await = None;
     Ok(())
+}
+
+async fn collect_projects(
+    collectors: &[Arc<Mutex<MonitoredProjectCollector>>],
+    observed_at_ms: i64,
+) -> Vec<rdashboard::domain::ProjectTelemetry> {
+    futures_util::future::join_all(
+        collectors
+            .iter()
+            .map(|collector| async move { collector.lock().await.collect(observed_at_ms).await }),
+    )
+    .await
+}
+
+#[derive(Clone, Debug)]
+struct MonitoredProjectCollector {
+    health: ProjectHealthCollector,
+    resources: ProjectResourceCollector,
+}
+
+impl MonitoredProjectCollector {
+    async fn collect(&mut self, observed_at_ms: i64) -> rdashboard::domain::ProjectTelemetry {
+        let (mut project, resources) = tokio::join!(
+            self.health.collect(observed_at_ms),
+            self.resources.collect(observed_at_ms),
+        );
+        project.resources = resources;
+        project
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ProjectHealthCollector {
+    Rimg(RimgHealthCollector),
+    Http(HttpHealthCollector),
+}
+
+impl ProjectHealthCollector {
+    async fn collect(&mut self, observed_at_ms: i64) -> rdashboard::domain::ProjectTelemetry {
+        match self {
+            Self::Rimg(collector) => collector.collect(observed_at_ms).await,
+            Self::Http(collector) => collector.collect(observed_at_ms).await,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -272,8 +328,7 @@ fn spawn_collection_loop(
     state: DashboardState,
     metrics_store: MetricsStore,
     host_source: HostObservationSource,
-    project_collector: Arc<Mutex<RimgHealthCollector>>,
-    project_resource_collector: Arc<Mutex<RimgResourceCollector>>,
+    project_collectors: Arc<Vec<Arc<Mutex<MonitoredProjectCollector>>>>,
 ) {
     tokio::spawn(async move {
         let operation_id = state
@@ -297,8 +352,7 @@ fn spawn_collection_loop(
                 &state,
                 &metrics_store,
                 &host_source,
-                &project_collector,
-                &project_resource_collector,
+                &project_collectors,
                 operation_id,
             ))
             .await
@@ -323,53 +377,99 @@ fn spawn_project_repository_collection(
     executor_client: Option<Arc<RootExecutorClient>>,
 ) {
     tokio::spawn(async move {
-        let Some((project_id, metrics_store, executor_client)) =
-            project_repository_collection_context(&state, executor_client).await
-        else {
+        let project_ids = state
+            .latest_snapshot
+            .read()
+            .await
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .projects
+                    .iter()
+                    .map(|project| project.project_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(metrics_store) = state.metrics_store.clone() else {
+            for project_id in &project_ids {
+                set_project_repository_error(
+                    &state,
+                    project_id,
+                    "Хранилище истории репозитория не настроено.",
+                )
+                .await;
+            }
+            return;
+        };
+        let Some(executor_client) = executor_client else {
+            for project_id in &project_ids {
+                set_project_repository_error(
+                    &state,
+                    project_id,
+                    "Источник принятого Git-дерева не настроен.",
+                )
+                .await;
+            }
             return;
         };
 
-        loop {
-            let now_ms = match unix_time_ms() {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!(error = %error, "repository observation skipped because the host clock is invalid");
-                    set_project_repository_error(
-                        &state,
-                        &project_id,
-                        "Часы сервера недоступны; почасовой снимок репозитория пропущен.",
-                    )
-                    .await;
-                    tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
-                    continue;
-                }
-            };
-            match metrics_store.next_project_repository_observation_at(&project_id) {
-                Ok(Some(next_at_ms)) if next_at_ms > now_ms => {
-                    tokio::time::sleep(duration_until(now_ms, next_at_ms)).await;
-                    continue;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(error = %error, "repository observation schedule could not be loaded");
-                    set_project_repository_error(
-                        &state,
-                        &project_id,
-                        "Расписание почасовых снимков репозитория недоступно.",
-                    )
-                    .await;
-                    tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
-                    continue;
-                }
-            }
+        for project_id in project_ids {
+            tokio::spawn(collect_project_repository_loop(
+                state.clone(),
+                metrics_store.clone(),
+                Arc::clone(&executor_client),
+                project_id,
+            ));
+        }
+    });
+}
 
-            match executor_client
-                .observe_project_source(project_id.clone())
-                .await
-            {
-                Ok(observation) => match metrics_store
-                    .record_project_repository_sample(now_ms, &observation)
-                {
+async fn collect_project_repository_loop(
+    state: DashboardState,
+    metrics_store: MetricsStore,
+    executor_client: Arc<RootExecutorClient>,
+    project_id: ProjectId,
+) {
+    loop {
+        let now_ms = match unix_time_ms() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(error = %error, "repository observation skipped because the host clock is invalid");
+                set_project_repository_error(
+                    &state,
+                    &project_id,
+                    "Часы сервера недоступны; почасовой снимок репозитория пропущен.",
+                )
+                .await;
+                tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
+                continue;
+            }
+        };
+        match metrics_store.next_project_repository_observation_at(&project_id) {
+            Ok(Some(next_at_ms)) if next_at_ms > now_ms => {
+                tokio::time::sleep(duration_until(now_ms, next_at_ms)).await;
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(error = %error, "repository observation schedule could not be loaded");
+                set_project_repository_error(
+                    &state,
+                    &project_id,
+                    "Расписание почасовых снимков репозитория недоступно.",
+                )
+                .await;
+                tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
+                continue;
+            }
+        }
+
+        match executor_client
+            .observe_project_source(project_id.clone())
+            .await
+        {
+            Ok(observation) => {
+                match metrics_store.record_project_repository_sample(now_ms, &observation) {
                     Ok(RepositorySampleWrite::Recorded) => {
                         state
                             .project_repository_errors
@@ -394,17 +494,17 @@ fn spawn_project_repository_collection(
                         tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
                         continue;
                     }
-                },
-                Err(error) => {
-                    warn!(error = %error, "repository observation unavailable");
-                    set_project_repository_error(&state, &project_id, &error.to_string()).await;
-                    tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
-                    continue;
                 }
             }
-            tokio::time::sleep(project_repository_interval()).await;
+            Err(error) => {
+                warn!(error = %error, "repository observation unavailable");
+                set_project_repository_error(&state, &project_id, &error.to_string()).await;
+                tokio::time::sleep(PROJECT_REPOSITORY_FAILURE_RETRY).await;
+                continue;
+            }
         }
-    });
+        tokio::time::sleep(project_repository_interval()).await;
+    }
 }
 
 fn spawn_project_integration_collection(
@@ -548,38 +648,6 @@ fn deliver_notification_handoff(
     Ok(delivered)
 }
 
-async fn project_repository_collection_context(
-    state: &DashboardState,
-    executor_client: Option<Arc<RootExecutorClient>>,
-) -> Option<(ProjectId, MetricsStore, Arc<RootExecutorClient>)> {
-    let project_id: ProjectId = match PROJECT_ID_RIMG.parse() {
-        Ok(project_id) => project_id,
-        Err(error) => {
-            error!(error = %error, "fixed project identifier is invalid");
-            return None;
-        }
-    };
-    let Some(metrics_store) = state.metrics_store.clone() else {
-        set_project_repository_error(
-            state,
-            &project_id,
-            "Хранилище истории репозитория не настроено.",
-        )
-        .await;
-        return None;
-    };
-    let Some(executor_client) = executor_client else {
-        set_project_repository_error(
-            state,
-            &project_id,
-            "Источник принятого Git-дерева не настроен.",
-        )
-        .await;
-        return None;
-    };
-    Some((project_id, metrics_store, executor_client))
-}
-
 fn project_repository_interval() -> Duration {
     Duration::from_millis(u64::try_from(PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS).unwrap_or(u64::MAX))
 }
@@ -628,8 +696,7 @@ async fn apply_metric_retention(state: &DashboardState, metrics_store: &MetricsS
 struct Config {
     listen: SocketAddr,
     data_dir: PathBuf,
-    rimg_collector: RimgHealthCollector,
-    rimg_resource_collector: RimgResourceCollector,
+    project_collectors: Vec<MonitoredProjectCollector>,
     executor_socket: Option<PathBuf>,
     access: Option<CloudflareAccessConfig>,
     credential_directory: Option<PathBuf>,
@@ -656,31 +723,7 @@ impl Config {
                 return Err(ConfigError::NonUnicodeDataDirectory);
             }
         };
-        let rimg_base_url = match std::env::var("RDASHBOARD_RIMG_BASE_URL") {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ConfigError::NonUnicodeRimgBaseUrl);
-            }
-        };
-        let rimg_collector = RimgHealthCollector::from_optional_base_url(
-            rimg_base_url.as_deref(),
-            PROJECT_HEALTH_TIMEOUT,
-        )
-        .map_err(ConfigError::RimgBaseUrl)?;
-        let rimg_resource_socket = match std::env::var("RDASHBOARD_RIMG_RESOURCE_SOCKET") {
-            Ok(value) if value == RIMG_RESOURCE_SOCKET_PATH => Some(PathBuf::from(value)),
-            Ok(_) => return Err(ConfigError::InvalidRimgResourceSocket),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ConfigError::NonUnicodeRimgResourceSocket);
-            }
-        };
-        let rimg_resource_collector = RimgResourceCollector::from_optional_socket_path(
-            rimg_resource_socket.as_deref(),
-            PROJECT_RESOURCE_TIMEOUT,
-        )
-        .map_err(ConfigError::RimgResourceSocket)?;
+        let project_collectors = vec![configured_rimg_project()?, configured_telegram_gateway()?];
         let executor_socket = match std::env::var("RDASHBOARD_EXECUTOR_SOCKET") {
             Ok(value) if value == ROOT_EXECUTOR_SOCKET_PATH => Some(PathBuf::from(value)),
             Ok(_) => return Err(ConfigError::InvalidExecutorSocket),
@@ -708,14 +751,81 @@ impl Config {
         Ok(Self {
             listen,
             data_dir,
-            rimg_collector,
-            rimg_resource_collector,
+            project_collectors,
             executor_socket,
             access,
             credential_directory,
             notifier_socket,
         })
     }
+}
+
+fn configured_rimg_project() -> Result<MonitoredProjectCollector, ConfigError> {
+    let base_url = match std::env::var("RDASHBOARD_RIMG_BASE_URL") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::NonUnicodeRimgBaseUrl);
+        }
+    };
+    let health =
+        RimgHealthCollector::from_optional_base_url(base_url.as_deref(), PROJECT_HEALTH_TIMEOUT)
+            .map_err(ConfigError::RimgBaseUrl)?;
+    let socket = match std::env::var("RDASHBOARD_RIMG_RESOURCE_SOCKET") {
+        Ok(value) if value == RIMG_RESOURCE_SOCKET_PATH => Some(PathBuf::from(value)),
+        Ok(_) => return Err(ConfigError::InvalidRimgResourceSocket),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::NonUnicodeRimgResourceSocket);
+        }
+    };
+    let resources = ProjectResourceCollector::from_optional_socket_path(
+        socket.as_deref(),
+        PROJECT_RESOURCE_TIMEOUT,
+    )
+    .map_err(ConfigError::RimgResourceSocket)?;
+    Ok(MonitoredProjectCollector {
+        health: ProjectHealthCollector::Rimg(health),
+        resources,
+    })
+}
+
+fn configured_telegram_gateway() -> Result<MonitoredProjectCollector, ConfigError> {
+    let base_url = match std::env::var("RDASHBOARD_TELEGRAM_GATEWAY_BASE_URL") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::NonUnicodeTelegramGatewayBaseUrl);
+        }
+    };
+    let project_id: ProjectId = PROJECT_ID_TELEGRAM_GATEWAY
+        .parse()
+        .map_err(|_| ConfigError::InvalidTelegramGatewayProjectId)?;
+    let health = HttpHealthCollector::from_optional_base_url(
+        project_id.clone(),
+        TELEGRAM_GATEWAY_DISPLAY_NAME,
+        base_url.as_deref(),
+        PROJECT_HEALTH_TIMEOUT,
+    )
+    .map_err(ConfigError::TelegramGatewayBaseUrl)?;
+    let socket = match std::env::var("RDASHBOARD_TELEGRAM_GATEWAY_RESOURCE_SOCKET") {
+        Ok(value) if value == RIMG_RESOURCE_SOCKET_PATH => Some(PathBuf::from(value)),
+        Ok(_) => return Err(ConfigError::InvalidTelegramGatewayResourceSocket),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::NonUnicodeTelegramGatewayResourceSocket);
+        }
+    };
+    let resources = ProjectResourceCollector::for_project(
+        project_id,
+        socket.as_deref(),
+        PROJECT_RESOURCE_TIMEOUT,
+    )
+    .map_err(ConfigError::TelegramGatewayResourceSocket)?;
+    Ok(MonitoredProjectCollector {
+        health: ProjectHealthCollector::Http(health),
+        resources,
+    })
 }
 
 fn validate_configured_data_dir(path: &Path) -> Result<(), ConfigError> {
@@ -796,6 +906,18 @@ enum ConfigError {
     InvalidRimgResourceSocket,
     #[error("RDASHBOARD_RIMG_RESOURCE_SOCKET must be valid Unicode")]
     NonUnicodeRimgResourceSocket,
+    #[error("the internal telegram-gateway project ID is invalid")]
+    InvalidTelegramGatewayProjectId,
+    #[error("RDASHBOARD_TELEGRAM_GATEWAY_BASE_URL is invalid: {0}")]
+    TelegramGatewayBaseUrl(HttpHealthConfigError),
+    #[error("RDASHBOARD_TELEGRAM_GATEWAY_BASE_URL must be valid Unicode")]
+    NonUnicodeTelegramGatewayBaseUrl,
+    #[error("RDASHBOARD_TELEGRAM_GATEWAY_RESOURCE_SOCKET is invalid: {0}")]
+    TelegramGatewayResourceSocket(RimgConfigError),
+    #[error("RDASHBOARD_TELEGRAM_GATEWAY_RESOURCE_SOCKET must be {RIMG_RESOURCE_SOCKET_PATH}")]
+    InvalidTelegramGatewayResourceSocket,
+    #[error("RDASHBOARD_TELEGRAM_GATEWAY_RESOURCE_SOCKET must be valid Unicode")]
+    NonUnicodeTelegramGatewayResourceSocket,
     #[error("RDASHBOARD_EXECUTOR_SOCKET must be {ROOT_EXECUTOR_SOCKET_PATH}")]
     InvalidExecutorSocket,
     #[error("RDASHBOARD_EXECUTOR_SOCKET must be valid Unicode")]
@@ -810,8 +932,14 @@ enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, validate_configured_data_dir};
-    use std::path::Path;
+    use super::{
+        ConfigError, HttpHealthCollector, MonitoredProjectCollector, PROJECT_HEALTH_TIMEOUT,
+        PROJECT_ID_TELEGRAM_GATEWAY, PROJECT_RESOURCE_TIMEOUT, ProjectHealthCollector,
+        ProjectResourceCollector, RimgHealthCollector, TELEGRAM_GATEWAY_DISPLAY_NAME,
+        collect_projects, shared_project_collectors, validate_configured_data_dir,
+    };
+    use rdashboard::domain::ProjectId;
+    use std::{path::Path, str::FromStr as _};
 
     #[test]
     fn configured_data_directory_requires_an_absolute_normalized_path() {
@@ -823,5 +951,47 @@ mod tests {
                 Err(ConfigError::EmptyDataDirectory)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn configured_collection_keeps_each_project_as_an_independent_row() {
+        let rimg = MonitoredProjectCollector {
+            health: ProjectHealthCollector::Rimg(
+                RimgHealthCollector::from_optional_base_url(None, PROJECT_HEALTH_TIMEOUT)
+                    .expect("unconfigured rimg health collector"),
+            ),
+            resources: ProjectResourceCollector::from_optional_socket_path(
+                None,
+                PROJECT_RESOURCE_TIMEOUT,
+            )
+            .expect("unconfigured rimg resource collector"),
+        };
+        let gateway_id =
+            ProjectId::from_str(PROJECT_ID_TELEGRAM_GATEWAY).expect("telegram gateway project ID");
+        let gateway = MonitoredProjectCollector {
+            health: ProjectHealthCollector::Http(
+                HttpHealthCollector::from_optional_base_url(
+                    gateway_id.clone(),
+                    TELEGRAM_GATEWAY_DISPLAY_NAME,
+                    None,
+                    PROJECT_HEALTH_TIMEOUT,
+                )
+                .expect("unconfigured gateway health collector"),
+            ),
+            resources: ProjectResourceCollector::for_project(
+                gateway_id,
+                None,
+                PROJECT_RESOURCE_TIMEOUT,
+            )
+            .expect("unconfigured gateway resource collector"),
+        };
+        let collectors = shared_project_collectors(&[rimg, gateway]);
+
+        let projects = collect_projects(&collectors, 42).await;
+
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].project_id.as_str(), "rimg");
+        assert_eq!(projects[1].project_id.as_str(), PROJECT_ID_TELEGRAM_GATEWAY);
+        assert_eq!(projects[1].display_name, TELEGRAM_GATEWAY_DISPLAY_NAME);
     }
 }

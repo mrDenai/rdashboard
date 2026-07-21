@@ -339,15 +339,24 @@ seconds: during a rolling gap those expected fail-closed activations must not pe
 listening socket. Each activation remains deadline- and resource-bounded, and the next collection
 automatically resolves the replacement container once it becomes healthy.
 
+Install `rdashboard-telegram-gateway.env` as root-owned mode `0644` at
+`/usr/lib/rdashboard/rdashboard-telegram-gateway.env`. It fixes the operator-visible stable health
+route at `https://tg.4u.ge/health` and reuses the same peer-authenticated observer socket for resource
+attribution. The controller follows no redirects and treats only HTTP 200 as healthy; this deliberately
+checks the real Cloudflare/Kamal Proxy route rather than only container reachability.
+
 Before starting the observer, write the controller's actual non-root numeric UID as
 `RDASHBOARD_OBSERVER_ALLOWED_UID=<uid>` in root-owned `/etc/rdashboard/observer.env`; no other value
 belongs in that file. The persistent root observer creates
 `/run/rdashboard-observer/observer.sock` as `root:rdashboard` mode `0660`, verifies every connecting
 peer UID, and accepts only the versioned `project_resources` request for an installed project. The
-current installed handler recognizes only `rimg`; the request cannot select a container, Docker
-command, label, socket or host path. The observer performs fixed, two-second-bounded Docker queries,
-requires exact Kamal labels `service=rimg` and `role=web`, revalidates running/healthy state and a
-private `kamal` address, then returns only a bounded numeric resource record. Its service has fixed
+installed handler recognizes exact compiled profiles for `rimg` and `telegram-gateway`; the request
+cannot select a container, Docker command, label, socket or host path. The observer performs fixed,
+two-second-bounded Docker queries and requires the profile's exact Kamal service/role labels, running
+state and private `kamal` address. `rimg` additionally requires Docker `healthy`.
+`telegram-gateway` has no image-level Docker `HEALTHCHECK`, so its profile accepts only the explicit
+`missing` health field while the independent stable HTTP probe remains the availability authority.
+The observer returns only a bounded numeric resource record. Its service has fixed
 CPU, memory, task and descriptor limits and no network namespace. A stale socket left by a crash is
 reconciled only when its protected owner/group/mode/inode contract still matches; a live socket or
 changed path fails closed.
@@ -411,7 +420,7 @@ Review the repository candidate `config/source-projects.json`, render it as cano
 exactly and contains only owner-controlled deployment values:
 
 ```json
-{"projects":[{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":3,"project_id":"ralert","release_class":"stateful_compatible"},{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":2,"project_id":"rdashboard","release_class":"code_only_compatible"}],"purpose":"rdashboard.source-project-controls.v1","schema_version":1}
+{"projects":[{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":3,"project_id":"ralert","release_class":"stateful_compatible"},{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":2,"project_id":"rdashboard","release_class":"code_only_compatible"},{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":2,"project_id":"telegram-gateway","release_class":"stateful_compatible"}],"purpose":"rdashboard.source-project-controls.v1","schema_version":1}
 ```
 
 Render the reviewed candidate without accepting trailing whitespace or noncanonical installed bytes:

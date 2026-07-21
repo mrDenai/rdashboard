@@ -1,6 +1,7 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode, header},
 };
@@ -866,6 +867,50 @@ fn repository_history_enforces_hourly_sampling_and_preserves_commit_metrics() {
     );
 }
 
+async fn assert_versioned_status_asset(app: Router, html: &str) {
+    assert!(!html.contains("__ASSET_VERSION__"));
+    let app_asset = html
+        .split("<script src=\"")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .unwrap_or_else(|| panic!("versioned application asset is missing: {html}"));
+    assert!(app_asset.starts_with("/assets/"));
+    assert!(app_asset.ends_with("/app.js"));
+    let status_asset = app_asset.replace("/app.js", "/status.js");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(status_asset)
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("status script response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static(
+            "text/javascript; charset=utf-8"
+        ))
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL),
+        Some(&header::HeaderValue::from_static(
+            "public, max-age=31536000, immutable"
+        ))
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap_or_else(|error| panic!("read status script: {error}"))
+        .to_bytes();
+    assert!(
+        body.windows(b"evaluateHostObservation".len())
+            .any(|window| window == b"evaluateHostObservation")
+    );
+}
+
 #[tokio::test]
 async fn http_surface_is_loopback_slice_with_strict_headers_and_truthful_empty_state() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
@@ -923,34 +968,7 @@ async fn http_surface_is_loopback_slice_with_strict_headers_and_truthful_empty_s
     assert!(!html.contains("metric-psi"));
     assert!(!html.contains("Контур операций"));
     assert!(!html.contains("<script>"));
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/assets/status.js")
-                .body(Body::empty())
-                .unwrap_or_else(|error| panic!("request: {error}")),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("status script response: {error}"));
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(header::CONTENT_TYPE),
-        Some(&header::HeaderValue::from_static(
-            "text/javascript; charset=utf-8"
-        ))
-    );
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .unwrap_or_else(|error| panic!("read status script: {error}"))
-        .to_bytes();
-    assert!(
-        body.windows(b"evaluateHostObservation".len())
-            .any(|window| window == b"evaluateHostObservation")
-    );
+    assert_versioned_status_asset(app.clone(), html).await;
 
     let response = app
         .clone()
@@ -1812,4 +1830,10 @@ fn browser_assets_use_safe_dom_updates_and_central_live_regions() {
     assert!(css.contains("prefers-reduced-motion: reduce"));
     assert!(css.contains("@supports not (content-visibility: auto)"));
     assert!(css.contains("overflow-x: auto"));
+    assert!(css.contains(".project-table th:nth-child(9)"));
+    assert!(css.contains(".notification-timestamp"));
+    assert!(css.contains("white-space: nowrap"));
+    assert!(javascript.contains("Медиана CPU / RAM"));
+    assert!(javascript.contains("Трафик за 1 час"));
+    assert!(javascript.contains("appendProjectTimestamp"));
 }

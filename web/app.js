@@ -547,39 +547,52 @@ function createProjectResourceCell(current, history) {
   }
 
   const cell = createSummaryCell(
-    `${formatPercent(current.cpu_percent)} · ${formatBytes(current.memory_used_bytes)}`,
+    `CPU ${formatPercent(current.cpu_percent)}`,
     current.status,
-    `RAM из ${formatBytes(current.memory_limit_bytes)}`,
+    `RAM ${formatBytes(current.memory_used_bytes)} из ${formatBytes(current.memory_limit_bytes)}`,
   );
   if (!history) {
-    appendProjectCellDetail(cell, "История загружается…");
+    appendResourceGroup(cell, "История", "Загружается…");
     return cell;
   }
   if (history.error && history.windows.length === 0) {
-    appendProjectCellDetail(cell, "История недоступна");
+    appendResourceGroup(cell, "История", "Недоступна");
     return cell;
   }
 
   const windows = new Map(history.windows.map((window) => [window.window, window]));
-  const labels = { hour: "1ч", day: "1д", week: "7д", month: "30д" };
+  const labels = { hour: "1 ч", day: "1 д", week: "7 д", month: "30 д" };
   const medians = HOST_HISTORY_WINDOWS.map((name) => {
     const window = windows.get(name);
     const cpu = formatPercent(window?.medians?.cpu_percent);
     const memory = formatBytes(window?.medians?.memory_used_bytes);
-    return `${labels[name]} ${cpu}/${memory}`;
+    return `${labels[name]}: ${cpu} / ${memory}`;
   });
-  appendProjectCellDetail(cell, medians.join(" · "), "resource-history");
+  appendResourceGroup(cell, "Медиана CPU / RAM", medians.join(" · "));
 
   const hour = windows.get("hour");
   if (hour?.totals) {
-    appendProjectCellDetail(
+    appendResourceGroup(
       cell,
-      `трафик 1ч ↓ ${formatBytes(hour.totals.network_rx_bytes)} · ↑ ${formatBytes(hour.totals.network_tx_bytes)}`,
-      "resource-history",
+      "Трафик за 1 час",
+      `↓ ${formatBytes(hour.totals.network_rx_bytes)} · ↑ ${formatBytes(hour.totals.network_tx_bytes)}`,
     );
   }
-  if (history.error) appendProjectCellDetail(cell, "Последняя сохранённая история");
+  if (history.error) appendResourceGroup(cell, "Актуальность", "Последние сохранённые данные");
   return cell;
+}
+
+function appendResourceGroup(cell, label, value) {
+  const group = document.createElement("div");
+  group.className = "project-resource-group";
+  const term = document.createElement("span");
+  term.className = "project-resource-label";
+  term.textContent = label;
+  const detail = document.createElement("span");
+  detail.className = "project-resource-value";
+  detail.textContent = value;
+  group.append(term, detail);
+  cell.append(group);
 }
 
 function appendProjectCellDetail(cell, text, extraClass = null) {
@@ -777,10 +790,7 @@ function createNotificationsCell(cached) {
     presentation.state,
     notificationKindLabel(latest.event.kind),
   );
-  appendProjectCellDetail(
-    cell,
-    new Date(latest.updated_at_ms).toLocaleString("ru-RU"),
-  );
+  appendProjectTimestamp(cell, latest.updated_at_ms);
   if (latest.state === "delivered_possible_duplicate") {
     appendProjectCellDetail(cell, "Повтор сохранил исходную неопределённость");
   } else if (latest.last_error_code !== null) {
@@ -788,6 +798,25 @@ function createNotificationsCell(cached) {
   }
   if (cached.fetchError) appendProjectCellDetail(cell, "Показан последний сохранённый статус");
   return cell;
+}
+
+function appendProjectTimestamp(cell, timestampMs) {
+  const date = new Date(timestampMs);
+  if (!Number.isFinite(date.getTime())) {
+    appendProjectCellDetail(cell, "Время события недоступно");
+    return;
+  }
+  const timestamp = document.createElement("time");
+  timestamp.className = "notification-timestamp";
+  timestamp.dateTime = date.toISOString();
+  timestamp.title = date.toLocaleString("ru-RU");
+  timestamp.textContent = date.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  cell.append(timestamp);
 }
 
 function appendProjectCellLink(cell, text, href) {

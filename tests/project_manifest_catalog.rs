@@ -246,6 +246,70 @@ fn ralert_contract_separates_stateful_templates_from_disposable_images() {
 }
 
 #[test]
+fn telegram_gateway_contract_preserves_state_and_uses_the_generic_worker() {
+    let (_, manifest) = catalog()
+        .into_iter()
+        .find(|(id, _)| id == "telegram-gateway")
+        .unwrap_or_else(|| panic!("telegram-gateway manifest is required"));
+
+    assert_eq!(
+        manifest.source.remote_url.as_str(),
+        "ssh://git@github.com/mrDenai/telegram-gateway.git"
+    );
+    assert_eq!(manifest.build.kind, BuildKind::Oci);
+    assert_eq!(manifest.data_volumes.len(), 1);
+    assert_eq!(manifest.data_volumes[0].path.as_str(), "/data");
+    assert_eq!(manifest.data_volumes[0].class, DataClass::Stateful);
+    assert!(manifest.data_volumes[0].backup_required);
+    assert_eq!(manifest.migration.entrypoint, MigrationEntrypoint::None);
+    assert_eq!(
+        manifest.migration.write_fence,
+        WriteFencePolicy::Unsupported
+    );
+    assert_eq!(manifest.health_checks.len(), 1);
+    assert_eq!(
+        manifest.health_checks[0].endpoint.as_str(),
+        "http://telegram-gateway:8081/health"
+    );
+
+    let preparation = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+        .unwrap_or_else(|| panic!("gateway preparation node is required"));
+    let preparation_profile = manifest
+        .workflow
+        .profile(&preparation.profile_id)
+        .unwrap_or_else(|| panic!("gateway preparation profile is required"));
+    assert_eq!(
+        preparation_profile.worker_pool,
+        WorkflowWorkerPoolV1::VpsRequired
+    );
+    assert_eq!(
+        preparation_profile.network_class,
+        WorkflowNetworkClassV1::DependencyEgress
+    );
+    assert_eq!(
+        manifest
+            .host_preparation
+            .as_ref()
+            .unwrap_or_else(|| panic!("gateway host preparation is required"))
+            .adapter_id,
+        WorkflowHostPreparationAdapterV1::CargoCratesIoV1
+    );
+    assert_eq!(
+        manifest
+            .workflow
+            .nodes
+            .iter()
+            .filter(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn source_tree_host_preparation_rejects_dependency_network_authority() {
     let (_, mut manifest) = catalog()
         .into_iter()

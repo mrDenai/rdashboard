@@ -15,6 +15,13 @@
       "auto_deploy": false,
       "maximum_attempts": 2,
       "release_class": "code_only_compatible"
+    },
+    {
+      "project_id": "telegram-gateway",
+      "installed_policy_version": 1,
+      "auto_deploy": false,
+      "maximum_attempts": 2,
+      "release_class": "stateful_compatible"
     }
   ]
 }

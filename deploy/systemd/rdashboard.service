@@ -15,6 +15,7 @@ Environment=RDASHBOARD_EXECUTOR_SOCKET=/run/rdashboard/executor.sock
 Environment=RDASHBOARD_ACCESS_REQUIRED=true
 EnvironmentFile=-/etc/rdashboard/controller.env
 EnvironmentFile=/usr/lib/rdashboard/rdashboard-rimg-health.env
+EnvironmentFile=/usr/lib/rdashboard/rdashboard-telegram-gateway.env
 StateDirectory=rdashboard
 StateDirectoryMode=0750
 UMask=0027

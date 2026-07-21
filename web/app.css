@@ -394,6 +394,7 @@ tbody tr:last-child td {
 }
 
 .project-table {
+  min-width: 90rem;
   table-layout: fixed;
 }
 
@@ -442,13 +443,14 @@ tbody tr:last-child td {
 }
 
 .project-table th:nth-child(1) { width: 8%; }
-.project-table th:nth-child(2) { width: 10%; }
-.project-table th:nth-child(3) { width: 22%; }
-.project-table th:nth-child(4) { width: 10%; }
-.project-table th:nth-child(5) { width: 9%; }
-.project-table th:nth-child(6) { width: 20%; }
-.project-table th:nth-child(7) { width: 10%; }
-.project-table th:nth-child(8) { width: 11%; }
+.project-table th:nth-child(2) { width: 9%; }
+.project-table th:nth-child(3) { width: 23%; }
+.project-table th:nth-child(4) { width: 8%; }
+.project-table th:nth-child(5) { width: 8%; }
+.project-table th:nth-child(6) { width: 13%; }
+.project-table th:nth-child(7) { width: 11%; }
+.project-table th:nth-child(8) { width: 10%; }
+.project-table th:nth-child(9) { width: 10%; }
 
 .project-row > th {
   color: var(--text);
@@ -456,6 +458,10 @@ tbody tr:last-child td {
   font-size: 0.82rem;
   letter-spacing: normal;
   text-transform: none;
+  vertical-align: top;
+}
+
+.project-row > td {
   vertical-align: top;
 }
 
@@ -499,6 +505,40 @@ tbody tr:last-child td {
 .resource-history {
   font-variant-numeric: tabular-nums;
   line-height: 1.35;
+}
+
+.project-resource-group {
+  margin-block-start: 0.35rem;
+}
+
+.project-resource-label {
+  display: block;
+  color: var(--quiet);
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+.project-resource-value {
+  display: block;
+  margin-block-start: 0.08rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  overflow-wrap: normal;
+}
+
+.notification-timestamp {
+  display: block;
+  margin-block-start: 0.18rem;
+  color: var(--muted);
+  font-family: ui-monospace, "Cascadia Mono", monospace;
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: normal;
+  white-space: nowrap;
 }
 
 .project-table .empty-state {
