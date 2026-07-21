@@ -1,7 +1,7 @@
 # Dashboard automation review
 
 - Workflow directory: `.agent/workflows/2026-07-19-dashboard-automation`
-- Status: complete for Phases 1 and 2
+- Status: complete for Phases 1 and 2 plus production notification activation
 - Reviewed: 2026-07-22
 - Scope: task-owned Phase 1 changes in `rdashboard` and `rimg`, plus the Phase 2 isolated notifier
 - Excluded: user-owned `rdashboard/.agent/workflows/2026-07-15-rdashboard-production/*`
@@ -146,3 +146,87 @@ Phase 2 is production-worthy as an inactive local implementation and may be comm
 remains fail-closed until a dedicated gateway project, reviewed destination, notifier UID, environment,
 per-project gateway credential, binary and systemd units are installed. No gateway or rdashboard
 deployment, push, service change, credential write or provider call was performed.
+
+## Production notification activation review
+
+### Verdict
+
+Production notification delivery is active and verified through the existing `ops` / `sartulibot`
+gateway route. The controller never received the gateway secret. `rdashboard.service`,
+`rdashboard-notify.service` and `rdashboard-observer.service` are active with zero restarts, and the
+loopback health endpoint is green. No unresolved P0-P2 finding remains in the activation scope.
+
+### Installed route and isolation
+
+- Gateway origin/project: fixed `https://tg.4u.ge`, existing project `ops` and bot `sartulibot`.
+- Destination: the exact live Sartuli destination, chat `-5057084213`, thread `0`.
+- The existing 64-byte gateway API secret was copied inside the VPS from the live Sartuli container
+  directly to root-owned mode-`0600` `/etc/rdashboard/credentials/telegram-gateway-secret`; it was not
+  printed, downloaded or added to controller configuration.
+- `rdashboard-notify` has its own system UID/GID, owner-only state and a mode-`0660`
+  peer-authenticated Unix socket. The controller receives only the notifier group and socket path.
+- The production base `rdashboard.service` was preserved. Only the notifier drop-in was added.
+
+### Activation incident and resolution
+
+The first current-controller start failed closed with `InvalidRimgResourceSocket`: production still
+had the legacy `/run/rdashboard/rimg-resources.sock` provider, while the current committed controller
+accepts only the persistent observer socket. The previous controller binary was restored immediately,
+the notifier drop-in was removed from the active unit, and `/health` recovered before further work.
+No database restore was required and no data was lost.
+
+The committed persistent observer prerequisite was then installed using the hardened repository unit
+plus a narrow `ExecStart` override for the existing `/usr/libexec/rdashboard` production layout. A
+second consistent data snapshot was taken before the successful current-controller start. This exposed
+a separate production defect: the fixed `docker stats --no-stream` command takes 1.10 seconds on this
+host and was deterministically killed by the one-second subprocess deadline. `docker ps` and
+`docker inspect` each measured 0.10 seconds. The observer deadline is now two seconds while the outer
+request deadline remains four seconds; the error text and systemd documentation were updated with it.
+
+Bare `bin/ci` passed after the timeout correction and again after the regression assertion; the final
+run exited 0 and covered 301 active
+library tests, all binary/integration/socket/workflow suites, nine browser-contract tests and release
+build. The final test pins the two-second subprocess deadline and requires the four-second request
+deadline to remain larger. Fresh `deepseek-free` consultation returned dispatcher status `ANSWERED`,
+verdict `SAFE`, no P0-P2 finding and no open question at state fingerprint
+`9daa13aa95d773bd9f4ce5c93fd03ca82ffbea617e3db008ae93a9c745762c42`. Direct review also retains one
+P3 observation: three independently two-second-bounded Docker commands have a six-second theoretical
+sum; the unchanged four-second request deadline still fails that case closed, and measured production
+latency is 1.30 seconds total.
+
+### Live verification
+
+- Installed artifact SHA-256 values:
+  - controller: `a322615fb8d5dcf87a3cc9d279e25ea5dc9999ed35dd97e94dde2e6b7099fa60`;
+  - notifier: `df40683b204fe1b48d96dabec422751d8a786c5d88f79865f42072f19dd11989`;
+  - corrected observer: `d00c205e3befc5952306222f6ef1c234ae40704fc5e88fc2f8540759e6725c8b`.
+- A controller-UID peer request to the installed notifier returned `configured=true` for `rimg`.
+- One stable, idempotent activation event was accepted by the notifier and reached terminal
+  `delivered` after two attempts (gateway submit plus status poll), with a gateway UUID, no possible
+  duplicate and no error code. Neither message text, UUID nor credential was emitted to verification
+  logs.
+- After the observer correction, at least eight consecutive five-second SQLite resource samples were
+  `fresh`; the earlier observer warning stopped. Current controller/notifier/observer memory was about
+  19/5/7 MiB respectively.
+- The pre-existing repository observation warning (`executor ... InternalFailure`) remains outside this
+  notification activation and was not hidden or reclassified.
+
+### Rollback evidence
+
+- Latest consistent pre-current-controller data snapshot:
+  `/var/lib/rdashboard-backups/pre-current-ee7aa06-20260721T223412Z`.
+- Earlier pre-attempt snapshot:
+  `/var/lib/rdashboard-backups/pre-notifier-ee7aa06-20260721T222638Z`.
+- Previous controller binaries:
+  `/usr/libexec/rdashboard/rdashboardd.prev-ee7aa06` and
+  `/usr/libexec/rdashboard/rdashboardd.prev2-ee7aa06`, both SHA-256
+  `53474403a072596704d48247f09aee1ea17705f7a0a9b60e8b4f8abca88ff425`.
+- Previous one-second observer:
+  `/usr/libexec/rdashboard/rdashboard-observer.prev-1s-ee7aa06`.
+- Previous legacy rimg fixed environment:
+  `/usr/lib/rdashboard/rdashboard-rimg-health.env.prev-ee7aa06`.
+- Notification planning can be disabled without touching its credential or outbox by moving only
+  `/etc/systemd/system/rdashboard.service.d/rdashboard-notifier.conf` out of the drop-in directory,
+  reloading systemd and restarting the controller. A full controller rollback must stop the service,
+  restore the previous binary and legacy fixed environment, disable that drop-in, and restore the
+  latest consistent data snapshot only if the old binary rejects the migrated stores.

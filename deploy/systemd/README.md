@@ -345,7 +345,7 @@ belongs in that file. The persistent root observer creates
 `/run/rdashboard-observer/observer.sock` as `root:rdashboard` mode `0660`, verifies every connecting
 peer UID, and accepts only the versioned `project_resources` request for an installed project. The
 current installed handler recognizes only `rimg`; the request cannot select a container, Docker
-command, label, socket or host path. The observer performs fixed, one-second-bounded Docker queries,
+command, label, socket or host path. The observer performs fixed, two-second-bounded Docker queries,
 requires exact Kamal labels `service=rimg` and `role=web`, revalidates running/healthy state and a
 private `kamal` address, then returns only a bounded numeric resource record. Its service has fixed
 CPU, memory, task and descriptor limits and no network namespace. A stale socket left by a crash is

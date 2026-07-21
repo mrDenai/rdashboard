@@ -1,7 +1,7 @@
 # Dashboard automation implementation plan
 
 - Workflow directory: `.agent/workflows/2026-07-19-dashboard-automation`
-- Status: complete locally
+- Status: production notification activation complete
 - Last updated: 2026-07-22
 - Depends on: `brief.md`, `research.md`
 
@@ -11,8 +11,9 @@ Complete the safe autonomous phase of the `rimg` operations surface: replace the
 placeholders with durable provider-backed states, preprocess only structurally anonymous GlitchTip
 aggregates through DeepSeek Free, establish a typed Telegram notification contract, reuse the existing
 verified backup/deploy evidence instead of duplicating it, and prove a Docker application-build path
-that does not retain the multi-gigabyte native compilation graph. Production activation, push and
-deployment remain explicitly out of scope.
+that does not retain the multi-gigabyte native compilation graph. The original implementation phase
+excluded production activation; U005 now authorizes only the notification activation defined at the
+end of this plan. Push and every unrelated deployment capability remain out of scope.
 
 ## Ownership and change boundaries
 
@@ -22,7 +23,8 @@ deployment remain explicitly out of scope.
 - Existing modified files under
   `.agent/workflows/2026-07-15-rdashboard-production/` are user-owned and must not be staged or edited.
 - Secret values are never written to source, workflow artifacts, SQLite fixtures, model briefs or logs.
-- No GitHub push, provider write, production install, service restart or deployment is authorized.
+- No GitHub push or unrelated provider/deployment mutation is authorized. U005 narrowly authorizes the
+  production notification install, required service restarts and one bounded delivery verification.
 
 ## Implementation steps
 
@@ -159,7 +161,7 @@ These do not block local implementation or fake-provider/Docker verification.
 | B001 | Create/install a dedicated GlitchTip token limited to read-only scopes under a least-privilege user and fixed credential `glitchtip-read-token`. | The existing operator environment token must not be silently promoted into a production service identity and may see multiple projects. |
 | B002 | Install the existing OpenCode key as controller-only systemd credential `opencode-api-key`; confirm the accepted policy is aggregate-only use of the US-hosted free route whose data may improve the model. | The user required this model, but credential installation and acceptance of the provider's current data terms are external production actions. |
 | B003 | Provision a GitHub App or equivalent short-lived/fine-grained credential with only private-repository Pull Requests/Checks metadata read access as `github-metadata-token`. | The private repository's PR/check state is not available anonymously, and the source SSH key cannot call the API. |
-| B004 | Register/choose the `telegram-gateway` project, destination chat/thread and per-project API secret; install the secret only for a separate notifier UID. | The controller must not infer a chat or receive the gateway credential. |
+| B004 | **Resolved by U005.** Reused the existing `ops` / `sartulibot` gateway project, Sartuli chat `-5057084213`, thread `0`, and installed its existing API secret only for the separate notifier UID. | The controller inferred nothing and never received the gateway credential. |
 | B005 | Supply the production `age` recipient/restore-key owner, Drive folder/service account, retention schedule and restore-drill owner. | Keys, provider mutation and retention/destruction policy are external owner decisions; no production backup files exist today. |
 | B006 | Register the generated source deploy key read-only for `mrDenai/rimg`, install source config/credentials/service and validate accepted-tree reconciliation. | Production currently has no source service/config and repository access registration is an external GitHub action. |
 | B007 | Create and route the narrow GitHub webhook endpoint, install its HMAC secret in the source boundary and decide the public ingress/DNS/Cloudflare route. | Public routing and secret registration are external mutations; periodic reconciliation remains the repair path. |
@@ -245,3 +247,40 @@ repository remains an external activation responsibility and is not part of this
   `974c3a0c32d85bc6a1a872a9c196f03cb599be2b3d1c530f76ed6ba71ca3e4de`.
 - The local commit is authorized by U003. Push, installation, gateway registration/configuration and
   production delivery remain outside this closure.
+
+## Production notification activation
+
+Authorization: U005. Scope is limited to activating the committed notification slice against the
+existing `ops` / `sartulibot` gateway route and Sartuli destination.
+
+1. **Complete — resolve installed inputs without exposing secrets.** Confirm the single existing
+   Sartuli destination, locate the existing `ops` API credential, validate the controller UID, current
+   health, disk headroom and rollback state.
+   Resolved from the live Sartuli container: `https://tg.4u.ge`, project `ops`, chat `-5057084213`,
+   thread `0`; the 64-byte secret is present and will be copied server-side without disclosure.
+   Controller UID is `999`, health is green and root has 12.0 GiB free.
+2. **Complete — install inactive notifier prerequisites.** Preserve the current controller/data state,
+   install the two verified binaries, create the dedicated notifier identity, install the root-owned
+   environment/credential and notifier unit, then start and verify the notifier before controller
+   wiring.
+   The installed notifier is active with zero restarts, a 1.4 MiB working set, a dedicated UID/GID,
+   mode-0700 state and a mode-0660 peer-authenticated socket. The secret remains root-only and was
+   copied entirely within the VPS from the live Sartuli container.
+3. **Complete — activate the controller transport.** Install only the notifier drop-in while preserving
+   the currently deployed base controller unit, reload systemd, restart the controller and require both
+   services plus the dashboard health contract to pass.
+   The first current-controller start failed closed on the legacy rimg resource socket contract. The
+   previous binary was immediately restored and `/health` recovered. The committed persistent observer
+   prerequisite was then installed without replacing the production base unit. Production measurement
+   showed `docker stats --no-stream` requires 1.10 seconds, so the one-second subprocess deadline was
+   corrected to two seconds; bare `bin/ci` and an independent `deepseek-free` review found no P0-P2
+   issue. The redeployed controller, notifier and observer are active with zero restarts.
+4. **Complete — verify bounded delivery and rollback readiness.** Confirm configured dashboard state,
+   gateway acceptance/terminal delivery without printing message content or credentials, inspect safe
+   logs/resources, and retain exact disable/restore commands and backups.
+   A peer-authenticated controller-UID query returned `configured=true`. One idempotent activation event
+   traversed the controller-UID protocol -> notifier outbox -> `telegram-gateway` and reached
+   `delivered` after submit plus status poll, with a gateway UUID, no possible duplicate and no error
+   code. Eight
+   consecutive five-second rimg samples were `fresh` after the observer hotfix. Rollback controller
+   binaries and consistent data snapshots remain installed at the paths recorded in `review.md`.

@@ -25,7 +25,11 @@ use tracing_subscriber::EnvFilter;
 const DOCKER: &str = "/usr/bin/docker";
 const DOCKER_HOST: &str = "unix:///var/run/docker.sock";
 const TIMEOUT: &str = "/usr/bin/timeout";
-const DOCKER_COMMAND_TIMEOUT: &str = "1s";
+// `docker stats --no-stream` waits for a second sample before it can calculate CPU.
+// A one-second process deadline therefore kills valid observations on production even
+// when the daemon is healthy. Keep the subprocess bounded below the four-second
+// request deadline while allowing that required sampling interval plus small overhead.
+const DOCKER_COMMAND_TIMEOUT: &str = "2s";
 const PROJECT_ID: &str = "rimg";
 const ALLOWED_UID_ENV: &str = "RDASHBOARD_OBSERVER_ALLOWED_UID";
 const MAX_DOCKER_OUTPUT_BYTES: usize = 16 * 1024;
@@ -422,7 +426,7 @@ enum ObserverError {
     InvalidInternalProjectId,
     #[error("the fixed Docker CLI could not be executed: {0}")]
     DockerExec(io::Error),
-    #[error("the fixed Docker query failed or exceeded its one-second deadline")]
+    #[error("the fixed Docker query failed or exceeded its two-second deadline")]
     DockerFailure,
     #[error("Docker returned more output than the bounded observer contract permits")]
     DockerOutputTooLarge,
@@ -504,6 +508,8 @@ mod tests {
 
     #[test]
     fn fixed_docker_command_has_a_hard_subprocess_deadline() {
+        assert_eq!(DOCKER_COMMAND_TIMEOUT, "2s");
+        assert!(REQUEST_TIMEOUT > Duration::from_secs(2));
         let command = docker_command(&strings(&["ps", "--no-trunc"]));
         assert_eq!(command.get_program(), OsStr::new(TIMEOUT));
         assert_eq!(

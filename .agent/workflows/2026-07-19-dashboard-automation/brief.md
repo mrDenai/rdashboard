@@ -1,7 +1,7 @@
 # Dashboard automation brief
 
 - Workflow directory: `.agent/workflows/2026-07-19-dashboard-automation`
-- Status: complete locally
+- Status: production notification activation complete
 - Last updated: 2026-07-22
 
 ## User input log
@@ -69,3 +69,22 @@ Normalized constraint:
   service contract. `rdashboard` must not call the Telegram Bot API directly or receive a bot token.
 - Recover the earlier notification-slice intent and verification evidence before changing or closing
   the implementation.
+
+### U005 — 2026-07-22
+
+Faithful English rendering:
+
+Use `sartulibot`, send to the same chat as the Sartuli project, and proceed with the production deploy.
+
+Normalized decision and authorization:
+
+- Reuse the already registered `telegram-gateway` project `ops` and its `sartulibot` identity rather
+  than registering another project or bot.
+- Reuse the same reviewed chat and optional thread currently used by Sartuli through that gateway
+  project.
+- Production installation and activation of the committed `rdashboard` notification slice are
+  explicitly authorized, including credential/config installation, binary and unit installation,
+  daemon reload, service restart and bounded delivery verification.
+- Preserve a rollback copy of the current controller and database state. Do not activate unrelated
+  self-update/workflow services, deploy `telegram-gateway`, change its bot registration, delete caches
+  or mutate unrelated production state.
