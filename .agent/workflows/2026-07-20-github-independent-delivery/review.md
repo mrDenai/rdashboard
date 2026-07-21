@@ -1603,3 +1603,83 @@ Slice 12b is production-worthy as an inactive verified producer/root-publication
 committed. Executable-path migration, recovery tooling, inactive project/policy onboarding and host
 drills remain the next local/activation slices; this result alone does not make a pushed `rdashboard`
 commit deploy itself.
+
+## Slice 12c versioned runtime and root recovery review
+
+### Scope and outcome
+
+This slice makes the previously staged A/B pointer control the executable application and supplies a
+controller-independent recovery kit while keeping the feature inactive:
+
+- all eleven application service units and four fixed transient-job clients now execute below the
+  relative, verified `/var/lib/rdashboard-bootstrap/current/bin` release pointer;
+- both the native producer policy and the separately installed bootstrap policy require the same exact
+  sorted 15-binary payload. Missing, extra or mode-substituted application binaries fail before release
+  production or installed-policy admission;
+- `rdashboard-bootstrap` and the new `rdashboard-recovery` remain outside the release slots. The root
+  CLI accepts only inspect, active-operation replay, exact-current restart, exact journal/LKG/backup
+  restore or an exact 40-character SHA handoff admission. It accepts no shell, tag or caller path;
+- recovery and bootstrap share the journal's cross-process exclusive lock. Recovery additionally proves
+  the systemd bootstrap inactive, and every command retains the journal guard through its service or
+  pointer action;
+- a `NeedsReconcile` record is durable debt: it is not an active coordinator operation, but it blocks
+  all newer candidates, cannot be retention-pruned and can become `RolledBack` only after the exact
+  verified backup/LKG tuple starts and passes health;
+- the socket-activated rimg health helper is quiesced during a pointer switch but excluded from the
+  permanently active service-health set, so bootstrap does not convert on-demand work into a mandatory
+  daemon;
+- bootstrap and explicit recovery use the same bounded handoff scanner. It validates the fixed root,
+  exact publication shape, file ownership/mode/link count and stable bytes, then revalidates the exact
+  publication directory inode after both descriptor and archive have been inspected.
+
+No host unit, release slot, signing policy, credential, project manifest, GitHub setting, VPS/i9 state,
+push or deployment was changed. Initial-slot provisioning, inactive `rdashboard` project/policy
+onboarding, destructive host drills and explicit production activation remain separate work.
+
+### Self-review and first consultation findings
+
+- The initial implementation included the socket-activated rimg health service in the mandatory active
+  health set. It is now stop-only during switch and resumes by socket activation.
+- The existing terminal-history pruning treated `NeedsReconcile` as ordinary terminal history and the
+  bootstrap could discover a newer candidate while unresolved debt existed. Journal begin, bootstrap
+  discovery, recovery admission and current restart now fail closed on that debt; a regression proves
+  it cannot be pruned or bypassed.
+- The first exact DeepSeek review returned `SAFE` but reported two medium-confidence P2 observations.
+  The journal already had a process-wide `flock`; however, `restart-current` explicitly dropped its
+  guard before the service action, so the guard now spans that action. The handoff scanner now performs
+  the requested post-read directory-inode revalidation.
+- The same review asked whether the installed bootstrap policy independently requires the complete
+  payload. The installed loader now enforces the exact application list directly, and a regression
+  proves an otherwise canonical incomplete policy is rejected while the complete policy loads.
+- Its remaining P3 orphan-release observation is accepted for this inactive slice: a fully verified,
+  immutable staged candidate may remain after a failure before coordinator admission. It is not
+  referenced or activated, and bounded release retention remains part of the later activation slice.
+
+### Verification
+
+- Final bare `bin/ci`: passed, exit code 0.
+- It covered formatting, strict Clippy, 296 active library tests with two credentialed live-provider
+  tests ignored by design, every binary/integration/socket/scheduler/worker suite, both generated
+  schema checks, nine browser contracts and the optimized release build.
+- The final optimized release phase completed in 4 minutes 18 seconds.
+- `git diff --cached --check` passed. The final exact 30-path product/config/test binary diff SHA-256
+  reviewed independently is
+  `18b09f72eaa426da426a7e6209f043cd55fa9f12e3ad8c8d9fe2f0ad1302e2ff`.
+
+### Independent consultation
+
+The final review inspected the corrected exact hash above:
+
+- route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`;
+- status: `ANSWERED`, one attempt, CLI `1.18.3`, 195 seconds;
+- state fingerprint: `c52e0895047c67f8f7c26e39c1c836f288904473445f3797a68087a4be1096a3`;
+- brief SHA-256: `55dccf5f3ba9bacdc20628567ccff8cc9cbe96e6880dcb2899d67c904a4a8fdc`;
+- response SHA-256: `4b0a81c9ea553636eee973881e74185438fd0b667d7f610b12a7b9e246888aae`;
+- verdict: `SAFE`, no P0-P2 finding and no open question. It explicitly confirmed the prior lock,
+  handoff-inode and installed-policy concerns are closed.
+
+### Verdict
+
+Slice 12c is production-worthy as an inactive local versioned-runtime and root-recovery boundary and
+may be committed. A push still will not self-deploy on the VPS until the `rdashboard` project/policy,
+initial current/LKG slots, host failure drills and separately authorized activation are completed.

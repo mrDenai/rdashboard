@@ -534,9 +534,9 @@ mod unix {
                 line == "RDASHBOARD_RIMG_RESOURCE_SOCKET=/run/rdashboard-observer/observer.sock"
             }));
             assert!(!controller.contains("docker.sock"));
-            assert!(
-                service.contains("ExecStart=/usr/libexec/rdashboard/rdashboard-rimg-health-proxy")
-            );
+            assert!(service.contains(
+                "ExecStart=/var/lib/rdashboard-bootstrap/current/bin/rdashboard-rimg-health-proxy"
+            ));
             assert!(
                 service
                     .lines()

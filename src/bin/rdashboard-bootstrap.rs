@@ -1,18 +1,12 @@
-use std::{
-    collections::BTreeSet,
-    fs::{self, File},
-    io::Read as _,
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
-    path::{Path, PathBuf},
-    str::FromStr as _,
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
 use rdashboard::{
-    domain::{EvidenceDigest, GitCommitId},
     self_update::{
-        InstalledSelfUpdatePolicyV1, SelfReleaseStoreV1, SelfUpdateJournalV1, SelfUpdateOutcomeV1,
-        SignedSelfReleaseV1, load_installed_self_update_policy_from,
+        SelfReleaseStoreV1, SelfUpdateJournalV1, SelfUpdateOutcomeV1, SelfUpdatePhaseV1,
+        load_installed_self_update_policy_from,
+    },
+    self_update_handoff::{
+        SELF_RELEASE_HANDOFF_ROOT, SelfReleaseHandoffError, discover_newest_self_release_handoff,
     },
     self_update_runtime::{
         InstalledSelfUpdatePlatformV1, InstalledSelfUpdateServiceRuntimeV1,
@@ -24,11 +18,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const POLICY_PATH: &str = "/etc/rdashboard/self-update-policy.jcs";
-const HANDOFF_ROOT: &str = "/var/lib/rdashboard-build/self-releases";
 const LOOP_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_HANDOFF_FILES: usize = 128;
-const MAX_DESCRIPTOR_BYTES: u64 = 256 * 1024;
-const MAX_RELEASE_BYTES: u64 = 512 * 1024 * 1024;
 
 fn main() -> Result<(), BootstrapError> {
     if std::env::args_os().len() != 1 {
@@ -67,11 +57,17 @@ fn run_cycle(release_reader_gid: u32) -> Result<CycleResult, BootstrapError> {
         active.candidate_release_digest
     } else {
         let records = journal.records()?;
+        if records
+            .iter()
+            .any(|record| record.phase == SelfUpdatePhaseV1::NeedsReconcile)
+        {
+            return Err(BootstrapError::RecoveryRequired);
+        }
         let store = SelfReleaseStoreV1::open(&paths.releases, 0, 0, release_reader_gid)?;
         let current_digest = read_current_release(&paths, 0, &store)?;
         let current = store.verify_staged(&current_digest)?;
-        let Some(candidate) = discover_candidate(
-            Path::new(HANDOFF_ROOT),
+        let Some(candidate) = discover_newest_self_release_handoff(
+            Path::new(SELF_RELEASE_HANDOFF_ROOT),
             &policy,
             0,
             0,
@@ -113,242 +109,6 @@ fn run_cycle(release_reader_gid: u32) -> Result<CycleResult, BootstrapError> {
     Ok(CycleResult::Terminal(outcome))
 }
 
-#[derive(Debug)]
-struct CandidateHandoff {
-    descriptor: SignedSelfReleaseV1,
-    descriptor_path: PathBuf,
-    archive_path: PathBuf,
-}
-
-#[allow(clippy::similar_names, clippy::too_many_arguments)]
-fn discover_candidate(
-    root: &Path,
-    policy: &InstalledSelfUpdatePolicyV1,
-    owner_uid: u32,
-    owner_gid: u32,
-    reader_gid: u32,
-    current_sequence: u64,
-    terminal_candidates: &BTreeSet<EvidenceDigest>,
-    now_ms: i64,
-) -> Result<Option<CandidateHandoff>, BootstrapError> {
-    validate_handoff_root(root, owner_uid, owner_gid)?;
-    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
-    if entries.len() > MAX_HANDOFF_FILES {
-        return Err(BootstrapError::HandoffCapacityExceeded);
-    }
-    entries.sort_by_key(fs::DirEntry::file_name);
-    let mut candidates = Vec::new();
-    for entry in &entries {
-        let path = entry.path();
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| BootstrapError::UnsafeHandoff)?;
-        if name.starts_with(".stage-") {
-            validate_hidden_staging(&path, &name)?;
-            continue;
-        }
-        let source_head =
-            GitCommitId::from_str(&name).map_err(|_| BootstrapError::UnsafeHandoff)?;
-        validate_published_directory(&path, owner_uid, reader_gid)?;
-        let descriptor_path = path.join("release.jcs");
-        let archive_path = path.join("release.tar");
-        let bytes = read_handoff_file(
-            &descriptor_path,
-            owner_uid,
-            reader_gid,
-            MAX_DESCRIPTOR_BYTES,
-        )?;
-        let descriptor = SignedSelfReleaseV1::decode_canonical(&bytes)?;
-        if descriptor.manifest.source_head != source_head {
-            return Err(BootstrapError::HandoffBinding);
-        }
-        if now_ms > descriptor.expires_at_ms {
-            descriptor.verify(policy, descriptor.expires_at_ms)?;
-        } else {
-            descriptor.verify(policy, now_ms)?;
-        }
-        validate_large_handoff_file(&archive_path, owner_uid, reader_gid, MAX_RELEASE_BYTES)?;
-        if now_ms > descriptor.expires_at_ms
-            || descriptor.manifest.source_sequence <= current_sequence
-            || terminal_candidates.contains(&descriptor.manifest.manifest_digest)
-        {
-            continue;
-        }
-        candidates.push(CandidateHandoff {
-            descriptor,
-            descriptor_path,
-            archive_path,
-        });
-    }
-    candidates.sort_by(|left, right| {
-        left.descriptor
-            .manifest
-            .source_sequence
-            .cmp(&right.descriptor.manifest.source_sequence)
-            .then_with(|| {
-                left.descriptor
-                    .manifest
-                    .manifest_digest
-                    .cmp(&right.descriptor.manifest.manifest_digest)
-            })
-    });
-    if candidates.windows(2).any(|pair| {
-        pair[0].descriptor.manifest.source_sequence == pair[1].descriptor.manifest.source_sequence
-            && pair[0].descriptor.manifest.manifest_digest
-                != pair[1].descriptor.manifest.manifest_digest
-    }) {
-        return Err(BootstrapError::ConflictingSourceSequence);
-    }
-    Ok(candidates.pop())
-}
-
-#[allow(clippy::similar_names)]
-fn validate_handoff_root(
-    root: &Path,
-    owner_uid: u32,
-    owner_gid: u32,
-) -> Result<(), BootstrapError> {
-    let metadata = fs::symlink_metadata(root)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != owner_uid
-        || metadata.gid() != owner_gid
-        || metadata.permissions().mode() & 0o7777 != 0o711
-    {
-        return Err(BootstrapError::UnsafeHandoff);
-    }
-    Ok(())
-}
-
-fn validate_hidden_staging(path: &Path, name: &str) -> Result<(), BootstrapError> {
-    let suffix = name
-        .strip_prefix(".stage-")
-        .ok_or(BootstrapError::UnsafeHandoff)?;
-    let Some((lease, generation)) = suffix.split_once("-g") else {
-        return Err(BootstrapError::UnsafeHandoff);
-    };
-    if lease.len() != 32
-        || !lease.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || generation.is_empty()
-        || generation.len() > 10
-        || !generation.bytes().all(|byte| byte.is_ascii_digit())
-        || generation == "0"
-    {
-        return Err(BootstrapError::UnsafeHandoff);
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(BootstrapError::UnsafeHandoff);
-    }
-    Ok(())
-}
-
-fn validate_published_directory(
-    path: &Path,
-    owner_uid: u32,
-    reader_gid: u32,
-) -> Result<(), BootstrapError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != owner_uid
-        || metadata.gid() != reader_gid
-        || metadata.permissions().mode() & 0o7777 != 0o550
-    {
-        return Err(BootstrapError::UnsafeHandoff);
-    }
-    let names = fs::read_dir(path)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let expected = ["release.jcs", "release.tar"]
-        .into_iter()
-        .map(Into::into)
-        .collect::<BTreeSet<_>>();
-    if names != expected {
-        return Err(BootstrapError::UnsafeHandoff);
-    }
-    Ok(())
-}
-
-fn read_handoff_file(
-    path: &Path,
-    owner_uid: u32,
-    reader_gid: u32,
-    maximum_bytes: u64,
-) -> Result<Vec<u8>, BootstrapError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != owner_uid
-        || metadata.gid() != reader_gid
-        || metadata.permissions().mode() & 0o7777 != 0o440
-        || metadata.len() == 0
-        || metadata.len() > maximum_bytes
-    {
-        return Err(BootstrapError::UnsafeHandoff);
-    }
-    let bytes = fs::read(path)?;
-    let after = fs::symlink_metadata(path)?;
-    if u64::try_from(bytes.len()).ok() != Some(metadata.len())
-        || after.dev() != metadata.dev()
-        || after.ino() != metadata.ino()
-        || after.len() != metadata.len()
-    {
-        return Err(BootstrapError::ConcurrentChange);
-    }
-    Ok(bytes)
-}
-
-fn validate_large_handoff_file(
-    path: &Path,
-    owner_uid: u32,
-    reader_gid: u32,
-    maximum_bytes: u64,
-) -> Result<(), BootstrapError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != owner_uid
-        || metadata.gid() != reader_gid
-        || metadata.permissions().mode() & 0o7777 != 0o440
-        || metadata.len() == 0
-        || metadata.len() > maximum_bytes
-    {
-        return Err(BootstrapError::UnsafeHandoff);
-    }
-    let mut file = File::open(path)?;
-    let opened = file.metadata()?;
-    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-        return Err(BootstrapError::ConcurrentChange);
-    }
-    let mut total = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        total = total
-            .checked_add(u64::try_from(read).map_err(|_| BootstrapError::ConcurrentChange)?)
-            .ok_or(BootstrapError::ConcurrentChange)?;
-        if total > metadata.len() {
-            return Err(BootstrapError::ConcurrentChange);
-        }
-    }
-    let after = fs::symlink_metadata(path)?;
-    if total != metadata.len()
-        || after.dev() != metadata.dev()
-        || after.ino() != metadata.ino()
-        || after.len() != metadata.len()
-    {
-        return Err(BootstrapError::ConcurrentChange);
-    }
-    Ok(())
-}
-
 fn required_id(name: &'static str) -> Result<u32, BootstrapError> {
     let value = std::env::var(name).map_err(|_| BootstrapError::MissingConfiguration(name))?;
     let parsed = value
@@ -383,18 +143,12 @@ enum BootstrapError {
     MissingConfiguration(&'static str),
     #[error("self-update setting {0} is invalid")]
     InvalidConfiguration(&'static str),
-    #[error("the self-release handoff is unsafe")]
-    UnsafeHandoff,
-    #[error("the self-release handoff does not bind its exact source and archive")]
-    HandoffBinding,
-    #[error("the self-release handoff exceeded its fixed capacity")]
-    HandoffCapacityExceeded,
-    #[error("two self releases claim the same source sequence")]
-    ConflictingSourceSequence,
-    #[error("a self-release handoff file changed while it was read")]
-    ConcurrentChange,
+    #[error(transparent)]
+    Handoff(#[from] SelfReleaseHandoffError),
     #[error("self-update tracing could not be initialized")]
     Tracing,
+    #[error("a self-update operation requires root recovery")]
+    RecoveryRequired,
     #[error(transparent)]
     SelfUpdate(#[from] rdashboard::self_update::SelfUpdateError),
     #[error(transparent)]
@@ -412,12 +166,13 @@ impl BootstrapError {
             Self::MissingConfiguration(_) | Self::InvalidConfiguration(_) => {
                 "self_update_configuration_invalid"
             }
-            Self::UnsafeHandoff | Self::HandoffBinding | Self::ConcurrentChange => {
-                "self_update_handoff_invalid"
+            Self::Handoff(SelfReleaseHandoffError::CapacityExceeded) => "self_update_handoff_full",
+            Self::Handoff(SelfReleaseHandoffError::ConflictingSourceSequence) => {
+                "self_update_source_conflict"
             }
-            Self::HandoffCapacityExceeded => "self_update_handoff_full",
-            Self::ConflictingSourceSequence => "self_update_source_conflict",
+            Self::Handoff(_) => "self_update_handoff_invalid",
             Self::Tracing => "self_update_tracing_failed",
+            Self::RecoveryRequired => "self_update_recovery_required",
             Self::SelfUpdate(_) => "self_update_contract_failed",
             Self::Runtime(_) => "self_update_runtime_failed",
             Self::Time(_) => "self_update_clock_invalid",
@@ -428,13 +183,20 @@ impl BootstrapError {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::MetadataExt as _;
+    use std::{
+        collections::BTreeSet,
+        fs,
+        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+        str::FromStr as _,
+    };
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use ed25519_dalek::SigningKey;
+    use rdashboard::domain::{EvidenceDigest, GitCommitId};
     use rdashboard::self_update::{
-        InstalledSelfUpdatePolicyInputV1, SelfReleaseManifestInputV1, SelfReleaseSignatureInputV1,
-        SelfReleaseSourceV1, SelfUpdateFilePolicyV1, build_signed_self_release,
+        InstalledSelfUpdatePolicyInputV1, InstalledSelfUpdatePolicyV1, SelfReleaseManifestInputV1,
+        SelfReleaseSignatureInputV1, SelfReleaseSourceV1, SelfUpdateFilePolicyV1,
+        build_signed_self_release,
     };
     use tempfile::tempdir;
 
@@ -521,9 +283,11 @@ mod tests {
     #[test]
     fn installed_paths_and_capacity_are_fixed() {
         assert_eq!(POLICY_PATH, "/etc/rdashboard/self-update-policy.jcs");
-        assert_eq!(HANDOFF_ROOT, "/var/lib/rdashboard-build/self-releases");
+        assert_eq!(
+            SELF_RELEASE_HANDOFF_ROOT,
+            "/var/lib/rdashboard-build/self-releases"
+        );
         assert_eq!(LOOP_INTERVAL, Duration::from_secs(2));
-        assert_eq!(MAX_HANDOFF_FILES, 128);
     }
 
     #[test]
@@ -534,7 +298,7 @@ mod tests {
             .join("handoff/.stage-0123456789abcdef0123456789abcdef-g1");
         fs::create_dir(&staging).expect("create hidden staging");
         fs::write(staging.join("partial"), b"partial").expect("write partial staging");
-        let candidate = discover_candidate(
+        let candidate = discover_newest_self_release_handoff(
             &directory.path().join("handoff"),
             &policy,
             uid,
@@ -560,7 +324,7 @@ mod tests {
         let (directory, policy, uid, gid, _) = published_fixture();
         fs::write(directory.path().join("handoff/orphan.jcs"), b"orphan").expect("write orphan");
         assert!(matches!(
-            discover_candidate(
+            discover_newest_self_release_handoff(
                 &directory.path().join("handoff"),
                 &policy,
                 uid,
@@ -570,7 +334,7 @@ mod tests {
                 &BTreeSet::new(),
                 2_000,
             ),
-            Err(BootstrapError::UnsafeHandoff)
+            Err(SelfReleaseHandoffError::UnsafeHandoff)
         ));
     }
 }

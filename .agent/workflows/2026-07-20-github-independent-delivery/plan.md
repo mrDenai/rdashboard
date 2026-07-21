@@ -105,7 +105,7 @@ Implementation progress:
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
 | 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4h locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state, the inactive rootless BuildKit activation boundary and a verified typed OCI build-result handoff. Live systemd/dedicated-filesystem/quota/concurrency proof and the first project-specific sealed-base preparation remain; no activation is implied. |
 | 5-11 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
-| 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Executable-path migration, root recovery CLI, installed project/policy integration, failure drills and explicit activation remain. |
+| 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Slice 12c migrates the complete application payload to one atomic `current/bin` slot and adds the stable root recovery CLI. Installed project/policy integration, initial-slot provisioning, failure drills and explicit activation remain. |
 
 Implementation ledger:
 
@@ -504,8 +504,7 @@ Implementation ledger:
 - The persistent bootstrap owns fixed service ordering, online integrity-checked SQLite backups,
   relative exact `current`/`last-known-good` pointers, candidate health proof and database-first rollback.
   An unknown pointer or unhealthy prior release becomes `needs_reconcile`. The unit remains inactive;
-  generic-worker handoff production, versioned executable paths, the root recovery CLI and host failure
-  drills remain required before any production authorization.
+  host failure drills and explicit activation remain required before any production authorization.
 - Slice 12b closes the generic-worker producer boundary without adding another build. Native release
   packaging now depends on the exact verification receipt and reuses the same VPS-owned operation
   `target`; the scheduler will not strand required outputs on optional i9 capacity. The fixed client
@@ -515,8 +514,15 @@ Implementation ledger:
 - Native and OCI build kinds are now explicit in V2 manifests and must match the release adapter;
   existing OCI manifests remain canonical-compatible. The self-release launcher credential moved to an
   optional drop-in so verification-only and OCI-only installations do not acquire a new startup
-  prerequisite. All local producer code remains inactive until its manifest, launcher policy, initial
-  release slots and host drills are installed and authorized together.
+  prerequisite.
+- Slice 12c makes the A/B pointer operational rather than documentary. All versioned service and fixed
+  job-client paths now resolve below `/var/lib/rdashboard-bootstrap/current/bin`, and the native policy
+  rejects any payload other than the complete fixed 15-binary runtime. The bootstrap and recovery CLI
+  remain stable outside the slot. The root-only CLI admits no path, tag or shell: it can inspect,
+  replay a nonterminal operation, restart exact current, restore only the journal-bound exact LKG from
+  its verified backup, or admit an exact SHA-named signed handoff through the normal coordinator.
+  All local producer code remains inactive until its manifest, launcher policy, initial release slots
+  and host drills are installed and authorized together.
 
 ### 1. Establish trustworthy lifecycle, resource and failure evidence
 

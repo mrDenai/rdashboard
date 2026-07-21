@@ -8,7 +8,7 @@ Requires=rdashboard-executor.service
 Type=simple
 User=rdashboard
 Group=rdashboard
-ExecStart=/usr/libexec/rdashboard/rdashboardd
+ExecStart=/var/lib/rdashboard-bootstrap/current/bin/rdashboardd
 Environment=RDASHBOARD_LISTEN=127.0.0.1:3100
 Environment=RDASHBOARD_DATA_DIR=/var/lib/rdashboard
 Environment=RDASHBOARD_EXECUTOR_SOCKET=/run/rdashboard/executor.sock

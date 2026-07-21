@@ -19,14 +19,14 @@ use crate::{
         ExecutionTerminalReceiptV1, GIB,
     },
     phase6::{AuthorizedPhaseSpecV1, FixedAdapterRequestV1, Phase6ContractError},
+    self_update::CURRENT_ADAPTER_RECEIPT_EXECUTABLE,
 };
 
 pub const EXECUTION_START_FILE_NAME: &str = "execution-start.jcs";
 pub const EXECUTION_TERMINAL_FILE_NAME: &str = "terminal-receipt.jcs";
 pub const EXECUTION_CLEANUP_FILE_NAME: &str = "cleanup-receipt.jcs";
 pub const EXECUTION_TERMINATION_INTENT_FILE_NAME: &str = "termination-intent.jcs";
-pub const INSTALLED_ADAPTER_RECEIPT_EXECUTABLE: &str =
-    "/usr/libexec/rdashboard/rdashboard-adapter-receipt";
+pub const INSTALLED_ADAPTER_RECEIPT_EXECUTABLE: &str = CURRENT_ADAPTER_RECEIPT_EXECUTABLE;
 pub const INSTALLED_JOB_DIRECTORY: &str = "/job";
 
 const SPEC_FILE_NAME: &str = "spec.jcs";

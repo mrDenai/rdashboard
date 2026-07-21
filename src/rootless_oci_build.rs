@@ -22,13 +22,13 @@ use crate::{
         WorkflowLeaseV1, WorkflowNodeKindV1,
     },
     rootless_oci::BUILDCTL_EXECUTABLE,
+    self_update::CURRENT_ROOTLESS_OCI_BUILD_EXECUTABLE,
 };
 
 pub const ROOTLESS_OCI_BUILD_POLICY_SCHEMA_VERSION: u16 = 1;
 pub const ROOTLESS_OCI_BUILD_REQUEST_SCHEMA_VERSION: u16 = 1;
 pub const ROOTLESS_OCI_BUILD_RESULT_SCHEMA_VERSION: u16 = 1;
-pub const ROOTLESS_OCI_BUILD_EXECUTABLE: &str =
-    "/usr/libexec/rdashboard/rdashboard-workflow-oci-build";
+pub const ROOTLESS_OCI_BUILD_EXECUTABLE: &str = CURRENT_ROOTLESS_OCI_BUILD_EXECUTABLE;
 pub const ROOTLESS_OCI_BUILD_REQUEST_PATH: &str = "/request/oci-build-request.jcs";
 pub const ROOTLESS_OCI_BUILD_PREPARED_ROOT: &str = "/prepared/source";
 pub const ROOTLESS_OCI_BUILD_DEPENDENCY_ROOT: &str = "/dependencies";

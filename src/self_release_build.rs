@@ -22,17 +22,18 @@ use crate::{
         WorkflowLeaseV1, WorkflowNodeKindV1,
     },
     self_update::{
-        BuiltSelfReleaseArchiveV1, InstalledSelfUpdatePolicyV1, SelfReleaseManifestInputV1,
-        SelfReleaseManifestV1, SelfReleaseSignatureInputV1, SelfReleaseSourceV1, SelfUpdateError,
-        SignedSelfReleaseV1, build_self_release_archive, verify_signed_self_release_archive,
+        BuiltSelfReleaseArchiveV1, CURRENT_SELF_RELEASE_BUILD_EXECUTABLE,
+        InstalledSelfUpdatePolicyV1, SelfReleaseManifestInputV1, SelfReleaseManifestV1,
+        SelfReleaseSignatureInputV1, SelfReleaseSourceV1, SelfUpdateError, SignedSelfReleaseV1,
+        VERSIONED_SELF_RELEASE_BINARIES, build_self_release_archive,
+        verify_signed_self_release_archive,
     },
 };
 
 pub const SELF_RELEASE_BUILD_POLICY_SCHEMA_VERSION: u16 = 1;
 pub const SELF_RELEASE_BUILD_REQUEST_SCHEMA_VERSION: u16 = 1;
 pub const SELF_RELEASE_BUILD_RESULT_SCHEMA_VERSION: u16 = 1;
-pub const SELF_RELEASE_BUILD_EXECUTABLE: &str =
-    "/usr/libexec/rdashboard/rdashboard-workflow-self-release-build";
+pub const SELF_RELEASE_BUILD_EXECUTABLE: &str = CURRENT_SELF_RELEASE_BUILD_EXECUTABLE;
 pub const SELF_RELEASE_BUILD_REQUEST_PATH: &str = "/request/self-release-build-request.jcs";
 pub const SELF_RELEASE_BUILD_OPERATION_ROOT: &str = "/operation";
 pub const SELF_RELEASE_BUILD_OUTPUT_ROOT: &str = "/output";
@@ -130,6 +131,16 @@ impl SelfReleaseBinaryV1 {
     }
 }
 
+pub fn versioned_self_release_binaries() -> Vec<SelfReleaseBinaryV1> {
+    VERSIONED_SELF_RELEASE_BINARIES
+        .iter()
+        .map(|binary_name| SelfReleaseBinaryV1 {
+            binary_name: (*binary_name).to_owned(),
+            release_path: format!("bin/{binary_name}"),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelfReleaseBuildPolicyV1 {
@@ -179,7 +190,8 @@ impl SelfReleaseBuildPolicyV1 {
     }
 
     pub fn validate(&self) -> Result<(), SelfReleaseBuildError> {
-        self.self_update_policy.validate()?;
+        self.self_update_policy
+            .validate_versioned_application_payload()?;
         let expected_project =
             ProjectId::from_str("rdashboard").map_err(|_| SelfReleaseBuildError::InvalidPolicy)?;
         let expected_files = self
@@ -201,7 +213,7 @@ impl SelfReleaseBuildPolicyV1 {
                 ..=self.self_update_policy.maximum_state_schema_version)
                 .contains(&self.state_schema_version)
             || !(1_000..=MAX_VALIDITY_MS).contains(&self.signature_validity_ms)
-            || self.binaries.is_empty()
+            || self.binaries != versioned_self_release_binaries()
             || self.binaries.len() > MAX_POLICY_FILES
             || !self.binaries.windows(2).all(|pair| pair[0] < pair[1])
             || self
@@ -1551,6 +1563,7 @@ mod tests {
 
     fn policy() -> SelfReleaseBuildPolicyV1 {
         let key = signing_key();
+        let binaries = versioned_self_release_binaries();
         let self_update = InstalledSelfUpdatePolicyV1::new(InstalledSelfUpdatePolicyInputV1 {
             key_id: "self-release-2026".to_owned(),
             key_epoch: 1,
@@ -1559,34 +1572,16 @@ mod tests {
             minimum_state_schema_version: 1,
             maximum_state_schema_version: 3,
             maximum_release_bytes: 64 * 1024 * 1024,
-            files: vec![
-                SelfUpdateFilePolicyV1 {
-                    path: "bin/rdashboard-worker".to_owned(),
+            files: binaries
+                .iter()
+                .map(|binary| SelfUpdateFilePolicyV1 {
+                    path: binary.release_path.clone(),
                     mode: 0o555,
-                },
-                SelfUpdateFilePolicyV1 {
-                    path: "bin/rdashboardd".to_owned(),
-                    mode: 0o555,
-                },
-            ],
+                })
+                .collect(),
         })
         .expect("self-update policy");
-        SelfReleaseBuildPolicyV1::new(
-            self_update,
-            3,
-            60_000,
-            vec![
-                SelfReleaseBinaryV1 {
-                    binary_name: "rdashboard-worker".to_owned(),
-                    release_path: "bin/rdashboard-worker".to_owned(),
-                },
-                SelfReleaseBinaryV1 {
-                    binary_name: "rdashboardd".to_owned(),
-                    release_path: "bin/rdashboardd".to_owned(),
-                },
-            ],
-        )
-        .expect("build policy")
+        SelfReleaseBuildPolicyV1::new(self_update, 3, 60_000, binaries).expect("build policy")
     }
 
     fn lease() -> WorkflowLeaseV1 {
@@ -1767,6 +1762,22 @@ mod tests {
     }
 
     #[test]
+    fn policy_requires_the_complete_versioned_runtime_payload() {
+        let policy = policy();
+        let mut incomplete = policy.binaries.clone();
+        incomplete.pop();
+        assert!(
+            SelfReleaseBuildPolicyV1::new(
+                policy.self_update_policy,
+                policy.state_schema_version,
+                policy.signature_validity_ms,
+                incomplete,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn fixed_client_reuses_release_outputs_without_compiling_again() {
         let policy = policy();
         let request = SelfReleaseBuildRequestV1::from_policy(&lease(), &policy).expect("request");
@@ -1779,7 +1790,10 @@ mod tests {
         )
         .expect("build release archive");
         assert_eq!(result.manifest.source_head, request.source_sha);
-        assert_eq!(result.manifest.files.len(), 2);
+        assert_eq!(
+            result.manifest.files.len(),
+            VERSIONED_SELF_RELEASE_BINARIES.len()
+        );
         assert_eq!(
             fs::read_dir(&fixture.output)
                 .expect("output entries")

@@ -43,6 +43,7 @@ use crate::{
         SELF_RELEASE_BUILD_EXECUTABLE, SELF_RELEASE_BUILD_REQUEST_PATH, SelfReleaseBuildError,
         SelfReleaseBuildPolicyV1, SelfReleaseBuildRequestV1, SelfReleaseHandoffStoreV1,
     },
+    self_update::CURRENT_WORKFLOW_JOB_EXECUTABLE,
     workflow_execution_grant::{
         VerifiedWorkflowExecutionGrantV1, WorkflowExecutionGrantError,
         WorkflowExecutionGrantVerificationKeyV1, WorkflowExecutionGrantVerifierV1,
@@ -52,7 +53,7 @@ use crate::{
 pub const WORKFLOW_LAUNCHER_POLICY_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_LAUNCHER_POLICY_PATH: &str = "/etc/rdashboard/workflow-launcher.jcs";
 pub const WORKFLOW_LAUNCHER_JOB_ROOT: &str = "/var/lib/rdashboard-workflow-launcher/jobs";
-pub const WORKFLOW_JOB_EXECUTABLE: &str = "/usr/libexec/rdashboard/rdashboard-workflow-job";
+pub const WORKFLOW_JOB_EXECUTABLE: &str = CURRENT_WORKFLOW_JOB_EXECUTABLE;
 pub const SYSTEMD_RUN_EXECUTABLE: &str = "/usr/bin/systemd-run";
 
 const ENV_EXECUTABLE: &str = "/usr/bin/env";
@@ -2835,7 +2836,7 @@ mod tests {
             PREPARED_RUN_COMPOSITION_FILE, PREPARED_RUN_SOURCE_DIRECTORY, PreparationKeyMaterialV1,
             PreparationStore, PreparedRunCompositionV1, open_test_preparation_store,
         },
-        self_release_build::SelfReleaseBinaryV1,
+        self_release_build::versioned_self_release_binaries,
         self_update::{
             InstalledSelfUpdatePolicyInputV1, InstalledSelfUpdatePolicyV1, SelfUpdateFilePolicyV1,
         },
@@ -3274,6 +3275,7 @@ mod tests {
 
     fn configured_self_release_policy(fixture: &LauncherFixture) -> WorkflowLauncherPolicyV1 {
         let signing_key = SigningKey::from_bytes(&[47_u8; 32]);
+        let binaries = versioned_self_release_binaries();
         let self_update_policy =
             InstalledSelfUpdatePolicyV1::new(InstalledSelfUpdatePolicyInputV1 {
                 key_id: "self-release-2026".to_owned(),
@@ -3283,25 +3285,20 @@ mod tests {
                 minimum_state_schema_version: 1,
                 maximum_state_schema_version: 1,
                 maximum_release_bytes: 64 * 1024 * 1024,
-                files: vec![SelfUpdateFilePolicyV1 {
-                    path: "bin/rdashboardd".to_owned(),
-                    mode: 0o555,
-                }],
+                files: binaries
+                    .iter()
+                    .map(|binary| SelfUpdateFilePolicyV1 {
+                        path: binary.release_path.clone(),
+                        mode: 0o555,
+                    })
+                    .collect(),
             })
             .expect("self-update policy");
         let mut policy = fixture.policy.clone();
         policy.allowed_adapters = vec![WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1];
         policy.self_release_build = Some(
-            SelfReleaseBuildPolicyV1::new(
-                self_update_policy,
-                1,
-                60_000,
-                vec![SelfReleaseBinaryV1 {
-                    binary_name: "rdashboardd".to_owned(),
-                    release_path: "bin/rdashboardd".to_owned(),
-                }],
-            )
-            .expect("self-release build policy"),
+            SelfReleaseBuildPolicyV1::new(self_update_policy, 1, 60_000, binaries)
+                .expect("self-release build policy"),
         );
         policy.self_release_reader_gid =
             Some(fixture.policy.build_gid.checked_add(1).expect("reader GID"));

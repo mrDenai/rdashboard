@@ -607,7 +607,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/deploy/systemd/rdashboard-rimg-health.env"
         ));
-        assert!(observer.contains("ExecStart=/usr/libexec/rdashboard/rdashboard-observer"));
+        assert!(
+            observer.contains(
+                "ExecStart=/var/lib/rdashboard-bootstrap/current/bin/rdashboard-observer"
+            )
+        );
         assert!(observer.contains("RuntimeDirectory=rdashboard-observer"));
         assert!(observer.contains("MemoryMax=64M"));
         assert!(observer.contains("TasksMax=32"));

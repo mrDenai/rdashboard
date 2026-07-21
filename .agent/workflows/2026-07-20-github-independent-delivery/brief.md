@@ -244,3 +244,16 @@ Normalized instruction:
   foundation.
 - Preserve the external authorization boundary: local code, tests, review and a task-scoped commit are
   authorized; installing or activating the host path is not.
+
+### U015 — 2026-07-21
+
+Faithful English rendering:
+
+Continue.
+
+Normalized instruction:
+
+- Continue the authorized local implementation from the next real self-update gap. Do not replace
+  implementation with another status explanation.
+- Complete the versioned executable-path and controller-independent root recovery boundary while
+  preserving the existing no-host-mutation authorization boundary.

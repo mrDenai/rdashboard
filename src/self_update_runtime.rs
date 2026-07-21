@@ -55,6 +55,8 @@ pub const SELF_UPDATE_SERVICE_ORDER: &[&str] = &[
     "rdashboard.service",
 ];
 
+pub const SELF_UPDATE_QUIESCE_ONLY_SERVICES: &[&str] = &["rdashboard-rimg-health.service"];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelfUpdateStateDatabaseV1 {
     pub name: String,
@@ -175,6 +177,9 @@ pub struct InstalledSelfUpdateServiceRuntimeV1;
 impl SelfUpdateServiceRuntimeV1 for InstalledSelfUpdateServiceRuntimeV1 {
     fn stop_services(&mut self) -> Result<(), SelfUpdatePlatformFailureV1> {
         for service in SELF_UPDATE_SERVICE_ORDER.iter().rev() {
+            run_systemctl(["stop", *service], "service_stop_failed")?;
+        }
+        for service in SELF_UPDATE_QUIESCE_ONLY_SERVICES {
             run_systemctl(["stop", *service], "service_stop_failed")?;
         }
         Ok(())
@@ -590,6 +595,20 @@ pub fn read_current_release(
 ) -> Result<EvidenceDigest, SelfUpdateRuntimeError> {
     paths.validate()?;
     read_release_link(&paths.current_link, &paths.releases, owner_uid, store)
+}
+
+pub fn read_last_known_good_release(
+    paths: &SelfUpdateRuntimePathsV1,
+    owner_uid: u32,
+    store: &SelfReleaseStoreV1,
+) -> Result<EvidenceDigest, SelfUpdateRuntimeError> {
+    paths.validate()?;
+    read_release_link(
+        &paths.last_known_good_link,
+        &paths.releases,
+        owner_uid,
+        store,
+    )
 }
 
 impl<R: SelfUpdateServiceRuntimeV1> SelfUpdatePlatformV1 for InstalledSelfUpdatePlatformV1<R> {
@@ -1584,6 +1603,15 @@ mod tests {
                 .collect::<BTreeSet<_>>()
                 .len(),
             SELF_UPDATE_SERVICE_ORDER.len()
+        );
+        assert_eq!(
+            SELF_UPDATE_QUIESCE_ONLY_SERVICES,
+            ["rdashboard-rimg-health.service"]
+        );
+        assert!(
+            SELF_UPDATE_QUIESCE_ONLY_SERVICES
+                .iter()
+                .all(|service| !SELF_UPDATE_SERVICE_ORDER.contains(service))
         );
         assert_eq!(SYSTEMCTL_EXECUTABLE, "/usr/bin/systemctl");
         assert_eq!(HEALTH_ADDRESS, "127.0.0.1:3100");

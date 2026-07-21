@@ -28,6 +28,38 @@ pub(crate) static SELF_UPDATE_FILESYSTEM_TEST_LOCK: Mutex<()> = Mutex::new(());
 const SELF_RELEASE_PURPOSE: &str = "rdashboard.self-release.v1";
 const SELF_RELEASE_SIGNATURE_DOMAIN: &str = "rdashboard.self-release-signature.v1";
 const SELF_UPDATE_POLICY_PURPOSE: &str = "rdashboard.self-update-policy.v1";
+
+pub const SELF_UPDATE_CURRENT_BIN_ROOT: &str = "/var/lib/rdashboard-bootstrap/current/bin";
+pub const CURRENT_ADAPTER_RECEIPT_EXECUTABLE: &str =
+    "/var/lib/rdashboard-bootstrap/current/bin/rdashboard-adapter-receipt";
+pub const CURRENT_WORKFLOW_JOB_EXECUTABLE: &str =
+    "/var/lib/rdashboard-bootstrap/current/bin/rdashboard-workflow-job";
+pub const CURRENT_ROOTLESS_OCI_BUILD_EXECUTABLE: &str =
+    "/var/lib/rdashboard-bootstrap/current/bin/rdashboard-workflow-oci-build";
+pub const CURRENT_SELF_RELEASE_BUILD_EXECUTABLE: &str =
+    "/var/lib/rdashboard-bootstrap/current/bin/rdashboard-workflow-self-release-build";
+
+/// The complete application payload advanced by the A/B `current` pointer.
+///
+/// The bootstrap supervisor and policy-pinned external adapters deliberately stay outside this
+/// set so recovery remains available when an application release is invalid.
+pub const VERSIONED_SELF_RELEASE_BINARIES: &[&str] = &[
+    "rdashboard-adapter-receipt",
+    "rdashboard-dependency-fetcher",
+    "rdashboard-executor",
+    "rdashboard-observer",
+    "rdashboard-rimg-health-proxy",
+    "rdashboard-source",
+    "rdashboard-source-dispatcher",
+    "rdashboard-source-ingress",
+    "rdashboard-worker",
+    "rdashboard-workflow-gateway",
+    "rdashboard-workflow-job",
+    "rdashboard-workflow-launcher",
+    "rdashboard-workflow-oci-build",
+    "rdashboard-workflow-self-release-build",
+    "rdashboardd",
+];
 const MAX_RELEASE_FILES: usize = 64;
 const MAX_RELEASE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_RELEASE_BYTES: u64 = 512 * 1024 * 1024;
@@ -479,6 +511,21 @@ impl InstalledSelfUpdatePolicyV1 {
         Ok(())
     }
 
+    pub fn validate_versioned_application_payload(&self) -> Result<(), SelfUpdateError> {
+        self.validate()?;
+        let expected = VERSIONED_SELF_RELEASE_BINARIES
+            .iter()
+            .map(|binary| SelfUpdateFilePolicyV1 {
+                path: format!("bin/{binary}"),
+                mode: 0o555,
+            })
+            .collect::<Vec<_>>();
+        if self.files != expected {
+            return Err(SelfUpdateError::InvalidPolicy);
+        }
+        Ok(())
+    }
+
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, SelfUpdateError> {
         self.validate()?;
         Ok(serde_jcs::to_vec(self)?)
@@ -907,7 +954,9 @@ pub fn load_installed_self_update_policy_from(
     owner_uid: u32,
 ) -> Result<InstalledSelfUpdatePolicyV1, SelfUpdateError> {
     let bytes = read_stable_owner_file(path, owner_uid, 0o400, MAX_DESCRIPTOR_BYTES)?;
-    InstalledSelfUpdatePolicyV1::decode_canonical(&bytes)
+    let policy = InstalledSelfUpdatePolicyV1::decode_canonical(&bytes)?;
+    policy.validate_versioned_application_payload()?;
+    Ok(policy)
 }
 
 const SELF_UPDATE_RECORD_PURPOSE: &str = "rdashboard.self-update-record.v1";
@@ -1149,8 +1198,23 @@ impl SelfUpdateJournalV1 {
         if active_record(&records)?.is_some() {
             return Err(SelfUpdateError::UpdateAlreadyActive);
         }
+        if records
+            .values()
+            .any(|record| record.phase == SelfUpdatePhaseV1::NeedsReconcile)
+        {
+            return Err(SelfUpdateError::RecoveryRequired);
+        }
         if records.len() >= MAX_SELF_UPDATE_RECORDS {
-            let mut terminal = records.values().cloned().collect::<Vec<_>>();
+            let mut terminal = records
+                .values()
+                .filter(|record| {
+                    matches!(
+                        record.phase,
+                        SelfUpdatePhaseV1::Succeeded | SelfUpdatePhaseV1::RolledBack
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             terminal.sort_by(|left, right| {
                 left.updated_at_ms
                     .cmp(&right.updated_at_ms)
@@ -1194,6 +1258,35 @@ impl SelfUpdateJournalV1 {
             return Err(SelfUpdateError::JournalRecordConflict);
         }
         let next = current.transitioned(phase, backup_receipt_digest, failure_reason, now_ms)?;
+        self.publish_record(&next, false)?;
+        Ok(next)
+    }
+
+    pub fn mark_recovered_rollback(
+        &self,
+        record: &SelfUpdateRecordV1,
+        now_ms: i64,
+    ) -> Result<SelfUpdateRecordV1, SelfUpdateError> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| SelfUpdateError::JournalLockPoisoned)?;
+        let records = self.load_records()?;
+        let current = records
+            .get(&record.operation_id)
+            .ok_or(SelfUpdateError::JournalRecordMissing)?;
+        if current != record
+            || current.phase != SelfUpdatePhaseV1::NeedsReconcile
+            || current.backup_receipt_digest.is_none()
+        {
+            return Err(SelfUpdateError::JournalRecordConflict);
+        }
+        let next = current.transitioned(
+            SelfUpdatePhaseV1::RolledBack,
+            current.backup_receipt_digest.clone(),
+            current.failure_reason.as_deref(),
+            now_ms,
+        )?;
         self.publish_record(&next, false)?;
         Ok(next)
     }
@@ -1330,7 +1423,10 @@ fn valid_phase_transition(from: SelfUpdatePhaseV1, to: SelfUpdatePhaseV1) -> boo
             )
             | (Phase::CommitPending, Phase::Succeeded)
             | (Phase::RollbackPending, Phase::RollbackHealthPending)
-            | (Phase::RollbackHealthPending, Phase::RolledBack)
+            | (
+                Phase::RollbackHealthPending | Phase::NeedsReconcile,
+                Phase::RolledBack
+            )
     ) || (!from.is_terminal() && to == Phase::NeedsReconcile)
 }
 
@@ -2279,6 +2375,8 @@ pub enum SelfUpdateError {
     MultipleActiveUpdates,
     #[error("a different self-update operation is already active")]
     UpdateAlreadyActive,
+    #[error("a self-update operation requires root recovery")]
+    RecoveryRequired,
     #[error("the self-update journal record is invalid")]
     InvalidJournalRecord,
     #[error("the self-update journal transition is invalid")]
@@ -2603,6 +2701,58 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn installed_policy_loader_requires_the_complete_versioned_application() {
+        let fixture = Fixture::new();
+        let policy_path = fixture.directory.path().join("installed-policy.jcs");
+        fs::write(
+            &policy_path,
+            fixture
+                .policy()
+                .canonical_bytes()
+                .expect("incomplete policy bytes"),
+        )
+        .expect("write incomplete installed policy");
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o400))
+            .expect("protect installed policy");
+        assert!(matches!(
+            load_installed_self_update_policy_from(&policy_path, fixture.uid),
+            Err(SelfUpdateError::InvalidPolicy)
+        ));
+
+        let complete = InstalledSelfUpdatePolicyV1::new(InstalledSelfUpdatePolicyInputV1 {
+            key_id: "self-release-2026".to_owned(),
+            key_epoch: 1,
+            public_key: URL_SAFE_NO_PAD.encode(fixture.signing_key.verifying_key().as_bytes()),
+            runtime_contract_digest: digest("runtime contract"),
+            minimum_state_schema_version: 2,
+            maximum_state_schema_version: 3,
+            maximum_release_bytes: 128 * 1024 * 1024,
+            files: VERSIONED_SELF_RELEASE_BINARIES
+                .iter()
+                .map(|binary| SelfUpdateFilePolicyV1 {
+                    path: format!("bin/{binary}"),
+                    mode: 0o555,
+                })
+                .collect(),
+        })
+        .expect("complete installed policy");
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600))
+            .expect("make installed policy writable");
+        fs::write(
+            &policy_path,
+            complete.canonical_bytes().expect("complete policy bytes"),
+        )
+        .expect("write complete installed policy");
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o400))
+            .expect("protect complete installed policy");
+        assert_eq!(
+            load_installed_self_update_policy_from(&policy_path, fixture.uid)
+                .expect("load complete policy"),
+            complete
+        );
+    }
+
     #[derive(Debug)]
     struct FakePlatform {
         active: EvidenceDigest,
@@ -2823,7 +2973,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_journal_history_is_bounded_without_removing_active_work() {
+    fn resolved_terminal_history_is_bounded_without_removing_active_work() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let journal = journal_fixture(&directory);
         for index in 0..MAX_SELF_UPDATE_RECORDS {
@@ -2834,15 +2984,18 @@ mod tests {
                     i64::try_from(index).expect("bounded index"),
                 )
                 .expect("begin update");
-            journal
+            let unresolved = journal
                 .transition(
                     &record,
                     SelfUpdatePhaseV1::NeedsReconcile,
-                    None,
+                    Some(digest(&format!("backup-{index}"))),
                     Some("test_reconcile"),
                     record.updated_at_ms,
                 )
-                .expect("finish update");
+                .expect("require recovery");
+            journal
+                .mark_recovered_rollback(&unresolved, unresolved.updated_at_ms)
+                .expect("finish recovered update");
         }
         assert_eq!(
             journal.records().expect("full bounded history").len(),
@@ -2864,5 +3017,106 @@ mod tests {
                 .operation_id,
             newest.operation_id
         );
+    }
+
+    #[test]
+    fn unresolved_recovery_debt_blocks_new_updates_and_cannot_be_pruned() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal = journal_fixture(&directory);
+        let record = journal
+            .begin(digest("candidate"), digest("previous"), 1_000)
+            .expect("begin update");
+        let unresolved = journal
+            .transition(
+                &record,
+                SelfUpdatePhaseV1::NeedsReconcile,
+                Some(digest("backup")),
+                Some("active_release_changed"),
+                1_001,
+            )
+            .expect("require recovery");
+        assert!(matches!(
+            journal.begin(digest("new candidate"), digest("previous"), 1_002),
+            Err(SelfUpdateError::RecoveryRequired)
+        ));
+        assert_eq!(journal.records().expect("records"), [unresolved]);
+    }
+
+    #[test]
+    fn every_versioned_service_executes_from_the_atomic_current_slot() {
+        let services = [
+            (
+                "rdashboard-dependency-fetcher",
+                include_str!("../deploy/systemd/rdashboard-dependency-fetcher.service"),
+            ),
+            (
+                "rdashboard-executor",
+                include_str!("../deploy/systemd/rdashboard-executor.service"),
+            ),
+            (
+                "rdashboard-observer",
+                include_str!("../deploy/systemd/rdashboard-observer.service"),
+            ),
+            (
+                "rdashboard-rimg-health-proxy",
+                include_str!("../deploy/systemd/rdashboard-rimg-health.service"),
+            ),
+            (
+                "rdashboard-source",
+                include_str!("../deploy/systemd/rdashboard-source.service"),
+            ),
+            (
+                "rdashboard-source-dispatcher",
+                include_str!("../deploy/systemd/rdashboard-source-dispatcher.service"),
+            ),
+            (
+                "rdashboard-source-ingress",
+                include_str!("../deploy/systemd/rdashboard-source-ingress.service"),
+            ),
+            (
+                "rdashboard-worker",
+                include_str!("../deploy/systemd/rdashboard-worker.service"),
+            ),
+            (
+                "rdashboard-workflow-gateway",
+                include_str!("../deploy/systemd/rdashboard-workflow-gateway.service"),
+            ),
+            (
+                "rdashboard-workflow-launcher",
+                include_str!("../deploy/systemd/rdashboard-workflow-launcher.service"),
+            ),
+            (
+                "rdashboardd",
+                include_str!("../deploy/systemd/rdashboard.service"),
+            ),
+        ];
+        for (binary, service) in services {
+            let expected = format!("ExecStart={SELF_UPDATE_CURRENT_BIN_ROOT}/{binary}");
+            let exec_starts = service
+                .lines()
+                .filter(|line| line.starts_with("ExecStart="))
+                .collect::<Vec<_>>();
+            assert_eq!(exec_starts, [expected.as_str()]);
+            assert!(VERSIONED_SELF_RELEASE_BINARIES.contains(&binary));
+        }
+
+        assert_eq!(
+            CURRENT_ADAPTER_RECEIPT_EXECUTABLE,
+            format!("{SELF_UPDATE_CURRENT_BIN_ROOT}/rdashboard-adapter-receipt")
+        );
+        assert_eq!(
+            CURRENT_WORKFLOW_JOB_EXECUTABLE,
+            format!("{SELF_UPDATE_CURRENT_BIN_ROOT}/rdashboard-workflow-job")
+        );
+        assert_eq!(
+            CURRENT_ROOTLESS_OCI_BUILD_EXECUTABLE,
+            format!("{SELF_UPDATE_CURRENT_BIN_ROOT}/rdashboard-workflow-oci-build")
+        );
+        assert_eq!(
+            CURRENT_SELF_RELEASE_BUILD_EXECUTABLE,
+            format!("{SELF_UPDATE_CURRENT_BIN_ROOT}/rdashboard-workflow-self-release-build")
+        );
+        assert!(!VERSIONED_SELF_RELEASE_BINARIES.contains(&"rdashboard-bootstrap"));
+        assert!(!VERSIONED_SELF_RELEASE_BINARIES.contains(&"rdashboard-recovery"));
     }
 }

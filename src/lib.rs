@@ -88,6 +88,10 @@ pub mod self_release_build;
 #[cfg(unix)]
 pub mod self_update;
 #[cfg(unix)]
+pub mod self_update_handoff;
+#[cfg(unix)]
+pub mod self_update_recovery;
+#[cfg(unix)]
 pub mod self_update_runtime;
 pub mod source;
 #[cfg(unix)]

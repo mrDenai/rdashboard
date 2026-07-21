@@ -2,9 +2,9 @@
 
 ## Controller and browser boundary
 
-Install `rdashboard.service` and the controller binary at
-`/usr/libexec/rdashboard/rdashboardd`. The service binds only `127.0.0.1:3100` and reads optional
-browser-access settings from `/etc/rdashboard/controller.env`. For a public route, create the
+Install `rdashboard.service`; its controller binary is supplied by the verified A/B release at
+`/var/lib/rdashboard-bootstrap/current/bin/rdashboardd`. The service binds only `127.0.0.1:3100` and
+reads optional browser-access settings from `/etc/rdashboard/controller.env`. For a public route, create the
 Cloudflare Access self-hosted application first, then install all three values together in that
 file, owned by `root:rdashboard` and mode `0640` or stricter:
 
@@ -461,8 +461,8 @@ and acknowledges only after scheduler admission is durable. A newer head superse
 delivery, while periodic reconciliation refreshes an expired current-head attestation.
 
 The executor always serves the bounded observation protocol and can optionally enable the admitted
-backup and installed-deployment mutation paths described below. Install the binary at
-`/usr/libexec/rdashboard/rdashboard-executor`, create the
+backup and installed-deployment mutation paths described below. Its verified release binary is
+`/var/lib/rdashboard-bootstrap/current/bin/rdashboard-executor`; create the
 system group `rdashboard`, keep `/etc/rdashboard` root-owned and not group/other writable, and
 install a root-owned `/etc/rdashboard/executor.json` with mode `0640` or stricter:
 
@@ -515,10 +515,9 @@ the blocking adapter wait and explicitly kills/stops the active transient unit; 
 before starting another queued job, and the intent-persisted journal remains replayable on the next
 start. Omitting the authority keeps mutation unavailable.
 
-Install the repository-built `rdashboard-adapter-receipt` executable at
-`/usr/libexec/rdashboard/rdashboard-adapter-receipt` as a root-owned, non-symlinked executable that
-is not group- or world-writable. Every fixed adapter transient unit binds this exact path through
-`ExecStopPost=`. The helper runs before `systemd-run --collect` can discard the unit cgroup and
+The repository-built `rdashboard-adapter-receipt` executable is part of the verified A/B payload at
+`/var/lib/rdashboard-bootstrap/current/bin/rdashboard-adapter-receipt`. Every fixed adapter transient
+unit binds this exact path through `ExecStopPost=`. The helper runs before `systemd-run --collect` can discard the unit cgroup and
 atomically writes owner-only `terminal-receipt.jcs` evidence beside the job request. The root
 executor validates that receipt and then writes `cleanup-receipt.jcs`; a durable
 `execution-start.jcs` without a completed result is reconciliation-only and must never be executed
