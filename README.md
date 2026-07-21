@@ -108,6 +108,14 @@ The project overview reads bounded, project-scoped operation history from
 same durable controller journal that drives execution; the browser does not infer success from a
 workflow or container state and retains the recorded failure summary when an attempt fails.
 
+`GET /api/v1/projects/{project_id}/notifications` reports bounded delivery history from the optional
+isolated notifier. Without the notifier systemd drop-in it truthfully returns `configured=false` and
+the browser shows `Не настроено`; the controller neither receives a Telegram credential nor creates
+an undeliverable queue. When configured, integration transitions and their local handoff are committed
+atomically, while the notifier owns asynchronous gateway polling, deduplication and explicit unknown,
+retry, possible-duplicate and permanent-failure states. Activation inputs and service boundaries are
+documented in [`deploy/systemd/README.md`](deploy/systemd/README.md).
+
 `GET /api/v1/projects/{project_id}/resource-history` returns CPU and memory medians plus network
 and block-I/O counter deltas for the same completed hour, day, week and 30-day windows as the host
 overview. Raw per-project observations share the host collection transaction and are compacted into

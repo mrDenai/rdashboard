@@ -64,6 +64,38 @@ const operationPhaseLabels = Object.freeze({
   reconciliation: "Сверка состояния",
 });
 
+const notificationStateLabels = Object.freeze({
+  pending: { state: "partial", label: "В очереди" },
+  sending: { state: "partial", label: "Отправляется" },
+  delivery_unknown: { state: "error", label: "Исход неизвестен" },
+  retry_scheduled: { state: "stale", label: "Повтор запланирован" },
+  delivered: { state: "fresh", label: "Доставлено" },
+  delivered_possible_duplicate: { state: "partial", label: "Возможен дубль" },
+  permanently_failed: { state: "error", label: "Ошибка доставки" },
+});
+
+const notificationKindLabels = Object.freeze({
+  error_priority_changed: "Изменился приоритет ошибок",
+  error_collection_failed: "Сбор ошибок недоступен",
+  error_collection_recovered: "Сбор ошибок восстановлен",
+  dependency_update_changed: "Изменились зависимости",
+  dependency_checks_failed: "Проверки зависимостей упали",
+  dependency_checks_recovered: "Проверки зависимостей восстановлены",
+  dependency_collection_failed: "Сбор обновлений недоступен",
+  dependency_collection_recovered: "Сбор обновлений восстановлен",
+  operation_started: "Операция началась",
+  operation_succeeded: "Операция завершена",
+  operation_failed: "Операция завершилась ошибкой",
+  backup_verified: "Бэкап проверен",
+  backup_failed: "Бэкап завершился ошибкой",
+  deploy_succeeded: "Деплой завершён",
+  deploy_rolled_back: "Выполнен откат",
+  deploy_failed: "Деплой завершился ошибкой",
+  source_signal_lost: "Сигнал источника потерян",
+  source_recovered: "Источник восстановлен",
+  controller_failed: "Контроллер остановился с ошибкой",
+});
+
 const workflowAttemptLabels = Object.freeze({
   queued: { state: "partial", label: "◌ В очереди" },
   waiting_for_mutation: { state: "partial", label: "◇ Ждёт завершения мутации" },
@@ -209,6 +241,15 @@ export function operationResultPresentation(result) {
 
 export function operationPhaseLabel(phase) {
   return operationPhaseLabels[phase] ?? "Неизвестная фаза";
+}
+
+export function notificationStatePresentation(state) {
+  const value = notificationStateLabels[state];
+  return value ? presentation(value.state, value.label) : presentation("unknown", "Неизвестно");
+}
+
+export function notificationKindLabel(kind) {
+  return notificationKindLabels[kind] ?? "Неизвестное событие";
 }
 
 export function workflowAttemptPresentation(state) {

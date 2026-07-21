@@ -1,8 +1,8 @@
 # Dashboard automation brief
 
 - Workflow directory: `.agent/workflows/2026-07-19-dashboard-automation`
-- Status: complete
-- Last updated: 2026-07-19
+- Status: complete locally
+- Last updated: 2026-07-22
 
 ## User input log
 
@@ -26,3 +26,46 @@ Normalized constraints and authorization:
 - Keep execution bounded and clean up task-created Docker/build artifacts so local validation does not leave multi-gigabyte residue.
 - Put user-owned or external blockers in the workflow artifact set rather than stopping safe independent work.
 - Secret values must not be copied into workflow artifacts, logs, model briefs, tests, or source control.
+
+### U002 — 2026-07-19
+
+Faithful English rendering:
+
+Continue.
+
+Normalized continuation:
+
+- Resume the same dashboard-automation task after the autonomous Phase 1 handoff.
+- Continue through every safe, locally verifiable step that does not require unresolved production
+  credentials, user-owned policy choices, push, deployment or external-system mutation.
+- Preserve the original no-deploy and blocker-recording boundaries from U001.
+
+### U003 — 2026-07-22
+
+Faithful English rendering:
+
+Even if these changes were not yours, finish them through a commit. There is another repository for
+the Telegram gateway; determine whether this work relates to deploying that gateway.
+
+Normalized authorization and question:
+
+- Take ownership of the existing uncommitted `rdashboard` notification-delivery slice, complete its
+  implementation, verification and review, and create one task-scoped local commit.
+- Preserve unrelated production-workflow and GitHub-independent-delivery artifacts and do not push or
+  deploy.
+- Inspect the separate `telegram-gateway` repository read-only to establish whether this slice is a
+  gateway client integration or includes gateway deployment responsibility.
+
+### U004 — 2026-07-22
+
+Faithful English rendering:
+
+If this work sends notifications, they must be sent through the gateway. Review prior session logs if
+needed to understand what was implemented.
+
+Normalized constraint:
+
+- Every real Telegram delivery initiated by `rdashboard` must use the separate `telegram-gateway`
+  service contract. `rdashboard` must not call the Telegram Bot API directly or receive a bot token.
+- Recover the earlier notification-slice intent and verification evidence before changing or closing
+  the implementation.

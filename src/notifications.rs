@@ -7,6 +7,7 @@ const MAX_EVENT_KEY_BYTES: usize = 128;
 const MAX_NOTIFICATION_TEXT_BYTES: usize = 3_500;
 const MAX_OCCURRENCE_KEY_BYTES: usize = 256;
 const MAX_GATEWAY_PROJECT_BYTES: usize = 32;
+const MAX_BROWSER_SAFE_TIMESTAMP: i64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +17,9 @@ pub enum NotificationKindV1 {
     ErrorCollectionRecovered,
     DependencyUpdateChanged,
     DependencyChecksFailed,
+    DependencyChecksRecovered,
+    DependencyCollectionFailed,
+    DependencyCollectionRecovered,
     OperationStarted,
     OperationSucceeded,
     OperationFailed,
@@ -26,6 +30,7 @@ pub enum NotificationKindV1 {
     DeployFailed,
     SourceSignalLost,
     SourceRecovered,
+    ControllerFailed,
 }
 
 impl NotificationKindV1 {
@@ -36,6 +41,9 @@ impl NotificationKindV1 {
             Self::ErrorCollectionRecovered => "error_collection_recovered",
             Self::DependencyUpdateChanged => "dependency_update_changed",
             Self::DependencyChecksFailed => "dependency_checks_failed",
+            Self::DependencyChecksRecovered => "dependency_checks_recovered",
+            Self::DependencyCollectionFailed => "dependency_collection_failed",
+            Self::DependencyCollectionRecovered => "dependency_collection_recovered",
             Self::OperationStarted => "operation_started",
             Self::OperationSucceeded => "operation_succeeded",
             Self::OperationFailed => "operation_failed",
@@ -46,7 +54,124 @@ impl NotificationKindV1 {
             Self::DeployFailed => "deploy_failed",
             Self::SourceSignalLost => "source_signal_lost",
             Self::SourceRecovered => "source_recovered",
+            Self::ControllerFailed => "controller_failed",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDeliveryStateV1 {
+    Pending,
+    Sending,
+    DeliveryUnknown,
+    RetryScheduled,
+    Delivered,
+    DeliveredPossibleDuplicate,
+    PermanentlyFailed,
+}
+
+impl NotificationDeliveryStateV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Sending => "sending",
+            Self::DeliveryUnknown => "delivery_unknown",
+            Self::RetryScheduled => "retry_scheduled",
+            Self::Delivered => "delivered",
+            Self::DeliveredPossibleDuplicate => "delivered_possible_duplicate",
+            Self::PermanentlyFailed => "permanently_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationRouteV1 {
+    TelegramGateway,
+}
+
+impl NotificationRouteV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TelegramGateway => "telegram_gateway",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveryRecordV1 {
+    pub schema_version: u16,
+    pub event: NotificationEventV1,
+    pub state: NotificationDeliveryStateV1,
+    pub attempt_count: u32,
+    pub route: Option<NotificationRouteV1>,
+    pub provider_message_id: Option<uuid::Uuid>,
+    pub last_error_code: Option<String>,
+    pub retry_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl NotificationDeliveryRecordV1 {
+    pub fn validate(&self) -> Result<(), NotificationContractError> {
+        self.event.validate()?;
+        if self.schema_version != NOTIFICATION_SCHEMA_VERSION
+            || !(0..=MAX_BROWSER_SAFE_TIMESTAMP).contains(&self.retry_at_ms)
+            || !(self.event.created_at_ms..=MAX_BROWSER_SAFE_TIMESTAMP)
+                .contains(&self.updated_at_ms)
+            || self
+                .last_error_code
+                .as_deref()
+                .is_some_and(|code| !valid_error_code(code))
+        {
+            return Err(NotificationContractError::InvalidDeliveryRecord);
+        }
+        let valid_shape = match self.state {
+            NotificationDeliveryStateV1::Pending => {
+                self.attempt_count == 0
+                    && self.route.is_none()
+                    && self.provider_message_id.is_none()
+                    && self.last_error_code.is_none()
+                    && self.retry_at_ms == self.updated_at_ms
+            }
+            NotificationDeliveryStateV1::Sending => {
+                self.attempt_count > 0
+                    && self.route == Some(NotificationRouteV1::TelegramGateway)
+                    && self.last_error_code.is_none()
+            }
+            NotificationDeliveryStateV1::DeliveryUnknown => {
+                self.attempt_count > 0
+                    && self.route == Some(NotificationRouteV1::TelegramGateway)
+                    && self.provider_message_id.is_none()
+                    && self.last_error_code.is_some()
+                    && self.retry_at_ms > self.updated_at_ms
+            }
+            NotificationDeliveryStateV1::RetryScheduled => {
+                self.attempt_count > 0
+                    && self.route == Some(NotificationRouteV1::TelegramGateway)
+                    && self.last_error_code.is_some()
+                    && self.retry_at_ms > self.updated_at_ms
+            }
+            NotificationDeliveryStateV1::Delivered
+            | NotificationDeliveryStateV1::DeliveredPossibleDuplicate => {
+                self.attempt_count > 0
+                    && self.route == Some(NotificationRouteV1::TelegramGateway)
+                    && self.provider_message_id.is_some()
+                    && self.last_error_code.is_none()
+                    && self.retry_at_ms == self.updated_at_ms
+            }
+            NotificationDeliveryStateV1::PermanentlyFailed => {
+                self.attempt_count > 0
+                    && self.route == Some(NotificationRouteV1::TelegramGateway)
+                    && self.last_error_code.is_some()
+                    && self.retry_at_ms == self.updated_at_ms
+            }
+        };
+        if !valid_shape {
+            return Err(NotificationContractError::InvalidDeliveryRecord);
+        }
+        Ok(())
     }
 }
 
@@ -104,7 +229,7 @@ impl NotificationEventV1 {
 
     pub fn validate(&self) -> Result<(), NotificationContractError> {
         if self.schema_version != NOTIFICATION_SCHEMA_VERSION
-            || self.created_at_ms < 0
+            || !(0..=MAX_BROWSER_SAFE_TIMESTAMP).contains(&self.created_at_ms)
             || !valid_event_key(&self.event_key)
             || !valid_notification_text(&self.text)
         {
@@ -160,7 +285,7 @@ impl TelegramGatewayMessageV1 {
             chat_id,
             message_thread_id,
             text: event.text.clone(),
-            format: String::new(),
+            format: "plain".to_owned(),
             disable_web_page_preview: true,
             event_key: event.event_key.clone(),
             dedup_key: event.dedup_key.to_string(),
@@ -173,7 +298,7 @@ impl TelegramGatewayMessageV1 {
         if !valid_gateway_project(&self.project_id)
             || self.chat_id == 0
             || self.message_thread_id < 0
-            || !self.format.is_empty()
+            || self.format != "plain"
             || !self.disable_web_page_preview
             || !valid_event_key(&self.event_key)
             || !valid_notification_text(&self.text)
@@ -215,6 +340,14 @@ fn valid_gateway_project(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+fn valid_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum NotificationContractError {
     #[error("notification occurrence key is invalid")]
@@ -227,6 +360,8 @@ pub enum NotificationContractError {
     DedupMismatch,
     #[error("Telegram gateway request is invalid")]
     InvalidGatewayRequest,
+    #[error("notification delivery record is invalid")]
+    InvalidDeliveryRecord,
 }
 
 #[cfg(test)]
@@ -285,6 +420,7 @@ mod tests {
             TelegramGatewayMessageV1::from_event(&event, "rdashboard", -100, 0).expect("request");
         assert_eq!(request.event_key, event.event_key);
         assert_eq!(request.dedup_key, event.dedup_key.as_str());
+        assert_eq!(request.format, "plain");
         assert!(request.disable_web_page_preview);
     }
 

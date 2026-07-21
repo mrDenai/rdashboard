@@ -1,9 +1,9 @@
 # Dashboard automation review
 
 - Workflow directory: `.agent/workflows/2026-07-19-dashboard-automation`
-- Status: complete
-- Reviewed: 2026-07-19
-- Scope: task-owned Phase 1 changes in `rdashboard` and `rimg`
+- Status: complete for Phases 1 and 2
+- Reviewed: 2026-07-22
+- Scope: task-owned Phase 1 changes in `rdashboard` and `rimg`, plus the Phase 2 isolated notifier
 - Excluded: user-owned `rdashboard/.agent/workflows/2026-07-15-rdashboard-production/*`
   and `rimg/.agent/*`
 
@@ -82,3 +82,67 @@ deployment, service restart, provider write or production cache deletion occurre
 - `rimg`: keep `config/deploy.yml` on the legacy Dockerfile (the current state) and revert the task
   commit. `.titanium/opt/4u` is a local reproducible artifact and can be regenerated with `bin/update`;
   no production candidate path was activated.
+
+## Phase 2 isolated notification-delivery closure
+
+### Reviewed target
+
+- Baseline HEAD: `c6a71f036b0093ca5741f98ebe96495c1851edeb`.
+- Exact staged product/config/test diff SHA-256:
+  `8251ab147fcc370af42df54eca29863f613c458e71f450e0f98d41c34289c479`.
+- Scope: 19 paths, 4,302 insertions and 227 deletions. It contains the dedicated notifier binary,
+  delivery worker, peer-authenticated socket, deterministic planner, restart-safe notification store,
+  atomic controller handoff, authenticated dashboard projection, systemd contract and tests.
+- Excluded: the dirty production workflow under `.agent/workflows/2026-07-15-rdashboard-production`,
+  the GitHub-independent delivery workflow and consultation scratch directories.
+
+### Gateway contract and deployment boundary
+
+Read-only inspection of `/home/denai/RustroverProjects/telegram-gateway` at `6f35bdc` confirmed that
+`POST /api/v1/messages` accepts the staged request fields and returns a gateway UUID, while
+`GET /api/v1/messages/{uuid}?project_id=...` exposes the asynchronous state used by the delivery
+worker. `rdashboard-notify` fixes the production origin to `https://tg.4u.ge`, disables redirects,
+bounds time and response bytes, and reads only the per-project gateway bearer credential through
+systemd. No `rdashboard` notification path calls the Telegram Bot API or accepts a bot token.
+
+This commit is a client and isolation boundary only. It does not register a gateway project, choose a
+chat/thread, install a credential, change the `telegram-gateway` repository, deploy that service or
+activate notifier delivery.
+
+### Findings and dispositions
+
+1. Earlier review P2 findings for indistinguishable handoff-capacity backpressure and the
+   accepted-submit/local-bind-failure crash window are fixed. The controller emits a distinct bounded
+   capacity diagnostic, and the regression proves an expired unbound send becomes a possible
+   duplicate rather than false clean delivery.
+2. Final direct contract comparison found the request serialized an empty `format`, which the current
+   gateway implementation tolerated as plain text but its OpenAPI does not declare. The request now
+   sends explicit `format=plain`, validation requires it and the contract test pins it.
+3. No direct Telegram client, bot token, privilege leak, event-loss path or unresolved P0-P2 finding
+   remains in the reviewed scope.
+
+### Verification
+
+- Final bare `bin/ci`: passed, exit code 0.
+- Covered formatting, strict Clippy, 301 active library tests with two credentialed live-provider tests
+  ignored by design, all binary/integration/socket/scheduler suites, nine browser tests and the
+  optimized release build.
+- Release build completed in 5 minutes 11 seconds.
+- `git diff --cached --check`: passed.
+
+### Independent consultation
+
+- Route/model: `deepseek-free` / `opencode/deepseek-v4-flash-free`.
+- Status: `ANSWERED`, one attempt, CLI `1.18.3`, 43 seconds.
+- State fingerprint: `974c3a0c32d85bc6a1a872a9c196f03cb599be2b3d1c530f76ed6ba71ca3e4de`.
+- Brief SHA-256: `6ba23a2625d995cee67aee477673dc1a9e9a14f109eac72aa2955b91bef74a2b`.
+- Response:
+  `.agent/workflows/2026-07-19-dashboard-automation/consult-phase2-20260722-final/response.md`.
+- Verdict: `PASS`, no P0-P2 finding and no open question.
+
+### Verdict and residual activation risk
+
+Phase 2 is production-worthy as an inactive local implementation and may be committed. Actual delivery
+remains fail-closed until a dedicated gateway project, reviewed destination, notifier UID, environment,
+per-project gateway credential, binary and systemd units are installed. No gateway or rdashboard
+deployment, push, service change, credential write or provider call was performed.

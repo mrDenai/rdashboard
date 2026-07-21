@@ -6,6 +6,8 @@ import {
   formatHistoryCoverage,
   formatSampleAge,
   mutationStatePresentation,
+  notificationKindLabel,
+  notificationStatePresentation,
   operationKindLabel,
   operationPhaseLabel,
   operationResultPresentation,
@@ -143,6 +145,31 @@ test("repository history reports only fully covered size changes", () => {
   assert.equal(repositorySizeChange([{ observed_at_ms: 0, total_bytes: 100 }], hour), null);
   assert.equal(repositorySizeChange([{ observed_at_ms: 0, total_bytes: -1 }], hour), null);
   assert.equal(repositorySizeChange([samples[1], samples[0], samples[2]], hour), null);
+});
+
+test("notification delivery preserves ambiguous and terminal outcomes", () => {
+  assert.deepEqual(notificationStatePresentation("delivered"), {
+    state: "fresh",
+    label: "Доставлено",
+  });
+  assert.deepEqual(notificationStatePresentation("delivery_unknown"), {
+    state: "error",
+    label: "Исход неизвестен",
+  });
+  assert.deepEqual(notificationStatePresentation("delivered_possible_duplicate"), {
+    state: "partial",
+    label: "Возможен дубль",
+  });
+  assert.deepEqual(notificationStatePresentation("invented"), {
+    state: "unknown",
+    label: "Неизвестно",
+  });
+  assert.equal(notificationKindLabel("dependency_checks_failed"), "Проверки зависимостей упали");
+  assert.equal(
+    notificationKindLabel("dependency_checks_recovered"),
+    "Проверки зависимостей восстановлены",
+  );
+  assert.equal(notificationKindLabel("invented"), "Неизвестное событие");
 });
 
 test("workflow overview is strict and keeps recovery and cleanup visible", () => {

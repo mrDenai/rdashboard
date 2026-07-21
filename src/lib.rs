@@ -59,7 +59,11 @@ pub mod kamal_adapter;
 pub mod metrics;
 #[cfg(unix)]
 pub mod mutation_admission;
+pub mod notification_delivery;
+pub mod notification_planner;
 pub mod notifications;
+#[cfg(unix)]
+pub mod notifier_socket;
 #[cfg(unix)]
 pub mod observer;
 #[cfg(unix)]

@@ -28,6 +28,7 @@ use crate::{
     mutation_admission::{
         ExecuteMutationGrantV1, ObserveMutationStatusV1, PrepareMutationIntentV1,
     },
+    notifier_socket::{NotifierClientV1, NotifierProjectRecordsV1},
     scheduler::{WorkflowAttemptPageV1, WorkflowJournalReaderV1},
     store::{
         IntegrationStore, IntegrationStoreError, MetricsStore,
@@ -73,6 +74,7 @@ pub struct DashboardState {
     pub metrics_store: Option<MetricsStore>,
     pub integration_store: Option<IntegrationStore>,
     pub operation_history: Option<DurableController>,
+    pub notifier_client: Option<Arc<NotifierClientV1>>,
     pub workflow_reader: WorkflowJournalReaderV1,
     pub project_repository_errors: Arc<RwLock<BTreeMap<String, String>>>,
 }
@@ -90,6 +92,7 @@ impl DashboardState {
             metrics_store: None,
             integration_store: None,
             operation_history: None,
+            notifier_client: None,
             workflow_reader,
             project_repository_errors: Arc::new(RwLock::new(BTreeMap::new())),
         }
@@ -116,6 +119,12 @@ impl DashboardState {
     #[must_use]
     pub fn with_operation_history(mut self, controller: DurableController) -> Self {
         self.operation_history = Some(controller);
+        self
+    }
+
+    #[must_use]
+    pub fn with_notifier_client(mut self, client: Arc<NotifierClientV1>) -> Self {
+        self.notifier_client = Some(client);
         self
     }
 }
@@ -151,6 +160,10 @@ pub fn router_with_access(
         .route(
             "/api/v1/projects/{project_id}/updates",
             get(project_updates),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/notifications",
+            get(project_notifications),
         )
         .route("/api/v1/workflows", get(workflow_overview))
         .route("/api/v1/events", get(events))
@@ -628,6 +641,62 @@ async fn project_updates(
             StatusCode::INTERNAL_SERVER_ERROR,
             "project_updates_failed",
             "Project dependency updates could not be loaded.",
+        )
+        .into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectNotificationsResponse {
+    schema_version: u16,
+    generated_at_ms: i64,
+    project_id: ProjectId,
+    configured: bool,
+    records: Vec<crate::notifications::NotificationDeliveryRecordV1>,
+}
+
+impl ProjectNotificationsResponse {
+    fn configured(records: NotifierProjectRecordsV1) -> Self {
+        Self {
+            schema_version: records.schema_version,
+            generated_at_ms: records.generated_at_ms,
+            project_id: records.project_id,
+            configured: true,
+            records: records.records,
+        }
+    }
+}
+
+async fn project_notifications(
+    State(state): State<DashboardState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+) -> Response {
+    let Some(client) = state.notifier_client.clone() else {
+        let generated_at_ms = match unix_time_ms() {
+            Ok(value) => value,
+            Err(error) => return clock_problem(&error),
+        };
+        return Json(ProjectNotificationsResponse {
+            schema_version: 1,
+            generated_at_ms,
+            project_id,
+            configured: false,
+            records: Vec::new(),
+        })
+        .into_response();
+    };
+    match tokio::task::spawn_blocking(move || client.project_records(project_id, 20)).await {
+        Ok(Ok(records)) => Json(ProjectNotificationsResponse::configured(records)).into_response(),
+        Ok(Err(_)) => ApiProblem::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_notifications_unavailable",
+            "Project notification delivery state is unavailable.",
+        )
+        .into_response(),
+        Err(_) => ApiProblem::response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_notifications_failed",
+            "Project notification delivery state could not be loaded.",
         )
         .into_response(),
     }

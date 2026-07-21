@@ -14,6 +14,7 @@ use rdashboard::{
     executor_socket::{ROOT_EXECUTOR_SOCKET_PATH, RootExecutorClient},
     integration_collectors::ProjectIntegrationCollectors,
     metrics::HostCollector,
+    notifier_socket::{NOTIFIER_SOCKET_PATH, NotifierClientV1},
     projects::{RimgConfigError, RimgHealthCollector, RimgResourceCollector},
     store::{
         ControlStore, IntegrationStore, MetricsStore, PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS,
@@ -44,6 +45,8 @@ const PROJECT_REPOSITORY_ERROR_MAX_BYTES: usize = 512;
 const PROJECT_REPOSITORY_FAILURE_RETRY: Duration = Duration::from_mins(5);
 const PROJECT_INTEGRATION_INTERVAL: Duration = Duration::from_mins(5);
 const PROJECT_INTEGRATION_TIMEOUT: Duration = Duration::from_secs(20);
+const NOTIFICATION_HANDOFF_INTERVAL: Duration = Duration::from_secs(5);
+const NOTIFICATION_HANDOFF_BATCH: usize = 50;
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
@@ -70,20 +73,16 @@ async fn main() -> Result<(), DynError> {
         .map(|socket_path| RootExecutorClient::new(socket_path, EXECUTOR_REQUEST_TIMEOUT))
         .transpose()?
         .map(Arc::new);
+    let notifier_client = configured_notifier(config.notifier_socket.as_deref())?;
     let durable_controller = DurableController::new(control_store.clone());
-    let state = executor_client
-        .as_ref()
-        .map_or_else(
-            || DashboardState::new(hub.clone(), SAMPLE_INTERVAL),
-            |client| {
-                DashboardState::new(hub.clone(), SAMPLE_INTERVAL).with_mutation_api(
-                    DashboardMutationApiV1::new(durable_controller.clone(), Arc::clone(client)),
-                )
-            },
-        )
-        .with_metrics_store(metrics_store.clone())
-        .with_integration_store(integration_store.clone())
-        .with_operation_history(durable_controller);
+    let state = dashboard_state(
+        hub.clone(),
+        metrics_store.clone(),
+        integration_store.clone(),
+        durable_controller,
+        executor_client.as_ref(),
+        notifier_client.as_ref(),
+    );
     let host_source = executor_client.clone().map_or_else(
         || {
             HostObservationSource::Local(Arc::new(Mutex::new(HostCollector::linux(
@@ -138,7 +137,14 @@ async fn main() -> Result<(), DynError> {
         project_resource_collector,
     );
     spawn_project_repository_collection(state.clone(), executor_client);
-    spawn_project_integration_collection(integration_store, integration_collectors);
+    if let Some(client) = notifier_client.as_ref() {
+        spawn_notification_handoff_delivery(integration_store.clone(), Arc::clone(client));
+    }
+    spawn_project_integration_collection(
+        integration_store,
+        integration_collectors,
+        notifier_client.is_some(),
+    );
 
     let listener = TcpListener::bind(config.listen).await?;
     info!(listen = %config.listen, data_dir = %config.data_dir.display(), "rdashboardd listening");
@@ -146,6 +152,42 @@ async fn main() -> Result<(), DynError> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+fn configured_notifier(
+    socket_path: Option<&Path>,
+) -> Result<Option<Arc<NotifierClientV1>>, rdashboard::notifier_socket::NotifierClientError> {
+    socket_path
+        .map(|path| NotifierClientV1::new(path, EXECUTOR_REQUEST_TIMEOUT).map(Arc::new))
+        .transpose()
+}
+
+fn dashboard_state(
+    hub: EventHub,
+    metrics_store: MetricsStore,
+    integration_store: IntegrationStore,
+    durable_controller: DurableController,
+    executor_client: Option<&Arc<RootExecutorClient>>,
+    notifier_client: Option<&Arc<NotifierClientV1>>,
+) -> DashboardState {
+    let state = DashboardState::new(hub, SAMPLE_INTERVAL);
+    let state = if let Some(client) = executor_client {
+        state.with_mutation_api(DashboardMutationApiV1::new(
+            durable_controller.clone(),
+            Arc::clone(client),
+        ))
+    } else {
+        state
+    };
+    let state = state
+        .with_metrics_store(metrics_store)
+        .with_integration_store(integration_store)
+        .with_operation_history(durable_controller);
+    if let Some(client) = notifier_client {
+        state.with_notifier_client(Arc::clone(client))
+    } else {
+        state
+    }
 }
 
 async fn collect_and_publish(
@@ -368,6 +410,7 @@ fn spawn_project_repository_collection(
 fn spawn_project_integration_collection(
     store: IntegrationStore,
     collectors: ProjectIntegrationCollectors,
+    notifications_enabled: bool,
 ) {
     tokio::spawn(async move {
         let project_id: ProjectId = match PROJECT_ID_RIMG.parse() {
@@ -396,27 +439,49 @@ fn spawn_project_integration_collection(
             let cycle_project = project_id.clone();
             let persisted = tokio::task::spawn_blocking(move || {
                 let errors_result = match errors {
-                    Ok(data) => cycle_store.record_errors_success(now_ms, data).map(|_| ()),
-                    Err(error) => cycle_store
-                        .record_errors_failure(&cycle_project, now_ms, error.into_failure())
-                        .map(|_| ()),
+                    Ok(data) if notifications_enabled => {
+                        cycle_store.record_errors_success_with_notifications(now_ms, data)
+                    }
+                    Ok(data) => cycle_store.record_errors_success(now_ms, data),
+                    Err(error) if notifications_enabled => cycle_store
+                        .record_errors_failure_with_notifications(
+                            &cycle_project,
+                            now_ms,
+                            error.into_failure(),
+                        ),
+                    Err(error) => cycle_store.record_errors_failure(
+                        &cycle_project,
+                        now_ms,
+                        error.into_failure(),
+                    ),
                 };
                 let updates_result = match updates {
-                    Ok(data) => cycle_store.record_updates_success(now_ms, data).map(|_| ()),
-                    Err(error) => cycle_store
-                        .record_updates_failure(&cycle_project, now_ms, error.into_failure())
-                        .map(|_| ()),
+                    Ok(data) if notifications_enabled => {
+                        cycle_store.record_updates_success_with_notifications(now_ms, data)
+                    }
+                    Ok(data) => cycle_store.record_updates_success(now_ms, data),
+                    Err(error) if notifications_enabled => cycle_store
+                        .record_updates_failure_with_notifications(
+                            &cycle_project,
+                            now_ms,
+                            error.into_failure(),
+                        ),
+                    Err(error) => cycle_store.record_updates_failure(
+                        &cycle_project,
+                        now_ms,
+                        error.into_failure(),
+                    ),
                 };
                 (errors_result, updates_result)
             })
             .await;
             match persisted {
                 Ok((errors_result, updates_result)) => {
-                    if let Err(error) = errors_result {
-                        error!(error = %error, integration = "errors", "project integration record could not be persisted");
+                    if let Err(error) = &errors_result {
+                        log_integration_persistence_error(error, "errors");
                     }
-                    if let Err(error) = updates_result {
-                        error!(error = %error, integration = "updates", "project integration record could not be persisted");
+                    if let Err(error) = &updates_result {
+                        log_integration_persistence_error(error, "updates");
                     }
                 }
                 Err(error) => {
@@ -425,6 +490,62 @@ fn spawn_project_integration_collection(
             }
         }
     });
+}
+
+fn log_integration_persistence_error(
+    error: &rdashboard::store::IntegrationStoreError,
+    integration: &'static str,
+) {
+    if matches!(
+        error,
+        rdashboard::store::IntegrationStoreError::NotificationHandoffFull
+    ) {
+        error!(
+            integration,
+            "notification handoff capacity blocked the atomic integration commit"
+        );
+    } else {
+        error!(error = %error, integration, "project integration record could not be persisted");
+    }
+}
+
+fn spawn_notification_handoff_delivery(store: IntegrationStore, notifier: Arc<NotifierClientV1>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(NOTIFICATION_HANDOFF_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let cycle_store = store.clone();
+            let cycle_notifier = Arc::clone(&notifier);
+            match tokio::task::spawn_blocking(move || {
+                deliver_notification_handoff(&cycle_store, &cycle_notifier)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    warn!(error = %error, "notification handoff remains pending");
+                }
+                Err(error) => {
+                    warn!(error = %error, "notification handoff task failed");
+                }
+            }
+        }
+    });
+}
+
+fn deliver_notification_handoff(
+    store: &IntegrationStore,
+    notifier: &NotifierClientV1,
+) -> Result<usize, NotificationHandoffError> {
+    let events = store.pending_notification_events(NOTIFICATION_HANDOFF_BATCH)?;
+    let mut delivered = 0;
+    for event in events {
+        notifier.enqueue(event.clone())?;
+        store.acknowledge_notification_event(&event)?;
+        delivered += 1;
+    }
+    Ok(delivered)
 }
 
 async fn project_repository_collection_context(
@@ -512,6 +633,7 @@ struct Config {
     executor_socket: Option<PathBuf>,
     access: Option<CloudflareAccessConfig>,
     credential_directory: Option<PathBuf>,
+    notifier_socket: Option<PathBuf>,
 }
 
 impl Config {
@@ -575,6 +697,14 @@ impl Config {
         {
             return Err(ConfigError::InvalidCredentialDirectory);
         }
+        let notifier_socket = match std::env::var("RDASHBOARD_NOTIFIER_SOCKET") {
+            Ok(value) if value == NOTIFIER_SOCKET_PATH => Some(PathBuf::from(value)),
+            Ok(_) => return Err(ConfigError::InvalidNotifierSocket),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::NonUnicodeNotifierSocket);
+            }
+        };
         Ok(Self {
             listen,
             data_dir,
@@ -583,6 +713,7 @@ impl Config {
             executor_socket,
             access,
             credential_directory,
+            notifier_socket,
         })
     }
 }
@@ -636,6 +767,14 @@ async fn shutdown_signal() {
 }
 
 #[derive(Debug, thiserror::Error)]
+enum NotificationHandoffError {
+    #[error("integration notification handoff failed: {0}")]
+    Integration(#[from] rdashboard::store::IntegrationStoreError),
+    #[error("notifier handoff failed: {0}")]
+    Notifier(#[from] rdashboard::notifier_socket::NotifierClientError),
+}
+
+#[derive(Debug, thiserror::Error)]
 enum ConfigError {
     #[error("RDASHBOARD_LISTEN is invalid: {0}")]
     ListenAddress(std::net::AddrParseError),
@@ -661,6 +800,10 @@ enum ConfigError {
     InvalidExecutorSocket,
     #[error("RDASHBOARD_EXECUTOR_SOCKET must be valid Unicode")]
     NonUnicodeExecutorSocket,
+    #[error("RDASHBOARD_NOTIFIER_SOCKET must be {NOTIFIER_SOCKET_PATH}")]
+    InvalidNotifierSocket,
+    #[error("RDASHBOARD_NOTIFIER_SOCKET must be valid Unicode")]
+    NonUnicodeNotifierSocket,
     #[error(transparent)]
     Access(#[from] CloudflareAccessConfigError),
 }

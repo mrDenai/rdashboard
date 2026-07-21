@@ -1485,6 +1485,40 @@ async fn project_integration_http_surface_is_scoped_and_preserves_last_success()
 }
 
 #[tokio::test]
+async fn project_notifications_surface_is_truthfully_unconfigured_without_notifier() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let control = ControlStore::open(directory.path().join("control.sqlite"))
+        .unwrap_or_else(|error| panic!("open control: {error}"));
+    let app = router(DashboardState::new(
+        EventHub::new(control),
+        Duration::from_secs(5),
+    ));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/projects/rimg/notifications")
+                .body(Body::empty())
+                .unwrap_or_else(|error| panic!("request: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("notification response: {error}"));
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("read notifications: {error}"))
+            .to_bytes(),
+    )
+    .unwrap_or_else(|error| panic!("decode notifications: {error}"));
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["project_id"], "rimg");
+    assert_eq!(payload["configured"], false);
+    assert_eq!(payload["records"].as_array().map(Vec::len), Some(0));
+}
+
+#[tokio::test]
 async fn mutation_http_surface_fails_closed_without_root_executor_configuration() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
     let control = ControlStore::open(directory.path().join("control.sqlite"))
@@ -1761,11 +1795,16 @@ fn browser_assets_use_safe_dom_updates_and_central_live_regions() {
     assert!(javascript.contains("envelope.delivered_at_ms"));
     assert!(javascript.contains("performance.now()"));
     assert!(!javascript.contains("Date.now()"));
+    assert!(html.contains("<th scope=\"col\">Уведомления</th>"));
+    assert!(javascript.contains("validProjectNotifications"));
+    assert!(javascript.contains("delivered_possible_duplicate"));
+    assert!(javascript.contains("/notifications"));
     assert!(html.contains("id=\"workflow-heading\">Workflow и деплои</h2>"));
     assert!(html.contains("Последние попытки workflow для всех установленных проектов"));
     assert!(javascript.contains("validWorkflowOverview"));
     assert!(javascript.contains("/api/v1/workflows?limit=20"));
     assert!(status_javascript.contains("projectConditionLabels"));
+    assert!(status_javascript.contains("notificationStateLabels"));
     assert!(status_javascript.contains("workflowAttemptLabels"));
     assert!(status_javascript.contains("signal_lost: \"× Сигнал потерян\""));
     assert!(status_javascript.contains("intervalMs * 2"));

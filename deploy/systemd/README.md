@@ -275,13 +275,48 @@ preserves the last successful integration record. The OpenCode route receives no
 culprit, path, event body, stack trace, issue ID or deep link. The free provider is therefore not an
 incident authority and never gates collection, backup or deployment.
 
-Telegram delivery is a separate activation boundary. The repository contains a durable idempotent
-outbox and the exact `telegram-gateway` request contract, but `rdashboard.service` neither opens that
-outbox nor receives a gateway API secret. Before enabling delivery, register a dedicated gateway
-project, choose the exact chat and optional thread, install a separate notifier user/service with its
-own credential, and grant it only the narrow outbox transport needed for claiming and completing
-messages. Until those values exist, do not enqueue notifications: an accumulating undeliverable queue
-would be a false success state rather than useful monitoring.
+Telegram delivery is a separate, inactive activation boundary. The controller never receives the
+gateway secret or opens the delivery database. `rdashboard-notify.service` runs the
+`/usr/libexec/rdashboard/rdashboard-notify` binary as a dedicated `rdashboard-notify` user with the
+matching dedicated group. The optional controller drop-in adds only that transport group to
+`rdashboard.service`; the runtime directory is not group-writable, and every request is also bound to
+the installed controller UID through peer credentials. The notifier is not a member of `rdashboard`
+and cannot read the controller StateDirectory. It owns its mode-`0700` StateDirectory, submits a
+content-bound deduplication key to the fixed HTTPS gateway, follows the gateway's asynchronous message
+status, and retains explicit `delivery_unknown` and `delivered_possible_duplicate` states across
+retries and restarts.
+
+Do not install the controller drop-in until all installation values exist. Create the matching
+`rdashboard-notify` system user and group without a login shell or home, install
+`rdashboard-notify.service`, and place these
+non-secret values in root-owned `/etc/rdashboard/notifier.env`, mode `0644` or stricter:
+
+```sh
+RDASHBOARD_NOTIFY_CONTROLLER_UID=991
+RDASHBOARD_NOTIFY_GATEWAY_PROJECT=replace_with_dedicated_gateway_project
+RDASHBOARD_NOTIFY_CHAT_ID=-1000000000000
+RDASHBOARD_NOTIFY_THREAD_ID=0
+```
+
+`RDASHBOARD_NOTIFY_CONTROLLER_UID` must be the actual numeric UID of `rdashboard`, not the example.
+The gateway project must be dedicated to this route; the chat ID must identify the reviewed operator
+chat, and thread `0` means no topic. Install its bearer secret as the root-owned, mode-`0600` regular
+file `/etc/rdashboard/credentials/telegram-gateway-secret`. The service receives only the systemd
+credential copy and never reads the source credential directory.
+
+Start and inspect `rdashboard-notify.service` first. Then install
+`rdashboard-notifier.conf` as a drop-in for `rdashboard.service` and restart the controller. The
+drop-in adds the exact `/run/rdashboard-notify/notify.sock` path plus a hard service dependency. Once
+active, each integration transition and its notifier handoff are committed atomically in
+`integrations.sqlite`; a controller crash or unavailable notifier leaves a bounded durable handoff
+for retry instead of losing the event. The notifier's separate outbox then owns gateway retry and
+terminal delivery state. Removing the controller drop-in and restarting the controller disables new
+notification planning without exposing the secret or fabricating a configured dashboard state.
+
+No unit or credential is installed or enabled by repository checkout alone. Production activation
+requires a reviewed gateway project, chat/thread, numeric UID, credential, binary installation,
+daemon reload and service restarts; those are deployment actions outside the local verification
+workflow.
 
 For private rimg health collection, also install
 `rdashboard-rimg-health.socket`, `rdashboard-rimg-health.service` and the

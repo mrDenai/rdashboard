@@ -1,8 +1,8 @@
 # Dashboard automation implementation plan
 
 - Workflow directory: `.agent/workflows/2026-07-19-dashboard-automation`
-- Status: complete
-- Last updated: 2026-07-19
+- Status: complete locally
+- Last updated: 2026-07-22
 - Depends on: `brief.md`, `research.md`
 
 ## Outcome
@@ -197,3 +197,51 @@ These do not block local implementation or fake-provider/Docker verification.
 - Bare `bin/ci` passed in both changed repositories after the final review fixes.
 - Production activation remains deliberately fail-closed behind blockers B001-B009; no push, deploy,
   service mutation or provider write was performed.
+
+## Continuation Phase 2 — isolated notification delivery
+
+The continuation authorized by U002 resumes the same task without relaxing any activation boundary.
+The next coherent local unit is the missing notifier runtime, because the Phase 1 outbox contract is
+not yet deliverable and its ambiguous-success lineage currently collapses incorrectly after retry.
+
+1. **Complete — make delivery state exact and restart-safe.** Replace internal approximation names
+   with the public contract states, preserve ambiguity through
+   `delivery_unknown -> retry_scheduled -> delivered_possible_duplicate`, retain an accepted gateway
+   UUID for polling after restart, distinguish known retryable rejection from unknown acceptance, and
+   migrate the schema-v1 local store without blessing corrupt rows.
+2. **Complete — implement the isolated notifier boundary.** Add a dedicated `rdashboard-notify` binary
+   that exclusively owns the notification SQLite journal and gateway credential, serves a bounded
+   peer-UID-authenticated Unix protocol to the controller, and drains the outbox through the exact
+   asynchronous `telegram-gateway` POST/status contract with deadlines, body limits, no redirects and
+   safe error codes.
+3. **Complete — connect typed producers and observation.** When the optional notifier socket is
+   installed, enqueue only meaningful integration transitions with deterministic identities; expose
+   bounded delivery records through the authenticated dashboard. Missing notifier configuration must
+   remain `not_configured` and must not accumulate an undeliverable local queue.
+4. **Complete — add the installation contract without activating it.** Ship hardened notifier systemd
+   units/drop-ins and document the exact controller UID, gateway project, chat/thread and credential
+   inputs still owned by B004. Do not install, start or call the live gateway.
+5. **Complete — verify, review and commit.** Run bare `bin/ci`, perform direct adversarial review plus a
+   fresh `deepseek-free` review of the exact changed scope, resolve verified P0-P2 findings, rerun the
+   gate and create one new task-scoped local commit without push.
+
+Phase 2 owns the `rdashboard` gateway client and notifier boundary only. Every outbound Telegram
+message uses the fixed `telegram-gateway` REST contract at `https://tg.4u.ge`; `rdashboard` contains no
+Bot API client or bot token. Registering/configuring/deploying the separate `telegram-gateway`
+repository remains an external activation responsibility and is not part of this commit.
+
+### Phase 2 closure evidence
+
+- Bare `bin/ci` passed on 2026-07-22 with exit code 0 after the gateway format correction. It covered
+  formatting, strict Clippy, 301 active library tests with two credentialed live tests ignored by
+  design, all binary/integration/socket/scheduler suites, nine browser tests and the optimized release
+  build. The release phase completed in 5 minutes 11 seconds.
+- `telegram-gateway` was inspected read-only at commit `6f35bdc`. Its OpenAPI and server routes confirm
+  the exact message-submit and status-poll contract used here. No gateway repository file was changed.
+- Exact staged product/config/test diff SHA-256:
+  `8251ab147fcc370af42df54eca29863f613c458e71f450e0f98d41c34289c479`.
+- Fresh `deepseek-free` review status `ANSWERED`, verdict `PASS`, with no P0-P2 finding or open
+  question. The reviewed state fingerprint is
+  `974c3a0c32d85bc6a1a872a9c196f03cb599be2b3d1c530f76ed6ba71ca3e4de`.
+- The local commit is authorized by U003. Push, installation, gateway registration/configuration and
+  production delivery remain outside this closure.

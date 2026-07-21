@@ -4,6 +4,8 @@ import {
   evaluateHostObservation,
   formatHistoryCoverage,
   formatSampleAge,
+  notificationKindLabel,
+  notificationStatePresentation,
   operationKindLabel,
   operationResultPresentation,
   projectConditionPresentation,
@@ -74,6 +76,8 @@ const runtime = {
   projectUpdatesLoading: new Set(),
   projectErrors: new Map(),
   projectErrorsLoading: new Set(),
+  projectNotifications: new Map(),
+  projectNotificationsLoading: new Set(),
   workflowOverview: null,
   workflowLoading: false,
   workflowFailed: false,
@@ -84,6 +88,7 @@ const PROJECT_OPERATIONS_REFRESH_MS = 30_000;
 const PROJECT_RESOURCES_REFRESH_MS = 60_000;
 const PROJECT_REPOSITORY_REFRESH_MS = 5 * 60_000;
 const PROJECT_INTEGRATIONS_REFRESH_MS = 60_000;
+const PROJECT_NOTIFICATIONS_REFRESH_MS = 30_000;
 const WORKFLOW_OVERVIEW_REFRESH_MS = 5_000;
 const PROJECT_INTEGRATIONS_STALE_MS = 15 * 60_000;
 const HOST_HISTORY_WINDOWS = Object.freeze(["hour", "day", "week", "month"]);
@@ -447,7 +452,7 @@ function renderProjects(projects) {
     const row = document.createElement("tr");
     const empty = document.createElement("td");
     empty.className = "empty-state";
-    empty.colSpan = 8;
+    empty.colSpan = 9;
     empty.textContent = "Проекты ещё не подключены.";
     row.append(empty);
     elements.projectList.append(row);
@@ -499,6 +504,7 @@ function createProjectRow(project, loadIntegrations) {
   const repository = runtime.projectRepositories.get(projectId);
   const updates = runtime.projectUpdates.get(projectId);
   const errors = runtime.projectErrors.get(projectId);
+  const notifications = runtime.projectNotifications.get(projectId);
   row.append(
     identity,
     conditionCell,
@@ -514,6 +520,7 @@ function createProjectRow(project, loadIntegrations) {
     createRepositoryCell(repository),
     createUpdatesCell(updates),
     createErrorsCell(errors),
+    createNotificationsCell(notifications),
   );
 
   if (loadIntegrations) {
@@ -522,6 +529,7 @@ function createProjectRow(project, loadIntegrations) {
     loadProjectRepository(projectId, false);
     loadProjectUpdates(projectId, false);
     loadProjectErrors(projectId, false);
+    loadProjectNotifications(projectId, false);
   }
   return row;
 }
@@ -748,6 +756,37 @@ function createErrorsCell(cached) {
   if (data.analysis_error) appendProjectCellDetail(cell, data.analysis_error.detail);
   if (record.collection_error) appendProjectCellDetail(cell, record.collection_error.detail);
   if (cached.fetchError) appendProjectCellDetail(cell, "API дашборда временно недоступен");
+  return cell;
+}
+
+function createNotificationsCell(cached) {
+  if (!cached) return createSummaryCell("Загрузка…", "loading");
+  if (!cached.payload) {
+    return createSummaryCell("Недоступно", "error", cached.fetchError || "Нет данных");
+  }
+  if (!cached.payload.configured) {
+    return createSummaryCell("Не настроено", "unknown", "Доставка отключена");
+  }
+  if (cached.payload.records.length === 0) {
+    return createSummaryCell("Нет событий", "fresh", "Очередь пуста");
+  }
+  const latest = cached.payload.records[0];
+  const presentation = notificationStatePresentation(latest.state);
+  const cell = createSummaryCell(
+    presentation.label,
+    presentation.state,
+    notificationKindLabel(latest.event.kind),
+  );
+  appendProjectCellDetail(
+    cell,
+    new Date(latest.updated_at_ms).toLocaleString("ru-RU"),
+  );
+  if (latest.state === "delivered_possible_duplicate") {
+    appendProjectCellDetail(cell, "Повтор сохранил исходную неопределённость");
+  } else if (latest.last_error_code !== null) {
+    appendProjectCellDetail(cell, latest.last_error_code);
+  }
+  if (cached.fetchError) appendProjectCellDetail(cell, "Показан последний сохранённый статус");
   return cell;
 }
 
@@ -1006,6 +1045,36 @@ async function loadProjectErrors(projectId, refresh) {
   );
 }
 
+async function loadProjectNotifications(projectId, refresh) {
+  if (runtime.projectNotificationsLoading.has(projectId)) return;
+  if (!refresh && runtime.projectNotifications.has(projectId)) return;
+  runtime.projectNotificationsLoading.add(projectId);
+  try {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/notifications`,
+      { headers: { Accept: "application/json" }, cache: "no-store" },
+    );
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(problem.detail || "Статус уведомлений недоступен.");
+    }
+    const payload = await response.json();
+    if (!validProjectNotifications(payload, projectId)) {
+      throw new Error("Сервер вернул неподдерживаемый контракт уведомлений.");
+    }
+    runtime.projectNotifications.set(projectId, { payload });
+  } catch (error) {
+    const previous = runtime.projectNotifications.get(projectId);
+    runtime.projectNotifications.set(projectId, {
+      payload: previous?.payload ?? null,
+      fetchError: error.message,
+    });
+  } finally {
+    runtime.projectNotificationsLoading.delete(projectId);
+    refreshProjectOverview(projectId);
+  }
+}
+
 async function loadProjectIntegration(projectId, refresh, route, cache, loading, validator) {
   if (loading.has(projectId)) return;
   if (!refresh && cache.has(projectId)) return;
@@ -1044,6 +1113,151 @@ function validProjectErrorsRecord(record, projectId) {
 function validProjectUpdatesRecord(record, projectId) {
   if (!validIntegrationRecord(record, projectId, validProjectUpdatesData)) return false;
   return record.data === null || record.data.project_id === projectId;
+}
+
+function validProjectNotifications(payload, projectId) {
+  if (!exactKeys(payload, [
+    "schema_version",
+    "generated_at_ms",
+    "project_id",
+    "configured",
+    "records",
+  ])) return false;
+  if (
+    payload.schema_version !== 1
+    || !safeNonnegativeInteger(payload.generated_at_ms)
+    || payload.project_id !== projectId
+    || typeof payload.configured !== "boolean"
+    || !Array.isArray(payload.records)
+    || payload.records.length > 20
+    || (!payload.configured && payload.records.length !== 0)
+  ) return false;
+  let previousUpdated = Number.MAX_SAFE_INTEGER;
+  for (const record of payload.records) {
+    if (!validNotificationRecord(record, projectId) || record.updated_at_ms > previousUpdated) {
+      return false;
+    }
+    previousUpdated = record.updated_at_ms;
+  }
+  return true;
+}
+
+function validNotificationRecord(record, projectId) {
+  if (!exactKeys(record, [
+    "schema_version",
+    "event",
+    "state",
+    "attempt_count",
+    "route",
+    "provider_message_id",
+    "last_error_code",
+    "retry_at_ms",
+    "updated_at_ms",
+  ])) return false;
+  const states = [
+    "pending",
+    "sending",
+    "delivery_unknown",
+    "retry_scheduled",
+    "delivered",
+    "delivered_possible_duplicate",
+    "permanently_failed",
+  ];
+  if (
+    record.schema_version !== 1
+    || !validNotificationEvent(record.event, projectId)
+    || !states.includes(record.state)
+    || !safeNonnegativeInteger(record.attempt_count)
+    || !(record.route === null || record.route === "telegram_gateway")
+    || !(record.provider_message_id === null || validUuid(record.provider_message_id))
+    || !(record.last_error_code === null
+      || (typeof record.last_error_code === "string"
+        && /^[a-z0-9_]{1,64}$/.test(record.last_error_code)))
+    || !safeNonnegativeInteger(record.retry_at_ms)
+    || !safeNonnegativeInteger(record.updated_at_ms)
+    || record.updated_at_ms < record.event.created_at_ms
+  ) return false;
+  const attempted = record.attempt_count > 0 && record.route === "telegram_gateway";
+  if (record.state === "pending") {
+    return record.attempt_count === 0
+      && record.route === null
+      && record.provider_message_id === null
+      && record.last_error_code === null
+      && record.retry_at_ms === record.updated_at_ms;
+  }
+  if (!attempted) return false;
+  if (record.state === "sending") return record.last_error_code === null;
+  if (["delivered", "delivered_possible_duplicate"].includes(record.state)) {
+    return record.provider_message_id !== null
+      && record.last_error_code === null
+      && record.retry_at_ms === record.updated_at_ms;
+  }
+  if (["delivery_unknown", "retry_scheduled", "permanently_failed"].includes(record.state)) {
+    return record.last_error_code !== null
+      && (record.state !== "delivery_unknown" || record.provider_message_id === null)
+      && (record.state === "permanently_failed"
+        ? record.retry_at_ms === record.updated_at_ms
+        : record.retry_at_ms > record.updated_at_ms);
+  }
+  return false;
+}
+
+function validNotificationEvent(event, projectId) {
+  const kinds = [
+    "error_priority_changed",
+    "error_collection_failed",
+    "error_collection_recovered",
+    "dependency_update_changed",
+    "dependency_checks_failed",
+    "dependency_checks_recovered",
+    "dependency_collection_failed",
+    "dependency_collection_recovered",
+    "operation_started",
+    "operation_succeeded",
+    "operation_failed",
+    "backup_verified",
+    "backup_failed",
+    "deploy_succeeded",
+    "deploy_rolled_back",
+    "deploy_failed",
+    "source_signal_lost",
+    "source_recovered",
+    "controller_failed",
+  ];
+  return exactKeys(event, [
+    "schema_version",
+    "project_id",
+    "kind",
+    "event_key",
+    "occurrence_digest",
+    "dedup_key",
+    "text",
+    "created_at_ms",
+  ])
+    && event.schema_version === 1
+    && event.project_id === projectId
+    && kinds.includes(event.kind)
+    && typeof event.event_key === "string"
+    && /^[a-z0-9._:-]{1,128}$/.test(event.event_key)
+    && typeof event.occurrence_digest === "string"
+    && /^[0-9a-f]{64}$/.test(event.occurrence_digest)
+    && typeof event.dedup_key === "string"
+    && /^[0-9a-f]{64}$/.test(event.dedup_key)
+    && boundedNotificationText(event.text)
+    && safeNonnegativeInteger(event.created_at_ms);
+}
+
+function boundedNotificationText(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value === value.trim()
+    && new TextEncoder().encode(value).length <= 3_500
+    && !/[\u0000-\u0009\u000b-\u001f\u007f]/.test(value);
+}
+
+function validUuid(value) {
+  return typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 
 function validIntegrationRecord(record, projectId, validateData) {
@@ -1471,6 +1685,12 @@ window.setInterval(() => {
     loadProjectErrors(projectId, true);
   }
 }, PROJECT_INTEGRATIONS_REFRESH_MS);
+window.setInterval(() => {
+  if (!runtime.latestSnapshot?.projects) return;
+  for (const project of runtime.latestSnapshot.projects) {
+    loadProjectNotifications(String(project.project_id), true);
+  }
+}, PROJECT_NOTIFICATIONS_REFRESH_MS);
 
 loadHostHistory(true);
 loadWorkflowOverview(false);
