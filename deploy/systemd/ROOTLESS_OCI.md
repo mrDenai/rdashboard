@@ -72,16 +72,23 @@ the placeholders:
   "platform": "linux/amd64",
   "build_args": [{"key": "RUBY_VERSION", "value": "4.0.0"}],
   "base_inputs": [{
-    "source": "docker.io/library/debian:trixie-slim",
+    "source": "docker.io/library/debian:trixie-slim@sha256:9bb8a3626890e084ab54e888fdd7c4b6d2f119071cd4c5dc5fecb4d73062aa5f",
     "layout_name": "debian-trixie",
     "dependency_path": "oci-layouts/debian-trixie",
-    "manifest_digest": "sha256:<64 lowercase hex>"
+    "manifest_digest": "sha256:9bb8a3626890e084ab54e888fdd7c4b6d2f119071cd4c5dc5fecb4d73062aa5f"
   }],
-  "local_inputs": [{
-    "source": "native",
-    "local_name": "native",
-    "toolchain_path": "rimg-native/opt/4u"
-  }],
+  "local_inputs": [
+    {
+      "source": "native",
+      "local_name": "native",
+      "toolchain_path": "rimg-native/opt/4u"
+    },
+    {
+      "source": "runtime-support",
+      "local_name": "runtime-support",
+      "toolchain_path": "rimg-native/runtime-support"
+    }
+  ],
   "verified_output": {
     "context_name": "verified-release",
     "directory": "release",
@@ -95,12 +102,16 @@ the placeholders:
 The adapter invokes the installed client directly; repository `bin/build-oci-release` scripts are not
 part of the authority boundary. Every non-scratch base must already exist as a sealed OCI layout in the
 dependency snapshot and be named by `base_inputs`; the daemon's private network intentionally cannot
-fetch it on demand. Dockerfiles that request an external `# syntax=` frontend fail before `buildctl`
+fetch it on demand. The source name must match the digest-pinned `FROM` reference byte for byte; the
+layout manifest digest is the same pinned linux/amd64 manifest. Dockerfiles that request an external
+`# syntax=` frontend fail before `buildctl`
 starts. No secret, SSH mount, entitlement, registry output or external cache argument can be supplied.
 `local_inputs` name exact root-owned, non-group/world-writable subtrees below the single
 `/var/lib/rdashboard-build/toolchains` store. The launcher exposes only that store read-only; project
 Dockerfiles do not install their own Rust, Cargo or native compiler stack. For rimg the additional
-`rimg-native` tree is published once under its checked fingerprint and manifest.
+`rimg-native` tree is published once under its checked fingerprint and manifest. Its `opt/4u` subtree
+contains the pruned native runtime while `runtime-support` contains the separately verified CA bundle;
+the final offline assembly consumes both sealed inputs and does not run a package manager.
 The canonical non-secret build request remains root-owned inside the mode-`0700` result store and is
 mode `0444` so the unrelated unprivileged build UID can open its individual read-only bind mount; the
 host path is otherwise untraversable and the transient mount namespace exposes only that exact file.
