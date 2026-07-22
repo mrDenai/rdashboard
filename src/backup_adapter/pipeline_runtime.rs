@@ -34,6 +34,7 @@ pub const BACKUP_ADAPTER_CONFIG_PATH: &str = "/etc/rdashboard/projects/rimg/back
 pub const AGE_EXECUTABLE_PATH: &str = "/usr/libexec/rdashboard/age";
 pub const RCLONE_EXECUTABLE_PATH: &str = "/usr/libexec/rdashboard/rclone";
 pub const RCLONE_CONFIG_PATH: &str = "/etc/rdashboard/projects/rimg/rclone.conf";
+const PROJECT_CONFIG_ROOT: &str = "/etc/rdashboard/projects";
 
 const BACKUP_ROOT: &str = "/var/lib/rdashboard-executor/backups";
 const SYSTEMD_CREDENTIAL_ROOT: &str = "/run/credentials";
@@ -133,11 +134,12 @@ impl InstalledBackupPipelineRuntimeV1 {
     ) -> Result<Self, BackupAdapterError> {
         let unit_name = fixed_adapter_unit_name(spec, sequence)?;
         let credential_path = credential_path_for_unit(&unit_name);
+        let (config_path, rclone_config_path) = backup_runtime_paths(&spec.project_id);
         Self::new_bound(
-            Path::new(BACKUP_ADAPTER_CONFIG_PATH),
+            &config_path,
             Path::new(AGE_EXECUTABLE_PATH),
             Path::new(RCLONE_EXECUTABLE_PATH),
-            Path::new(RCLONE_CONFIG_PATH),
+            &rclone_config_path,
             &credential_path,
             Path::new(BACKUP_ROOT),
             job_directory,
@@ -192,6 +194,11 @@ impl InstalledBackupPipelineRuntimeV1 {
             required_uid,
         })
     }
+}
+
+fn backup_runtime_paths(project_id: &ProjectId) -> (PathBuf, PathBuf) {
+    let root = Path::new(PROJECT_CONFIG_ROOT).join(project_id.as_str());
+    (root.join("backup-runtime.jcs"), root.join("rclone.conf"))
 }
 
 fn credential_path_for_unit(unit_name: &str) -> PathBuf {
@@ -1452,6 +1459,30 @@ mod tests {
             Path::new(SYSTEMD_CREDENTIAL_ROOT)
                 .join(format!("{unit_name}.service"))
                 .join("rimg-drive-service-account.json")
+        );
+    }
+
+    #[test]
+    fn installed_backup_paths_are_project_scoped_and_preserve_rimg() {
+        let rimg = "rimg"
+            .parse::<ProjectId>()
+            .unwrap_or_else(|error| panic!("rimg project id: {error}"));
+        assert_eq!(
+            backup_runtime_paths(&rimg),
+            (
+                PathBuf::from(BACKUP_ADAPTER_CONFIG_PATH),
+                PathBuf::from(RCLONE_CONFIG_PATH),
+            )
+        );
+        let gateway = "telegram-gateway"
+            .parse::<ProjectId>()
+            .unwrap_or_else(|error| panic!("gateway project id: {error}"));
+        assert_eq!(
+            backup_runtime_paths(&gateway),
+            (
+                PathBuf::from("/etc/rdashboard/projects/telegram-gateway/backup-runtime.jcs"),
+                PathBuf::from("/etc/rdashboard/projects/telegram-gateway/rclone.conf"),
+            )
         );
     }
 

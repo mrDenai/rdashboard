@@ -443,8 +443,9 @@ fn transient_unit_arguments(
             .map(|path| format!("--property=ReadWritePaths={path}")),
     );
     if drive_credentials_required(job.profile) {
+        let credential_source = drive_credential_source(&job.project_id);
         arguments.push(format!(
-            "--property=LoadCredential={DRIVE_SERVICE_ACCOUNT_CREDENTIAL_NAME}:{DRIVE_SERVICE_ACCOUNT_CREDENTIAL_SOURCE}"
+            "--property=LoadCredential={DRIVE_SERVICE_ACCOUNT_CREDENTIAL_NAME}:{credential_source}"
         ));
     }
     if kamal_credentials_required(job.profile) {
@@ -476,6 +477,17 @@ fn kamal_credential_sources(project_id: &ProjectId) -> (String, String) {
         format!("{root}/kamal-secrets.env"),
         format!("{root}/kamal-ssh-key"),
     )
+}
+
+fn drive_credential_source(project_id: &ProjectId) -> String {
+    if project_id.as_str() == "rimg" {
+        DRIVE_SERVICE_ACCOUNT_CREDENTIAL_SOURCE.to_owned()
+    } else {
+        format!(
+            "{PROJECT_CREDENTIAL_ROOT}/{}/drive-service-account.json",
+            project_id.as_str()
+        )
+    }
 }
 
 const fn drive_credentials_required(profile: FixedAdapterProfileV1) -> bool {
@@ -1564,6 +1576,24 @@ mod tests {
     }
 
     #[test]
+    fn drive_credentials_preserve_rimg_and_scope_other_projects() {
+        let rimg = "rimg"
+            .parse::<ProjectId>()
+            .unwrap_or_else(|error| panic!("rimg project id: {error}"));
+        assert_eq!(
+            drive_credential_source(&rimg),
+            DRIVE_SERVICE_ACCOUNT_CREDENTIAL_SOURCE
+        );
+        let gateway = "telegram-gateway"
+            .parse::<ProjectId>()
+            .unwrap_or_else(|error| panic!("gateway project id: {error}"));
+        assert_eq!(
+            drive_credential_source(&gateway),
+            format!("{PROJECT_CREDENTIAL_ROOT}/telegram-gateway/drive-service-account.json")
+        );
+    }
+
+    #[test]
     fn rejects_request_conflict_and_requires_result_reconciliation() {
         let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
         let root = temp.path().join("adapter-jobs");
@@ -1882,7 +1912,8 @@ mod tests {
             FixedAdapterProfileV1::KamalCodeRollback
         ));
         let load_credential = format!(
-            "--property=LoadCredential={DRIVE_SERVICE_ACCOUNT_CREDENTIAL_NAME}:{DRIVE_SERVICE_ACCOUNT_CREDENTIAL_SOURCE}"
+            "--property=LoadCredential={DRIVE_SERVICE_ACCOUNT_CREDENTIAL_NAME}:{}",
+            drive_credential_source(&encrypt.project_id)
         );
         let upload_arguments = transient_unit_arguments(
             &PreparedAdapterJobV1 {

@@ -635,6 +635,13 @@ installed inputs:
   `root_folder_id`;
 - `/etc/rdashboard/credentials/rimg-drive-service-account.json`, root-owned and mode `0600`.
 
+The encryption/upload runtime is project-scoped even though backup capture is still rimg-specific in
+this milestone. A non-rimg project reads the same canonical contract from
+`/etc/rdashboard/projects/<project-id>/backup-runtime.jcs` and `rclone.conf`, and only its
+`/etc/rdashboard/credentials/projects/<project-id>/drive-service-account.json` is eligible for the
+transient upload/readback units. The installed document still binds the exact project and mutation
+policy digest, so a project-specific path cannot authorize a foreign backup.
+
 The service-account file is loaded only into the upload and independent-readback transient units
 with systemd `LoadCredential=`. It is read inside the unit from
 `/run/credentials/<transient-unit>.service/rimg-drive-service-account.json`; it must never be put
