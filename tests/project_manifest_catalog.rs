@@ -266,6 +266,7 @@ fn rimg_contract_records_native_build_state_and_fenced_migration_without_activat
             .as_str(),
         "Dockerfile.runtime"
     );
+    assert_rimg_verified_output(&manifest);
     assert_eq!(manifest.data_volumes.len(), 3);
     assert_eq!(manifest.data_volumes[0].path.as_str(), "/app/data");
     assert_eq!(manifest.data_volumes[0].class, DataClass::Stateful);
@@ -348,6 +349,29 @@ fn rimg_contract_records_native_build_state_and_fenced_migration_without_activat
             .unwrap_or_else(|| panic!("rimg host preparation is required"))
             .adapter_id,
         WorkflowHostPreparationAdapterV1::CargoCratesIoV1
+    );
+}
+
+fn assert_rimg_verified_output(manifest: &ProjectManifestV2) {
+    let verified_output = manifest
+        .build
+        .verified_output
+        .as_ref()
+        .unwrap_or_else(|| panic!("rimg verified OCI output is required"));
+    assert_eq!(verified_output.context_name, "verified-release");
+    assert_eq!(verified_output.directory.as_str(), "release");
+    assert_eq!(verified_output.max_files, 1);
+    let release = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+        .unwrap_or_else(|| panic!("rimg release node is required"));
+    assert!(
+        release
+            .depends_on
+            .iter()
+            .any(|node| node.as_str() == "verify")
     );
 }
 

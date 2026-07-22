@@ -10,12 +10,12 @@ use uuid::Uuid;
 use crate::{
     domain::{
         EvidenceDigest, GitCommitId, OperationKind, ProjectId, ProjectManifestV2,
-        WorkflowAdapterIdV1, WorkflowCacheClassV1, WorkflowCleanupReceiptV1,
-        WorkflowCleanupResultV1, WorkflowExecutionProfileV1, WorkflowLeaseInputV1, WorkflowLeaseV1,
-        WorkflowNodeActivationV1, WorkflowNodeId, WorkflowNodeKindV1, WorkflowNodeOutcomeV1,
-        WorkflowNodeReceiptV1, WorkflowOperationStateV1, WorkflowProfileId,
-        WorkflowReductionInputV1, WorkflowReductionReceiptV1, WorkflowWorkerPoolV1,
-        valid_workflow_identity,
+        WorkflowAdapterIdV1, WorkflowArtifactKindV1, WorkflowCacheClassV1,
+        WorkflowCleanupReceiptV1, WorkflowCleanupResultV1, WorkflowExecutionProfileV1,
+        WorkflowLeaseInputV1, WorkflowLeaseV1, WorkflowNodeActivationV1, WorkflowNodeId,
+        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowOperationStateV1,
+        WorkflowProfileId, WorkflowReductionInputV1, WorkflowReductionReceiptV1,
+        WorkflowWorkerPoolV1, valid_workflow_identity,
     },
     store::{ControlStore, StoreError},
 };
@@ -1334,7 +1334,7 @@ fn operation_state_for_candidate(
     worker: &WorkflowWorkerRegistrationV1,
     now_ms: i64,
 ) -> Result<OperationStateSelection, StoreError> {
-    if !adapter_uses_operation_state(candidate.profile.adapter_id)
+    if !node_uses_operation_state(candidate.node, candidate.profile.adapter_id)
         || candidate.profile.cache_class != WorkflowCacheClassV1::PreparedRun
     {
         return Ok(OperationStateSelection::NotUsed);
@@ -1431,7 +1431,7 @@ fn remaining_operation_state_consumers(
             .ok_or(StoreError::CorruptWorkflowJournal(
                 "operation-state profile absent",
             ))?;
-        if !adapter_uses_operation_state(profile.adapter_id)
+        if !node_uses_operation_state(node, profile.adapter_id)
             || profile.cache_class != WorkflowCacheClassV1::PreparedRun
             || !worker.pools.contains(&profile.worker_pool)
         {
@@ -1455,11 +1455,17 @@ fn remaining_operation_state_consumers(
     Ok(consumers)
 }
 
-fn adapter_uses_operation_state(adapter: WorkflowAdapterIdV1) -> bool {
+fn node_uses_operation_state(
+    node: &crate::domain::WorkflowNodeV1,
+    adapter: WorkflowAdapterIdV1,
+) -> bool {
     matches!(
         adapter,
         WorkflowAdapterIdV1::WorkerBareBinCiV1 | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
-    )
+    ) || adapter == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+        && node
+            .input_contracts
+            .contains(&WorkflowArtifactKindV1::VerificationReceipt)
 }
 
 fn operation_state_contract(
@@ -1752,7 +1758,7 @@ fn load_ready_candidates(
                 "candidate manifest binding",
             ));
         }
-        if verification_feeds_native_release(&manifest, manifest_node)
+        if verification_feeds_shared_release_output(&manifest, manifest_node)
             && !worker.pools.contains(&WorkflowWorkerPoolV1::VpsRequired)
         {
             continue;
@@ -1782,19 +1788,18 @@ fn load_ready_candidates(
     Ok(by_project.into_values().collect())
 }
 
-fn verification_feeds_native_release(
+fn verification_feeds_shared_release_output(
     manifest: &ProjectManifestV2,
     node: &crate::domain::WorkflowNodeV1,
 ) -> bool {
     node.kind == WorkflowNodeKindV1::Verification
         && manifest.workflow.nodes.iter().any(|candidate| {
             candidate.kind == WorkflowNodeKindV1::ReleaseBuild
+                && candidate.depends_on.contains(&node.node_id)
                 && manifest
                     .workflow
                     .profile(&candidate.profile_id)
-                    .is_some_and(|profile| {
-                        profile.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
-                    })
+                    .is_some_and(|profile| node_uses_operation_state(candidate, profile.adapter_id))
         })
 }
 

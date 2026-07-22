@@ -9,7 +9,13 @@
   "ci": "bin_ci",
   "build": {
     "context": "repository_root",
-    "dockerfile": "Dockerfile.runtime"
+    "dockerfile": "Dockerfile.runtime",
+    "verified_output": {
+      "context_name": "verified-release",
+      "directory": "release",
+      "max_bytes": 134217728,
+      "max_files": 1
+    }
   },
   "workflow": {
     "schema_version": 1,
@@ -240,10 +246,12 @@
         "activation": "always",
         "profile_id": "oci-release-build",
         "depends_on": [
-          "prepare"
+          "prepare",
+          "verify"
         ],
         "input_contracts": [
-          "prepared_run"
+          "prepared_run",
+          "verification_receipt"
         ],
         "output_contract": "release_build_result"
       },

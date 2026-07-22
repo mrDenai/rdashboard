@@ -35,8 +35,9 @@ use crate::{
     },
     rootless_oci::RootlessOciRuntimePolicyV1,
     rootless_oci_build::{
-        ROOTLESS_OCI_BUILD_EXECUTABLE, ROOTLESS_OCI_BUILD_REQUEST_PATH,
-        ROOTLESS_OCI_BUILD_SOCKET_PATH, RootlessOciBuildError, RootlessOciBuildPolicyV1,
+        ROOTLESS_OCI_BUILD_EXECUTABLE, ROOTLESS_OCI_BUILD_OPERATION_ROOT,
+        ROOTLESS_OCI_BUILD_REQUEST_PATH, ROOTLESS_OCI_BUILD_SOCKET_PATH,
+        ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT, RootlessOciBuildError, RootlessOciBuildPolicyV1,
         RootlessOciBuildRequestV1, RootlessOciBuildResultV1, RootlessOciResultStoreV1,
     },
     self_release_build::{
@@ -2117,6 +2118,7 @@ fn validate_launcher_lease(
 ) -> Result<(), WorkflowLauncherError> {
     policy.validate()?;
     lease.validate()?;
+    let requires_operation_state = lease_requires_operation_state(lease)?;
     if lease.worker_id != policy.worker_id
         || lease.host_id != policy.host_id
         || !matches!(
@@ -2124,11 +2126,7 @@ fn validate_launcher_lease(
             WorkflowWorkerPoolV1::VpsRequired | WorkflowWorkerPoolV1::BuildCompute
         )
         || lease.network_class != WorkflowNetworkClassV1::Offline
-        || matches!(
-            lease.adapter_id,
-            WorkflowAdapterIdV1::WorkerBareBinCiV1
-                | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
-        ) != lease.operation_state.is_some()
+        || requires_operation_state != lease.operation_state.is_some()
         || !policy.allowed_adapters.contains(&lease.adapter_id)
         || !matches!(
             lease.adapter_id,
@@ -2141,6 +2139,18 @@ fn validate_launcher_lease(
     }
     let _ = required_prepared_run_key(lease)?;
     Ok(())
+}
+
+fn lease_requires_operation_state(lease: &WorkflowLeaseV1) -> Result<bool, WorkflowLauncherError> {
+    match lease.adapter_id {
+        WorkflowAdapterIdV1::WorkerBareBinCiV1
+        | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 => Ok(true),
+        WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 => Ok(lease
+            .required_input_artifacts()?
+            .iter()
+            .any(|input| input.artifact_kind == WorkflowArtifactKindV1::VerificationReceipt)),
+        _ => Ok(false),
+    }
 }
 
 fn validate_launcher_cleanup_lease(
@@ -2179,15 +2189,18 @@ fn required_prepared_run_key(
     let Some(input) = prepared.next() else {
         return Err(WorkflowLauncherError::UnsupportedLease);
     };
-    let valid_input_shape = if lease.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 {
-        inputs.len() == 2
-            && inputs
-                .iter()
-                .filter(|input| input.artifact_kind == WorkflowArtifactKindV1::VerificationReceipt)
-                .count()
-                == 1
-    } else {
-        inputs.len() == 1
+    let verification_inputs = inputs
+        .iter()
+        .filter(|input| input.artifact_kind == WorkflowArtifactKindV1::VerificationReceipt)
+        .count();
+    let valid_input_shape = match lease.adapter_id {
+        WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 => {
+            inputs.len() == 2 && verification_inputs == 1 && lease.operation_state.is_some()
+        }
+        WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 if lease.operation_state.is_some() => {
+            inputs.len() == 2 && verification_inputs == 1
+        }
+        _ => inputs.len() == 1 && verification_inputs == 0,
     };
     if prepared.next().is_some() || !valid_input_shape {
         return Err(WorkflowLauncherError::UnsupportedLease);
@@ -2658,6 +2671,22 @@ fn transient_unit_arguments(
             ),
             format!("--property=BindPaths={}:/output", staging_path.display()),
             "--property=ReadWritePaths=/job /output".to_owned(),
+        ]);
+        if !request.local_inputs.is_empty() {
+            arguments.push(format!(
+                "--property=BindReadOnlyPaths={}:{ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT}",
+                crate::build_storage::SHARED_TOOLCHAIN_STORE_ROOT
+            ));
+        }
+        if request.verified_output.is_some() {
+            let operation_state_path =
+                operation_state_path.ok_or(WorkflowLauncherError::UnsupportedLease)?;
+            arguments.push(format!(
+                "--property=BindReadOnlyPaths={}:{ROOTLESS_OCI_BUILD_OPERATION_ROOT}",
+                operation_state_path.display()
+            ));
+        }
+        arguments.extend([
             "--".to_owned(),
             ENV_EXECUTABLE.to_owned(),
             "-i".to_owned(),
@@ -2701,6 +2730,10 @@ fn transient_unit_arguments(
         arguments.extend([
             "--property=ReadWritePaths=/job".to_owned(),
             format!(
+                "--property=BindReadOnlyPaths={}:{ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT}",
+                crate::build_storage::SHARED_TOOLCHAIN_STORE_ROOT
+            ),
+            format!(
                 "--property=BindPaths={}:/operation",
                 operation_state_path.display()
             ),
@@ -2713,8 +2746,11 @@ fn transient_unit_arguments(
             "CARGO_HOME=/job/cargo-home".to_owned(),
             "CARGO_NET_OFFLINE=true".to_owned(),
             "CARGO_TARGET_DIR=/operation/target".to_owned(),
+            "RUSTFLAGS=-C target-cpu=native -C link-arg=-fuse-ld=lld".to_owned(),
+            "TITANIUM_CPU_FLAGS=-march=native -O3 -fno-plt -fstack-clash-protection".to_owned(),
             "CCACHE_DIR=/operation/ccache".to_owned(),
             "CCACHE_TEMPDIR=/job/ccache-tmp".to_owned(),
+            format!("RDASHBOARD_TOOLCHAIN_ROOT={ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT}"),
             "RDASHBOARD_PREPARED_ROOT=/prepared".to_owned(),
             "RDASHBOARD_DEPENDENCY_ROOT=/dependencies".to_owned(),
             "RDASHBOARD_OPERATION_ROOT=/operation".to_owned(),
@@ -3267,9 +3303,32 @@ mod tests {
             platform: "linux/amd64".to_owned(),
             build_args: Vec::new(),
             base_inputs: Vec::new(),
+            local_inputs: Vec::new(),
+            verified_output: None,
             max_archive_bytes: 32 * 1024 * 1024,
         }];
         policy.validate().expect("configured OCI policy");
+        policy
+    }
+
+    fn configured_verified_oci_policy(fixture: &LauncherFixture) -> WorkflowLauncherPolicyV1 {
+        let mut policy = configured_oci_policy(fixture);
+        let build = policy
+            .rootless_oci_builds
+            .first_mut()
+            .expect("configured OCI build");
+        build.local_inputs = vec![crate::rootless_oci_build::RootlessOciLocalInputV1 {
+            source: "native".to_owned(),
+            local_name: "native".to_owned(),
+            toolchain_path: "rimg-native/opt/4u".to_owned(),
+        }];
+        build.verified_output = Some(crate::domain::VerifiedOciOutputPolicy {
+            context_name: "verified-release".to_owned(),
+            directory: "release".parse().expect("release directory"),
+            max_bytes: 128 * 1024 * 1024,
+            max_files: 1,
+        });
+        policy.validate().expect("configured verified OCI policy");
         policy
     }
 
@@ -3436,6 +3495,85 @@ mod tests {
         .expect("OCI lease")
     }
 
+    fn verified_oci_lease(fixture: &LauncherFixture) -> WorkflowLeaseV1 {
+        let base = oci_lease(fixture);
+        let node = crate::domain::WorkflowNodeV1 {
+            node_id: "release-build".parse().expect("release node ID"),
+            display_name: "Package verified OCI release".to_owned(),
+            kind: WorkflowNodeKindV1::ReleaseBuild,
+            activation: crate::domain::WorkflowNodeActivationV1::Always,
+            profile_id: "verified-oci".parse().expect("release profile ID"),
+            depends_on: vec![
+                "prepare".parse().expect("prepare node ID"),
+                "verify".parse().expect("verification node ID"),
+            ],
+            input_contracts: vec![
+                WorkflowArtifactKindV1::PreparedRun,
+                WorkflowArtifactKindV1::VerificationReceipt,
+            ],
+            output_contract: WorkflowArtifactKindV1::ReleaseBuildResult,
+        };
+        let profile = crate::domain::WorkflowExecutionProfileV1 {
+            profile_id: node.profile_id.clone(),
+            adapter_id: WorkflowAdapterIdV1::WorkerOciReleaseBuildV1,
+            worker_pool: WorkflowWorkerPoolV1::VpsRequired,
+            network_class: WorkflowNetworkClassV1::Offline,
+            cache_class: crate::domain::WorkflowCacheClassV1::PreparedRun,
+            timeout_ms: 30_000,
+            resources: base.resources.clone(),
+        };
+        let operation_state = crate::domain::WorkflowOperationStateV1::new(
+            base.attempt_id,
+            &base.project_id,
+            &base.source_sha,
+            &base.workflow_policy_digest,
+            &base.preparation_key,
+            &base.worker_id,
+            &base.host_id,
+            vec![
+                node.node_id.clone(),
+                "verify".parse().expect("verification node ID"),
+            ],
+            6 * 1024 * 1024 * 1024,
+            500_000,
+        )
+        .expect("verified OCI operation state");
+        let source_identity = base.source_identity.as_ref().expect("source identity");
+        let source_sequence = source_identity.sequence;
+        let source_attestation_digest = source_identity.attestation_digest.clone();
+        WorkflowLeaseV1::new(
+            Uuid::from_u128(51),
+            1,
+            Uuid::from_u128(52),
+            base.attempt_id,
+            base.project_id,
+            base.source_sha,
+            source_sequence,
+            source_attestation_digest,
+            base.workflow_policy_digest,
+            base.preparation_key,
+            &node,
+            &profile,
+            None,
+            vec![
+                base.input_artifacts[0].clone(),
+                WorkflowLeaseInputV1 {
+                    node_id: "verify".parse().expect("verification node ID"),
+                    artifact_kind: WorkflowArtifactKindV1::VerificationReceipt,
+                    output_digest: EvidenceDigest::sha256("verified bin/ci receipt"),
+                },
+            ],
+            EvidenceDigest::sha256("prepared run plus verified OCI output"),
+            base.worker_id,
+            base.host_id,
+            100,
+            30_100,
+        )
+        .expect("verified OCI lease")
+        .with_operation_state(operation_state)
+        .expect("stateful verified OCI lease")
+    }
+
     fn assert_rootless_oci_policy_coupling(fixture: &LauncherFixture) {
         let canonical_policy = fixture.policy.canonical_bytes().expect("canonical policy");
         assert_eq!(
@@ -3528,8 +3666,11 @@ mod tests {
                 "CARGO_HOME=/job/cargo-home",
                 "CARGO_NET_OFFLINE=true",
                 "CARGO_TARGET_DIR=/operation/target",
+                "RUSTFLAGS=-C target-cpu=native -C link-arg=-fuse-ld=lld",
+                "TITANIUM_CPU_FLAGS=-march=native -O3 -fno-plt -fstack-clash-protection",
                 "CCACHE_DIR=/operation/ccache",
                 "CCACHE_TEMPDIR=/job/ccache-tmp",
+                "RDASHBOARD_TOOLCHAIN_ROOT=/toolchains",
                 "RDASHBOARD_PREPARED_ROOT=/prepared",
                 "RDASHBOARD_DEPENDENCY_ROOT=/dependencies",
                 "RDASHBOARD_OPERATION_ROOT=/operation",
@@ -3615,6 +3756,44 @@ mod tests {
                 ROOTLESS_OCI_BUILD_EXECUTABLE,
             ]
         );
+    }
+
+    #[test]
+    fn verified_oci_authorization_reuses_gate_output_and_shared_toolchain_read_only() {
+        let fixture = fixture();
+        let policy = configured_verified_oci_policy(&fixture);
+        let lease = verified_oci_lease(&fixture);
+        let grant = fixture
+            .signer
+            .issue(&lease, 101, Uuid::from_u128(53))
+            .expect("execution grant");
+        let launch =
+            AuthorizedWorkflowLaunchV1::authorize(&policy, &fixture.reader, &lease, &grant, 101)
+                .expect("authorize verified OCI launch");
+        let request = launch.oci_build_request.as_ref().expect("OCI request");
+        assert!(request.verified_output.is_some());
+        assert_eq!(request.local_inputs.len(), 1);
+        let operation_state_path = launch
+            .operation_state_path
+            .as_ref()
+            .expect("verified operation state");
+        assert!(launch.arguments.iter().any(|argument| {
+            argument
+                == &format!(
+                    "--property=BindReadOnlyPaths={}:{ROOTLESS_OCI_BUILD_OPERATION_ROOT}",
+                    operation_state_path.display()
+                )
+        }));
+        assert!(launch.arguments.iter().any(|argument| {
+            argument
+                == &format!(
+                    "--property=BindReadOnlyPaths={}:{ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT}",
+                    crate::build_storage::SHARED_TOOLCHAIN_STORE_ROOT
+                )
+        }));
+        assert!(!launch.arguments.iter().any(|argument| {
+            argument.starts_with("--property=BindPaths=") && argument.ends_with(":/operation")
+        }));
     }
 
     #[test]

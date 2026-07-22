@@ -28,10 +28,11 @@ separately installed persistent bootstrap is the only A/B pointer, service-healt
 The source controls keep `auto_deploy=false`; installing or validating this catalog cannot create a
 release, start the bootstrap or mutate a host.
 
-The `rimg.json` entry records the private source, existing `Dockerfile.runtime`, two stateful paths,
+The `rimg.json` entry records the private source, existing `Dockerfile.runtime`, one verified release
+output reused by minimal OCI assembly, two stateful paths,
 derived uploads, exact liveness/readiness endpoints and the fenced application-migration position in
 the generic deployment graph. It deliberately remains `auto_deploy=false`. The current fixed Cargo
-preparer covers only its Rust packages: activation additionally requires sealing the already-built
-Titanium native toolchain as a verified prepared input and supplying it as the Dockerfile's `native`
-build context. Until that boundary is implemented and reviewed, the catalog may observe and archive
+preparer covers only its Rust packages: activation additionally requires publishing the already-built
+Titanium native toolchain once under the shared root-owned toolchain store and supplying it as the
+Dockerfile's read-only `native` context. Until that boundary is provisioned and reviewed, the catalog may observe and archive
 `rimg` source but cannot truthfully claim a runnable worker or deployment path.

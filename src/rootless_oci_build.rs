@@ -22,8 +22,8 @@ use crate::{
         required_host_available_bytes,
     },
     domain::{
-        EvidenceDigest, GitCommitId, ProjectId, WorkflowAdapterIdV1, WorkflowArtifactKindV1,
-        WorkflowLeaseV1, WorkflowNodeKindV1,
+        EvidenceDigest, GitCommitId, ProjectId, VerifiedOciOutputPolicy, WorkflowAdapterIdV1,
+        WorkflowArtifactKindV1, WorkflowLeaseV1, WorkflowNodeKindV1,
     },
     rootless_oci::BUILDCTL_EXECUTABLE,
     self_update::CURRENT_ROOTLESS_OCI_BUILD_EXECUTABLE,
@@ -36,6 +36,8 @@ pub const ROOTLESS_OCI_BUILD_EXECUTABLE: &str = CURRENT_ROOTLESS_OCI_BUILD_EXECU
 pub const ROOTLESS_OCI_BUILD_REQUEST_PATH: &str = "/request/oci-build-request.jcs";
 pub const ROOTLESS_OCI_BUILD_PREPARED_ROOT: &str = "/prepared/source";
 pub const ROOTLESS_OCI_BUILD_DEPENDENCY_ROOT: &str = "/dependencies";
+pub const ROOTLESS_OCI_BUILD_OPERATION_ROOT: &str = "/operation";
+pub const ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT: &str = "/toolchains";
 pub const ROOTLESS_OCI_BUILD_OUTPUT_ROOT: &str = "/output";
 pub const ROOTLESS_OCI_BUILD_SOCKET_PATH: &str = "/buildkit/buildkitd.sock";
 pub const ROOTLESS_OCI_RESULT_STORE_ROOT: &str = "/var/lib/rdashboard-build/oci-results";
@@ -90,9 +92,32 @@ pub struct RootlessOciBaseInputV1 {
     pub manifest_digest: OciDigest,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootlessOciLocalInputV1 {
+    pub source: String,
+    pub local_name: String,
+    pub toolchain_path: String,
+}
+
+impl RootlessOciLocalInputV1 {
+    fn validate(&self) -> Result<(), RootlessOciBuildError> {
+        if !valid_source_reference(&self.source)
+            || reserved_buildkit_context_name(&self.source)
+            || !valid_token(&self.local_name, 64)
+            || reserved_buildkit_context_name(&self.local_name)
+            || !valid_relative_path(&self.toolchain_path)
+        {
+            return Err(RootlessOciBuildError::InvalidPolicy);
+        }
+        Ok(())
+    }
+}
+
 impl RootlessOciBaseInputV1 {
     fn validate(&self) -> Result<(), RootlessOciBuildError> {
         if !valid_source_reference(&self.source)
+            || reserved_buildkit_context_name(&self.source)
             || !valid_token(&self.layout_name, 64)
             || !valid_relative_path(&self.dependency_path)
             || !self.dependency_path.starts_with("oci-layouts/")
@@ -116,6 +141,10 @@ pub struct RootlessOciBuildPolicyV1 {
     pub build_args: Vec<RootlessOciBuildArgV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_inputs: Vec<RootlessOciBaseInputV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_inputs: Vec<RootlessOciLocalInputV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_output: Option<VerifiedOciOutputPolicy>,
     pub max_archive_bytes: u64,
 }
 
@@ -131,8 +160,14 @@ impl RootlessOciBuildPolicyV1 {
             || !(MIN_ARCHIVE_BYTES..=MAX_ARCHIVE_BYTES).contains(&self.max_archive_bytes)
             || self.build_args.len() > 64
             || self.base_inputs.len() > 64
+            || self.local_inputs.len() > 16
+            || self
+                .verified_output
+                .as_ref()
+                .is_some_and(|output| !output.validate())
             || !self.build_args.windows(2).all(|pair| pair[0] < pair[1])
             || !self.base_inputs.windows(2).all(|pair| pair[0] < pair[1])
+            || !self.local_inputs.windows(2).all(|pair| pair[0] < pair[1])
         {
             return Err(RootlessOciBuildError::InvalidPolicy);
         }
@@ -140,6 +175,9 @@ impl RootlessOciBuildPolicyV1 {
             argument.validate()?;
         }
         for input in &self.base_inputs {
+            input.validate()?;
+        }
+        for input in &self.local_inputs {
             input.validate()?;
         }
         if !strictly_unique(self.build_args.iter().map(|argument| argument.key.as_str()))
@@ -154,6 +192,33 @@ impl RootlessOciBuildPolicyV1 {
                     .iter()
                     .map(|input| input.dependency_path.as_str()),
             )
+            || !strictly_unique(self.local_inputs.iter().map(|input| input.source.as_str()))
+            || !strictly_unique(
+                self.local_inputs
+                    .iter()
+                    .map(|input| input.local_name.as_str())
+                    .chain(
+                        self.verified_output
+                            .iter()
+                            .map(|output| output.context_name.as_str()),
+                    ),
+            )
+            || !strictly_unique(
+                self.local_inputs
+                    .iter()
+                    .map(|input| input.toolchain_path.as_str()),
+            )
+            || !strictly_unique(
+                self.base_inputs
+                    .iter()
+                    .map(|input| input.source.as_str())
+                    .chain(self.local_inputs.iter().map(|input| input.source.as_str()))
+                    .chain(
+                        self.verified_output
+                            .iter()
+                            .map(|output| output.context_name.as_str()),
+                    ),
+            )
         {
             return Err(RootlessOciBuildError::InvalidPolicy);
         }
@@ -164,6 +229,10 @@ impl RootlessOciBuildPolicyV1 {
 fn strictly_unique<'a>(values: impl Iterator<Item = &'a str>) -> bool {
     let mut seen = BTreeSet::new();
     values.into_iter().all(|value| seen.insert(value))
+}
+
+fn reserved_buildkit_context_name(value: &str) -> bool {
+    matches!(value, "context" | "dockerfile")
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -190,6 +259,10 @@ pub struct RootlessOciBuildRequestV1 {
     pub build_args: Vec<RootlessOciBuildArgV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_inputs: Vec<RootlessOciBaseInputV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_inputs: Vec<RootlessOciLocalInputV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_output: Option<VerifiedOciOutputPolicy>,
     pub max_archive_bytes: u64,
     pub request_digest: EvidenceDigest,
 }
@@ -217,6 +290,10 @@ struct RootlessOciBuildRequestPayload<'a> {
     build_args: &'a [RootlessOciBuildArgV1],
     #[serde(skip_serializing_if = "<[RootlessOciBaseInputV1]>::is_empty")]
     base_inputs: &'a [RootlessOciBaseInputV1],
+    #[serde(skip_serializing_if = "<[RootlessOciLocalInputV1]>::is_empty")]
+    local_inputs: &'a [RootlessOciLocalInputV1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_output: &'a Option<VerifiedOciOutputPolicy>,
     max_archive_bytes: u64,
 }
 
@@ -258,6 +335,8 @@ impl RootlessOciBuildRequestV1 {
             platform: policy.platform.clone(),
             build_args: policy.build_args.clone(),
             base_inputs: policy.base_inputs.clone(),
+            local_inputs: policy.local_inputs.clone(),
+            verified_output: policy.verified_output.clone(),
             max_archive_bytes: policy.max_archive_bytes,
             request_digest: EvidenceDigest::sha256([]),
         };
@@ -275,6 +354,8 @@ impl RootlessOciBuildRequestV1 {
             platform: self.platform.clone(),
             build_args: self.build_args.clone(),
             base_inputs: self.base_inputs.clone(),
+            local_inputs: self.local_inputs.clone(),
+            verified_output: self.verified_output.clone(),
             max_archive_bytes: self.max_archive_bytes,
         };
         policy.validate()?;
@@ -309,6 +390,7 @@ impl RootlessOciBuildRequestV1 {
             || self.workflow_policy_digest != lease.workflow_policy_digest
             || self.preparation_key != lease.preparation_key
             || self.expected_input_digest != lease.expected_input_digest
+            || self.verified_output.is_some() != lease_uses_verified_output(lease)?
             || lease
                 .resources
                 .as_ref()
@@ -359,10 +441,25 @@ impl RootlessOciBuildRequestV1 {
                 platform: &self.platform,
                 build_args: &self.build_args,
                 base_inputs: &self.base_inputs,
+                local_inputs: &self.local_inputs,
+                verified_output: &self.verified_output,
                 max_archive_bytes: self.max_archive_bytes,
             },
         )?))
     }
+}
+
+fn lease_uses_verified_output(lease: &WorkflowLeaseV1) -> Result<bool, RootlessOciBuildError> {
+    let inputs = lease.required_input_artifacts()?;
+    let has_verification = inputs
+        .iter()
+        .any(|input| input.artifact_kind == WorkflowArtifactKindV1::VerificationReceipt);
+    if has_verification && (inputs.len() != 2 || lease.operation_state.is_none())
+        || !has_verification && (inputs.len() != 1 || lease.operation_state.is_some())
+    {
+        return Err(RootlessOciBuildError::LeaseMismatch);
+    }
+    Ok(has_verification)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -377,6 +474,8 @@ pub struct RootlessOciBuildResultV1 {
     pub image_config_digest: OciDigest,
     pub archive_digest: EvidenceDigest,
     pub archive_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_output_digest: Option<EvidenceDigest>,
     pub result_digest: EvidenceDigest,
 }
 
@@ -391,6 +490,8 @@ struct RootlessOciBuildResultPayload<'a> {
     image_config_digest: &'a OciDigest,
     archive_digest: &'a EvidenceDigest,
     archive_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_output_digest: &'a Option<EvidenceDigest>,
 }
 
 impl RootlessOciBuildResultV1 {
@@ -400,6 +501,7 @@ impl RootlessOciBuildResultV1 {
         image_config_digest: OciDigest,
         archive_digest: EvidenceDigest,
         archive_bytes: u64,
+        verified_output_digest: Option<EvidenceDigest>,
     ) -> Result<Self, RootlessOciBuildError> {
         let mut result = Self {
             purpose: RESULT_PURPOSE.to_owned(),
@@ -411,6 +513,7 @@ impl RootlessOciBuildResultV1 {
             image_config_digest,
             archive_digest,
             archive_bytes,
+            verified_output_digest,
             result_digest: EvidenceDigest::sha256([]),
         };
         result.result_digest = result.calculate_digest()?;
@@ -429,6 +532,7 @@ impl RootlessOciBuildResultV1 {
             || self.project_id != request.project_id
             || self.source_sha != request.source_sha
             || !(MIN_ARCHIVE_BYTES..=request.max_archive_bytes).contains(&self.archive_bytes)
+            || self.verified_output_digest.is_some() != request.verified_output.is_some()
             || self.result_digest != self.calculate_digest()?
         {
             return Err(RootlessOciBuildError::InvalidResult);
@@ -472,6 +576,7 @@ impl RootlessOciBuildResultV1 {
                 image_config_digest: &self.image_config_digest,
                 archive_digest: &self.archive_digest,
                 archive_bytes: self.archive_bytes,
+                verified_output_digest: &self.verified_output_digest,
             },
         )?))
     }
@@ -517,6 +622,27 @@ pub fn buildctl_arguments(
             input.manifest_digest.as_str()
         ));
     }
+    for input in &request.local_inputs {
+        arguments.push(format!(
+            "--local={}={ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT}/{}",
+            input.local_name, input.toolchain_path
+        ));
+        arguments.push(format!(
+            "--opt=context:{}=local:{}",
+            input.source, input.local_name
+        ));
+    }
+    if let Some(output) = &request.verified_output {
+        arguments.push(format!(
+            "--local={}={ROOTLESS_OCI_BUILD_OPERATION_ROOT}/{}",
+            output.context_name,
+            output.directory.as_str()
+        ));
+        arguments.push(format!(
+            "--opt=context:{}=local:{}",
+            output.context_name, output.context_name
+        ));
+    }
     arguments.push(format!(
         "--output=type=oci,dest={ROOTLESS_OCI_BUILD_OUTPUT_ROOT}/{RESULT_ARCHIVE_FILE},name=rdashboard.local/{}:{}",
         request.project_id,
@@ -534,6 +660,8 @@ pub fn execute_installed_rootless_oci_build()
         Path::new(ROOTLESS_OCI_BUILD_REQUEST_PATH),
         Path::new(ROOTLESS_OCI_BUILD_PREPARED_ROOT),
         Path::new(ROOTLESS_OCI_BUILD_DEPENDENCY_ROOT),
+        Path::new(ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT),
+        Path::new(ROOTLESS_OCI_BUILD_OPERATION_ROOT),
         Path::new(ROOTLESS_OCI_BUILD_OUTPUT_ROOT),
         Path::new(BUILDCTL_EXECUTABLE),
     )
@@ -543,6 +671,8 @@ fn execute_rootless_oci_build(
     request_path: &Path,
     prepared_root: &Path,
     dependency_root: &Path,
+    toolchain_root: &Path,
+    operation_root: &Path,
     output_root: &Path,
     buildctl: &Path,
 ) -> Result<RootlessOciBuildResultV1, RootlessOciBuildError> {
@@ -560,6 +690,14 @@ fn execute_rootless_oci_build(
     for input in &request.base_inputs {
         validate_read_only_directory(&dependency_root.join(&input.dependency_path))?;
     }
+    for input in &request.local_inputs {
+        validate_root_owned_read_only_subdirectory(toolchain_root, &input.toolchain_path)?;
+    }
+    let verified_before = request
+        .verified_output
+        .as_ref()
+        .map(|output| verified_output_digest(operation_root, output))
+        .transpose()?;
     let arguments = buildctl_arguments(&request)?;
     let status = Command::new(buildctl)
         .args(arguments)
@@ -569,6 +707,14 @@ fn execute_rootless_oci_build(
         .status()?;
     if !status.success() {
         return Err(RootlessOciBuildError::BuildctlRejected);
+    }
+    let verified_after = request
+        .verified_output
+        .as_ref()
+        .map(|output| verified_output_digest(operation_root, output))
+        .transpose()?;
+    if verified_before != verified_after {
+        return Err(RootlessOciBuildError::ConcurrentChange);
     }
     let metadata_path = output_root.join(BUILDKIT_METADATA_FILE);
     let metadata = read_bounded_file(&metadata_path, MAX_METADATA_BYTES)?;
@@ -587,6 +733,7 @@ fn execute_rootless_oci_build(
         config_digest,
         archive_digest,
         archive_bytes,
+        verified_after,
     )?;
     fs::set_permissions(&archive_path, fs::Permissions::from_mode(0o400))?;
     write_new_read_only_file(
@@ -1592,6 +1739,129 @@ fn validate_read_only_directory(path: &Path) -> Result<(), RootlessOciBuildError
     Ok(())
 }
 
+fn validate_root_owned_read_only_directory(path: &Path) -> Result<(), RootlessOciBuildError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(RootlessOciBuildError::UnsafeInput);
+    }
+    Ok(())
+}
+
+fn validate_root_owned_read_only_subdirectory(
+    root: &Path,
+    relative: &str,
+) -> Result<(), RootlessOciBuildError> {
+    if !valid_relative_path(relative) {
+        return Err(RootlessOciBuildError::UnsafeInput);
+    }
+    validate_root_owned_read_only_directory(root)?;
+    let mut current = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let Component::Normal(segment) = component else {
+            return Err(RootlessOciBuildError::UnsafeInput);
+        };
+        current.push(segment);
+        validate_root_owned_read_only_directory(&current)?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct VerifiedOutputInventoryV1 {
+    purpose: &'static str,
+    entries: Vec<VerifiedOutputEntryV1>,
+}
+
+#[derive(Serialize)]
+struct VerifiedOutputEntryV1 {
+    path: String,
+    mode: u32,
+    bytes: u64,
+    sha256: EvidenceDigest,
+}
+
+fn verified_output_digest(
+    operation_root: &Path,
+    policy: &VerifiedOciOutputPolicy,
+) -> Result<EvidenceDigest, RootlessOciBuildError> {
+    if !policy.validate() {
+        return Err(RootlessOciBuildError::InvalidPolicy);
+    }
+    let root = operation_root.join(policy.directory.as_str());
+    validate_read_only_directory(&root)?;
+    let entries = inspect_verified_output(&root, policy)?;
+    if entries.is_empty() {
+        return Err(RootlessOciBuildError::UnsafeInput);
+    }
+    Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
+        &VerifiedOutputInventoryV1 {
+            purpose: "rdashboard.verified-oci-output.v1",
+            entries,
+        },
+    )?))
+}
+
+fn inspect_verified_output(
+    root: &Path,
+    policy: &VerifiedOciOutputPolicy,
+) -> Result<Vec<VerifiedOutputEntryV1>, RootlessOciBuildError> {
+    let maximum_files =
+        usize::try_from(policy.max_files).map_err(|_| RootlessOciBuildError::UnsafeInput)?;
+    let mut children = Vec::new();
+    for child in fs::read_dir(root)? {
+        if children.len() >= maximum_files {
+            return Err(RootlessOciBuildError::UnsafeInput);
+        }
+        children.push(child?);
+    }
+    children.sort_by_key(std::fs::DirEntry::file_name);
+    let mut entries = Vec::with_capacity(children.len());
+    let mut bytes = 0_u64;
+    for child in children {
+        let path = child.path();
+        let named = fs::symlink_metadata(&path)?;
+        if named.file_type().is_symlink()
+            || !named.is_file()
+            || named.nlink() != 1
+            || !matches!(named.permissions().mode() & 0o7777, 0o444 | 0o555)
+        {
+            return Err(RootlessOciBuildError::UnsafeInput);
+        }
+        bytes = bytes
+            .checked_add(named.len())
+            .ok_or(RootlessOciBuildError::UnsafeInput)?;
+        if bytes > policy.max_bytes {
+            return Err(RootlessOciBuildError::UnsafeInput);
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| RootlessOciBuildError::UnsafeInput)?
+            .to_str()
+            .ok_or(RootlessOciBuildError::UnsafeInput)?
+            .to_owned();
+        if !valid_relative_path(&relative) {
+            return Err(RootlessOciBuildError::UnsafeInput);
+        }
+        let file = File::open(&path)?;
+        let opened = file.metadata()?;
+        let sha256 = hash_file(&file, opened.len())?;
+        if !same_file(&named, &opened) || !same_file(&opened, &fs::symlink_metadata(&path)?) {
+            return Err(RootlessOciBuildError::ConcurrentChange);
+        }
+        entries.push(VerifiedOutputEntryV1 {
+            path: relative,
+            mode: named.permissions().mode() & 0o7777,
+            bytes: named.len(),
+            sha256,
+        });
+    }
+    Ok(entries)
+}
+
 fn validate_dockerfile_frontend(
     prepared_root: &Path,
     dockerfile_path: &str,
@@ -1940,6 +2210,8 @@ mod tests {
                     .parse()
                     .expect("OCI digest"),
             }],
+            local_inputs: Vec::new(),
+            verified_output: None,
             max_archive_bytes: 32 * 1024 * 1024,
         }
     }
@@ -2004,6 +2276,99 @@ mod tests {
         .expect("lease")
     }
 
+    fn verified_policy() -> RootlessOciBuildPolicyV1 {
+        let mut policy = policy();
+        policy.local_inputs = vec![RootlessOciLocalInputV1 {
+            source: "native".to_owned(),
+            local_name: "native".to_owned(),
+            toolchain_path: "rimg-native/opt/4u".to_owned(),
+        }];
+        policy.verified_output = Some(VerifiedOciOutputPolicy {
+            context_name: "verified-release".to_owned(),
+            directory: "release".parse().expect("release directory"),
+            max_bytes: 64 * 1024 * 1024,
+            max_files: 1,
+        });
+        policy
+    }
+
+    fn verified_lease() -> WorkflowLeaseV1 {
+        let base = lease();
+        let source_identity = base
+            .source_identity
+            .as_ref()
+            .expect("source identity")
+            .clone();
+        let node = WorkflowNodeV1 {
+            node_id: "release".parse().expect("node ID"),
+            display_name: "Release verified output".to_owned(),
+            kind: WorkflowNodeKindV1::ReleaseBuild,
+            activation: WorkflowNodeActivationV1::Always,
+            profile_id: "oci".parse().expect("profile ID"),
+            depends_on: vec![
+                "prepare".parse().expect("prepare node"),
+                "verify".parse().expect("verify node"),
+            ],
+            input_contracts: vec![
+                WorkflowArtifactKindV1::PreparedRun,
+                WorkflowArtifactKindV1::VerificationReceipt,
+            ],
+            output_contract: WorkflowArtifactKindV1::ReleaseBuildResult,
+        };
+        let profile = WorkflowExecutionProfileV1 {
+            profile_id: node.profile_id.clone(),
+            adapter_id: WorkflowAdapterIdV1::WorkerOciReleaseBuildV1,
+            worker_pool: WorkflowWorkerPoolV1::VpsRequired,
+            network_class: WorkflowNetworkClassV1::Offline,
+            cache_class: WorkflowCacheClassV1::PreparedRun,
+            timeout_ms: 60_000,
+            resources: base.resources.clone(),
+        };
+        let state = crate::domain::WorkflowOperationStateV1::new(
+            base.attempt_id,
+            &base.project_id,
+            &base.source_sha,
+            &base.workflow_policy_digest,
+            &base.preparation_key,
+            &base.worker_id,
+            &base.host_id,
+            vec![node.node_id.clone()],
+            1024 * 1024 * 1024,
+            100_000,
+        )
+        .expect("operation state");
+        WorkflowLeaseV1::new(
+            base.lease_id,
+            base.lease_generation,
+            base.request_id,
+            base.attempt_id,
+            base.project_id,
+            base.source_sha,
+            source_identity.sequence,
+            source_identity.attestation_digest,
+            base.workflow_policy_digest,
+            base.preparation_key,
+            &node,
+            &profile,
+            None,
+            vec![
+                base.input_artifacts[0].clone(),
+                WorkflowLeaseInputV1 {
+                    node_id: "verify".parse().expect("verify node"),
+                    artifact_kind: WorkflowArtifactKindV1::VerificationReceipt,
+                    output_digest: EvidenceDigest::sha256("verified bin/ci"),
+                },
+            ],
+            EvidenceDigest::sha256("prepared plus verified"),
+            base.worker_id,
+            base.host_id,
+            base.leased_at_ms,
+            base.expires_at_ms,
+        )
+        .and_then(|lease| lease.with_operation_state(state))
+        .expect("verified OCI lease")
+    }
+
     #[test]
     fn request_is_canonical_and_buildctl_argv_is_fixed() {
         let lease = lease();
@@ -2036,6 +2401,78 @@ mod tests {
     }
 
     #[test]
+    fn verified_output_and_shared_toolchain_are_explicit_read_only_contexts() {
+        let request = RootlessOciBuildRequestV1::from_policy(&verified_lease(), &verified_policy())
+            .expect("verified request");
+        let arguments = buildctl_arguments(&request).expect("buildctl arguments");
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| { argument == "--local=native=/toolchains/rimg-native/opt/4u" })
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| { argument == "--opt=context:native=local:native" })
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| { argument == "--local=verified-release=/operation/release" })
+        );
+        assert!(arguments.iter().any(|argument| {
+            argument == "--opt=context:verified-release=local:verified-release"
+        }));
+    }
+
+    #[test]
+    fn verified_output_inventory_is_flat_bounded_and_read_only() {
+        let directory = tempdir().expect("temporary directory");
+        let release = directory.path().join("release");
+        fs::create_dir(&release).expect("release directory");
+        fs::write(release.join("rimg"), b"verified binary").expect("release binary");
+        fs::set_permissions(release.join("rimg"), fs::Permissions::from_mode(0o555))
+            .expect("binary mode");
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o555)).expect("release mode");
+        let policy = verified_policy().verified_output.expect("verified output");
+        let first = verified_output_digest(directory.path(), &policy).expect("output digest");
+        assert_eq!(first.as_str().len(), 64);
+
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o755))
+            .expect("writable release mode");
+        assert!(matches!(
+            verified_output_digest(directory.path(), &policy),
+            Err(RootlessOciBuildError::UnsafeInput)
+        ));
+
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o755))
+            .expect("open release directory");
+        fs::write(release.join("extra"), b"unexpected payload").expect("extra file");
+        fs::set_permissions(release.join("extra"), fs::Permissions::from_mode(0o444))
+            .expect("extra file mode");
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o555))
+            .expect("seal release directory");
+        assert!(matches!(
+            verified_output_digest(directory.path(), &policy),
+            Err(RootlessOciBuildError::UnsafeInput)
+        ));
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o755))
+            .expect("open release directory");
+        fs::remove_file(release.join("extra")).expect("remove extra file");
+        fs::create_dir(release.join("nested")).expect("nested directory");
+        fs::set_permissions(release.join("nested"), fs::Permissions::from_mode(0o555))
+            .expect("nested directory mode");
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o555))
+            .expect("seal release directory");
+        let mut nested_policy = policy.clone();
+        nested_policy.max_files = 2;
+        assert!(matches!(
+            verified_output_digest(directory.path(), &nested_policy),
+            Err(RootlessOciBuildError::UnsafeInput)
+        ));
+    }
+
+    #[test]
     fn policy_rejects_duplicate_or_unsafe_dynamic_inputs() {
         let mut policy = policy();
         policy.build_args.push(policy.build_args[0].clone());
@@ -2055,6 +2492,42 @@ mod tests {
             policy.validate(),
             Err(RootlessOciBuildError::InvalidPolicy)
         ));
+        let mut policy = verified_policy();
+        policy.local_inputs[0].local_name = "context".to_owned();
+        assert!(matches!(
+            policy.validate(),
+            Err(RootlessOciBuildError::InvalidPolicy)
+        ));
+        let mut policy = verified_policy();
+        policy
+            .verified_output
+            .as_mut()
+            .expect("verified output")
+            .context_name = "dockerfile".to_owned();
+        assert!(matches!(
+            policy.validate(),
+            Err(RootlessOciBuildError::InvalidPolicy)
+        ));
+        let mut policy = verified_policy();
+        policy.local_inputs[0].local_name = "verified-release".to_owned();
+        assert!(matches!(
+            policy.validate(),
+            Err(RootlessOciBuildError::InvalidPolicy)
+        ));
+        for reserved_source in ["context", "dockerfile"] {
+            let mut policy = super::tests::policy();
+            policy.base_inputs[0].source = reserved_source.to_owned();
+            assert!(matches!(
+                policy.validate(),
+                Err(RootlessOciBuildError::InvalidPolicy)
+            ));
+            let mut policy = verified_policy();
+            policy.local_inputs[0].source = reserved_source.to_owned();
+            assert!(matches!(
+                policy.validate(),
+                Err(RootlessOciBuildError::InvalidPolicy)
+            ));
+        }
     }
 
     #[test]
@@ -2172,6 +2645,7 @@ mod tests {
             config_digest,
             archive_digest,
             archive_bytes,
+            None,
         )
         .expect("result");
         fs::set_permissions(&archive_path, fs::Permissions::from_mode(0o400))

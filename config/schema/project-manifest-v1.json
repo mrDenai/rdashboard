@@ -88,6 +88,16 @@
         },
         "kind": {
           "$ref": "#/$defs/BuildKind"
+        },
+        "verified_output": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VerifiedOciOutputPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -242,6 +252,34 @@
       "required": [
         "remote_url",
         "branch"
+      ]
+    },
+    "VerifiedOciOutputPolicy": {
+      "type": "object",
+      "properties": {
+        "context_name": {
+          "type": "string"
+        },
+        "directory": {
+          "type": "string"
+        },
+        "max_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_files": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "context_name",
+        "directory",
+        "max_bytes",
+        "max_files"
       ]
     },
     "WriteFencePolicy": {

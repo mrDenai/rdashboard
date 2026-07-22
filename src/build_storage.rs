@@ -4,6 +4,7 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// final artifact assembly. Ownership still separates its children; capacity is shared so identical
 /// toolchains and content-addressed inputs are not copied per project or worker.
 pub const SHARED_BUILD_STORAGE_ROOT: &str = "/var/lib/rdashboard-build";
+pub const SHARED_TOOLCHAIN_STORE_ROOT: &str = "/var/lib/rdashboard-build/toolchains";
 
 /// The shared filesystem must hold one maximum-sized operation plus the reusable preparation and
 /// packaging inputs needed to finish it. It is one bound for all projects, not a per-project quota.

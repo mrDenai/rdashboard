@@ -11,7 +11,7 @@ use rdashboard::{
         OperationPhase, OperationResult, OperationState, OperationStateError,
         PROJECT_MANIFEST_SCHEMA_VERSION, ProjectId, ProjectManifestV1, Redactor,
         RelativePolicyPath, ReleaseClass, RemoteUrl, Retryability, RollbackPolicy, SourcePolicy,
-        StructuredError, WriteFencePolicy,
+        StructuredError, VerifiedOciOutputPolicy, WriteFencePolicy,
     },
     policy::{PolicyBundleV1, PolicyError, PolicyVerifier, SignedPolicyBundleV1},
     protocol::{
@@ -40,6 +40,7 @@ fn valid_manifest() -> ProjectManifestV1 {
                 RelativePolicyPath::from_str("Dockerfile")
                     .unwrap_or_else(|error| panic!("fixture: {error}")),
             ),
+            verified_output: None,
         },
         health_checks: vec![HealthCheckPolicy {
             name: "readiness".to_owned(),
@@ -132,6 +133,21 @@ fn manifest_rejects_traversal_embedded_credentials_and_duplicates() {
     manifest
         .validate()
         .unwrap_or_else(|error| panic!("conventional Dockerfile variant: {error}"));
+
+    for reserved_context_name in ["context", "dockerfile"] {
+        let mut manifest = valid_manifest();
+        manifest.build.verified_output = Some(VerifiedOciOutputPolicy {
+            context_name: reserved_context_name.to_owned(),
+            directory: RelativePolicyPath::from_str("release")
+                .unwrap_or_else(|error| panic!("release path fixture: {error}")),
+            max_bytes: 64 * 1024 * 1024,
+            max_files: 1,
+        });
+        assert_eq!(
+            manifest.validate(),
+            Err(ManifestError::InvalidDockerfilePath)
+        );
+    }
 }
 
 #[test]

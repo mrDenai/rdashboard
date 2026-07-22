@@ -19,7 +19,7 @@ otherwise a setuid mapping helper could expose a reserved host identity through 
 
 Before any build service starts, provide one hard-bounded filesystem at
 `/var/lib/rdashboard-build`. It must be at least 16 GiB and contains the preparation CAS, operation
-state, BuildKit state and OCI results for every project. Their child directories keep distinct owners
+state, one root-owned `toolchains` tree, BuildKit state and OCI results for every project. Their child directories keep distinct owners
 and modes; the mode-`0711` root permits traversal without granting BuildKit the source-reader group.
 They share capacity so toolchains and content-addressed inputs are stored once. Do not
 mount a filesystem per component or per project. The host root filesystem must retain 20 GiB after an
@@ -74,6 +74,17 @@ the placeholders:
     "dependency_path": "oci-layouts/debian-trixie",
     "manifest_digest": "sha256:<64 lowercase hex>"
   }],
+  "local_inputs": [{
+    "source": "native",
+    "local_name": "native",
+    "toolchain_path": "rimg-native/opt/4u"
+  }],
+  "verified_output": {
+    "context_name": "verified-release",
+    "directory": "release",
+    "max_bytes": 134217728,
+    "max_files": 1
+  },
   "max_archive_bytes": 2147483648
 }]
 ```
@@ -83,13 +94,22 @@ part of the authority boundary. Every non-scratch base must already exist as a s
 dependency snapshot and be named by `base_inputs`; the daemon's private network intentionally cannot
 fetch it on demand. Dockerfiles that request an external `# syntax=` frontend fail before `buildctl`
 starts. No secret, SSH mount, entitlement, registry output or external cache argument can be supplied.
+`local_inputs` name exact root-owned, non-group/world-writable subtrees below the single
+`/var/lib/rdashboard-build/toolchains` store. The launcher exposes only that store read-only; project
+Dockerfiles do not install their own Rust, Cargo or native compiler stack. For rimg the additional
+`rimg-native` tree is published once under its checked fingerprint and manifest.
 The canonical non-secret build request remains root-owned inside the mode-`0700` result store and is
 mode `0444` so the unrelated unprivileged build UID can open its individual read-only bind mount; the
 host path is otherwise untraversable and the transient mount namespace exposes only that exact file.
 The client verifies BuildKit metadata plus every referenced OCI blob, and root verifies it again before
-atomically promoting the result. Process success without that typed result is workflow failure. OCI
-builds allocate no shared operation-state cache and can run independently beside verification. The
-root-owned unit/request registry retries staging cleanup after an ambiguous process wait. This result
+atomically promoting the result. Process success without that typed result is workflow failure. An OCI
+policy without `verified_output` allocates no operation state and may run independently beside
+verification. A policy with `verified_output` must wait for the exact verification receipt, reuse that
+attempt's operation state on the same VPS, expose only the declared sealed directory as a named
+context, and record its stable content digest before removing it. That directory is deliberately flat:
+only bounded regular single-link files are accepted; nested directories and extra entries fail before
+BuildKit starts. The root-owned unit/request registry retries staging cleanup after an ambiguous
+process wait. This result
 is not a `ReleaseBundle`: final sealing still waits for CI evidence, resource reservation and installed
 deployment policy.
 

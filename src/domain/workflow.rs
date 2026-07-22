@@ -641,26 +641,7 @@ fn validate_executor_mutation_graph(
     let build_profile = profiles
         .get(&build.profile_id)
         .ok_or_else(|| WorkflowContractError::MissingProfile(build.profile_id.clone()))?;
-    match build_profile.adapter_id {
-        WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 => {
-            require_dependencies(build, std::slice::from_ref(&prepare.node_id))?;
-        }
-        WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 => {
-            let [verification] = verification.as_slice() else {
-                return Err(WorkflowContractError::InvalidNodeCardinality(
-                    WorkflowNodeKindV1::Verification,
-                ));
-            };
-            let mut dependencies = vec![prepare.node_id.clone(), verification.node_id.clone()];
-            dependencies.sort();
-            require_dependencies(build, &dependencies)?;
-        }
-        _ => {
-            return Err(WorkflowContractError::ProfileKindMismatch(
-                build.node_id.clone(),
-            ));
-        }
-    }
+    validate_release_dependencies(build, build_profile, prepare, &verification)?;
     let mut reduce_dependencies = verification
         .iter()
         .map(|node| node.node_id.clone())
@@ -696,6 +677,45 @@ fn validate_executor_mutation_graph(
     require_dependencies(observe, std::slice::from_ref(&cutover.node_id))?;
     require_dependencies(rollback, std::slice::from_ref(&cutover.node_id))?;
     Ok(())
+}
+
+fn validate_release_dependencies(
+    build: &WorkflowNodeV1,
+    build_profile: &WorkflowExecutionProfileV1,
+    prepare: &WorkflowNodeV1,
+    verification: &[&WorkflowNodeV1],
+) -> Result<(), WorkflowContractError> {
+    match build_profile.adapter_id {
+        WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 => {
+            let parallel = vec![prepare.node_id.clone()];
+            let serial = if let [verification] = verification {
+                let mut dependencies = vec![prepare.node_id.clone(), verification.node_id.clone()];
+                dependencies.sort();
+                Some(dependencies)
+            } else {
+                None
+            };
+            if build.depends_on != parallel && serial.as_ref() != Some(&build.depends_on) {
+                return Err(WorkflowContractError::InvalidDependencies(
+                    build.node_id.clone(),
+                ));
+            }
+            Ok(())
+        }
+        WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 => {
+            let [verification] = verification else {
+                return Err(WorkflowContractError::InvalidNodeCardinality(
+                    WorkflowNodeKindV1::Verification,
+                ));
+            };
+            let mut dependencies = vec![prepare.node_id.clone(), verification.node_id.clone()];
+            dependencies.sort();
+            require_dependencies(build, &dependencies)
+        }
+        _ => Err(WorkflowContractError::ProfileKindMismatch(
+            build.node_id.clone(),
+        )),
+    }
 }
 
 fn validate_self_update_handoff_graph(

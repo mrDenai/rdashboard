@@ -125,6 +125,11 @@ impl ProjectManifestV2 {
         if !build_matches_release {
             return Err(ManifestError::BuildWorkflowMismatch);
         }
+        if self.build.kind == BuildKind::Oci
+            && self.build.verified_output.is_some() != self.consumes_verified_oci_output()?
+        {
+            return Err(ManifestError::BuildWorkflowMismatch);
+        }
         if let Some(policy) = self.host_preparation.as_ref() {
             let preparation_profile = self
                 .workflow
@@ -162,6 +167,25 @@ impl ProjectManifestV2 {
             return Err(ManifestError::WorkflowMigrationMismatch);
         }
         Ok(())
+    }
+
+    fn consumes_verified_oci_output(&self) -> Result<bool, ManifestError> {
+        let release = self
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .ok_or(ManifestError::BuildWorkflowMismatch)?;
+        let verification = self
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::Verification)
+            .ok_or(ManifestError::BuildWorkflowMismatch)?;
+        Ok(release.depends_on.contains(&verification.node_id)
+            && release
+                .input_contracts
+                .contains(&super::WorkflowArtifactKindV1::VerificationReceipt))
     }
 
     pub fn workflow_policy_digest(&self) -> Result<EvidenceDigest, ManifestError> {
@@ -282,31 +306,68 @@ pub struct BuildPolicy {
     pub kind: BuildKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<RelativePolicyPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_output: Option<VerifiedOciOutputPolicy>,
 }
 
 impl BuildPolicy {
     fn validate(&self) -> Result<(), ManifestError> {
-        let valid = match (&self.kind, &self.dockerfile) {
-            (BuildKind::Oci, Some(dockerfile)) => std::path::Path::new(dockerfile.as_str())
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|name| {
-                    name == "Dockerfile"
-                        || name.strip_prefix("Dockerfile.").is_some_and(|variant| {
-                            !variant.is_empty()
-                                && variant.bytes().all(|byte| {
-                                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
-                                })
-                        })
-                }),
-            (BuildKind::Native, None) => true,
-            (BuildKind::Oci, None) | (BuildKind::Native, Some(_)) => false,
+        let valid = match (&self.kind, &self.dockerfile, &self.verified_output) {
+            (BuildKind::Oci, Some(dockerfile), verified_output) => {
+                std::path::Path::new(dockerfile.as_str())
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| {
+                        name == "Dockerfile"
+                            || name.strip_prefix("Dockerfile.").is_some_and(|variant| {
+                                !variant.is_empty()
+                                    && variant.bytes().all(|byte| {
+                                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                                    })
+                            })
+                    })
+                    && verified_output
+                        .as_ref()
+                        .is_none_or(VerifiedOciOutputPolicy::validate)
+            }
+            (BuildKind::Native, None, None) => true,
+            (BuildKind::Oci, None, _)
+            | (BuildKind::Native, Some(_), _)
+            | (BuildKind::Native, None, Some(_)) => false,
         };
         if !valid {
             return Err(ManifestError::InvalidDockerfilePath);
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedOciOutputPolicy {
+    pub context_name: String,
+    pub directory: RelativePolicyPath,
+    pub max_bytes: u64,
+    pub max_files: u32,
+}
+
+impl VerifiedOciOutputPolicy {
+    pub(crate) fn validate(&self) -> bool {
+        valid_build_context_name(&self.context_name)
+            && (1024..=512 * 1024 * 1024).contains(&self.max_bytes)
+            && (1..=1_024).contains(&self.max_files)
+    }
+}
+
+fn valid_build_context_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && !matches!(value, "context" | "dockerfile")
+        && bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

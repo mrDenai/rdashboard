@@ -96,6 +96,16 @@ fn self_update_manifest() -> ProjectManifestV2 {
     manifest
 }
 
+fn rimg_manifest() -> ProjectManifestV2 {
+    let manifest: ProjectManifestV2 =
+        serde_json::from_str(include_str!("../config/project-manifests/rimg.json"))
+            .unwrap_or_else(|error| panic!("decode rimg manifest: {error}"));
+    manifest
+        .validate()
+        .unwrap_or_else(|error| panic!("rimg workflow fixture: {error}"));
+    manifest
+}
+
 fn admission(
     manifest: &ProjectManifestV2,
     sha_byte: char,
@@ -613,11 +623,11 @@ fn native_release_keeps_verification_and_packaging_on_the_same_required_host() {
 }
 
 #[test]
-fn vps_can_build_oci_in_parallel_without_duplicating_compiled_state() {
+fn verified_oci_reuses_the_exact_gate_output_on_the_same_vps() {
     let store = ControlStore::open(":memory:")
         .unwrap_or_else(|error| panic!("open control store: {error}"));
     let scheduler = DurableWorkflowScheduler::new(store);
-    let manifest = manifest("rimg", 1);
+    let manifest = rimg_manifest();
     scheduler
         .admit(
             &manifest,
@@ -635,30 +645,50 @@ fn vps_can_build_oci_in_parallel_without_duplicating_compiled_state() {
     let prepare = claim(&scheduler, &worker, 10);
     commit_success(&scheduler, &prepare, "prepare-state");
 
-    let first = claim(&scheduler, &worker, 30);
-    let second = claim(&scheduler, &worker, 31);
-    assert_ne!(second.node_kind, first.node_kind);
-    let (verification, release) = if first.node_kind == WorkflowNodeKindV1::Verification {
-        (&first, &second)
-    } else {
-        (&second, &first)
-    };
-    assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
-    assert!(release.operation_state.is_none());
+    let verification = claim(&scheduler, &worker, 30);
+    assert_eq!(verification.node_kind, WorkflowNodeKindV1::Verification);
     let verification_state = verification
         .operation_state
         .as_ref()
         .unwrap_or_else(|| panic!("verification compiled state"));
     assert_eq!(
         verification_state.consumer_nodes,
-        vec![verification.node_id.clone()]
+        vec![
+            "release-build"
+                .parse()
+                .unwrap_or_else(|error| panic!("release node: {error}")),
+            verification.node_id.clone(),
+        ]
     );
     assert!(
         scheduler
-            .claim_next(&worker, 32, 1_000)
-            .unwrap_or_else(|error| panic!("third parallel VPS claim: {error}"))
+            .claim_next(&worker, 31, 1_000)
+            .unwrap_or_else(|error| panic!("premature release claim: {error}"))
             .is_none(),
-        "only the independent verification and OCI build should be ready"
+        "OCI packaging must wait for the exact verification receipt"
+    );
+    commit_success(&scheduler, &verification, "verified-rimg");
+    let release = claim(&scheduler, &worker, 50);
+    assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+    assert_eq!(release.host_id, verification.host_id);
+    assert_eq!(
+        release
+            .operation_state
+            .as_ref()
+            .unwrap_or_else(|| panic!("release operation state"))
+            .state_key,
+        verification_state.state_key
+    );
+    assert_eq!(
+        release
+            .input_artifacts
+            .iter()
+            .map(|input| input.artifact_kind)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            WorkflowArtifactKindV1::PreparedRun,
+            WorkflowArtifactKindV1::VerificationReceipt,
+        ])
     );
 }
 
