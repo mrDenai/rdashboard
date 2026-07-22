@@ -123,6 +123,15 @@ fn manifest_rejects_traversal_embedded_credentials_and_duplicates() {
         manifest.validate(),
         Err(ManifestError::InvalidDockerfilePath)
     );
+
+    let mut manifest = valid_manifest();
+    manifest.build.dockerfile = Some(
+        RelativePolicyPath::from_str("Dockerfile.runtime")
+            .unwrap_or_else(|error| panic!("variant Dockerfile fixture: {error}")),
+    );
+    manifest
+        .validate()
+        .unwrap_or_else(|error| panic!("conventional Dockerfile variant: {error}"));
 }
 
 #[test]

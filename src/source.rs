@@ -445,6 +445,24 @@ pub struct SourceStore {
     bound_broker_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceOutboxStatus {
+    Pending,
+    Delivered,
+    Superseded,
+}
+
+impl SourceOutboxStatus {
+    fn parse(value: &str) -> Result<Self, SourceError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "delivered" => Ok(Self::Delivered),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(SourceError::CorruptLedger("source outbox status")),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SourceBrokerLease {
     lock_file: File,
@@ -1082,6 +1100,39 @@ impl SourceStore {
         prune_settled_outbox(&transaction)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    fn source_outbox_status(
+        &self,
+        project_id: &ProjectId,
+        source_sequence: u64,
+        attestation_digest: &EvidenceDigest,
+    ) -> Result<Option<SourceOutboxStatus>, SourceError> {
+        if source_sequence == 0 {
+            return Err(SourceError::SequenceRange);
+        }
+        let source_sequence =
+            i64::try_from(source_sequence).map_err(|_| SourceError::SequenceRange)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        self.require_bound_broker_epoch(&transaction)?;
+        let status = transaction
+            .query_row(
+                "SELECT status FROM source_outbox
+                 WHERE project_id = ?1 AND source_sequence = ?2
+                   AND attestation_digest = ?3",
+                params![
+                    project_id.as_str(),
+                    source_sequence,
+                    attestation_digest.as_str()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| SourceOutboxStatus::parse(&value))
+            .transpose()?;
+        transaction.commit()?;
+        Ok(status)
     }
 
     fn acknowledge_outbox(
@@ -1913,7 +1964,14 @@ fn enqueue_deployable_outcome(
 fn prune_settled_outbox(transaction: &Transaction<'_>) -> Result<(), SourceError> {
     transaction.execute(
         "DELETE FROM source_outbox
-         WHERE status != 'pending' AND outbox_sequence NOT IN (
+         WHERE status != 'pending'
+           AND NOT EXISTS (
+             SELECT 1 FROM source_projects AS current
+             WHERE current.project_id = source_outbox.project_id
+               AND current.sequence = source_outbox.source_sequence
+               AND current.attestation_digest = source_outbox.attestation_digest
+           )
+           AND outbox_sequence NOT IN (
              SELECT outbox_sequence FROM source_outbox
              WHERE status != 'pending'
              ORDER BY outbox_sequence DESC
@@ -3482,11 +3540,12 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
                     return Ok(SourceIngressOutcome::SourceDivergedNeedsOwner);
                 }
                 Some(CommitRelationship::Same) => {
-                    if let Some(outcome) = existing_same_head_delivery(&current, ingress)? {
+                    if let Some(outcome) = self.replay_same_head(project_id, &current, ingress)? {
                         return Ok(outcome);
                     }
-                    // A root-owned policy change deliberately re-attests the unchanged head and
-                    // advances the sequence, invalidating work authorized by the old policy.
+                    // A root-owned policy change, or an expired delivery that is still pending,
+                    // deliberately re-attests the unchanged head. An already delivered or
+                    // disabled unchanged head remains on the same immutable source generation.
                 }
                 None | Some(CommitRelationship::FastForward) => {}
             }
@@ -3535,6 +3594,27 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
         Err(SourceError::ConcurrentSourceUpdate)
     }
 
+    fn replay_same_head(
+        &self,
+        project_id: &ProjectId,
+        current: &SourceSnapshot,
+        ingress: &CandidateIngress<'_>,
+    ) -> Result<Option<SourceIngressOutcome>, SourceError> {
+        let current_attestation_digest =
+            current
+                .attestation_digest
+                .as_ref()
+                .ok_or(SourceError::CorruptLedger(
+                    "current head lacks attestation digest",
+                ))?;
+        let outbox_status = self.store.source_outbox_status(
+            project_id,
+            current.sequence,
+            current_attestation_digest,
+        )?;
+        existing_same_head_delivery(current, ingress, outbox_status)
+    }
+
     fn verify_delivery_live(
         &self,
         delivery: &VerifiedSourceDelivery,
@@ -3570,14 +3650,19 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
 fn existing_same_head_delivery(
     current: &SourceSnapshot,
     ingress: &CandidateIngress<'_>,
+    outbox_status: Option<SourceOutboxStatus>,
 ) -> Result<Option<SourceIngressOutcome>, SourceError> {
     let attestation = current
         .attestation
         .as_ref()
         .ok_or(SourceError::CorruptLedger("current head lacks attestation"))?;
+    let expired = ingress.now_ms >= attestation.payload.expires_at_ms;
+    let expired_attestation_must_be_delivered = expired
+        && ingress.installed_policy.auto_deploy
+        && outbox_status != Some(SourceOutboxStatus::Delivered);
     if attestation.payload.installed_policy != ingress.installed_policy.installed_policy
         || attestation.payload.repository_identity != ingress.installed_policy.repository_identity
-        || ingress.now_ms >= attestation.payload.expires_at_ms
+        || expired_attestation_must_be_delivered
     {
         return Ok(None);
     }

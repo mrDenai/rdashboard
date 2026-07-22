@@ -287,10 +287,18 @@ pub struct BuildPolicy {
 impl BuildPolicy {
     fn validate(&self) -> Result<(), ManifestError> {
         let valid = match (&self.kind, &self.dockerfile) {
-            (BuildKind::Oci, Some(dockerfile)) => {
-                std::path::Path::new(dockerfile.as_str()).file_name()
-                    == Some(std::ffi::OsStr::new("Dockerfile"))
-            }
+            (BuildKind::Oci, Some(dockerfile)) => std::path::Path::new(dockerfile.as_str())
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| {
+                    name == "Dockerfile"
+                        || name.strip_prefix("Dockerfile.").is_some_and(|variant| {
+                            !variant.is_empty()
+                                && variant.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                                })
+                        })
+                }),
             (BuildKind::Native, None) => true,
             (BuildKind::Oci, None) | (BuildKind::Native, Some(_)) => false,
         };

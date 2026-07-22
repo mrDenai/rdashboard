@@ -852,6 +852,157 @@ fn expired_same_head_attestations_are_renewed_for_direct_and_reconciled_ingress(
     );
 }
 
+fn overflow_settled_outbox(path: &std::path::Path) {
+    let mut connection = rusqlite::Connection::open(path)
+        .unwrap_or_else(|error| panic!("open outbox retention fixture: {error}"));
+    let transaction = connection
+        .transaction()
+        .unwrap_or_else(|error| panic!("begin outbox retention fixture: {error}"));
+    for index in 0..2_050 {
+        transaction
+            .execute(
+                "INSERT INTO source_outbox(
+                    project_id, source_sequence, attestation_json, attestation_digest,
+                    status, enqueued_at_ms, settled_at_ms
+                 ) VALUES (?1, 1, '{}', ?2, 'delivered', 103, 103)",
+                rusqlite::params![
+                    format!("retention-fixture-{index}"),
+                    format!("sha256:{index:064x}")
+                ],
+            )
+            .unwrap_or_else(|error| panic!("insert outbox retention fixture: {error}"));
+    }
+    transaction
+        .commit()
+        .unwrap_or_else(|error| panic!("commit outbox retention fixture: {error}"));
+}
+
+#[test]
+fn expired_delivered_head_keeps_its_generation_and_outbox_marker() {
+    let delivered_directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let delivered_path = delivered_directory.path().join("source.sqlite");
+    let delivered_store =
+        SourceStore::open(&delivered_path).unwrap_or_else(|error| panic!("source store: {error}"));
+    let delivered_repository = deterministic_repository();
+    delivered_repository
+        .insert_commit(&project(), &commit('a'), None)
+        .and_then(|()| delivered_repository.set_remote_head(&project(), commit('a')))
+        .unwrap_or_else(|error| panic!("prepare delivered source: {error}"));
+    let delivered = source_broker_with_ttl(
+        delivered_store,
+        delivered_repository,
+        source_policy(1),
+        10_000,
+        100,
+    );
+    delivered
+        .process_direct_push(
+            &project(),
+            "delivered-initial",
+            "refs/heads/main",
+            None,
+            commit('a'),
+            101,
+        )
+        .unwrap_or_else(|error| panic!("initial delivered source: {error}"));
+    let entry = delivered
+        .pending_outbox(1)
+        .unwrap_or_else(|error| panic!("pending delivered source: {error}"))
+        .remove(0);
+    delivered
+        .acknowledge_outbox(entry.outbox_sequence, &entry.attestation_digest, 102)
+        .unwrap_or_else(|error| panic!("acknowledge delivered source: {error}"));
+
+    overflow_settled_outbox(&delivered_path);
+    delivered
+        .acknowledge_outbox(entry.outbox_sequence, &entry.attestation_digest, 104)
+        .unwrap_or_else(|error| panic!("prune settled outbox: {error}"));
+    let connection = rusqlite::Connection::open(&delivered_path)
+        .unwrap_or_else(|error| panic!("inspect outbox retention fixture: {error}"));
+    let current_outbox_retained = connection
+        .query_row(
+            "SELECT COUNT(*) FROM source_outbox WHERE attestation_digest = ?1",
+            [entry.attestation_digest.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|error| panic!("inspect current outbox retention: {error}"));
+    assert_eq!(
+        current_outbox_retained, 1,
+        "settled outbox pruning must retain the current source generation"
+    );
+
+    delivered
+        .reconcile_remote_main(&project(), 10_101)
+        .unwrap_or_else(|error| panic!("reconcile delivered source: {error}"));
+    delivered
+        .process_direct_push(
+            &project(),
+            "delivered-replay",
+            "refs/heads/main",
+            Some(&commit('a')),
+            commit('a'),
+            10_102,
+        )
+        .unwrap_or_else(|error| panic!("replay delivered source: {error}"));
+    assert_eq!(
+        delivered
+            .store()
+            .snapshot(&project())
+            .unwrap_or_else(|error| panic!("delivered snapshot: {error}"))
+            .sequence,
+        1,
+        "an already delivered unchanged head must keep its immutable source generation"
+    );
+    assert!(
+        delivered
+            .pending_outbox(1)
+            .unwrap_or_else(|error| panic!("delivered outbox: {error}"))
+            .is_empty()
+    );
+}
+
+#[test]
+fn expired_disabled_head_does_not_create_periodic_generations() {
+    let disabled_directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let disabled_store = SourceStore::open(disabled_directory.path().join("source.sqlite"))
+        .unwrap_or_else(|error| panic!("disabled source store: {error}"));
+    let disabled_repository = deterministic_repository();
+    disabled_repository
+        .insert_commit(&project(), &commit('b'), None)
+        .and_then(|()| disabled_repository.set_remote_head(&project(), commit('b')))
+        .unwrap_or_else(|error| panic!("prepare disabled source: {error}"));
+    let mut disabled_policy = source_policy(1);
+    disabled_policy.auto_deploy = false;
+    let disabled = source_broker_with_ttl(
+        disabled_store,
+        disabled_repository,
+        disabled_policy,
+        10_000,
+        100,
+    );
+    disabled
+        .reconcile_remote_main(&project(), 101)
+        .unwrap_or_else(|error| panic!("initial disabled source: {error}"));
+    disabled
+        .reconcile_remote_main(&project(), 10_101)
+        .unwrap_or_else(|error| panic!("expired disabled source: {error}"));
+    assert_eq!(
+        disabled
+            .store()
+            .snapshot(&project())
+            .unwrap_or_else(|error| panic!("disabled snapshot: {error}"))
+            .sequence,
+        1,
+        "an unchanged disabled project must not generate periodic source archives"
+    );
+    assert!(
+        disabled
+            .pending_outbox(1)
+            .unwrap_or_else(|error| panic!("disabled outbox: {error}"))
+            .is_empty()
+    );
+}
+
 #[test]
 fn reconciliation_reevaluates_controls_and_historical_rewinds() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));

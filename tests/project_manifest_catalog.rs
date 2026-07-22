@@ -246,6 +246,112 @@ fn ralert_contract_separates_stateful_templates_from_disposable_images() {
 }
 
 #[test]
+fn rimg_contract_records_native_build_state_and_fenced_migration_without_activation() {
+    let (_, manifest) = catalog()
+        .into_iter()
+        .find(|(id, _)| id == "rimg")
+        .unwrap_or_else(|| panic!("rimg manifest is required"));
+
+    assert_eq!(
+        manifest.source.remote_url.as_str(),
+        "ssh://git@github.com/mrDenai/rimg.git"
+    );
+    assert_eq!(manifest.build.kind, BuildKind::Oci);
+    assert_eq!(
+        manifest
+            .build
+            .dockerfile
+            .as_ref()
+            .unwrap_or_else(|| panic!("rimg Dockerfile is required"))
+            .as_str(),
+        "Dockerfile.runtime"
+    );
+    assert_eq!(manifest.data_volumes.len(), 3);
+    assert_eq!(manifest.data_volumes[0].path.as_str(), "/app/data");
+    assert_eq!(manifest.data_volumes[0].class, DataClass::Stateful);
+    assert!(manifest.data_volumes[0].backup_required);
+    assert_eq!(manifest.data_volumes[1].path.as_str(), "/app/masters");
+    assert_eq!(manifest.data_volumes[1].class, DataClass::Stateful);
+    assert!(manifest.data_volumes[1].backup_required);
+    assert_eq!(manifest.data_volumes[2].path.as_str(), "/app/uploads");
+    assert_eq!(manifest.data_volumes[2].class, DataClass::Derived);
+    assert!(!manifest.data_volumes[2].backup_required);
+    assert_eq!(
+        manifest.migration.entrypoint,
+        MigrationEntrypoint::ApplicationMigrate
+    );
+    assert_eq!(
+        manifest.migration.write_fence,
+        WriteFencePolicy::ApplicationProtocolV1
+    );
+
+    let endpoints = manifest
+        .health_checks
+        .iter()
+        .map(|check| (check.endpoint.as_str(), check.expected_status))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        endpoints,
+        BTreeSet::from([
+            ("http://rimg:8080/health/live", 204),
+            ("http://rimg:8080/health/ready", 204),
+        ])
+    );
+
+    let migration = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::Migration)
+        .unwrap_or_else(|| panic!("rimg migration node is required"));
+    assert_eq!(
+        manifest
+            .workflow
+            .profile(&migration.profile_id)
+            .unwrap_or_else(|| panic!("rimg migration profile is required"))
+            .adapter_id,
+        WorkflowAdapterIdV1::ExecutorMigrationV1
+    );
+    let candidate = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::CandidateHealth)
+        .unwrap_or_else(|| panic!("rimg candidate-health node is required"));
+    assert_eq!(
+        candidate
+            .depends_on
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec!["migration"]
+    );
+
+    let preparation = manifest
+        .workflow
+        .nodes
+        .iter()
+        .find(|node| node.kind == WorkflowNodeKindV1::HostPrepare)
+        .unwrap_or_else(|| panic!("rimg preparation node is required"));
+    assert_eq!(
+        manifest
+            .workflow
+            .profile(&preparation.profile_id)
+            .unwrap_or_else(|| panic!("rimg preparation profile is required"))
+            .network_class,
+        WorkflowNetworkClassV1::DependencyEgress
+    );
+    assert_eq!(
+        manifest
+            .host_preparation
+            .as_ref()
+            .unwrap_or_else(|| panic!("rimg host preparation is required"))
+            .adapter_id,
+        WorkflowHostPreparationAdapterV1::CargoCratesIoV1
+    );
+}
+
+#[test]
 fn telegram_gateway_contract_preserves_state_and_uses_the_generic_worker() {
     let (_, manifest) = catalog()
         .into_iter()
