@@ -635,12 +635,33 @@ installed inputs:
   `root_folder_id`;
 - `/etc/rdashboard/credentials/rimg-drive-service-account.json`, root-owned and mode `0600`.
 
-The encryption/upload runtime is project-scoped even though backup capture is still rimg-specific in
-this milestone. A non-rimg project reads the same canonical contract from
-`/etc/rdashboard/projects/<project-id>/backup-runtime.jcs` and `rclone.conf`, and only its
+The backup pipeline is project-scoped. A non-rimg project reads the same encryption/upload contract
+from `/etc/rdashboard/projects/<project-id>/backup-runtime.jcs` and `rclone.conf`, and only its
 `/etc/rdashboard/credentials/projects/<project-id>/drive-service-account.json` is eligible for the
 transient upload/readback units. The installed document still binds the exact project and mutation
 policy digest, so a project-specific path cannot authorize a foreign backup.
+
+A non-rimg SQLite service additionally installs canonical mode-`0600`
+`/etc/rdashboard/projects/<project-id>/sqlite-backup-runtime.jcs`. Its purpose is
+`rdashboard.installed-sqlite-backup-runtime.v1`; it binds the exact project and installed mutation
+policy digest, one absolute source database path, and the sorted table allowlist that defines the
+service's domain/staged-read check. The source is accepted only below either the existing Docker
+named-volume root `/var/lib/docker/volumes/<project-id>-data/_data` or the managed data root
+`/var/lib/rdashboard/projects/<project-id>/data`. The path and database must contain no symlink,
+must be root-owned with no group/world access and must have exactly one hard link. Telegram Gateway
+therefore uses `/var/lib/docker/volumes/telegram-gateway-data/_data/gateway.db` during adoption.
+
+For this profile the adapter performs SQLite's online backup API against the live WAL database; it
+does not copy `-wal` or `-shm`, drain the service, or grant the transient unit write access to the
+source volume. It publishes the snapshot through an fsynced pending file and hard link, validates
+integrity, foreign keys, the required-table domain contract and staged reads, then derives the
+application schema identity from the canonical `sqlite_schema` inventory. The immutable database is
+paired with `sqlite-capture-state.jcs`, which binds its digest, schema identity, original capture
+time and authorized backup digest. Replay accepts only the complete pair; a crash that published
+only one member causes a fresh online capture rather than invented timing evidence. This generic
+profile intentionally supports base snapshots only; cutover snapshots still require a real write
+fence and remain rimg-specific. The encrypted archive enumerates the signed manifest objects, while
+the rimg two-object archive retains its exact legacy `database.sqlite`/`masters.bundle` layout.
 
 The service-account file is loaded only into the upload and independent-readback transient units
 with systemd `LoadCredential=`. It is read inside the unit from

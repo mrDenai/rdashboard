@@ -438,7 +438,7 @@ fn transient_unit_arguments(
         format!("--property=BindReadOnlyPaths={source}:{destination}")
     }));
     arguments.extend(
-        fixed_write_paths(job.profile)
+        fixed_write_paths(job.profile, &job.project_id)
             .iter()
             .map(|path| format!("--property=ReadWritePaths={path}")),
     );
@@ -507,14 +507,19 @@ const fn kamal_credentials_required(profile: FixedAdapterProfileV1) -> bool {
     )
 }
 
-const fn fixed_write_paths(profile: FixedAdapterProfileV1) -> &'static [&'static str] {
+fn fixed_write_paths(
+    profile: FixedAdapterProfileV1,
+    project_id: &ProjectId,
+) -> &'static [&'static str] {
     match profile {
         FixedAdapterProfileV1::RimgDrain => &[RIMG_DATA_ROOT],
         FixedAdapterProfileV1::RimgMigrate => &[RIMG_DATA_ROOT, RDASHBOARD_LOCK_ROOT],
-        FixedAdapterProfileV1::BackupCapture => {
+        FixedAdapterProfileV1::BackupCapture if project_id.as_str() == "rimg" => {
             &[RIMG_DATA_ROOT, RDASHBOARD_BACKUP_ROOT, RDASHBOARD_LOCK_ROOT]
         }
-        FixedAdapterProfileV1::BackupEncryptAge => &[RDASHBOARD_BACKUP_ROOT],
+        FixedAdapterProfileV1::BackupCapture | FixedAdapterProfileV1::BackupEncryptAge => {
+            &[RDASHBOARD_BACKUP_ROOT]
+        }
         _ => &[],
     }
 }
@@ -1862,32 +1867,41 @@ mod tests {
             .unwrap_or_else(|error| panic!("backup transient unit: {error}"))
             .arguments()
             .to_vec();
-        for path in [
-            "/var/lib/rimg/data",
-            "/var/lib/rdashboard-executor/backups",
-            "/var/lib/rdashboard-executor/locks",
-        ] {
-            assert!(
-                arguments.contains(&format!("--property=ReadWritePaths={path}")),
-                "missing writable path {path}"
-            );
-        }
+        assert!(arguments.contains(
+            &"--property=ReadWritePaths=/var/lib/rdashboard-executor/backups".to_owned()
+        ));
         assert!(!arguments.iter().any(|argument| {
             argument.starts_with("--property=ReadWritePaths=")
                 && !matches!(
                     argument.as_str(),
                     "--property=ReadWritePaths=/job"
-                        | "--property=ReadWritePaths=/var/lib/rimg/data"
                         | "--property=ReadWritePaths=/var/lib/rdashboard-executor/backups"
-                        | "--property=ReadWritePaths=/var/lib/rdashboard-executor/locks"
                 )
         }));
 
         let encrypt = PreparedAdapterJobV1::prepare_in(&root, path_uid(temp.path()), &spec, 2)
             .unwrap_or_else(|error| panic!("prepare backup encryption: {error}"));
         assert_eq!(
-            fixed_write_paths(encrypt.profile()),
+            fixed_write_paths(encrypt.profile(), &encrypt.project_id),
             &["/var/lib/rdashboard-executor/backups"]
+        );
+        let gateway = "telegram-gateway"
+            .parse::<ProjectId>()
+            .unwrap_or_else(|error| panic!("gateway project id: {error}"));
+        assert_eq!(
+            fixed_write_paths(FixedAdapterProfileV1::BackupCapture, &gateway),
+            &["/var/lib/rdashboard-executor/backups"]
+        );
+        let rimg = "rimg"
+            .parse::<ProjectId>()
+            .unwrap_or_else(|error| panic!("rimg project id: {error}"));
+        assert_eq!(
+            fixed_write_paths(FixedAdapterProfileV1::BackupCapture, &rimg),
+            &[
+                "/var/lib/rimg/data",
+                "/var/lib/rdashboard-executor/backups",
+                "/var/lib/rdashboard-executor/locks",
+            ]
         );
         assert_eq!(
             fixed_adapter_unit_name(&spec, 2)

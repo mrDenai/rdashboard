@@ -3,10 +3,11 @@ use crate::{
     adapter_identity::{AdapterOperationIdentityKindV1, AdapterOperationIdentityV1},
     adapter_result::{AdapterResultContractError, FixedAdapterEvidenceV1, FixedAdapterResultV1},
     backup::{
-        BackupCheckEvidenceV1, BackupContractError, BackupEncryptionAlgorithmV1,
-        BackupEncryptionEvidenceV1, BackupManifestInputV1, BackupManifestV1, BackupObjectV1,
-        BackupSnapshotKindV1, LocalBackupEvidenceV1, OffsiteVerificationEvidenceV1,
-        OffsiteVerificationInputV1, ProviderUploadReceiptInputV1, ProviderUploadReceiptV1,
+        BackupCheckEvidenceV1, BackupConsistencyMechanismV1, BackupContractError,
+        BackupEncryptionAlgorithmV1, BackupEncryptionEvidenceV1, BackupManifestInputV1,
+        BackupManifestV1, BackupObjectV1, BackupSnapshotKindV1, LocalBackupEvidenceV1,
+        OffsiteVerificationEvidenceV1, OffsiteVerificationInputV1, ProviderUploadReceiptInputV1,
+        ProviderUploadReceiptV1,
     },
     phase6::{AuthorizedPhaseSpecV1, FixedAdapterProfileV1, Phase6ContractError},
     rimg_adapter::{
@@ -18,6 +19,8 @@ use crate::{
 pub mod pipeline_runtime;
 #[cfg(unix)]
 pub mod runtime;
+#[cfg(unix)]
+pub mod sqlite_runtime;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapturedBackupEvidenceV1 {
@@ -97,6 +100,14 @@ pub trait BackupCaptureRuntimeV1 {
     fn wait_before_drain_poll(&mut self) -> Result<(), BackupAdapterError>;
 }
 
+pub trait OnlineSqliteBackupCaptureRuntimeV1 {
+    fn capture(
+        &mut self,
+        spec: &AuthorizedPhaseSpecV1,
+        identity: &AdapterOperationIdentityV1,
+    ) -> Result<CapturedBackupEvidenceV1, BackupAdapterError>;
+}
+
 pub fn execute_backup_capture_step<R: BackupCaptureRuntimeV1>(
     job: &LoadedAdapterJobV1,
     runtime: &mut R,
@@ -128,6 +139,49 @@ pub fn execute_backup_capture_step<R: BackupCaptureRuntimeV1>(
         &identity,
         boundary == BaseBoundaryStateV1::Active,
     )?;
+    let result = capture_result(job, captured)?;
+    if backup.snapshot_kind == BackupSnapshotKindV1::Base && boundary == BaseBoundaryStateV1::Active
+    {
+        runtime
+            .resume(&identity)?
+            .document
+            .validate_resumed(&identity)?;
+    }
+    Ok(result)
+}
+
+pub fn execute_online_sqlite_backup_capture_step<R: OnlineSqliteBackupCaptureRuntimeV1>(
+    job: &LoadedAdapterJobV1,
+    runtime: &mut R,
+) -> Result<FixedAdapterResultV1, BackupAdapterError> {
+    if job.request.profile != FixedAdapterProfileV1::BackupCapture {
+        return Err(BackupAdapterError::InvalidExecutionBoundary);
+    }
+    let backup = job
+        .spec
+        .backup
+        .as_ref()
+        .ok_or(BackupAdapterError::MissingBackupAuthorization)?;
+    let identity = job.operation_identity()?;
+    if backup.snapshot_kind != BackupSnapshotKindV1::Base
+        || backup.unit.consistency != BackupConsistencyMechanismV1::SqliteOnlineBackupV1
+        || identity.kind != AdapterOperationIdentityKindV1::BaseBackup
+    {
+        return Err(BackupAdapterError::OperationIdentityMismatch);
+    }
+    let captured = runtime.capture(&job.spec, &identity)?;
+    capture_result(job, captured)
+}
+
+fn capture_result(
+    job: &LoadedAdapterJobV1,
+    captured: CapturedBackupEvidenceV1,
+) -> Result<FixedAdapterResultV1, BackupAdapterError> {
+    let backup = job
+        .spec
+        .backup
+        .as_ref()
+        .ok_or(BackupAdapterError::MissingBackupAuthorization)?;
     let manifest = BackupManifestV1::new(
         backup,
         BackupManifestInputV1 {
@@ -138,13 +192,6 @@ pub fn execute_backup_capture_step<R: BackupCaptureRuntimeV1>(
             checks: captured.checks,
         },
     )?;
-    if backup.snapshot_kind == BackupSnapshotKindV1::Base && boundary == BaseBoundaryStateV1::Active
-    {
-        runtime
-            .resume(&identity)?
-            .document
-            .validate_resumed(&identity)?;
-    }
     Ok(FixedAdapterResultV1::new(
         &job.spec,
         job.request.sequence,
@@ -477,6 +524,19 @@ mod tests {
         }
     }
 
+    impl OnlineSqliteBackupCaptureRuntimeV1 for FakeBackupRuntime {
+        fn capture(
+            &mut self,
+            _spec: &AuthorizedPhaseSpecV1,
+            _identity: &AdapterOperationIdentityV1,
+        ) -> Result<CapturedBackupEvidenceV1, BackupAdapterError> {
+            self.capture_create_flags.push(true);
+            self.captured
+                .take()
+                .ok_or(BackupAdapterError::InvalidSnapshot)
+        }
+    }
+
     struct FakePipelineRuntime {
         encrypt_calls: usize,
         upload_calls: usize,
@@ -538,6 +598,22 @@ mod tests {
 
         assert_eq!(runtime.begin_calls, 1);
         assert_eq!(runtime.resume_calls, 1);
+        assert_eq!(runtime.capture_create_flags, vec![true]);
+        assert!(matches!(
+            result.evidence,
+            FixedAdapterEvidenceV1::BackupManifest(_)
+        ));
+    }
+
+    #[test]
+    fn online_sqlite_base_capture_never_enters_the_rimg_drain_boundary() {
+        let fixture = base_capture_fixture();
+        let mut runtime = active_capture_runtime(&fixture);
+        let result = execute_online_sqlite_backup_capture_step(&fixture.job, &mut runtime)
+            .unwrap_or_else(|error| panic!("execute online capture: {error}"));
+
+        assert_eq!(runtime.begin_calls, 0);
+        assert_eq!(runtime.resume_calls, 0);
         assert_eq!(runtime.capture_create_flags, vec![true]);
         assert!(matches!(
             result.evidence,

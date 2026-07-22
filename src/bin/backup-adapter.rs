@@ -4,7 +4,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         adapter_entrypoint::{FixedAdapterInvocationV1, LoadedAdapterJobV1},
         backup_adapter::{
             execute_backup_capture_step, execute_backup_encrypt_step, execute_backup_readback_step,
-            execute_backup_upload_step, pipeline_runtime::InstalledBackupPipelineRuntimeV1,
+            execute_backup_upload_step, execute_online_sqlite_backup_capture_step,
+            pipeline_runtime::InstalledBackupPipelineRuntimeV1,
+            sqlite_runtime::InstalledOnlineSqliteBackupRuntimeV1,
         },
         phase6::FixedAdapterProfileV1,
         rimg_adapter::runtime::InstalledRimgAdminRuntimeV1,
@@ -29,8 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("fixed backup adapter result path has no job directory")?;
     let result = match profile {
         FixedAdapterProfileV1::BackupCapture => {
-            let mut runtime = InstalledRimgAdminRuntimeV1::new(job_directory, &job.spec)?;
-            execute_backup_capture_step(&job, &mut runtime)?
+            if job.spec.project_id.as_str() == "rimg" {
+                let mut runtime = InstalledRimgAdminRuntimeV1::new(job_directory, &job.spec)?;
+                execute_backup_capture_step(&job, &mut runtime)?
+            } else {
+                let mut runtime = InstalledOnlineSqliteBackupRuntimeV1::new(&job.spec)?;
+                execute_online_sqlite_backup_capture_step(&job, &mut runtime)?
+            }
         }
         FixedAdapterProfileV1::BackupEncryptAge => {
             let mut runtime = InstalledBackupPipelineRuntimeV1::new(

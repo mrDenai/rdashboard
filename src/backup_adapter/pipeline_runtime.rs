@@ -933,38 +933,74 @@ fn write_plaintext_archive(
     required_uid: u32,
 ) -> Result<(), BackupAdapterError> {
     let manifest_bytes = manifest.canonical_bytes()?;
-    let database = manifest
-        .objects
-        .iter()
-        .find(|object| object.kind == BackupObjectKindV1::SqliteDatabase)
-        .ok_or(BackupAdapterError::InvalidSnapshot)?;
-    let masters = manifest
-        .objects
-        .iter()
-        .find(|object| object.kind == BackupObjectKindV1::Master)
-        .ok_or(BackupAdapterError::InvalidSnapshot)?;
+    if manifest.objects.is_empty() {
+        return Err(BackupAdapterError::InvalidSnapshot);
+    }
+    let entries = archive_object_entries(snapshot, manifest)?;
     writer.write_all(ARCHIVE_MAGIC)?;
-    writer.write_all(&3_u32.to_be_bytes())?;
+    writer.write_all(
+        &u32::try_from(entries.len().saturating_add(1))
+            .map_err(|_| BackupAdapterError::InvalidSnapshot)?
+            .to_be_bytes(),
+    )?;
     write_memory_entry(
         writer,
         "rdashboard-manifest.jcs",
         &manifest_bytes,
         &EvidenceDigest::sha256(&manifest_bytes),
     )?;
-    write_file_entry(
-        writer,
-        "database.sqlite",
-        &snapshot.join("database.sqlite"),
-        database,
-        required_uid,
-    )?;
-    write_file_entry(
-        writer,
-        "masters.bundle",
-        &snapshot.join("masters.bundle"),
-        masters,
-        required_uid,
-    )
+    for entry in entries {
+        write_file_entry(writer, entry.name, &entry.path, entry.object, required_uid)?;
+    }
+    Ok(())
+}
+
+struct ArchiveObjectEntryV1<'a> {
+    name: &'a str,
+    path: PathBuf,
+    object: &'a crate::backup::BackupObjectV1,
+}
+
+fn archive_object_entries<'a>(
+    snapshot: &Path,
+    manifest: &'a BackupManifestV1,
+) -> Result<Vec<ArchiveObjectEntryV1<'a>>, BackupAdapterError> {
+    if manifest.project_id.as_str() == "rimg" {
+        if manifest.objects.len() != 2 {
+            return Err(BackupAdapterError::InvalidSnapshot);
+        }
+        let database = manifest
+            .objects
+            .iter()
+            .find(|object| object.kind == BackupObjectKindV1::SqliteDatabase)
+            .ok_or(BackupAdapterError::InvalidSnapshot)?;
+        let masters = manifest
+            .objects
+            .iter()
+            .find(|object| object.kind == BackupObjectKindV1::Master)
+            .ok_or(BackupAdapterError::InvalidSnapshot)?;
+        return Ok(vec![
+            ArchiveObjectEntryV1 {
+                name: "database.sqlite",
+                path: snapshot.join("database.sqlite"),
+                object: database,
+            },
+            ArchiveObjectEntryV1 {
+                name: "masters.bundle",
+                path: snapshot.join("masters.bundle"),
+                object: masters,
+            },
+        ]);
+    }
+    Ok(manifest
+        .objects
+        .iter()
+        .map(|object| ArchiveObjectEntryV1 {
+            name: object.path.as_str(),
+            path: snapshot.join(object.path.as_str()),
+            object,
+        })
+        .collect())
 }
 
 fn write_memory_entry(
@@ -1483,6 +1519,85 @@ mod tests {
                 PathBuf::from("/etc/rdashboard/projects/telegram-gateway/backup-runtime.jcs"),
                 PathBuf::from("/etc/rdashboard/projects/telegram-gateway/rclone.conf"),
             )
+        );
+    }
+
+    #[test]
+    fn archive_layout_preserves_rimg_and_uses_signed_paths_for_other_projects() {
+        let spec = test_base_backup_phase_spec();
+        let backup = spec
+            .backup
+            .as_ref()
+            .unwrap_or_else(|| panic!("backup authorization"));
+        let database_digest = EvidenceDigest::sha256("database");
+        let objects = backup
+            .unit
+            .expected_objects
+            .iter()
+            .map(|expected| crate::backup::BackupObjectV1 {
+                path: expected.path.clone(),
+                kind: expected.kind,
+                size_bytes: 16,
+                sha256: if expected.kind == BackupObjectKindV1::SqliteDatabase {
+                    database_digest.clone()
+                } else {
+                    EvidenceDigest::sha256("masters")
+                },
+                uid: expected.uid,
+                gid: expected.gid,
+                mode: expected.mode,
+                hard_link_count: 1,
+            })
+            .collect();
+        let checks = backup
+            .unit
+            .required_checks
+            .iter()
+            .map(|check| crate::backup::BackupCheckEvidenceV1 {
+                name: check.name.clone(),
+                kind: check.kind,
+                definition_digest: check.definition_digest.clone(),
+                checked_object_digest: database_digest.clone(),
+                outcome: crate::backup::BackupCheckOutcomeV1::Passed,
+                observation_digest: EvidenceDigest::sha256(check.name.as_bytes()),
+            })
+            .collect();
+        let mut manifest = BackupManifestV1::new(
+            backup,
+            crate::backup::BackupManifestInputV1 {
+                application_schema_version: "4".to_owned(),
+                started_at_ms: 1_100,
+                completed_at_ms: 1_100,
+                objects,
+                checks,
+            },
+        )
+        .unwrap_or_else(|error| panic!("manifest: {error}"));
+        manifest.project_id = "rimg"
+            .parse()
+            .unwrap_or_else(|error| panic!("rimg project id: {error}"));
+        let snapshot = Path::new("/snapshot");
+        let rimg = archive_object_entries(snapshot, &manifest)
+            .unwrap_or_else(|error| panic!("rimg entries: {error}"));
+        assert_eq!(
+            rimg.iter()
+                .map(|entry| (entry.name, entry.path.as_path()))
+                .collect::<Vec<_>>(),
+            [
+                ("database.sqlite", Path::new("/snapshot/database.sqlite")),
+                ("masters.bundle", Path::new("/snapshot/masters.bundle")),
+            ]
+        );
+
+        let mut generic = manifest;
+        generic.project_id = "telegram-gateway"
+            .parse()
+            .unwrap_or_else(|error| panic!("gateway project id: {error}"));
+        let generic = archive_object_entries(snapshot, &generic)
+            .unwrap_or_else(|error| panic!("generic entries: {error}"));
+        assert_eq!(
+            generic.iter().map(|entry| entry.name).collect::<Vec<_>>(),
+            ["data/masters", "data/rimg.db"]
         );
     }
 
