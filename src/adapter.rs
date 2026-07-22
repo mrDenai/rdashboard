@@ -19,7 +19,7 @@ use crate::{
     },
     domain::{
         EvidenceDigest, ExecutionCleanupReceiptV1, ExecutionCleanupStateV1, ExecutionResultV1,
-        ExecutionTerminalReceiptV1,
+        ExecutionTerminalReceiptV1, ProjectId,
     },
     execution_receipt::{
         ExecutionReceiptRuntimeError, ExecutionTerminationKindV1,
@@ -56,6 +56,7 @@ pub const KAMAL_SECRETS_CREDENTIAL_SOURCE: &str =
     "/etc/rdashboard/credentials/rimg-kamal-secrets.env";
 pub const KAMAL_SSH_KEY_CREDENTIAL_NAME: &str = "rimg-kamal-ssh-key";
 pub const KAMAL_SSH_KEY_CREDENTIAL_SOURCE: &str = "/etc/rdashboard/credentials/rimg-kamal-ssh-key";
+const PROJECT_CREDENTIAL_ROOT: &str = "/etc/rdashboard/credentials/projects";
 const OUTER_DEADLINE_GRACE: Duration = Duration::from_secs(15);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -68,6 +69,7 @@ pub enum PreparedAdapterJobStateV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedAdapterJobV1 {
+    project_id: ProjectId,
     job_directory: PathBuf,
     spec_path: PathBuf,
     request_path: PathBuf,
@@ -127,6 +129,7 @@ impl PreparedAdapterJobV1 {
             result_state
         };
         Ok(Self {
+            project_id: spec.project_id.clone(),
             job_directory,
             spec_path,
             request_path,
@@ -169,6 +172,7 @@ impl PreparedAdapterJobV1 {
     ) -> Result<(), AdapterJobError> {
         let request = spec.fixed_adapter_request(self.sequence)?;
         if request.digest()? != self.request_document_digest
+            || spec.project_id != self.project_id
             || request.profile != self.profile
             || request.result_schema != self.result_schema
             || request.timeout_ms != self.timeout_ms
@@ -444,13 +448,10 @@ fn transient_unit_arguments(
         ));
     }
     if kamal_credentials_required(job.profile) {
+        let (secrets_source, ssh_key_source) = kamal_credential_sources(&job.project_id);
         arguments.extend([
-            format!(
-                "--property=LoadCredential={KAMAL_SECRETS_CREDENTIAL_NAME}:{KAMAL_SECRETS_CREDENTIAL_SOURCE}"
-            ),
-            format!(
-                "--property=LoadCredential={KAMAL_SSH_KEY_CREDENTIAL_NAME}:{KAMAL_SSH_KEY_CREDENTIAL_SOURCE}"
-            ),
+            format!("--property=LoadCredential={KAMAL_SECRETS_CREDENTIAL_NAME}:{secrets_source}"),
+            format!("--property=LoadCredential={KAMAL_SSH_KEY_CREDENTIAL_NAME}:{ssh_key_source}"),
         ]);
     }
     arguments.extend([
@@ -461,6 +462,20 @@ fn transient_unit_arguments(
     ]);
     arguments.extend(command.argv.iter().map(|argument| (*argument).to_owned()));
     arguments
+}
+
+fn kamal_credential_sources(project_id: &ProjectId) -> (String, String) {
+    if project_id.as_str() == "rimg" {
+        return (
+            KAMAL_SECRETS_CREDENTIAL_SOURCE.to_owned(),
+            KAMAL_SSH_KEY_CREDENTIAL_SOURCE.to_owned(),
+        );
+    }
+    let root = format!("{PROJECT_CREDENTIAL_ROOT}/{}", project_id.as_str());
+    (
+        format!("{root}/kamal-secrets.env"),
+        format!("{root}/kamal-ssh-key"),
+    )
 }
 
 const fn drive_credentials_required(profile: FixedAdapterProfileV1) -> bool {
@@ -1447,6 +1462,16 @@ mod tests {
             .unwrap_or_else(|error| panic!("transient unit plan: {error}"));
         assert_eq!(unit.executable(), SYSTEMD_RUN_EXECUTABLE);
         assert_eq!(unit.outer_deadline(), Duration::from_secs(315));
+        assert!(unit.arguments().contains(&format!(
+            "--property=LoadCredential={KAMAL_SECRETS_CREDENTIAL_NAME}:{PROJECT_CREDENTIAL_ROOT}/adapter-test/kamal-secrets.env"
+        )));
+        assert!(unit.arguments().contains(&format!(
+            "--property=LoadCredential={KAMAL_SSH_KEY_CREDENTIAL_NAME}:{PROJECT_CREDENTIAL_ROOT}/adapter-test/kamal-ssh-key"
+        )));
+        assert!(!unit.arguments().iter().any(|argument| {
+            argument.contains(KAMAL_SECRETS_CREDENTIAL_SOURCE)
+                || argument.contains(KAMAL_SSH_KEY_CREDENTIAL_SOURCE)
+        }));
         assert!(
             unit.arguments()
                 .contains(&"--property=RuntimeMaxSec=300000ms".to_owned())
@@ -1490,12 +1515,6 @@ mod tests {
         );
         assert_receipt_capture_plan(&unit);
         assert!(!unit.arguments().contains(&"--pipe".to_owned()));
-        assert!(unit.arguments().contains(&format!(
-            "--property=LoadCredential={KAMAL_SECRETS_CREDENTIAL_NAME}:{KAMAL_SECRETS_CREDENTIAL_SOURCE}"
-        )));
-        assert!(unit.arguments().contains(&format!(
-            "--property=LoadCredential={KAMAL_SSH_KEY_CREDENTIAL_NAME}:{KAMAL_SSH_KEY_CREDENTIAL_SOURCE}"
-        )));
         assert!(
             unit.arguments()
                 .windows(2)
@@ -1518,6 +1537,30 @@ mod tests {
         let replayed = PreparedAdapterJobV1::prepare_in(&root, uid, &spec, 1)
             .unwrap_or_else(|error| panic!("replay adapter job: {error}"));
         assert_eq!(replayed, prepared);
+    }
+
+    #[test]
+    fn kamal_credentials_preserve_rimg_and_scope_other_projects() {
+        let rimg = "rimg"
+            .parse::<ProjectId>()
+            .unwrap_or_else(|error| panic!("rimg project id: {error}"));
+        assert_eq!(
+            kamal_credential_sources(&rimg),
+            (
+                KAMAL_SECRETS_CREDENTIAL_SOURCE.to_owned(),
+                KAMAL_SSH_KEY_CREDENTIAL_SOURCE.to_owned(),
+            )
+        );
+        let gateway = "telegram-gateway"
+            .parse::<ProjectId>()
+            .unwrap_or_else(|error| panic!("gateway project id: {error}"));
+        assert_eq!(
+            kamal_credential_sources(&gateway),
+            (
+                format!("{PROJECT_CREDENTIAL_ROOT}/telegram-gateway/kamal-secrets.env"),
+                format!("{PROJECT_CREDENTIAL_ROOT}/telegram-gateway/kamal-ssh-key"),
+            )
+        );
     }
 
     #[test]

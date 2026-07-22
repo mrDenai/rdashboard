@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{Read as _, Write as _},
+    net::{IpAddr, SocketAddr, TcpStream},
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
@@ -35,6 +36,7 @@ use crate::{
 
 pub const KAMAL_ADAPTER_CONFIG_PATH: &str =
     "/etc/rdashboard/projects/rimg/kamal-adapter-runtime.jcs";
+const PROJECT_CONFIG_ROOT: &str = "/etc/rdashboard/projects";
 pub const KAMAL_EXECUTABLE_PATH: &str = "/usr/libexec/rdashboard/kamal";
 pub const DOCKER_EXECUTABLE_PATH: &str = "/usr/bin/docker";
 pub const SKOPEO_EXECUTABLE_PATH: &str = "/usr/bin/skopeo";
@@ -46,14 +48,10 @@ const GENERATED_RUNTIME_ENV_FILE: &str = "stable-backend.env";
 const EXPECTED_KAMAL_VERSION: &str = "2.12.0";
 const EPHEMERAL_REGISTRY_CONTAINER: &str = "rdashboard-registry";
 const EPHEMERAL_REGISTRY_LABEL: &str = "io.rdashboard.role=ephemeral-registry-v1";
-const STABLE_ROUTER_CONTAINER: &str = "rdashboard-rimg-router";
-const STABLE_ROUTER_VOLUME: &str = "rdashboard-rimg-router-state";
-const STABLE_ROUTER_SERVICE: &str = "rimg-internal";
 const STABLE_ROUTER_ROLE: &str = "stable-router-v1";
 const STABLE_ROUTER_VOLUME_ROLE: &str = "stable-router-state-v1";
 const STABLE_BACKEND_ROLE: &str = "stable-backend-v1";
 const STABLE_ROUTER_STATE_PATH: &str = "/home/kamal-proxy/.config/kamal-proxy/kamal-proxy.state";
-const STABLE_ROUTER_HTTP_PORT: u16 = 8080;
 const MIN_REGISTRY_STORAGE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REGISTRY_STORAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const REGISTRY_START_ATTEMPTS: u8 = 10;
@@ -67,6 +65,9 @@ const MAX_SECRET_VALUE_BYTES: usize = 4096;
 const KAMAL_COMPLETION_MARGIN_MS: u64 = 30_000;
 const VERSION_OBSERVATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const VERSION_OBSERVATION_ATTEMPTS: u8 = 3;
+const MAX_HEALTH_PATH_BYTES: usize = 256;
+const MAX_HEALTH_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_STABLE_NAME_BYTES: usize = 160;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -91,7 +92,147 @@ pub struct InstalledKamalAdapterRuntimeV3 {
     pub kamal_version: String,
 }
 
-impl InstalledKamalAdapterRuntimeV3 {
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledHttpHealthProbeV1 {
+    pub path: String,
+    pub expected_status: u16,
+    pub timeout_ms: u64,
+    pub interval_ms: u64,
+    pub attempts: u16,
+}
+
+impl InstalledHttpHealthProbeV1 {
+    fn is_valid(&self) -> bool {
+        self.path.starts_with('/')
+            && self.path.len() <= MAX_HEALTH_PATH_BYTES
+            && !self.path.starts_with("//")
+            && self.path.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~')
+            })
+            && (200..=299).contains(&self.expected_status)
+            && (100..=5_000).contains(&self.timeout_ms)
+            && (100..=5_000).contains(&self.interval_ms)
+            && (1..=120).contains(&self.attempts)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledKamalAdapterRuntimeV4 {
+    pub purpose: String,
+    pub schema_version: u16,
+    pub project_id: ProjectId,
+    pub installed_rimg_policy_digest: EvidenceDigest,
+    pub installed_kamal_policy_digest: EvidenceDigest,
+    pub template_digest: EvidenceDigest,
+    pub credential_versions_digest: EvidenceDigest,
+    pub kamal_sha256: EvidenceDigest,
+    pub docker_sha256: EvidenceDigest,
+    pub skopeo_sha256: EvidenceDigest,
+    pub registry_image: String,
+    pub registry_local_image_id: OciDigest,
+    pub registry_storage_bytes: u64,
+    pub stable_router_image: String,
+    pub stable_router_local_image_id: OciDigest,
+    pub secrets_sha256: EvidenceDigest,
+    pub ssh_private_key_sha256: EvidenceDigest,
+    pub kamal_version: String,
+    pub stable_http_health: InstalledHttpHealthProbeV1,
+}
+
+#[derive(Clone, Debug)]
+enum InstalledStableHealthV1 {
+    Docker,
+    Http(InstalledHttpHealthProbeV1),
+}
+
+#[derive(Clone, Debug)]
+struct InstalledKamalAdapterRuntime {
+    project_id: ProjectId,
+    installed_rimg_policy_digest: EvidenceDigest,
+    installed_kamal_policy_digest: EvidenceDigest,
+    template_digest: EvidenceDigest,
+    credential_versions_digest: EvidenceDigest,
+    kamal_sha256: EvidenceDigest,
+    docker_sha256: EvidenceDigest,
+    skopeo_sha256: EvidenceDigest,
+    registry_image: String,
+    registry_local_image_id: OciDigest,
+    registry_storage_bytes: u64,
+    stable_router_image: String,
+    stable_router_local_image_id: OciDigest,
+    secrets_sha256: EvidenceDigest,
+    ssh_private_key_sha256: EvidenceDigest,
+    kamal_version: String,
+    stable_health: InstalledStableHealthV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StableRouteIdentityV1 {
+    router_container: String,
+    router_volume: String,
+    proxy_service: String,
+    network_alias: String,
+    app_port: u16,
+}
+
+impl StableRouteIdentityV1 {
+    fn from_plan(plan: &KamalDeploymentPlanV1) -> Result<Self, KamalAdapterError> {
+        let mut ports = plan
+            .ports()
+            .iter()
+            .filter(|port| port.protocol == KamalPortProtocolV1::Tcp);
+        let app_port = ports
+            .next()
+            .ok_or(KamalAdapterError::RuntimeConfigMismatch)?
+            .container_port;
+        if ports.next().is_some() {
+            return Err(KamalAdapterError::RuntimeConfigMismatch);
+        }
+        Self::from_parts(plan.project_id(), plan.network_alias().as_str(), app_port)
+    }
+
+    fn from_parts(
+        project_id: &ProjectId,
+        network_alias: &str,
+        app_port: u16,
+    ) -> Result<Self, KamalAdapterError> {
+        let project = project_id.as_str();
+        let route = Self {
+            router_container: format!("rdashboard-{project}-router"),
+            router_volume: format!("rdashboard-{project}-router-state"),
+            proxy_service: format!("{project}-internal"),
+            network_alias: network_alias.to_owned(),
+            app_port,
+        };
+        if app_port == 0
+            || network_alias.is_empty()
+            || [
+                &route.router_container,
+                &route.router_volume,
+                &route.proxy_service,
+            ]
+            .into_iter()
+            .any(|name| name.len() > MAX_STABLE_NAME_BYTES)
+        {
+            return Err(KamalAdapterError::RuntimeConfigMismatch);
+        }
+        Ok(route)
+    }
+}
+
+fn installed_runtime_config_path(project_id: &ProjectId) -> PathBuf {
+    if project_id.as_str() == "rimg" {
+        PathBuf::from(KAMAL_ADAPTER_CONFIG_PATH)
+    } else {
+        Path::new(PROJECT_CONFIG_ROOT)
+            .join(project_id.as_str())
+            .join("kamal-adapter-runtime.jcs")
+    }
+}
+
+impl InstalledKamalAdapterRuntime {
     fn load(
         path: &Path,
         kamal_path: &Path,
@@ -102,11 +243,36 @@ impl InstalledKamalAdapterRuntimeV3 {
     ) -> Result<Self, KamalAdapterError> {
         let bytes = read_stable_private_file(path, required_uid, MAX_RUNTIME_CONFIG_BYTES)
             .map_err(|_| KamalAdapterError::RuntimeConfigMismatch)?;
-        let config: Self = serde_json::from_slice(&bytes)?;
-        if serde_jcs::to_vec(&config)? != bytes
-            || config.purpose != "rdashboard.installed-kamal-adapter-runtime.v3"
-            || config.schema_version != 3
-            || config.project_id != spec.project_id
+        let schema_version = serde_json::from_slice::<serde_json::Value>(&bytes)?
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(KamalAdapterError::RuntimeConfigMismatch)?;
+        let config = match schema_version {
+            3 => {
+                let legacy: InstalledKamalAdapterRuntimeV3 = serde_json::from_slice(&bytes)?;
+                if serde_jcs::to_vec(&legacy)? != bytes
+                    || legacy.purpose != "rdashboard.installed-kamal-adapter-runtime.v3"
+                    || legacy.schema_version != 3
+                    || legacy.project_id.as_str() != "rimg"
+                {
+                    return Err(KamalAdapterError::RuntimeConfigMismatch);
+                }
+                Self::from_v3(legacy)
+            }
+            4 => {
+                let current: InstalledKamalAdapterRuntimeV4 = serde_json::from_slice(&bytes)?;
+                if serde_jcs::to_vec(&current)? != bytes
+                    || current.purpose != "rdashboard.installed-kamal-adapter-runtime.v4"
+                    || current.schema_version != 4
+                    || !current.stable_http_health.is_valid()
+                {
+                    return Err(KamalAdapterError::RuntimeConfigMismatch);
+                }
+                Self::from_v4(current)
+            }
+            _ => return Err(KamalAdapterError::RuntimeConfigMismatch),
+        };
+        if config.project_id != spec.project_id
             || config.installed_rimg_policy_digest != spec.installed_rimg_policy_digest
             || config.kamal_version != EXPECTED_KAMAL_VERSION
             || !valid_registry_image(&config.registry_image)
@@ -132,11 +298,55 @@ impl InstalledKamalAdapterRuntimeV3 {
         }
         Ok(config)
     }
+
+    fn from_v3(config: InstalledKamalAdapterRuntimeV3) -> Self {
+        Self {
+            project_id: config.project_id,
+            installed_rimg_policy_digest: config.installed_rimg_policy_digest,
+            installed_kamal_policy_digest: config.installed_kamal_policy_digest,
+            template_digest: config.template_digest,
+            credential_versions_digest: config.credential_versions_digest,
+            kamal_sha256: config.kamal_sha256,
+            docker_sha256: config.docker_sha256,
+            skopeo_sha256: config.skopeo_sha256,
+            registry_image: config.registry_image,
+            registry_local_image_id: config.registry_local_image_id,
+            registry_storage_bytes: config.registry_storage_bytes,
+            stable_router_image: config.stable_router_image,
+            stable_router_local_image_id: config.stable_router_local_image_id,
+            secrets_sha256: config.secrets_sha256,
+            ssh_private_key_sha256: config.ssh_private_key_sha256,
+            kamal_version: config.kamal_version,
+            stable_health: InstalledStableHealthV1::Docker,
+        }
+    }
+
+    fn from_v4(config: InstalledKamalAdapterRuntimeV4) -> Self {
+        Self {
+            project_id: config.project_id,
+            installed_rimg_policy_digest: config.installed_rimg_policy_digest,
+            installed_kamal_policy_digest: config.installed_kamal_policy_digest,
+            template_digest: config.template_digest,
+            credential_versions_digest: config.credential_versions_digest,
+            kamal_sha256: config.kamal_sha256,
+            docker_sha256: config.docker_sha256,
+            skopeo_sha256: config.skopeo_sha256,
+            registry_image: config.registry_image,
+            registry_local_image_id: config.registry_local_image_id,
+            registry_storage_bytes: config.registry_storage_bytes,
+            stable_router_image: config.stable_router_image,
+            stable_router_local_image_id: config.stable_router_local_image_id,
+            secrets_sha256: config.secrets_sha256,
+            ssh_private_key_sha256: config.ssh_private_key_sha256,
+            kamal_version: config.kamal_version,
+            stable_health: InstalledStableHealthV1::Http(config.stable_http_health),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct InstalledKamalRuntimeV1 {
-    config: InstalledKamalAdapterRuntimeV3,
+    config: InstalledKamalAdapterRuntime,
     kamal_path: PathBuf,
     docker_path: PathBuf,
     skopeo_path: PathBuf,
@@ -157,8 +367,9 @@ impl InstalledKamalRuntimeV1 {
         let unit_name = fixed_adapter_unit_name(spec, sequence)?;
         let credential_root =
             Path::new(SYSTEMD_CREDENTIAL_ROOT).join(format!("{unit_name}.service"));
+        let runtime_config_path = installed_runtime_config_path(&spec.project_id);
         Self::new_bound(
-            Path::new(KAMAL_ADAPTER_CONFIG_PATH),
+            &runtime_config_path,
             Path::new(KAMAL_EXECUTABLE_PATH),
             Path::new(DOCKER_EXECUTABLE_PATH),
             Path::new(SKOPEO_EXECUTABLE_PATH),
@@ -188,7 +399,7 @@ impl InstalledKamalRuntimeV1 {
     ) -> Result<Self, KamalAdapterError> {
         validate_private_directory(job_directory, required_uid)
             .map_err(|_| KamalAdapterError::RuntimeConfigMismatch)?;
-        let config = InstalledKamalAdapterRuntimeV3::load(
+        let config = InstalledKamalAdapterRuntime::load(
             runtime_config_path,
             kamal_path,
             docker_path,
@@ -253,6 +464,7 @@ impl InstalledKamalRuntimeV1 {
         let document = render_config(
             spec,
             plan,
+            &self.config.stable_health,
             path_text(&self.secrets_path)?,
             path_text(&self.ssh_key_path)?,
         )?;
@@ -455,23 +667,6 @@ impl InstalledKamalRuntimeV1 {
         )
     }
 
-    fn stable_backend_port(plan: &KamalDeploymentPlanV1) -> Result<u16, KamalAdapterError> {
-        let mut ports = plan
-            .ports()
-            .iter()
-            .filter(|port| port.protocol == KamalPortProtocolV1::Tcp);
-        let port = ports
-            .next()
-            .ok_or(KamalAdapterError::RuntimeConfigMismatch)?;
-        if ports.next().is_some() {
-            return Err(KamalAdapterError::RuntimeConfigMismatch);
-        }
-        if port.container_port != STABLE_ROUTER_HTTP_PORT {
-            return Err(KamalAdapterError::RuntimeConfigMismatch);
-        }
-        Ok(port.container_port)
-    }
-
     fn stable_runtime_environment(
         &self,
         plan: &KamalDeploymentPlanV1,
@@ -541,7 +736,7 @@ impl InstalledKamalRuntimeV1 {
                 return Err(KamalAdapterError::StableBackendOwnershipMismatch);
             }
             run_status_command(&self.docker_path, &["container", "start", &name])?;
-            self.wait_for_stable_backend_health(&name)?;
+            self.wait_for_stable_backend_health(&name, plan)?;
             return Ok(name);
         }
 
@@ -592,37 +787,95 @@ impl InstalledKamalRuntimeV1 {
         }
         arguments.push(image);
         run_status_command_owned(&self.docker_path, &arguments)?;
-        self.wait_for_stable_backend_health(&name)?;
+        self.wait_for_stable_backend_health(&name, plan)?;
         Ok(name)
     }
 
-    fn wait_for_stable_backend_health(&self, name: &str) -> Result<(), KamalAdapterError> {
-        for _ in 0..120 {
-            let output = run_bounded_command(
-                &self.docker_path,
-                &[
-                    "container",
-                    "inspect",
-                    "--format={{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
-                    name,
-                ],
-            )?;
-            if output.status.success() {
-                let status = String::from_utf8(output.stdout)
-                    .map_err(|_| KamalAdapterError::StableBackendUnhealthy)?;
-                if status.trim() == "healthy" {
-                    return Ok(());
-                }
-                if status.trim() == "unhealthy" || status.trim() == "missing" {
-                    return Err(KamalAdapterError::StableBackendUnhealthy);
+    fn wait_for_stable_backend_health(
+        &self,
+        name: &str,
+        plan: &KamalDeploymentPlanV1,
+    ) -> Result<(), KamalAdapterError> {
+        match &self.config.stable_health {
+            InstalledStableHealthV1::Docker => {
+                for attempt in 0..120 {
+                    let output = run_bounded_command(
+                        &self.docker_path,
+                        &[
+                            "container",
+                            "inspect",
+                            "--format={{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
+                            name,
+                        ],
+                    )?;
+                    if output.status.success() {
+                        let status = String::from_utf8(output.stdout)
+                            .map_err(|_| KamalAdapterError::StableBackendUnhealthy)?;
+                        if status.trim() == "healthy" {
+                            return Ok(());
+                        }
+                        if status.trim() == "unhealthy" || status.trim() == "missing" {
+                            return Err(KamalAdapterError::StableBackendUnhealthy);
+                        }
+                    }
+                    if attempt + 1 < 120 {
+                        thread::sleep(Duration::from_secs(1));
+                    }
                 }
             }
-            thread::sleep(Duration::from_secs(1));
+            InstalledStableHealthV1::Http(probe) => {
+                let route = StableRouteIdentityV1::from_plan(plan)?;
+                for attempt in 0..probe.attempts {
+                    if self.http_health_succeeds(name, route.app_port, probe)? {
+                        return Ok(());
+                    }
+                    if attempt + 1 < probe.attempts {
+                        thread::sleep(Duration::from_millis(probe.interval_ms));
+                    }
+                }
+            }
         }
         Err(KamalAdapterError::StableBackendUnhealthy)
     }
 
-    fn ensure_stable_router(&self, network: &str) -> Result<(), KamalAdapterError> {
+    fn http_health_succeeds(
+        &self,
+        name: &str,
+        port: u16,
+        probe: &InstalledHttpHealthProbeV1,
+    ) -> Result<bool, KamalAdapterError> {
+        let output = run_bounded_command(
+            &self.docker_path,
+            &[
+                "container",
+                "inspect",
+                "--format={{(index .NetworkSettings.Networks \"kamal\").IPAddress}}",
+                name,
+            ],
+        )?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let address = String::from_utf8(output.stdout)
+            .map_err(|_| KamalAdapterError::StableBackendUnhealthy)?;
+        let ip = IpAddr::from_str(address.trim())
+            .map_err(|_| KamalAdapterError::StableBackendUnhealthy)?;
+        if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+            return Err(KamalAdapterError::StableBackendUnhealthy);
+        }
+        probe_http_health(
+            SocketAddr::new(ip, port),
+            probe,
+            Duration::from_millis(probe.timeout_ms),
+        )
+    }
+
+    fn ensure_stable_router(
+        &self,
+        plan: &KamalDeploymentPlanV1,
+    ) -> Result<StableRouteIdentityV1, KamalAdapterError> {
+        let route = StableRouteIdentityV1::from_plan(plan)?;
+        let network = plan.network().as_str();
         if self
             .inspect_local_image_id(&self.config.stable_router_image)?
             .as_ref()
@@ -630,14 +883,14 @@ impl InstalledKamalRuntimeV1 {
         {
             return Err(KamalAdapterError::RuntimeConfigMismatch);
         }
-        self.ensure_stable_router_volume()?;
+        self.ensure_stable_router_volume(&route)?;
         let inspected = run_bounded_command(
             &self.docker_path,
             &[
                 "container",
                 "inspect",
                 "--format={{.Image}}|{{index .Config.Labels \"io.rdashboard.role\"}}|{{.HostConfig.NetworkMode}}",
-                STABLE_ROUTER_CONTAINER,
+                &route.router_container,
             ],
         )?;
         let expected = format!(
@@ -654,33 +907,35 @@ impl InstalledKamalRuntimeV1 {
             }
             run_status_command(
                 &self.docker_path,
-                &["container", "start", STABLE_ROUTER_CONTAINER],
+                &["container", "start", &route.router_container],
             )?;
-            if self.stable_router_has_network_alias(network)? {
-                return self.wait_for_stable_router();
+            if self.stable_router_has_network_alias(network, &route)? {
+                self.wait_for_stable_router(&route)?;
+                return Ok(route);
             }
             run_status_command(
                 &self.docker_path,
-                &["container", "rm", "--force", STABLE_ROUTER_CONTAINER],
+                &["container", "rm", "--force", &route.router_container],
             )?;
         }
         let state_mount = format!(
-            "type=volume,source={STABLE_ROUTER_VOLUME},target=/home/kamal-proxy/.config/kamal-proxy"
+            "type=volume,source={},target=/home/kamal-proxy/.config/kamal-proxy",
+            route.router_volume
         );
-        let http_port = format!("--http-port={STABLE_ROUTER_HTTP_PORT}");
+        let http_port = format!("--http-port={}", route.app_port);
         run_status_command(
             &self.docker_path,
             &[
                 "run",
                 "--detach",
                 "--name",
-                STABLE_ROUTER_CONTAINER,
+                &route.router_container,
                 "--label",
                 &format!("io.rdashboard.role={STABLE_ROUTER_ROLE}"),
                 "--network",
                 network,
                 "--network-alias",
-                "rimg",
+                &route.network_alias,
                 "--restart=unless-stopped",
                 "--read-only",
                 "--memory=128m",
@@ -703,36 +958,44 @@ impl InstalledKamalRuntimeV1 {
                 "--https-port=8443",
             ],
         )?;
-        if !self.stable_router_has_network_alias(network)? {
+        if !self.stable_router_has_network_alias(network, &route)? {
             return Err(KamalAdapterError::StableRouterOwnershipMismatch);
         }
-        self.wait_for_stable_router()
+        self.wait_for_stable_router(&route)?;
+        Ok(route)
     }
 
-    fn stable_router_has_network_alias(&self, network: &str) -> Result<bool, KamalAdapterError> {
+    fn stable_router_has_network_alias(
+        &self,
+        network: &str,
+        route: &StableRouteIdentityV1,
+    ) -> Result<bool, KamalAdapterError> {
         let output = run_bounded_command(
             &self.docker_path,
             &[
                 "container",
                 "inspect",
                 "--format={{json .NetworkSettings.Networks}}",
-                STABLE_ROUTER_CONTAINER,
+                &route.router_container,
             ],
         )?;
         if !output.status.success() {
             return Err(KamalAdapterError::StableRouterOwnershipMismatch);
         }
-        stable_router_has_network_alias(&output.stdout, network)
+        stable_router_has_network_alias(&output.stdout, network, &route.network_alias)
     }
 
-    fn wait_for_stable_router(&self) -> Result<(), KamalAdapterError> {
+    fn wait_for_stable_router(
+        &self,
+        route: &StableRouteIdentityV1,
+    ) -> Result<(), KamalAdapterError> {
         for attempt in 0..STABLE_ROUTER_START_ATTEMPTS {
             let output = run_bounded_command(
                 &self.docker_path,
                 &[
                     "container",
                     "exec",
-                    STABLE_ROUTER_CONTAINER,
+                    &route.router_container,
                     "kamal-proxy",
                     "version",
                 ],
@@ -750,6 +1013,7 @@ impl InstalledKamalRuntimeV1 {
     fn require_exclusive_stable_router_alias(
         &self,
         network: &str,
+        route: &StableRouteIdentityV1,
     ) -> Result<(), KamalAdapterError> {
         let router = run_bounded_command(
             &self.docker_path,
@@ -757,7 +1021,7 @@ impl InstalledKamalRuntimeV1 {
                 "container",
                 "inspect",
                 "--format={{.Id}}",
-                STABLE_ROUTER_CONTAINER,
+                &route.router_container,
             ],
         )?;
         if !router.status.success() {
@@ -804,7 +1068,8 @@ impl InstalledKamalRuntimeV1 {
             if !inspected.status.success() {
                 return Err(KamalAdapterError::StableRouterOwnershipMismatch);
             }
-            let has_alias = container_has_network_alias(&inspected.stdout, network, "rimg")?;
+            let has_alias =
+                container_has_network_alias(&inspected.stdout, network, &route.network_alias)?;
             if member_id == router_id {
                 found_router = has_alias;
             } else if has_alias {
@@ -818,14 +1083,17 @@ impl InstalledKamalRuntimeV1 {
         }
     }
 
-    fn ensure_stable_router_volume(&self) -> Result<(), KamalAdapterError> {
+    fn ensure_stable_router_volume(
+        &self,
+        route: &StableRouteIdentityV1,
+    ) -> Result<(), KamalAdapterError> {
         let inspected = run_bounded_command(
             &self.docker_path,
             &[
                 "volume",
                 "inspect",
                 "--format={{index .Labels \"io.rdashboard.role\"}}",
-                STABLE_ROUTER_VOLUME,
+                &route.router_volume,
             ],
         )?;
         if inspected.status.success() {
@@ -844,18 +1112,21 @@ impl InstalledKamalRuntimeV1 {
                 "create",
                 "--label",
                 &format!("io.rdashboard.role={STABLE_ROUTER_VOLUME_ROLE}"),
-                STABLE_ROUTER_VOLUME,
+                &route.router_volume,
             ],
         )
     }
 
-    fn stable_router_target(&self) -> Result<Option<String>, KamalAdapterError> {
+    fn stable_router_target(
+        &self,
+        route: &StableRouteIdentityV1,
+    ) -> Result<Option<String>, KamalAdapterError> {
         let output = run_bounded_command(
             &self.docker_path,
             &[
                 "container",
                 "exec",
-                STABLE_ROUTER_CONTAINER,
+                &route.router_container,
                 "cat",
                 STABLE_ROUTER_STATE_PATH,
             ],
@@ -863,17 +1134,17 @@ impl InstalledKamalRuntimeV1 {
         if !output.status.success() {
             return Ok(None);
         }
-        decode_stable_router_target(&output.stdout)
+        decode_stable_router_target(&output.stdout, &route.proxy_service)
     }
 
     fn switch_stable_router(
         &self,
         target: &str,
-        port: u16,
+        route: &StableRouteIdentityV1,
         spec: &AuthorizedPhaseSpecV1,
     ) -> Result<(), KamalAdapterError> {
-        let target = format!("{target}:{port}");
-        if self.stable_router_target()?.as_deref() == Some(target.as_str()) {
+        let target = format!("{target}:{}", route.app_port);
+        if self.stable_router_target(route)?.as_deref() == Some(target.as_str()) {
             return Ok(());
         }
         let deploy_seconds = spec
@@ -884,17 +1155,22 @@ impl InstalledKamalRuntimeV1 {
             .div_ceil(1000);
         let deploy_timeout = format!("--deploy-timeout={deploy_seconds}s");
         let target_argument = format!("--target={target}");
+        let health_path = match &self.config.stable_health {
+            InstalledStableHealthV1::Docker => "/health/ready",
+            InstalledStableHealthV1::Http(probe) => probe.path.as_str(),
+        };
+        let health_path = format!("--health-check-path={health_path}");
         run_status_command(
             &self.docker_path,
             &[
                 "container",
                 "exec",
-                STABLE_ROUTER_CONTAINER,
+                &route.router_container,
                 "kamal-proxy",
                 "deploy",
-                STABLE_ROUTER_SERVICE,
+                &route.proxy_service,
                 &target_argument,
-                "--health-check-path=/health/ready",
+                &health_path,
                 "--health-check-interval=1s",
                 "--health-check-timeout=5s",
                 &deploy_timeout,
@@ -902,7 +1178,7 @@ impl InstalledKamalRuntimeV1 {
                 "--target-timeout=30s",
             ],
         )?;
-        if self.stable_router_target()?.as_deref() == Some(target.as_str()) {
+        if self.stable_router_target(route)?.as_deref() == Some(target.as_str()) {
             Ok(())
         } else {
             Err(KamalAdapterError::StableRouterStateMismatch)
@@ -993,17 +1269,21 @@ impl InstalledKamalRuntimeV1 {
                 )?
                 .load(&spec.project_id, current_digest)?;
                 let _ = self.import_candidate_image(&current)?;
-                self.ensure_stable_router(current.deployment_plan().network().as_str())?;
+                let route = self.ensure_stable_router(current.deployment_plan())?;
+                if route != StableRouteIdentityV1::from_plan(bundle.deployment_plan())? {
+                    return Err(KamalAdapterError::RuntimeConfigMismatch);
+                }
                 let target_endpoint = format!(
                     "{}:{}",
                     Self::stable_backend_name(bundle.deployment_plan()),
-                    Self::stable_backend_port(bundle.deployment_plan())?
+                    route.app_port
                 );
-                if self.stable_router_target()?.as_deref() == Some(target_endpoint.as_str()) {
+                if self.stable_router_target(&route)?.as_deref() == Some(target_endpoint.as_str()) {
                     let _ = self.ensure_stable_backend(bundle)?;
                     self.remove_adopted_bootstrap_container(&current)?;
                     self.require_exclusive_stable_router_alias(
                         current.deployment_plan().network().as_str(),
+                        &route,
                     )?;
                     if current.digest() != bundle.digest() {
                         self.stop_owned_stable_backend(&current)?;
@@ -1011,37 +1291,27 @@ impl InstalledKamalRuntimeV1 {
                     return Ok(());
                 }
                 let current_name = self.ensure_stable_backend(&current)?;
-                self.switch_stable_router(
-                    &current_name,
-                    Self::stable_backend_port(current.deployment_plan())?,
-                    spec,
-                )?;
+                self.switch_stable_router(&current_name, &route, spec)?;
                 self.remove_adopted_bootstrap_container(&current)?;
                 self.require_exclusive_stable_router_alias(
                     current.deployment_plan().network().as_str(),
+                    &route,
                 )?;
 
                 let target_name = self.ensure_stable_backend(bundle)?;
-                self.switch_stable_router(
-                    &target_name,
-                    Self::stable_backend_port(bundle.deployment_plan())?,
-                    spec,
-                )?;
+                self.switch_stable_router(&target_name, &route, spec)?;
                 if current.digest() != bundle.digest() {
                     self.stop_owned_stable_backend(&current)?;
                 }
             }
             KamalEffectKindV1::Rollback => {
-                self.ensure_stable_router(bundle.deployment_plan().network().as_str())?;
+                let route = self.ensure_stable_router(bundle.deployment_plan())?;
                 self.require_exclusive_stable_router_alias(
                     bundle.deployment_plan().network().as_str(),
+                    &route,
                 )?;
                 let target_name = self.ensure_stable_backend(bundle)?;
-                self.switch_stable_router(
-                    &target_name,
-                    Self::stable_backend_port(bundle.deployment_plan())?,
-                    spec,
-                )?;
+                self.switch_stable_router(&target_name, &route, spec)?;
                 let failed_digest = spec
                     .release_bundle_digest
                     .as_ref()
@@ -1161,6 +1431,11 @@ impl KamalRuntimeV1 for InstalledKamalRuntimeV1 {
         release_bundle_digest: &EvidenceDigest,
         effect: KamalEffectKindV1,
     ) -> Result<KamalDeploymentObservationV1, KamalAdapterError> {
+        if effect == KamalEffectKindV1::Bootstrap
+            && matches!(self.config.stable_health, InstalledStableHealthV1::Http(_))
+        {
+            return Err(KamalAdapterError::RuntimeConfigMismatch);
+        }
         let bundle = self.load_bundle(spec, release_bundle_digest)?;
         let plan = bundle.deployment_plan();
         let archive_source = self.import_candidate_image(&bundle)?;
@@ -1209,14 +1484,17 @@ struct StableRouterStateServiceV1 {
     active_targets: Vec<String>,
 }
 
-fn decode_stable_router_target(bytes: &[u8]) -> Result<Option<String>, KamalAdapterError> {
+fn decode_stable_router_target(
+    bytes: &[u8],
+    expected_service: &str,
+) -> Result<Option<String>, KamalAdapterError> {
     let Ok(services) = serde_json::from_slice::<Vec<StableRouterStateServiceV1>>(bytes) else {
         return Ok(None);
     };
     if services.is_empty() {
         return Ok(None);
     }
-    if services.len() != 1 || services[0].name != STABLE_ROUTER_SERVICE {
+    if services.len() != 1 || services[0].name != expected_service {
         return Err(KamalAdapterError::StableRouterOwnershipMismatch);
     }
     match services[0].active_targets.as_slice() {
@@ -1225,8 +1503,12 @@ fn decode_stable_router_target(bytes: &[u8]) -> Result<Option<String>, KamalAdap
     }
 }
 
-fn stable_router_has_network_alias(bytes: &[u8], network: &str) -> Result<bool, KamalAdapterError> {
-    container_has_network_alias(bytes, network, "rimg")
+fn stable_router_has_network_alias(
+    bytes: &[u8],
+    network: &str,
+    alias: &str,
+) -> Result<bool, KamalAdapterError> {
+    container_has_network_alias(bytes, network, alias)
 }
 
 fn container_has_network_alias(
@@ -1255,6 +1537,64 @@ fn valid_docker_container_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn probe_http_health(
+    address: SocketAddr,
+    probe: &InstalledHttpHealthProbeV1,
+    timeout: Duration,
+) -> Result<bool, KamalAdapterError> {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return Ok(false);
+    };
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| KamalAdapterError::StableBackendUnhealthy)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|_| KamalAdapterError::StableBackendUnhealthy)?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: health\r\nConnection: close\r\n\r\n",
+        probe.path
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Ok(false);
+    }
+    let mut response = Vec::new();
+    if stream
+        .take((MAX_HEALTH_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response)
+        .is_err()
+    {
+        return Ok(false);
+    }
+    if response.len() > MAX_HEALTH_RESPONSE_BYTES {
+        return Err(KamalAdapterError::StableBackendUnhealthy);
+    }
+    Ok(http_health_status_matches(&response, probe.expected_status))
+}
+
+fn http_health_status_matches(response: &[u8], expected_status: u16) -> bool {
+    let Some(status_line) = response.split(|byte| *byte == b'\n').next() else {
+        return false;
+    };
+    let Ok(status_line) = std::str::from_utf8(status_line) else {
+        return false;
+    };
+    let mut fields = status_line.trim_end_matches('\r').split_ascii_whitespace();
+    let Some(version) = fields.next() else {
+        return false;
+    };
+    let Some(status) = fields.next() else {
+        return false;
+    };
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return false;
+    }
+    let Ok(status) = status.parse::<u16>() else {
+        return false;
+    };
+    status == expected_status
 }
 
 #[derive(Serialize)]
@@ -1317,6 +1657,7 @@ struct GeneratedLoggingV1 {
 fn render_config<'a>(
     spec: &AuthorizedPhaseSpecV1,
     plan: &'a KamalDeploymentPlanV1,
+    stable_health: &InstalledStableHealthV1,
     secrets_path: &'a str,
     ssh_key_path: &'a str,
 ) -> Result<GeneratedKamalConfigV1<'a>, KamalAdapterError> {
@@ -1329,7 +1670,7 @@ fn render_config<'a>(
             web: GeneratedRoleV1 {
                 hosts: [plan.target_host().as_str()],
                 proxy: false,
-                options: render_server_options(plan),
+                options: render_server_options(plan, stable_health),
             },
         },
         registry: GeneratedRegistryV1 {
@@ -1360,24 +1701,11 @@ fn render_config<'a>(
     })
 }
 
-fn render_server_options(plan: &KamalDeploymentPlanV1) -> BTreeMap<String, serde_json::Value> {
+fn render_server_options(
+    plan: &KamalDeploymentPlanV1,
+    stable_health: &InstalledStableHealthV1,
+) -> BTreeMap<String, serde_json::Value> {
     let mut options = BTreeMap::from([
-        (
-            "health-cmd".to_owned(),
-            serde_json::Value::String("rimg --healthcheck".to_owned()),
-        ),
-        (
-            "health-interval".to_owned(),
-            serde_json::Value::String("10s".to_owned()),
-        ),
-        (
-            "health-retries".to_owned(),
-            serde_json::Value::Number(12.into()),
-        ),
-        (
-            "health-timeout".to_owned(),
-            serde_json::Value::String("5s".to_owned()),
-        ),
         (
             "network-alias".to_owned(),
             serde_json::Value::String(plan.network_alias().as_str().to_owned()),
@@ -1387,6 +1715,26 @@ fn render_server_options(plan: &KamalDeploymentPlanV1) -> BTreeMap<String, serde
             serde_json::Value::String(format!("{}:{}", plan.run_as().uid, plan.run_as().gid)),
         ),
     ]);
+    if matches!(stable_health, InstalledStableHealthV1::Docker) {
+        options.extend([
+            (
+                "health-cmd".to_owned(),
+                serde_json::Value::String("rimg --healthcheck".to_owned()),
+            ),
+            (
+                "health-interval".to_owned(),
+                serde_json::Value::String("10s".to_owned()),
+            ),
+            (
+                "health-retries".to_owned(),
+                serde_json::Value::Number(12.into()),
+            ),
+            (
+                "health-timeout".to_owned(),
+                serde_json::Value::String("5s".to_owned()),
+            ),
+        ]);
+    }
     let publish = plan
         .ports()
         .iter()
@@ -1771,35 +2119,39 @@ mod tests {
         assert_eq!(
             decode_stable_router_target(
                 br#"[{"name":"rimg-internal","active_targets":["backend:3000"]}]"#,
+                "rimg-internal",
             )
             .unwrap_or_else(|error| panic!("decode router state: {error}")),
             Some("backend:3000".to_owned())
         );
         assert_eq!(
-            decode_stable_router_target(b"not-json")
+            decode_stable_router_target(b"not-json", "rimg-internal")
                 .unwrap_or_else(|error| panic!("malformed state: {error}")),
             None
         );
         assert!(matches!(
             decode_stable_router_target(
                 br#"[{"name":"foreign","active_targets":["backend:3000"]}]"#,
+                "rimg-internal",
             ),
             Err(KamalAdapterError::StableRouterOwnershipMismatch)
         ));
         assert!(matches!(
             decode_stable_router_target(
                 br#"[{"name":"rimg-internal","active_targets":["one:3000","two:3000"]}]"#,
+                "rimg-internal",
             ),
             Err(KamalAdapterError::StableRouterStateMismatch)
         ));
     }
 
     #[test]
-    fn stable_router_network_requires_the_owned_rimg_alias() {
+    fn stable_router_network_requires_the_owned_project_alias() {
         assert!(
             stable_router_has_network_alias(
                 br#"{"kamal":{"Aliases":["rdashboard-rimg-router","rimg"]}}"#,
                 "kamal",
+                "rimg",
             )
             .unwrap_or_else(|error| panic!("router aliases: {error}"))
         );
@@ -1807,11 +2159,16 @@ mod tests {
             !stable_router_has_network_alias(
                 br#"{"kamal":{"Aliases":["rdashboard-rimg-router"]}}"#,
                 "kamal",
+                "rimg",
             )
             .unwrap_or_else(|error| panic!("router aliases: {error}"))
         );
         assert!(matches!(
-            stable_router_has_network_alias(br#"{"other":{"Aliases":["rimg"]}}"#, "kamal"),
+            stable_router_has_network_alias(
+                br#"{"other":{"Aliases":["telegram-gateway"]}}"#,
+                "kamal",
+                "telegram-gateway",
+            ),
             Err(KamalAdapterError::StableRouterOwnershipMismatch)
         ));
         assert!(
@@ -1821,5 +2178,82 @@ mod tests {
         assert!(valid_docker_container_id(&"a".repeat(64)));
         assert!(!valid_docker_container_id(&"A".repeat(64)));
         assert!(!valid_docker_container_id(&"a".repeat(63)));
+    }
+
+    #[test]
+    fn stable_route_identity_is_project_scoped_and_keeps_the_application_port() {
+        let project = ProjectId::from_str("telegram-gateway")
+            .unwrap_or_else(|error| panic!("project id: {error}"));
+        let route = StableRouteIdentityV1::from_parts(&project, "telegram-gateway", 8081)
+            .unwrap_or_else(|error| panic!("stable route: {error}"));
+        assert_eq!(route.router_container, "rdashboard-telegram-gateway-router");
+        assert_eq!(
+            route.router_volume,
+            "rdashboard-telegram-gateway-router-state"
+        );
+        assert_eq!(route.proxy_service, "telegram-gateway-internal");
+        assert_eq!(route.network_alias, "telegram-gateway");
+        assert_eq!(route.app_port, 8081);
+    }
+
+    #[test]
+    fn runtime_config_path_preserves_rimg_and_scopes_other_projects() {
+        let rimg = ProjectId::from_str("rimg").unwrap_or_else(|error| panic!("rimg: {error}"));
+        let gateway = ProjectId::from_str("telegram-gateway")
+            .unwrap_or_else(|error| panic!("gateway: {error}"));
+        assert_eq!(
+            installed_runtime_config_path(&rimg),
+            PathBuf::from(KAMAL_ADAPTER_CONFIG_PATH)
+        );
+        assert_eq!(
+            installed_runtime_config_path(&gateway),
+            PathBuf::from("/etc/rdashboard/projects/telegram-gateway/kamal-adapter-runtime.jcs")
+        );
+    }
+
+    #[test]
+    fn installed_http_health_probe_rejects_ambiguous_or_unbounded_inputs() {
+        let valid = InstalledHttpHealthProbeV1 {
+            path: "/health".to_owned(),
+            expected_status: 200,
+            timeout_ms: 1_000,
+            interval_ms: 500,
+            attempts: 20,
+        };
+        assert!(valid.is_valid());
+        for invalid in [
+            InstalledHttpHealthProbeV1 {
+                path: "health".to_owned(),
+                ..valid.clone()
+            },
+            InstalledHttpHealthProbeV1 {
+                path: "/health?deep=true".to_owned(),
+                ..valid.clone()
+            },
+            InstalledHttpHealthProbeV1 {
+                expected_status: 500,
+                ..valid.clone()
+            },
+            InstalledHttpHealthProbeV1 {
+                attempts: 0,
+                ..valid.clone()
+            },
+        ] {
+            assert!(!invalid.is_valid());
+        }
+    }
+
+    #[test]
+    fn installed_http_health_requires_the_exact_response_status() {
+        assert!(http_health_status_matches(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            200
+        ));
+        assert!(!http_health_status_matches(
+            b"HTTP/1.1 204 No Content\r\n\r\n",
+            200
+        ));
+        assert!(!http_health_status_matches(b"ICY 200 OK\r\n\r\n", 200));
+        assert!(!http_health_status_matches(b"HTTP/1.1 nope\r\n\r\n", 200));
     }
 }

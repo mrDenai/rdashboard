@@ -729,7 +729,8 @@ executor cannot otherwise traverse the daemon's mode-`0750` runtime directory. O
 using a different chrony group name, replace that one group token with the actual group owning
 `/run/chrony` and verify the socket remains non-world-accessible.
 
-The Kamal deploy and rollback profiles additionally require these root-owned installed inputs:
+The Kamal deploy and rollback profiles additionally require these root-owned installed inputs. The
+legacy rimg installation remains byte-for-byte compatible with its original paths and schema:
 
 - `/usr/libexec/rdashboard/kamal` at exactly Kamal `2.12.0`, `/usr/bin/docker` and
   `/usr/bin/skopeo`, all pinned by SHA-256 in
@@ -744,6 +745,19 @@ The Kamal deploy and rollback profiles additionally require these root-owned ins
 - `/etc/rdashboard/credentials/rimg-kamal-secrets.env`, containing exactly the authorized dotenv
   keys with substitution-free bounded values, and
   `/etc/rdashboard/credentials/rimg-kamal-ssh-key`, both root-owned and mode `0600`.
+
+Other projects use the canonical
+`/etc/rdashboard/projects/<project-id>/kamal-adapter-runtime.jcs` path and the canonical
+`rdashboard.installed-kamal-adapter-runtime.v4` schema. V4 adds one bounded HTTP health policy:
+an absolute query-free path, an expected 2xx status, a 100-5000 ms connect/read timeout and retry
+interval, and 1-120 attempts. Its credentials are isolated under
+`/etc/rdashboard/credentials/projects/<project-id>/kamal-secrets.env` and `kamal-ssh-key`; a
+transient unit receives only the credentials for the project bound into its authorized phase spec.
+The adapter connects only to the inspected private address of the candidate on the fixed `kamal`
+network, caps the HTTP response at 16 KiB and rejects unspecified, loopback or multicast addresses.
+V4 currently supports only an already-installed deploy or rollback. First-install bootstrap remains
+the legacy rimg path and fails closed for V4 until a separately reviewed adoption/bootstrap
+contract can create the initial release authority without guessing from a live container.
 
 Only Kamal profiles receive the two credentials through `LoadCredential=`. Before Kamal starts, the
 adapter verifies the promoted archive digest, imports it into the local Docker store with `skopeo`,
@@ -762,14 +776,17 @@ full Git SHA afterward; an already matching
 SHA is treated as crash replay rather than a second deployment. Repository `config/deploy.yml`,
 `.kamal`, hooks, destinations and the managed checkout are never read.
 
-Installed updates do not publish a backend port and do not give release containers the `rimg`
+Installed updates do not publish a backend port and do not give release containers the application's
 network alias. The sole long-lived alias belongs to the exact owned
-`rdashboard-rimg-router` container on the `kamal` network. Its only persisted state lives in the
-exact labelled `rdashboard-rimg-router-state` Docker volume. Each release runs as
-`rdashboard-rimg-backend-<full-git-sha>` with exact image, bundle and deployment-plan labels. The
-adapter starts and verifies the candidate, asks the private router to health-check
-`/health/ready`, switches and drains through the same `rimg-internal` service, then stops only the
-exact old owned backend. Reconciliation verifies router image, label, network and alias, waits for
+`rdashboard-<project-id>-router` container on the `kamal` network. Its only persisted state lives in
+the exact labelled `rdashboard-<project-id>-router-state` Docker volume. Each release runs as
+`rdashboard-<project-id>-backend-<full-git-sha>` with exact image, bundle and deployment-plan
+labels. The adapter derives the router port and alias from the signed deployment plan, starts and
+verifies the candidate with either the legacy Docker health state or the installed V4 HTTP probe,
+switches and drains through `<project-id>-internal`, then stops only the exact old owned backend.
+For rimg these derived identities remain exactly `rdashboard-rimg-router`,
+`rdashboard-rimg-router-state`, port 8080, alias `rimg`, service `rimg-internal` and health path
+`/health/ready`. Reconciliation verifies router image, label, network and project alias, waits for
 the proxy command endpoint, reads its persisted active target and idempotently reapplies the
 expected route when state is absent or corrupt. A foreign reserved container, volume, backend or
 route fails closed.
