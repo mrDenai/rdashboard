@@ -116,11 +116,13 @@ repository-visible tree. A separate exact operation-owned directory is mounted a
 for adapters that consume the target and compiler cache. Matching compiled consumers on the VPS
 execute serially against that directory; different attempts and hosts never share writable state. A
 native self-release keeps verification and packaging on the same VPS-owned operation state, so an
-optional build-only host cannot strand the required binaries or block the release. The OCI adapter
-neither mounts nor allocates operation state, so its independently bounded build can run beside
-verification without duplicating the verification cache. For OCI projects an optional build-only host
-gets a one-node local verification state and neither blocks the VPS nor causes its files to be
-transferred.
+optional build-only host cannot strand the required binaries or block the release. An OCI policy
+without `verified_output` neither mounts nor allocates operation state, so its independently bounded
+build can run beside verification. A policy such as rimg with `verified_output` instead keeps the
+verification state on the same VPS and mounts it read-only for final assembly; the OCI consumer extends
+the state's lifetime but does not increase its byte or inode capacity. For OCI projects an optional
+build-only host gets a one-node local verification state and neither blocks the VPS nor causes its
+files to be transferred.
 Each verification source copy preserves the sealed tree's modification times and stable
 `/job/workspace` path, which lets Cargo reuse the operation target instead of invalidating it merely
 because the tmpfs workspace was recreated.
@@ -224,11 +226,12 @@ and every operation contract limits accounted target/cache data to at most 6 GiB
 
 The worker and launcher refuse startup unless their fixed child directory remains on the same backing
 filesystem as `/var/lib/rdashboard-build` and ownership/mode is correct. New work is rejected unless
-its conservative maximum still leaves at least 20 GiB free on `/`; replaceable preparation entries
-begin LRU reclamation below the 30 GiB free-space target. Start with one worker slot and one launcher
-job on the production VPS so independent components cannot race their filesystem observations. The
-tmpfiles entries create the complete owned hierarchy on the existing filesystem; no extra mount is a
-prerequisite.
+its conservative maximum still leaves the 5 GiB hard emergency margin for the operating system,
+databases, logs and running services. Replaceable preparation entries begin eager LRU reclamation below
+the 30 GiB free-space target; that target describes the desired normal state and is not added to each
+operation's admission requirement. Start with one worker slot and one launcher job on the production
+VPS so independent components cannot race their filesystem observations. The tmpfiles entries create
+the complete owned hierarchy on the existing filesystem; no extra mount is a prerequisite.
 
 `source_tree_v1` remains deliberately offline and is valid only for a dependency-free repository or
 one whose complete gate dependencies are already vendored in the source tree. The additional
