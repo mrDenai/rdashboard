@@ -1862,3 +1862,354 @@ activation side effects.
 Slice 12e is production-worthy as an inactive local policy/initial-slot provisioning boundary and may
 be committed. Disposable-host kill/OOM/reboot drills and separately authorized production
 installation/activation remain outside this local slice; the commit alone does not make pushes deploy.
+
+## Slice 4i compact multi-project dashboard and Telegram gateway onboarding review
+
+### Scope and outcome
+
+- The project table now has nine bounded tracks and a 90-rem intrinsic minimum inside the existing
+  keyboard-scrollable frame. Notification time is rendered as a short semantic `time` value with a
+  full localized tooltip and cannot wrap character-by-character.
+- Resource telemetry is separated into labeled current CPU/RAM, windowed CPU/RAM medians and one-hour
+  traffic instead of one unlabeled value stream. Loading, unavailable and retained-history states stay
+  explicit.
+- The embedded browser assets use a SHA-256-derived path, and the versioned application module resolves
+  the matching versioned status module. Old stable routes remain non-cacheable compatibility inputs.
+- The controller publishes independent rimg and Telegram gateway observations concurrently. Gateway
+  service health comes from the fixed HTTPS `/health` route; numeric resources come through the
+  peer-authenticated observer. Repository history now runs once per monitored project.
+- The root observer accepts only the compiled `rimg` and `telegram-gateway` project IDs and derives
+  exact service/role filters internally. Gateway may have Docker health `missing`, matching its real
+  image contract, while running state, private Kamal address and the independent HTTP health authority
+  remain required.
+- The gateway source/workflow manifest is present with bare `bin/ci`, Cargo preparation, bounded local
+  OCI build, stateful `/data` backup, readiness, rollback and notifications. Source controls keep
+  `auto_deploy=false`.
+
+### Self-review findings and corrections
+
+- The screenshot defect was an omitted ninth-column track, not excess notification content. Adding a
+  real column width and no-wrap timestamp fixes the row-height root cause without hiding the event.
+- The first source manifest used HTTPS because that is the developer checkout remote. A live read-only
+  GitHub metadata check proved `mrDenai/telegram-gateway` is private; the production source broker has
+  no ambient credential helper and would fail to fetch it. The manifest now uses the pinned SSH form
+  and the generated source document requires the project-bound read-only key and reviewed known-hosts
+  credentials.
+- The observer tests now prove that an unknown caller-selected project is rejected before Docker
+  discovery. A controller test proves two configured collectors remain two ordered independent rows.
+- No deployment-active claim was accepted. The generic source, preparation, verification and local OCI
+  graph can admit this project, but the installed privileged mutation implementation still contains
+  rimg-specific backup/cutover/rollback policy and adapters. Generalizing that root boundary is the
+  next deployment slice; enabling gateway `auto_deploy` now would be false and unsafe.
+- The systemd environment, canonical source catalog, gateway webhook secret, SSH deploy key/host pin
+  and service restart remain one-time production installation work. No VPS state was changed here.
+
+### Verification
+
+- Final bare `bin/ci`: passed, exit code 0 after the private-repository correction.
+- It covered formatting, strict Clippy, 303 library tests with two credentialed live-provider tests
+  ignored by design, all binary/integration/socket/scheduler/worker/schema suites, nine browser
+  contract tests and the optimized release build.
+- `git diff --cached --check` passed. Final staged patch SHA-256:
+  `0013122dd4599051011dd81df1ebce90fcbb6d0dbf80c0a26fcb5d79afdf19de`.
+
+### Independent consultation
+
+- `deepseek-free` route check passed, but both the broad and narrowed fresh review requests returned
+  `PARTIAL` before a verdict. The broad request used state fingerprint
+  `c936f49eb33682ea3bdda15e13b92c4cecbb586488c53ca0385371a3e2d5c38d`, brief SHA-256
+  `946d9e1cc8a78dc466813471f72fbf649c89091ae091af1b7dd3cdf8736ad89e`, two attempts and 34
+  seconds. The narrowed request used state fingerprint
+  `7129636c2d76bc7a4b4b53aa868a6e17ad656791142f027a0228efce437bb26f`, brief SHA-256
+  `8781f495d1b5973c053beb1b7ae9553994e7881f74a5ac2b77566bb09021c9d3`, one attempt and 19
+  seconds.
+- Neither partial response contained a finding or verdict; both stopped while reading the diff. They
+  are recorded as unavailable review perspective, not as approval. Per the consultation contract, no
+  substitute route was used. The final disposition therefore rests on the complete gate and the
+  evidence-backed self-review above.
+
+### Verdict
+
+Slice 4i is production-worthy as a local compact UI and truthful inactive gateway onboarding boundary
+and may be committed. It does not deploy or activate production. Gateway monitoring requires the
+documented one-time host/catalog/credential installation; gateway deployment additionally requires the
+next generic privileged mutation-adapter slice before `auto_deploy` can safely change.
+
+## Slice 4j production monitoring deployment review
+
+### Production outcome
+
+- The pushed `c85a5ab56e294a279c4e1782283e6c6604f9eba4` controller and observer were installed into the
+  production host's existing `/usr/libexec/rdashboard` layout. Exact pre-deploy binaries are retained
+  under root-only `/var/lib/rdashboard-deployments/c85a5ab56e294a2`.
+- The controller received only fixed gateway monitoring inputs: `https://tg.4u.ge` for health and the
+  peer-authenticated persistent observer socket for resources. The deployed controller SHA-256 is
+  `628025d90918dd258a7de0eefa6b26342a7d2989d84b5f48524622482c413a8e`.
+- The first installation attempt restored the old binaries automatically because the script checked
+  the `Type=simple` observer socket before it became ready. The installer was corrected to wait for
+  bounded socket readiness, then the same exact candidate deployed successfully.
+- Live measurements showed low-activity `docker stats --no-stream` taking approximately two seconds,
+  exactly colliding with the observer's two-second subprocess deadline. The timeout was raised to
+  three seconds while remaining below the four-second authenticated request deadline, covered by the
+  existing fixed-command contract, and committed as
+  `5e727d280587c899b71fd4533c3773e6bd651dd2`. Its release observer SHA-256 is
+  `c75d48b1080c9019b355be83199032705ce626beac7d7bc6cfe13cb91c3a989c`; its exact previous binary is
+  retained under `/var/lib/rdashboard-deployments/5e727d280587c899b71fd4533c3773e6bd651dd2`.
+
+### Verification
+
+- Bare `bin/ci` passed after the observer deadline correction: format, strict Clippy, 303 active
+  library tests, all binary/integration/socket/scheduler/worker/schema suites, nine browser contract
+  tests and the optimized release build.
+- Production `rdashboard.service`, `rdashboard-observer.service` and `rdashboard-notify.service` are
+  active. `GET http://127.0.0.1:3100/health` returned `status=ok` with a current sample.
+- Six consecutive post-restart SQLite rows for each project reported `condition=healthy` and
+  `resource_status=fresh`; resource observation timestamps advanced on every five-second controller
+  sample. The observer journal contains no collection warning after the new process announced socket
+  readiness.
+- The persistent observer supersedes the legacy per-request resource collector. Exactly 717 historical
+  failed `rdashboard-rimg-resources@*.service` states were reset; the same bounded failed-unit query
+  then returned zero. No unrelated failed service was reset; the pre-existing `4u-backup.service` and
+  `logrotate.service` failures remain visible and outside this deployment.
+- Both exact `/tmp` staging directories were removed after verification. Root-only rollback binaries
+  remain in the versioned deployment directories above.
+
+### Deliberate limits and repository state
+
+- No failure, OOM or reboot drill was run, per the user's standing constraint.
+- The production source/bootstrap service is not installed or active, so repository observations for
+  both projects remain explicitly unavailable. Gateway source credentials and webhook registration
+  were not installed, and gateway `auto_deploy` remains false because its generic privileged mutation
+  adapter is not implemented.
+- The pushed controller commit is still `origin/main`. The measured observer hotfix is committed
+  locally and deployed, but is not pushed without separate push authorization.
+
+### Verdict
+
+The compact multi-project UI and Telegram gateway health/resource monitoring are live and healthy in
+production with exact rollback binaries. Production is intentionally ahead of `origin/main` only for
+the bounded observer timeout hotfix; source-driven deployment and gateway mutation remain inactive.
+
+## Slice 4k-a project-scoped Kamal mutation runtime review
+
+### Scope and outcome
+
+- Prepared adapter jobs now retain the authorized project identity and select only that project's
+  Kamal credentials. Existing rimg credential paths remain exact; other projects use the bounded
+  `/etc/rdashboard/credentials/projects/<project-id>` namespace.
+- Installed Kamal runtime V3 remains accepted only for rimg. Canonical V4 configuration is
+  project-bound and adds a bounded exact-status HTTP health probe for images such as Telegram
+  gateway that deliberately have no Docker HEALTHCHECK.
+- Stable backend, router, router-volume and proxy-service identities are derived from the signed
+  deployment plan's project, network alias and sole TCP application port. The rimg derivation remains
+  exactly compatible; Telegram gateway can use port 8081 and `/health` without receiving rimg names.
+- V4 first-install bootstrap fails before image import or mutation. Deploy/rollback support is only a
+  foundation for an already-authorized installed release; live-container adoption, generic stateful
+  backup/restore and phase-policy generalization remain explicit follow-up work. `auto_deploy=false`
+  is unchanged and no host or production state was mutated.
+
+### Verification and self-review
+
+- Final bare `bin/ci` passed after the review additions: strict formatting/Clippy, 306 active library
+  tests with two credentialed live-provider tests ignored by design, every binary/integration/socket/
+  scheduler/worker/schema suite, nine browser contract tests and the optimized release build.
+- `git diff --cached --check` passed. Final product/documentation patch SHA-256:
+  `98a00bb2ad9af152705f25099f6c5db2990b6787db785947fd89114cc444131a`.
+- Self-review confirmed that every path fragment comes from validated `ProjectId`, all Docker and
+  HTTP inputs remain separate bounded arguments, V3 rendering/routing stays exact for rimg, and the
+  current and candidate route identities must match before a switch.
+- The HTTP request path rejects query/control syntax and is capped at 256 bytes; connect/read/write
+  timeouts, retry interval/count and response bytes are bounded. Candidate IP comes only from Docker's
+  fixed `kamal` network inspection and unspecified, loopback and multicast addresses fail closed.
+
+### Independent consultation
+
+- `deepseek-free` / `opencode/deepseek-v4-flash-free` returned `ANSWERED` with `PASS`, no must-fix
+  finding or open question. State fingerprint
+  `d2e31a83f91a88e73bebaa4f525d0e4ee797326f7a8175d56c5e0d3997b3177b`, brief SHA-256
+  `b1f3ba72487184cbfddf03a01d76c8cbb2619d53eb965e670ecc2bb3f191ecf8`, one attempt, 119 seconds;
+  response: `/tmp/rdashboard-consult-kamal/response.md`.
+- The reviewer independently checked credential traversal resistance, CRLF/path bounds, pre-mutation
+  V4 bootstrap rejection, V3 rimg lock-in and cross-project route-switch prevention. All findings
+  were informational confirmations and require no correction.
+
+### Verdict
+
+The project-scoped Kamal runtime foundation has no unresolved P0-P2 finding. It is safe to commit as
+an inactive local sub-slice after the final bare gate; it does not yet authorize or perform Telegram
+gateway adoption, state migration, deployment or production activation.
+
+## Slice 4k-b project-scoped backup pipeline review
+
+### Scope and outcome
+
+- Backup encryption/upload/readback runtime and secret-free rclone configuration now load from the
+  authorized project's `/etc/rdashboard/projects/<project-id>` directory. The derived rimg paths are
+  exactly the existing constants.
+- Google Drive upload/readback transient units receive only the service-account source selected by
+  the job's retained project identity. rimg keeps its legacy credential path; other projects use
+  `/etc/rdashboard/credentials/projects/<project-id>/drive-service-account.json`.
+- Runtime validation remains bound to the exact phase project, installed mutation-policy digest,
+  provider version, recipient fingerprint, tool hashes, canonical rclone bytes and credential hash.
+- This slice deliberately does not claim generic capture: the next boundary is an atomic Gateway
+  SQLite backup from its named volume, followed by generic phase/adoption authority. No service,
+  credential, provider, source or production state was changed.
+
+### Verification and review
+
+- Bare `bin/ci` passed: strict formatting/Clippy, 308 active library tests with two credentialed
+  provider tests ignored by design, every binary/integration/socket/scheduler/worker/schema suite,
+  nine browser contract tests and the optimized release build.
+- Exact staged product patch SHA-256:
+  `63ce5a3761d27f840473a6ab84a60118b694a757c0b774dc16a34bc168a2100a`.
+- Self-review confirmed `ProjectId` is the sole dynamic path fragment and is already restricted to
+  bounded lowercase alphanumeric/hyphen syntax; arguments remain separate and no shell is involved.
+- `deepseek-free` / `opencode/deepseek-v4-flash-free` returned `ANSWERED` with
+  `NO_BLOCKING_DEFECT`, no open question. State fingerprint
+  `6d8cf1e0267d2fd56c2ddb809cf77be9912636da3eaee3d45605fa022f790642`, brief SHA-256
+  `eacf0f2bd5b07dfdc50902643fcfb8ad0f851fb4305376ff5653d1d2ec6f9ea5`, one attempt, 40 seconds;
+  response: `/tmp/rdashboard-consult-backup-scope/response.md`. All five findings were informational
+  confirmations of path safety, project/policy binding, credential isolation and truthful scope.
+
+### Verdict
+
+The project-scoped backup pipeline has no unresolved P0-P2 finding and is production-worthy as an
+inactive local foundation. Generic capture, Gateway adoption and production activation remain
+explicitly incomplete.
+
+## Slice 4k-c atomic online SQLite capture review
+
+### Scope and outcome
+
+- Non-rimg backup capture now uses a dedicated project/policy-bound installed runtime and SQLite's
+  Online Backup API. It never copies a live database, WAL or SHM file and never drains Gateway.
+- Source paths are confined to the exact project's Docker named-volume or managed data root and
+  must resolve without symlinks to a private root-owned single-link database. The transient unit
+  receives only backup-root write authority; rimg retains its exact historical mutable roots.
+- Snapshot database and canonical capture state are published through fsynced pending files and
+  hard links. Replay preserves the original authorized timestamp; an incomplete pair is recaptured
+  rather than accepted with invented evidence.
+- The snapshot is normalized out of WAL mode, checked for integrity, foreign keys, required tables
+  and staged reads, and assigned a deterministic schema identity from canonical `sqlite_schema`.
+- Generic encryption now enumerates signed manifest objects. The rimg archive keeps the exact
+  `database.sqlite` and `masters.bundle` entries and ordering.
+- This is deliberately base-only. Generic cutover/fencing, release phase policy, existing-service
+  adoption and production activation remain outside this slice.
+
+### Verification and review
+
+- Bare `bin/ci` passed after two test-contract corrections: strict formatting/Clippy, 312 active
+  library tests with two credentialed provider tests ignored by design, every binary/integration/
+  socket/scheduler/worker/schema suite, nine browser contract tests and the optimized release build
+  (`4m45s`).
+- Exact staged product patch SHA-256:
+  `c30034a73570b7933ea6bd394494f6a9724635815d031a8009ad182ba308cf85`.
+- The high-signal runtime test proves live WAL content is captured, replay remains immutable with
+  the original timestamp, and a deliberately incomplete snapshot/state pair is freshly recaptured.
+- `deepseek-free` / `opencode/deepseek-v4-flash-free` returned `ANSWERED` with `PASS`, no P0-P2
+  finding and no open question. State fingerprint
+  `f9b1f543e3c187a060189ce3caf63914641ea9d2f6da1bbad3c4eb9dbcba5283`, brief SHA-256
+  `10331b47052c4ddc35bc88140daf3fcbf4bfb4c0295a2886d26470ac974b085f`, one attempt, 150 seconds;
+  response: `/tmp/rdashboard-consult-sqlite-capture/response.md`.
+
+### Verdict
+
+The online SQLite capture and archive path have no unresolved P0-P2 finding and are ready to commit
+as an inactive local foundation. Telegram Gateway still cannot be activated until the generic
+phase policy and explicit existing-volume/service adoption contract are implemented and verified.
+
+## Slice 4l source-retention and inactive rimg catalog review
+
+### Scope and outcome
+
+- Live production evidence traced `/var/lib/rdashboard-build/source-exports` growth to periodic
+  re-attestation of unchanged heads after ingress TTL expiry. Disabled projects had no consumer for
+  those generations, yet each new sequence published another identical archive.
+- Same-head processing now renews an expired attestation only when auto-deploy is enabled and the
+  exact outbox entry is not delivered. Pending delivery after controller outage still renews;
+  delivered and disabled heads keep the same immutable sequence across direct push and reconcile.
+- Settled-outbox retention excludes the exact current source generation, so a delivered marker cannot
+  age out after 2,048 unrelated settled entries and provoke a later unnecessary re-attestation.
+- The inactive rimg catalog binds its private SSH source, existing `Dockerfile.runtime`, stateful
+  data/masters, derived uploads, exact 204 health endpoints and fenced migration node. The controls
+  remain `auto_deploy=false`; the missing sealed Titanium named build context is documented as an
+  activation blocker rather than hidden behind a failing worker path.
+
+### Verification and independent consultation
+
+- Bare `bin/ci` passed: strict formatting/Clippy, 314 active library tests with two credentialed live
+  tests ignored by design, all binary/integration/socket/scheduler/worker/schema suites, nine browser
+  contract tests and the optimized release build (`5m48s` for the release stage).
+- Exact staged product patch SHA-256:
+  `98eb0153348a2c6182b64fda3ff3a55f3234014937b0702810b43cf5a7620657`.
+- `deepseek-free` / `opencode/deepseek-v4-flash-free` returned `ANSWERED`, state fingerprint
+  `1b9c62670e0f70c24bfda00e166aacf2f572dee479856a24f97673f5db56d6f9`, brief SHA-256
+  `b01da7d28000719ad672ff8aa5e25205c883ae9fb6636279a69b889e5965f262`, two dispatcher attempts,
+  233 seconds; response: `/tmp/rdashboard-source-review-out/response.md`.
+- Its one low finding was accepted and fixed: pruning could remove the delivered row for the current
+  source generation. The final SQL retains that row and a regression test deliberately overflows the
+  2,048-row settled retention before proving the sequence remains stable. Dockerfile variant safety,
+  outbox uniqueness, pending refresh and inactive rimg scope were confirmed informationally.
+
+### Verdict
+
+No unresolved review finding remains. The source fix and inactive rimg catalog are ready for a local
+product commit. Production remains on the previous pushed commit until the new commit is pushed and
+installed; obsolete duplicate exports must be removed only after the corrected sequence is observed
+stable beyond its TTL.
+
+## Slice 4m production source activation review
+
+### Scope and outcome
+
+- Local `main`, exact remote `main` and the installed source broker were bound to
+  `9a42d9491c0b2f3da7bd54fb890e0f3be6f26a4e`; the active broker binary matched the local release
+  binary byte-for-byte.
+- A partial prior rimg setup contained only root-private credentials. The activation atomically added
+  its canonical installed manifest and three-project controls, generated the strict installed source
+  document, initialized the source-owned bare repository and created the setgid build-reader export
+  directory. Exact pre-mutation files and an online SQLite backup were retained under
+  `/var/lib/rdashboard-deployments/source-rimg-9a42d94-20260722T121215Z`.
+- All three projects remain `auto_deploy=false`. The public/private bridge is absent and inactive;
+  neither a build, candidate mutation nor deployment was enabled.
+
+### Live evidence
+
+- Installed canonical hashes are
+  `8a1452c51582aa1eb00764eae0ee0edf95a15abc0f76b38e5baa3173a166cb1a` for the rimg manifest and
+  `861f92217a33c228f94136921a8d2cc587e9ba0b7c019cd086429b3cd2cf0a9f` for source controls.
+- Source, dispatcher and ingress restarted cleanly. Loopback `http://127.0.0.1:3201/health` returned
+  204 and their combined journal had no warning-or-higher event from activation onward.
+- The production controller was aligned to the same commit with exact release SHA-256
+  `6ee04bee4d7421d0da8f1661a2fd60c2fbaf346a3ac1883e8939135feb94fa46`; its previous
+  `628025d9...` binary remains as an exact rollback copy. Controller `/health` returned `status=ok`,
+  its journal had no warning-or-higher event after restart, and the metrics journal reported fresh
+  healthy samples for both `rimg` and `telegram-gateway`.
+- The accepted heads are exactly `rdashboard=248@9a42d949`, `rimg=1@5303113e` and
+  `telegram-gateway=269@07106b22`. After 139 seconds, beyond the 120-second attestation TTL, all three
+  sequences and export counts were unchanged.
+- Dry cleanup inspection found no non-regular file, noncanonical basename or multi-link export. It
+  selected 1,028 obsolete files totaling 2,021,510,064 bytes while excluding each current exact
+  SHA-sequence `.tar`/`.jcs` pair. After deletion, each project has exactly that pair; the four retained
+  pre-existing files match their pre-cleanup SHA-256 values, ledger history is unchanged, services are
+  active and filesystem availability increased by 2,024,812,544 bytes.
+- A full repository `rdashboard-tmpfiles.conf` was briefly staged during the final continuation, then
+  removed from `/usr/lib/tmpfiles.d` before any reboot or tmpfiles application because the inactive
+  worker/build users do not yet exist. Its exact bytes were retained in the deployment rollback
+  directory as `rdashboard-tmpfiles.conf.not-installed`; the directly provisioned persistent source
+  repository/export directories remain valid.
+
+### Remaining boundary
+
+The source contour is production-ready but deliberately inert for deployment. The complete tmpfiles
+policy cannot be installed truthfully until the generic `rdashboard-worker` and
+`rdashboard-buildkit` identities plus their dedicated storage/quota boundary exist. That inactive
+worker/build activation, including rimg's missing sealed Titanium named context, is the next slice.
+GitHub workflow refinement, public bridge activation, automatic deployment, runner retirement,
+failure/reboot drills and broad cache cleanup are outside this result.
+
+### Verdict
+
+Slice 4m is complete with no known source-contour defect. Production accepts and retains one current
+source generation per installed inactive project, rimg is onboarded without deploy authority, and the
+previous duplicate-export leak has been both stopped and reclaimed.

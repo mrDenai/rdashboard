@@ -313,3 +313,132 @@ Normalized decision and constraint:
   verified activation safety.
 - This decision does not authorize VPS installation, service changes, credential installation,
   `auto_deploy` activation, push or deployment.
+
+### U020 — 2026-07-22
+
+Faithful English rendering:
+
+The single `rimg` project row has expanded to half the screen, which is unacceptable. The Telegram
+gateway must also be monitored and deployable.
+
+Normalized request and authorization:
+
+- Locally implement a compact, production-worthy project presentation that does not let one cell
+  inflate a complete project row.
+- Onboard `telegram-gateway` into the same dashboard-owned project model for truthful monitoring and
+  deployment capability; do not create a decorative UI-only row.
+- Preserve the existing external-mutation boundary: repository implementation, verification, review
+  and a task-scoped local commit are authorized, while push and production activation still require
+  fresh explicit authorization.
+
+### U021 — 2026-07-22
+
+Faithful English rendering:
+
+The reason for the expansion is shown in the screenshot.
+
+Normalized correction:
+
+- The observed height defect is caused by the newly added notification column receiving effectively
+  no usable width, so its timestamp wraps one character per line and expands the entire table row.
+- Fix the column contract and long-content wrapping at the layout boundary rather than hiding or
+  truncating the notification data.
+
+### U022 — 2026-07-22
+
+Faithful English rendering:
+
+Also fix this jumble; it is not understandable what is being displayed in the resources cell.
+
+Normalized acceptance criterion:
+
+- Replace the concatenated resource dump with a compact, labeled presentation that distinguishes
+  current CPU/RAM, memory history and recent network traffic without requiring the operator to infer
+  units or time windows.
+
+### U023 — 2026-07-22
+
+Faithful English rendering:
+
+Why did we stop? Deploy it; I pushed.
+
+Normalized authorization and constraint:
+
+- The pushed `rdashboard` commit may now be deployed to the production VPS, including the one-time
+  controller/observer/catalog wiring required to expose Telegram gateway monitoring.
+- Inspect the accepted and installed SHA first, preserve rollback/recovery state, and verify the live
+  dashboard/health/resource contracts without running the previously declined failure/reboot drills.
+- Do not enable `telegram-gateway` automatic production mutation: its generic privileged
+  backup/cutover/rollback adapter is still unimplemented, so `auto_deploy=false` remains mandatory.
+
+### U024 — 2026-07-22
+
+Faithful English rendering:
+
+Why have we stopped again?
+
+Normalized instruction:
+
+- Continue the authorized local implementation after the completed production monitoring deployment;
+  do not stop at the push synchronization checkpoint while safe repository work remains.
+- Prioritize the next coherent boundary that turns Telegram gateway onboarding from observation-only
+  into a real generic deployment capability, without enabling production mutation or running the
+  declined failure/reboot drills.
+- Preserve the existing full-gate, substantive-review, task-scoped commit and fresh external-mutation
+  authorization boundaries.
+
+### U025 — 2026-07-22
+
+Faithful English rendering:
+
+Then do it.
+
+Normalized authorization and constraints:
+
+- Continue with the immediately preceding concrete next stage: onboard `rimg` into the installed
+  source/workflow catalog, activate the bounded generic worker/build/deploy path and the prepared
+  `rdashboard` A/B self-update path, then enable automatic deployment one project at a time only after
+  the complete live path for that project succeeds.
+- The production and GitHub-provider mutations inherently required for that activation are authorized
+  in this stage. A repository push, unrelated destructive cleanup, runner retirement and broad cache
+  deletion remain outside this instruction.
+- Preserve the user's explicit refusal of failure, OOM and reboot drills. Connect the public webhook
+  only after the local ingress path is proven; do not call an unverified or incomplete path active.
+
+### U026 — 2026-07-22
+
+Faithful English rendering:
+
+I pushed it.
+
+Normalized authorization and state update:
+
+- Commit `9a42d94` is now expected on `origin/main`; verify the exact remote SHA before production
+  mutation.
+- Continue the already authorized production source-contour installation, live TTL stability proof
+  and task-owned duplicate source-export reclamation.
+- Preserve `auto_deploy=false`, the no-drill constraint and exact rollback copies; do not broaden this
+  acknowledgement into runner retirement, broad Docker/cache cleanup or unrelated mutations.
+
+### U027 — 2026-07-22
+
+Faithful English rendering:
+
+Stop refining the temporary GitHub deployment path. `rdashboard` will own deployment, so retain the
+GitHub cancellation/lock incident only as a design lesson and resume the work that was underway before
+that detour. Explain the exact stop point and continue.
+
+Normalized instruction:
+
+- Do not modify the GitHub deployment workflow now.
+- Resume the already-authorized production source-contour activation at pushed exact commit
+  `9a42d9491c0b2f3da7bd54fb890e0f3be6f26a4e`, including the current follow-up hardening commit
+  `b69cbf1` already present on remote main, after exact remote/local and production preflight.
+- Install and prove the source broker/dispatcher/ingress boundary with `auto_deploy=false`, then wait
+  beyond the attestation TTL before reclaiming only the proven duplicate source exports owned by the
+  retired generation bug.
+- Carry the observed Kamal cancellation lesson into rdashboard's later mutation state machine:
+  supersede only after a newer candidate is fully admitted, and cancel/release only the exact owned
+  attempt. Do not implement that by extending the temporary GitHub path.
+- Legacy Sartuli master deletion and off-host backup remain deferred; no runner retirement, broad
+  cache cleanup, repository push or failure/reboot drill is authorized.

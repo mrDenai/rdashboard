@@ -2,7 +2,7 @@
 
 - Workflow directory: `.agent/workflows/2026-07-20-github-independent-delivery`
 - Status: implementation in progress
-- Last updated: 2026-07-21
+- Last updated: 2026-07-22
 - Depends on: `brief.md`, `research.md`
 
 ## Outcome
@@ -103,11 +103,56 @@ Implementation progress:
 | 1. Lifecycle, resource and failure evidence | In progress | Slice 1a locally completes the persistent peer-authenticated observer migration. Slice 1b locally completes Failure Capsule V2 plus capture-before-collection terminal and cleanup receipts for the existing fixed transient adapter boundary. Only the separately authorized live baseline/comparison remains in this step. |
 | 2. Installed workflow and scheduler journal | Complete locally | Slices 2a-2c implement the strict V2 installed DAG, durable scheduler, single peer-authenticated cross-project worker gateway, bounded restart-safe renewal, cleanup-before-reuse and a bounded read-only controller/dashboard projection. The actual generic worker remains step 4. |
 | 3. Multi-project source ingress and durable controller delivery | In progress | Slices 3a-3b locally implement signed source-to-controller delivery, strict multi-project source installation and bounded durable GitHub webhook ingress. Forced-push ingress and the separately authorized live timing drill remain in this step. |
-| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4h locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state, the inactive rootless BuildKit activation boundary and a verified typed OCI build-result handoff. Live systemd/dedicated-filesystem/quota/concurrency proof and the first project-specific sealed-base preparation remain; no activation is implied. |
+| 4. Generic VPS worker, sealed preparation and storage fence | In progress | Slices 4a-4h locally complete exact source/dependency-to-lease binding, the sealed CAS/storage-admission foundation, short-lived signed execution grants, the fixed peer-authenticated root launcher, the unprivileged shared worker, explicit sealed input composition, fixed Cargo.lock/crates.io dependency preparation, bounded operation-owned compiled state, the inactive rootless BuildKit activation boundary and a verified typed OCI build-result handoff. Slice 4k is now implementing the generic stateful OCI mutation boundary required by Telegram gateway. Live systemd/dedicated-filesystem/quota/concurrency proof and the first project-specific sealed-base preparation remain; no activation is implied. |
+| 4i. Compact multi-project dashboard and Telegram gateway onboarding | Completed locally | The nine-column/resource UI, content-addressed assets, exact two-project health/resource/repository observation, and private-SSH gateway source/workflow contract are implemented and pass bare `bin/ci`. `auto_deploy=false` remains truthful: the installed privileged mutation adapter is still rimg-specific, so gateway cutover/rollback is the next implementation boundary rather than an active capability. |
+| 4j. Deploy the pushed monitoring slice to production | Completed | Deployed pushed controller commit `c85a5ab56e294a279c4e1782283e6c6604f9eba4` through the installed legacy layout with exact rollback copies, fixed gateway health/observer wiring and `auto_deploy=false`. A measured two-second Docker-stats boundary required verified observer hotfix `5e727d280587c899b71fd4533c3773e6bd651dd2`; production then sustained fresh rimg/gateway samples, all three runtime services and controller health. Reset 717 obsolete failed transient rimg collector states. Source/bootstrap activation, repository credentials and failure/reboot drills remain deliberately outside this authorized step. |
+| 4k. Generic stateful OCI mutation adapter for Telegram gateway | In progress | Three local sub-slices now make Kamal, backup-pipeline paths/credentials, and atomic online SQLite base capture project-scoped while preserving exact rimg behavior. Gateway capture reads its live WAL database through SQLite Online Backup, has crash-safe immutable replay evidence, and grants no source-volume writes. Remaining work is the generic phase/release policy plus an explicit initial adoption contract for the already-running gateway. Source remains `auto_deploy=false`; no production activation or drills. |
+| 4l. Bound unchanged-source retention and onboard inactive rimg source | Completed locally | Production discovery found periodic TTL re-attestation of unchanged disabled heads had created about 1.8 GiB of duplicate source exports. The broker now refreshes only an enabled undelivered expired head, retains the current delivered outbox marker across pruning, and keeps delivered or disabled generations stable. The exact private rimg source/workflow/data/health/migration contract and setgid handoff path are cataloged with `auto_deploy=false`; Titanium remains an explicit sealed-input blocker. Bare `bin/ci` and independent review passed. Push, production install and duplicate-export reclamation remain pending. |
+| 4m. Activate and prove the production source contour | Completed | Exact `9a42d94` controller, source, dispatcher and loopback ingress now serve `rdashboard`, `rimg` and `telegram-gateway` with `auto_deploy=false`. The controller health contract is green and records fresh healthy samples for both managed runtime projects. The three accepted sequences remained `248 / 1 / 269` beyond the 120-second TTL, ingress health returned 204 and no warning-or-higher journal event appeared. After a typed dry inventory, 1,028 obsolete duplicate exports totaling 2,021,510,064 file bytes were removed while the current six `.tar`/`.jcs` files and the complete ledger history were retained. No public bridge, project deployment, runner retirement or broad cache deletion was activated. |
+| 4n. Activate bounded worker storage and artifact-native rimg inputs | Blocked on host storage; design in progress | Production has only one 75 GB disk/root filesystem and 14.3 GB available, with no LVM/free device. The existing hard fences require separate preparation (about 8 GiB), operations (6-8 GiB), BuildKit (1.5-2.5 GiB) and OCI-result (4-6 GiB) filesystems while retaining at least 12 GiB free on root. Add a separate 32 GB volume or equivalent unallocated disk extent before installing the missing worker/build identities and units. Locally, replace the current unsealed `native` context plus duplicate Rust compilation with one sealed Titanium artifact, one verified release binary and minimal final OCI assembly; do not add a temporary Docker-compatible shadow path. |
 | 5-11 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 | 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Slice 12c migrates the complete application payload to one atomic `current/bin` slot and adds the stable root recovery CLI. Slice 12d adds the inactive exact `rdashboard` source/workflow catalog and a terminal self-update handoff graph that cannot also enter the generic executor mutation path. Slice 12e is implementing one generated launcher/bootstrap policy bundle plus crash-safe first-slot provisioning. Failure drills and explicit activation remain. |
 
 Implementation ledger:
+
+- Slice 4m production activation on 2026-07-22 bound local and remote `main` to exact commit
+  `9a42d9491c0b2f3da7bd54fb890e0f3be6f26a4e`. The active source binary SHA-256 exactly matches the
+  current release binary (`50fbbf5a...`). Exact rollback state lives under
+  `/var/lib/rdashboard-deployments/source-rimg-9a42d94-20260722T121215Z`, including an online SQLite
+  backup and the prior source/catalog/drop-in files.
+- The controller was then aligned to the same commit with release SHA-256 `6ee04bee...`; its prior
+  `628025d9...` binary remains as an exact rollback copy. `/health` is green, the source ingress returns
+  204, and the metrics journal reports fresh healthy states for both `rimg` and `telegram-gateway`.
+- Production now has one exact three-project manifest/control/generated-source set. The canonical rimg
+  manifest SHA-256 is `8a1452c51582aa1eb00764eae0ee0edf95a15abc0f76b38e5baa3173a166cb1a`;
+  controls SHA-256 is `861f92217a33c228f94136921a8d2cc587e9ba0b7c019cd086429b3cd2cf0a9f`.
+  Source, dispatcher and loopback ingress are active, ingress `/health` returns 204, and the public
+  Kamal-network bridge remains absent/inactive. Every project remains `auto_deploy=false`.
+- The broker accepted `rdashboard=248@9a42d949`, `rimg=1@5303113e` and
+  `telegram-gateway=269@07106b22`. All sequences and export counts remained unchanged 139 seconds after
+  rimg acceptance, beyond the configured 120-second TTL, with no warning-or-higher source/dispatcher/
+  ingress journal event.
+- The typed cleanup inventory found only regular, single-link, canonical-name exports. It retained the
+  current `.tar`/`.jcs` pair for each project and removed 492 obsolete rdashboard files
+  (1,810,014,756 bytes) plus 536 obsolete Telegram Gateway files (211,495,308 bytes). The six retained
+  files still match their pre-cleanup hashes, source ledger history remains intact, and free space
+  increased by 2,024,812,544 filesystem bytes.
+- Full `rdashboard-tmpfiles.conf` is deliberately not installed yet: production does not have the
+  `rdashboard-worker` and `rdashboard-buildkit` identities that the complete file references. The exact
+  rimg repository/export directories were created directly for source activation. Creating the missing
+  identities, dedicated storage/quota boundary and inactive generic worker/build services is the next
+  activation slice; this source slice grants no build or deploy authority.
+- The 4n live preflight found no safe storage layout on the current device. `/dev/vda1` is the sole
+  writable persistent filesystem and has 14,306,525,184 bytes available; there is no LVM/free device.
+  The four minimum hard-fenced filesystems consume about 19.5 GiB before filesystem overhead while the
+  root-reserve contract independently requires 12 GiB free. Loop files on the current root would
+  violate that reserve. Provision at least a separate 24 GiB extent; a 32 GB volume is the operational
+  recommendation and leaves margin for filesystem metadata and measured high water.
+- The rimg build preflight also rejected treating the present `Dockerfile.runtime` as the final path:
+  it requests an external Dockerfile frontend, consumes an unsealed `native` context and compiles the
+  Rust release again after bare `bin/ci`. The permanent integration must bind one sealed Titanium
+  artifact and the verified release binary into minimal OCI assembly. It must not revive the temporary
+  Docker-requiring compatibility shadow described by the older step-5 wording.
 
 - Slice 1a owns the new observer protocol/server/client, fixed Docker collector binary, observer
   service, rimg resource-client migration, removal of the legacy resource socket/template, contract
@@ -716,6 +761,73 @@ Verification:
 - In authorized shadow mode, run two projects and four matching claims concurrently and prove exactly
   one source materialization/dependency preparation per host, no per-slot clone/cache, bounded peak
   disk/RAM/CPU and zero owned residue after the reconciler interval.
+
+### 4i. Make project observation compact and onboard `telegram-gateway` truthfully
+
+Dependencies: the existing persistent observer, generic workflow catalog and read-only dashboard
+projection. This slice is prioritized by U020-U022 ahead of the older rimg-only shadow sequence.
+
+Observable outcome:
+
+- The project table has nine explicit bounded columns. Notification timestamps remain readable and
+  cannot wrap character-by-character or inflate a complete row; genuine narrow viewports use the
+  existing keyboard-scrollable table frame.
+- The resource cell presents current CPU/RAM, RAM limit, windowed CPU/RAM medians and one-hour network
+  totals as separately labeled facts. It does not concatenate unlike measurements into an unlabeled
+  telemetry dump.
+- HTML points at content-addressed asset paths derived from the embedded CSS and JavaScript bytes.
+  A new release cannot combine fresh HTML with stale unversioned CSS/module code.
+- The controller collects an exact set of monitored projects instead of constructing one hard-coded
+  rimg row. `rimg` retains its versioned health interpretation; `telegram-gateway` receives a bounded
+  health probe, resource observation through the peer-authenticated observer and repository history.
+- The root observer maps only installed project IDs to exact Docker service/role labels. The caller
+  cannot choose labels, container IDs or Docker arguments. Gateway observation accepts the real
+  production contract `service=telegram-gateway`, `role=web`, a running container on the private
+  `kamal` network and separately proven HTTP health; it does not require a Docker `HEALTHCHECK` that
+  the current image does not define.
+- `config/project-manifests/telegram-gateway.json` binds the canonical repository, bare `bin/ci`,
+  Cargo preparation, local OCI build, `/data` stateful backup requirement, `/health` readiness,
+  rollback and notifications. `config/source-projects.json` admits the project only with
+  `auto_deploy=false`.
+- No UI label claims that production deployment is active merely because the source/build manifest
+  exists. Discovery must state whether the existing rimg-specific installed mutation policy can
+  execute this project; if not, that generic root adapter remains an explicit next implementation
+  boundary rather than a silent fallback to repository scripts or GitHub Actions.
+
+Implementation decisions:
+
+- Keep the semantic table because the data is a direct repeated-field comparison. Use intrinsic
+  minimum sizing, an explicit table minimum width and horizontal overflow rather than shrinking a
+  timestamp below its readable size. This follows the selected local CSS layout guidance on bounded
+  tracks and real `overflow: auto`.
+- Keep monitoring profiles compiled/root-installed in this slice. A later catalog-driven profile
+  loader may replace them only when it preserves the same exact label/health allowlist and peer
+  boundary; repository content never selects Docker queries.
+- Use the gateway's stable production HTTPS health route for service availability and Docker only for
+  resource attribution. This observes the actual operator-visible route while keeping the controller
+  away from the Docker socket.
+
+Owned paths:
+
+- `web/{index.html,app.css,app.js}` and focused browser/web route contracts.
+- `src/web/routes.rs`, `src/projects/*`, `src/bin/rdashboardd.rs`,
+  `src/bin/rdashboard-observer.rs`, relevant observer/project tests and installed service environment
+  documentation.
+- `config/project-manifests/telegram-gateway.json`, `config/source-projects.json`, schema/catalog
+  contract assertions and the active workflow artifacts.
+
+Verification:
+
+- Bare `bin/ci` in `rdashboard` after the complete slice, followed by an owned-diff inspection and a
+  fresh substantive review. The gateway repository remains unchanged unless source evidence proves a
+  missing deployment-facing contract must be fixed there; if it changes, its bare `bin/ci` is also
+  required.
+- Static/browser contracts cover the nine-cell row, non-breaking notification time, labeled resource
+  groups, versioned module resolution, loading/error/unconfigured states and the two-project snapshot.
+- Observer contracts cover both exact project profiles, missing Docker health for gateway, wrong
+  labels/network/running state, ambiguous candidates and caller-selected unknown projects.
+- No production service, source catalog, webhook, credential, volume, image or route is changed in the
+  local implementation slice.
 
 ### 5. Produce and prove the `rimg` shadow candidate through the generic worker
 
