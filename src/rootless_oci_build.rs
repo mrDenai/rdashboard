@@ -1069,7 +1069,7 @@ fn parse_buildkit_metadata(bytes: &[u8]) -> Result<(OciDigest, OciDigest), Rootl
 
 #[derive(Clone, Copy, Debug)]
 struct ResultFilesystemSnapshot {
-    shared_hard_boundary: bool,
+    shared_storage_domain: bool,
     total_bytes: u64,
     available_bytes: u64,
     host_available_bytes: u64,
@@ -1099,8 +1099,7 @@ impl ResultFilesystemProbe for InstalledResultFilesystemProbe {
         let result_metadata = fs::metadata(&self.root)?;
         let shared_metadata = fs::metadata(shared_root)?;
         Ok(ResultFilesystemSnapshot {
-            shared_hard_boundary: is_exact_mount_point(shared_root)?
-                && result_metadata.dev() == shared_metadata.dev(),
+            shared_storage_domain: result_metadata.dev() == shared_metadata.dev(),
             total_bytes: stats.f_blocks.saturating_mul(fragment),
             available_bytes: stats.f_bavail.saturating_mul(fragment),
             host_available_bytes: host.available_space(),
@@ -1404,7 +1403,7 @@ impl RootlessOciResultStoreV1 {
 
     fn verify_boundary(&self) -> Result<(), RootlessOciBuildError> {
         let snapshot = self.probe.inspect(&self.root_handle)?;
-        if !snapshot.shared_hard_boundary
+        if !snapshot.shared_storage_domain
             || snapshot.total_bytes < SHARED_BUILD_STORAGE_MIN_BYTES
             || snapshot.total_inodes == 0
             || snapshot.available_bytes > snapshot.total_bytes
@@ -2050,47 +2049,6 @@ fn valid_relative_path(value: &str) -> bool {
         .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn is_exact_mount_point(path: &Path) -> Result<bool, RootlessOciBuildError> {
-    let canonical = fs::canonicalize(path)?;
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-    for line in mountinfo.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let _mount_id = fields.next();
-        let _parent_id = fields.next();
-        let _major_minor = fields.next();
-        let _root = fields.next();
-        let Some(mount_point) = fields.next() else {
-            continue;
-        };
-        if decode_mountinfo_path(mount_point) == canonical.as_os_str().as_encoded_bytes() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn decode_mountinfo_path(value: &str) -> Vec<u8> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\\'
-            && index + 3 < bytes.len()
-            && bytes[index + 1..=index + 3].iter().all(u8::is_ascii_digit)
-        {
-            let octal = (bytes[index + 1] - b'0') * 64
-                + (bytes[index + 2] - b'0') * 8
-                + (bytes[index + 3] - b'0');
-            decoded.push(octal);
-            index += 4;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    decoded
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum RootlessOciBuildError {
     #[error("rootless OCI build policy is invalid")]
@@ -2131,7 +2089,7 @@ pub enum RootlessOciBuildError {
     StoreAlreadyOpen,
     #[error("rootless OCI result store lock is poisoned")]
     StoreLockPoisoned,
-    #[error("rootless OCI results are outside the shared hard-bounded build storage")]
+    #[error("rootless OCI results are outside the fixed shared build domain")]
     InvalidStoreBoundary,
     #[error("rootless OCI result store does not have enough bounded capacity")]
     StoreCapacityExceeded,
@@ -2672,7 +2630,7 @@ mod tests {
     impl ResultFilesystemProbe for FixedResultFilesystemProbe {
         fn inspect(&self, _root: &File) -> Result<ResultFilesystemSnapshot, RootlessOciBuildError> {
             Ok(ResultFilesystemSnapshot {
-                shared_hard_boundary: true,
+                shared_storage_domain: true,
                 total_bytes: 64 * 1024 * 1024 * 1024,
                 available_bytes: self.available_bytes,
                 host_available_bytes: self.host_available_bytes,

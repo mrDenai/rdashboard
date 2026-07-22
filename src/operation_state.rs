@@ -1,10 +1,9 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read as _, Write as _},
-    os::unix::{
-        ffi::OsStringExt as _,
-        fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+    os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
@@ -505,7 +504,7 @@ struct StateUsage {
 
 #[derive(Clone, Copy, Debug)]
 struct FilesystemBoundarySnapshot {
-    shared_hard_boundary: bool,
+    shared_storage_domain: bool,
     total_bytes: u64,
     available_bytes: u64,
     host_available_bytes: u64,
@@ -547,8 +546,7 @@ impl FilesystemBoundaryProbe for SystemFilesystemBoundaryProbe {
         let root_metadata = fs::metadata(&self.root)?;
         let shared_metadata = fs::metadata(shared_root)?;
         Ok(FilesystemBoundarySnapshot {
-            shared_hard_boundary: is_exact_mount_point(shared_root)?
-                && root_metadata.dev() == shared_metadata.dev(),
+            shared_storage_domain: root_metadata.dev() == shared_metadata.dev(),
             total_bytes: stats.f_blocks.saturating_mul(fragment_size),
             available_bytes: stats.f_bavail.saturating_mul(fragment_size),
             host_available_bytes: host.available_space(),
@@ -1206,7 +1204,7 @@ fn required_state(
 fn validate_boundary(
     boundary: FilesystemBoundarySnapshot,
 ) -> Result<(), WorkflowOperationStateError> {
-    if !boundary.shared_hard_boundary
+    if !boundary.shared_storage_domain
         || boundary.total_bytes < SHARED_BUILD_STORAGE_MIN_BYTES
         || boundary.total_inodes == 0
         || boundary.available_bytes > boundary.total_bytes
@@ -1521,53 +1519,6 @@ fn remove_record_temporaries(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn is_exact_mount_point(path: &Path) -> Result<bool, WorkflowOperationStateError> {
-    let contents = fs::read("/proc/self/mountinfo")?;
-    for line in contents.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
-        if fields.len() < 6 {
-            return Err(WorkflowOperationStateError::InvalidFilesystemBoundary);
-        }
-        if Path::new(&OsString::from_vec(decode_mountinfo_field(fields[4])?)) == path {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn is_exact_mount_point(_path: &Path) -> Result<bool, WorkflowOperationStateError> {
-    Ok(false)
-}
-
-fn decode_mountinfo_field(field: &[u8]) -> Result<Vec<u8>, WorkflowOperationStateError> {
-    let mut decoded = Vec::with_capacity(field.len());
-    let mut index = 0;
-    while index < field.len() {
-        if field[index] != b'\\' {
-            decoded.push(field[index]);
-            index += 1;
-            continue;
-        }
-        let escaped = field
-            .get(index + 1..index + 4)
-            .ok_or(WorkflowOperationStateError::InvalidFilesystemBoundary)?;
-        decoded.push(match escaped {
-            b"040" => b' ',
-            b"011" => b'\t',
-            b"012" => b'\n',
-            b"134" => b'\\',
-            _ => return Err(WorkflowOperationStateError::InvalidFilesystemBoundary),
-        });
-        index += 4;
-    }
-    Ok(decoded)
-}
-
 fn validate_time(value: i64) -> Result<(), WorkflowOperationStateError> {
     if value < 0 {
         Err(WorkflowOperationStateError::InvalidTime)
@@ -1586,7 +1537,7 @@ pub enum WorkflowOperationStateError {
     UnsafePath,
     #[error("workflow operation-state path changed while open")]
     PathChanged,
-    #[error("workflow operation-state requires the shared bounded build filesystem")]
+    #[error("workflow operation-state requires the fixed shared build domain")]
     InvalidFilesystemBoundary,
     #[error("workflow operation-state filesystem has insufficient free capacity")]
     FilesystemCapacityExceeded,
@@ -1696,7 +1647,7 @@ mod tests {
 
     fn valid_boundary() -> FilesystemBoundarySnapshot {
         FilesystemBoundarySnapshot {
-            shared_hard_boundary: true,
+            shared_storage_domain: true,
             total_bytes: 64 * 1024 * 1024 * 1024,
             available_bytes: 32 * 1024 * 1024 * 1024,
             host_available_bytes: 64 * 1024 * 1024 * 1024,
@@ -2193,10 +2144,10 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_boundary_is_hard_bounded_by_bytes_and_inodes() {
+    fn filesystem_domain_is_shared_and_capacity_is_internally_consistent() {
         for invalid in [
             FilesystemBoundarySnapshot {
-                shared_hard_boundary: false,
+                shared_storage_domain: false,
                 ..valid_boundary()
             },
             FilesystemBoundarySnapshot {

@@ -17,17 +17,19 @@ service group, and own non-overlapping ranges of at least 65,536 IDs in both `/e
 otherwise a setuid mapping helper could expose a reserved host identity through an unrelated account.
 `newuidmap` and `newgidmap` must remain root-owned mode `04755`.
 
-Before any build service starts, provide one hard-bounded filesystem at
-`/var/lib/rdashboard-build`. It must be at least 16 GiB and contains the preparation CAS, operation
-state, one root-owned `toolchains` tree, BuildKit state and OCI results for every project. Their child directories keep distinct owners
-and modes; the mode-`0711` root permits traversal without granting BuildKit the source-reader group.
-They share capacity so toolchains and content-addressed inputs are stored once. Do not
-mount a filesystem per component or per project. The host root filesystem must retain 20 GiB after an
-admitted write; replaceable CAS data starts LRU reclamation below the 30 GiB target.
+Before any build service starts, create `/var/lib/rdashboard-build` on the existing host filesystem.
+The backing filesystem must be at least 16 GiB and the directory contains the preparation CAS,
+operation state, one root-owned `toolchains` tree, BuildKit state and OCI results for every project.
+Their child directories keep distinct owners and modes; the mode-`0711` root permits traversal without
+granting BuildKit the source-reader group. They share capacity so toolchains and content-addressed
+inputs are stored once. Do not mount a filesystem per component or per project. The host filesystem
+must retain 20 GiB after an admitted write; replaceable CAS data starts LRU reclamation below the
+30 GiB target. The production VPS starts with one worker slot and one launcher job, making these
+admissions serial rather than racing independent capacity observations.
 
 BuildKit owns `/var/lib/rdashboard-build/buildkit`, group `rdashboard-build`, mode `0700`. Its own GC
 keeps at most 1.5 GB and begins reclaiming when the shared store has less than 4 GB free; these are
-cache controls, while the one shared filesystem remains the hard aggregate bound. OCI results live at
+cache controls inside the host-wide 20/30 GiB admission policy. OCI results live at
 the root-owned mode-`0700` `/var/lib/rdashboard-build/oci-results`. An individual policy may admit at
 most a 3 GiB OCI archive, and one atomically promoted pre-release result is retained per project.
 
@@ -36,10 +38,10 @@ service inherits a private systemd network namespace, and RootlessKit's `--net=h
 the service's isolated namespace rather than the VPS network. BuildKit receives no production
 credentials, application state, Docker/containerd/Podman socket, source store or executor socket.
 The OCI worker uses process sandboxing, permits no insecure entitlements, runs one build vertex at a
-time and keeps at most 1.5 GB before garbage collection in the shared hard-bounded store.
+time and keeps at most 1.5 GB before garbage collection in the shared store.
 
-Start `rdashboard-buildkit.service` only after the shared build filesystem is mounted and its child
-ownership is installed, then install a launcher policy that allows the OCI adapter.
+Start `rdashboard-buildkit.service` only after the shared directory hierarchy and child ownership are
+installed, then install a launcher policy that allows the OCI adapter.
 On launcher startup the read-only preflight verifies pinned binaries and configuration, subordinate ID
 ranges, kernel/AppArmor user-namespace switches, the exact shared storage boundary, the 20 GiB recovery reserve,
 runtime ownership and a live peer-restricted mode-`0660` Unix socket. Failure is logged with a stable

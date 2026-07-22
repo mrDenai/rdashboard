@@ -573,7 +573,7 @@ impl PreparationStorePolicy {
 
 #[derive(Clone, Copy, Debug)]
 struct FilesystemBoundarySnapshot {
-    shared_hard_boundary: bool,
+    shared_storage_domain: bool,
     store_total_bytes: u64,
     store_available_bytes: u64,
     host_available_bytes: u64,
@@ -592,7 +592,7 @@ struct TestPreparationBoundaryProbe;
 impl FilesystemBoundaryProbe for TestPreparationBoundaryProbe {
     fn inspect(&self) -> Result<FilesystemBoundarySnapshot, PreparationStoreError> {
         Ok(FilesystemBoundarySnapshot {
-            shared_hard_boundary: true,
+            shared_storage_domain: true,
             store_total_bytes: SHARED_BUILD_STORAGE_MIN_BYTES,
             store_available_bytes: SHARED_BUILD_STORAGE_MIN_BYTES,
             host_available_bytes: 64 * 1024 * 1024 * 1024,
@@ -614,8 +614,7 @@ impl FilesystemBoundaryProbe for SystemFilesystemBoundaryProbe {
         let store_metadata = fs::metadata(&self.root)?;
         let shared_metadata = fs::metadata(shared_root)?;
         Ok(FilesystemBoundarySnapshot {
-            shared_hard_boundary: is_exact_mount_point(shared_root)?
-                && store_metadata.dev() == shared_metadata.dev(),
+            shared_storage_domain: store_metadata.dev() == shared_metadata.dev(),
             store_total_bytes: store.total_space(),
             store_available_bytes: store.available_space(),
             host_available_bytes: host.available_space(),
@@ -825,7 +824,7 @@ impl PreparationStore {
     /// Produces a new non-source entry directly inside bounded CAS staging.
     ///
     /// The caller supplies a conservative payload byte/inode ceiling before the producer runs. This
-    /// avoids an unaccounted external scratch copy: staging lives in the same shared hard-bounded store as
+    /// avoids an unaccounted external scratch copy: staging lives in the same shared storage domain as
     /// the sealed store, is covered by the admission reservation, and is removed on every failure.
     pub fn get_or_prepare_bounded_directory<F, E>(
         &self,
@@ -2350,7 +2349,7 @@ fn validate_boundary(
     boundary: FilesystemBoundarySnapshot,
     incoming_bytes: u64,
 ) -> Result<(), PreparationStoreError> {
-    if !boundary.shared_hard_boundary
+    if !boundary.shared_storage_domain
         || boundary.allocation_granularity == 0
         || boundary.store_total_bytes < SHARED_BUILD_STORAGE_MIN_BYTES
     {
@@ -2691,55 +2690,6 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, PreparationStoreError>
         .map_err(|_| PreparationStoreError::OperationLockPoisoned)
 }
 
-#[cfg(target_os = "linux")]
-fn is_exact_mount_point(path: &Path) -> Result<bool, PreparationStoreError> {
-    let contents = fs::read("/proc/self/mountinfo")?;
-    for line in contents.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
-        if fields.len() < 6 {
-            return Err(PreparationStoreError::InvalidFilesystemBoundary);
-        }
-        let mount_point = decode_mountinfo_field(fields[4])?;
-        if Path::new(&OsString::from_vec(mount_point)) == path {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn is_exact_mount_point(_path: &Path) -> Result<bool, PreparationStoreError> {
-    Ok(false)
-}
-
-fn decode_mountinfo_field(field: &[u8]) -> Result<Vec<u8>, PreparationStoreError> {
-    let mut decoded = Vec::with_capacity(field.len());
-    let mut index = 0;
-    while index < field.len() {
-        if field[index] != b'\\' {
-            decoded.push(field[index]);
-            index += 1;
-            continue;
-        }
-        let escaped = field
-            .get(index + 1..index + 4)
-            .ok_or(PreparationStoreError::InvalidFilesystemBoundary)?;
-        let byte = match escaped {
-            b"040" => b' ',
-            b"011" => b'\t',
-            b"012" => b'\n',
-            b"134" => b'\\',
-            _ => return Err(PreparationStoreError::InvalidFilesystemBoundary),
-        };
-        decoded.push(byte);
-        index += 4;
-    }
-    Ok(decoded)
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PinRecordV1 {
@@ -2962,9 +2912,7 @@ pub enum PreparationStoreError {
     UntrustedLayout,
     #[error("preparation store is already open by another process")]
     StoreAlreadyOpen,
-    #[error(
-        "preparation store requires the shared bounded build filesystem and valid capacity facts"
-    )]
+    #[error("preparation store requires the fixed shared build domain and valid capacity facts")]
     InvalidFilesystemBoundary,
     #[error("preparation would violate the root filesystem emergency reserve")]
     RootEmergencyReserveViolated,
@@ -3086,7 +3034,7 @@ mod tests {
     fn probe(_max_bytes: u64) -> Arc<TestProbe> {
         Arc::new(TestProbe {
             snapshot: Mutex::new(FilesystemBoundarySnapshot {
-                shared_hard_boundary: true,
+                shared_storage_domain: true,
                 store_total_bytes: SHARED_BUILD_STORAGE_MIN_BYTES,
                 store_available_bytes: SHARED_BUILD_STORAGE_MIN_BYTES,
                 host_available_bytes: 64 * 1024 * 1024 * 1024,

@@ -6,8 +6,9 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const SHARED_BUILD_STORAGE_ROOT: &str = "/var/lib/rdashboard-build";
 pub const SHARED_TOOLCHAIN_STORE_ROOT: &str = "/var/lib/rdashboard-build/toolchains";
 
-/// The shared filesystem must hold one maximum-sized operation plus the reusable preparation and
-/// packaging inputs needed to finish it. It is one bound for all projects, not a per-project quota.
+/// The filesystem backing the shared directory must hold one maximum-sized operation plus the
+/// reusable preparation and packaging inputs needed to finish it. The existing host root filesystem
+/// is supported; capacity is enforced by admission and deterministic GC, not by extra mounts.
 pub const SHARED_BUILD_STORAGE_MIN_BYTES: u64 = 16 * GIB;
 
 /// The final-assembly engine is disposable, but its peak overlaps the OCI archive write and must be

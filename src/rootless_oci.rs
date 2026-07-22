@@ -1,10 +1,8 @@
 use std::{
-    ffi::OsString,
     fmt::Write as _,
     fs::{self, File},
     io::{self, Read as _},
     os::unix::{
-        ffi::OsStringExt as _,
         fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
         net::UnixStream,
     },
@@ -38,7 +36,6 @@ const SUBGID_PATH: &str = "/etc/subgid";
 const USER_NAMESPACE_LIMIT_PATH: &str = "/proc/sys/user/max_user_namespaces";
 const UNPRIVILEGED_USER_NAMESPACE_PATH: &str = "/proc/sys/kernel/unprivileged_userns_clone";
 const APPARMOR_USER_NAMESPACE_PATH: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
-const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 const MIN_SUBORDINATE_IDS: u64 = 65_536;
 const MIN_SUBORDINATE_ID_START: u64 = 65_536;
 const MAX_TOOL_BYTES: u64 = 256 * 1024 * 1024;
@@ -198,8 +195,7 @@ fn verify_shared_storage_boundary(
     let boundary = layout.boundary_probe.inspect(&layout.state_root)?;
     let state_metadata = fs::metadata(&layout.state_root)?;
     let storage_metadata = fs::metadata(&layout.storage_root)?;
-    if !is_exact_mount_point(&layout.storage_root, &layout.mountinfo)?
-        || state_metadata.dev() != storage_metadata.dev()
+    if state_metadata.dev() != storage_metadata.dev()
         || boundary.total_bytes < SHARED_BUILD_STORAGE_MIN_BYTES
         || boundary.total_inodes == 0
         || boundary.available_bytes > boundary.total_bytes
@@ -260,7 +256,7 @@ pub enum RootlessOciError {
     ApparmorBlocksUserNamespaces,
     #[error("rootless BuildKit state root is missing or unsafe")]
     UnsafeStateRoot,
-    #[error("rootless BuildKit state is outside the shared hard-bounded build storage")]
+    #[error("rootless BuildKit state is outside the fixed shared build domain")]
     InvalidStateBoundary,
     #[error("the host filesystem has less than the required 20 GiB recovery reserve")]
     RootEmergencyReserveViolated,
@@ -335,7 +331,7 @@ impl RootlessOciError {
                 "review the host AppArmor user-namespace policy before enabling rootless BuildKit"
             }
             Self::UnsafeStateRoot | Self::InvalidStateBoundary => {
-                "enable and prove the one shared hard boundary at /var/lib/rdashboard-build"
+                "restore the fixed shared build directory and its ownership on the host filesystem"
             }
             Self::RootEmergencyReserveViolated => {
                 "run ownership-based garbage collection without lowering the 20 GiB recovery reserve"
@@ -379,7 +375,6 @@ struct InstalledLayout {
     state_root: PathBuf,
     runtime_root: PathBuf,
     socket: PathBuf,
-    mountinfo: PathBuf,
     trusted_uid: u32,
     boundary_probe: Box<dyn FilesystemBoundaryProbe>,
     socket_probe: Box<dyn SocketProbe>,
@@ -404,7 +399,6 @@ impl InstalledLayout {
             state_root: BUILDKIT_STATE_ROOT.into(),
             runtime_root: BUILDKIT_RUNTIME_ROOT.into(),
             socket: BUILDKIT_SOCKET_PATH.into(),
-            mountinfo: MOUNTINFO_PATH.into(),
             trusted_uid: 0,
             boundary_probe: Box::new(SystemFilesystemBoundaryProbe),
             socket_probe: Box::new(SystemSocketProbe),
@@ -884,53 +878,6 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.mtime_nsec() == right.mtime_nsec()
 }
 
-#[cfg(target_os = "linux")]
-fn is_exact_mount_point(path: &Path, mountinfo: &Path) -> Result<bool, RootlessOciError> {
-    let contents = fs::read(mountinfo)?;
-    for line in contents.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
-        if fields.len() < 6 {
-            return Err(RootlessOciError::InvalidStateBoundary);
-        }
-        if Path::new(&OsString::from_vec(decode_mountinfo_field(fields[4])?)) == path {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn is_exact_mount_point(_path: &Path, _mountinfo: &Path) -> Result<bool, RootlessOciError> {
-    Ok(false)
-}
-
-fn decode_mountinfo_field(field: &[u8]) -> Result<Vec<u8>, RootlessOciError> {
-    let mut decoded = Vec::with_capacity(field.len());
-    let mut index = 0;
-    while index < field.len() {
-        if field[index] != b'\\' {
-            decoded.push(field[index]);
-            index += 1;
-            continue;
-        }
-        let escaped = field
-            .get(index + 1..index + 4)
-            .ok_or(RootlessOciError::InvalidStateBoundary)?;
-        decoded.push(match escaped {
-            b"040" => b' ',
-            b"011" => b'\t',
-            b"012" => b'\n',
-            b"134" => b'\\',
-            _ => return Err(RootlessOciError::InvalidStateBoundary),
-        });
-        index += 4;
-    }
-    Ok(decoded)
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1024,12 +971,6 @@ mod tests {
         fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o750))
             .expect("runtime mode");
         let socket = runtime_root.join("buildkitd.sock");
-        let mountinfo = root.join("mountinfo");
-        fs::write(
-            &mountinfo,
-            format!("1 0 0:1 / {} rw - tmpfs tmpfs rw\n", storage_root.display()),
-        )
-        .expect("mountinfo");
 
         let layout = InstalledLayout {
             buildkitd,
@@ -1048,7 +989,6 @@ mod tests {
             state_root,
             runtime_root,
             socket,
-            mountinfo,
             trusted_uid,
             boundary_probe: Box::new(FixedBoundaryProbe {
                 snapshot: FilesystemBoundarySnapshot {
@@ -1251,23 +1191,6 @@ mod tests {
         fixture
             .verify()
             .expect("missing optional kernel switches are accepted");
-    }
-
-    #[test]
-    fn mountinfo_fields_decode_only_the_kernel_escape_vocabulary() {
-        assert_eq!(
-            decode_mountinfo_field(b"/var/lib/with\\040space\\011tab\\012line\\134slash")
-                .expect("valid mountinfo field"),
-            b"/var/lib/with space\ttab\nline\\slash"
-        );
-        assert!(matches!(
-            decode_mountinfo_field(b"/var/lib/truncated\\04"),
-            Err(RootlessOciError::InvalidStateBoundary)
-        ));
-        assert!(matches!(
-            decode_mountinfo_field(b"/var/lib/unknown\\000"),
-            Err(RootlessOciError::InvalidStateBoundary)
-        ));
     }
 
     #[test]

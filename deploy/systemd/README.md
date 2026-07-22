@@ -213,20 +213,22 @@ measured CPU/RAM/IO capacity. The worker accepts 1-16 slots, but that protocol m
 installation default. It has no network namespace, capabilities, Docker/containerd/Podman socket,
 credential, controller state or production volume.
 
-Mount one shared hard-bounded filesystem at `/var/lib/rdashboard-build` before starting any build
-service. It must provide at least 16 GiB. Preparation CAS, operation state, BuildKit state and OCI
-results use owned child directories on this same filesystem; its root is mode `0711` so services can
-traverse only to an explicitly permitted child without listing or reading sibling stores. Projects share immutable toolchains and
-content-addressed dependencies instead of keeping private copies. The preparation CAS itself still
-refuses more than 6 GiB or 100,000 inodes, and every operation contract still limits accounted
-target/cache data to at most 6 GiB/500,000 inodes.
+Create one shared root-owned directory at `/var/lib/rdashboard-build` on the existing host filesystem
+before starting any build service. Its backing filesystem must provide at least 16 GiB total.
+Preparation CAS, operation state, BuildKit state and OCI results use owned child directories in this
+same domain; the shared root is mode `0711` so services can traverse only to an explicitly permitted
+child without listing or reading sibling stores. Projects share immutable toolchains and
+content-addressed dependencies instead of keeping private copies. Do not create a separate filesystem
+per service, project or cache. The preparation CAS itself refuses more than 6 GiB or 100,000 inodes,
+and every operation contract limits accounted target/cache data to at most 6 GiB/500,000 inodes.
 
-The worker and launcher refuse startup unless `/var/lib/rdashboard-build` is the exact hard boundary,
-their child is on that filesystem and ownership/mode is correct. New work is rejected unless its
-conservative maximum still leaves at least 20 GiB free on `/`; replaceable preparation entries begin
-LRU reclamation below the 30 GiB free-space target. The tmpfiles entries create owned children only;
-installation must provide and persist the one shared boundary first. Do not create separate build
-filesystems per service or project.
+The worker and launcher refuse startup unless their fixed child directory remains on the same backing
+filesystem as `/var/lib/rdashboard-build` and ownership/mode is correct. New work is rejected unless
+its conservative maximum still leaves at least 20 GiB free on `/`; replaceable preparation entries
+begin LRU reclamation below the 30 GiB free-space target. Start with one worker slot and one launcher
+job on the production VPS so independent components cannot race their filesystem observations. The
+tmpfiles entries create the complete owned hierarchy on the existing filesystem; no extra mount is a
+prerequisite.
 
 `source_tree_v1` remains deliberately offline and is valid only for a dependency-free repository or
 one whose complete gate dependencies are already vendored in the source tree. The additional

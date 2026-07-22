@@ -76,7 +76,7 @@ fn dependency_fetcher_has_one_public_registry_route_and_no_worker_state() {
 }
 
 #[test]
-fn rootless_buildkit_is_offline_shared_and_hard_bounded() {
+fn rootless_buildkit_is_offline_shared_and_resource_bounded() {
     let service = include_str!("../deploy/systemd/rdashboard-buildkit.service");
     let lines = service.lines().collect::<Vec<_>>();
     for required in [
