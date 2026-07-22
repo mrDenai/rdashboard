@@ -465,8 +465,12 @@ the public, digest-covered schema-v5 source document without putting a secret in
 Validate and atomically install it as `/etc/rdashboard/source.json`, `root:root` mode `0644`. It
 binds all fixed paths and peer identities, the exact project set, repository and policy identities,
 per-project credential names and digests, the attestation public key, connection/deadline bounds and
-the 30-second reconciliation interval. It contains no private bytes. Then generate the complete
-systemd credential drop-in from that installed document:
+the 30-second reconciliation interval. It contains no private bytes. When `/etc/rdashboard` remains
+the required `root:rdashboard` mode `0750`, grant only traversal to the two isolated readers with
+`setfacl -m u:rdashboard-source:--x,u:rdashboard-source-ingress:--x /etc/rdashboard`. Do not add
+either identity to the controller group or grant either identity directory listing; the root-owned
+mode-`0600` credential files remain unreadable through this ACL. Then generate the complete systemd
+credential drop-in from that installed document:
 
 ```sh
 /usr/libexec/rdashboard/rdashboard-source-config systemd-credentials \
@@ -476,11 +480,17 @@ systemd credential drop-in from that installed document:
 Atomically install the drop-in as `root:root` mode `0644`. The base unit intentionally has no
 `LoadCredential=` line; this generated file is the single exact list for the attestation seed, every
 webhook secret and only the SSH credentials required by the current project catalog. Regenerate it
-whenever the installed project set changes.
+whenever the installed project set changes. The source validates systemd's root-owned mode-`0440`
+credential projection as read-only service input; the originals under `/etc/rdashboard/credentials`
+remain root-owned mode `0600`.
 
 Initialize every canonical bare repository at
 `/var/lib/rdashboard-source/repositories/<project>.git` as `rdashboard-source`, using the reviewed
-`files` ref backend and owner-only modes. Before sending systemd `READY=1`, the broker recovers its
+`files` ref backend and owner-only modes. Apply `rdashboard-tmpfiles.conf` after every catalog change:
+each installed project must already have a source-owned, `rdashboard-build-readers` group,
+mode-`2750` directory at `/var/lib/rdashboard-build/source-exports/<project>`. The hardened source
+service cannot create a new setgid handoff directory itself, and startup fails closed when the
+catalog and tmpfiles provisioning differ. Before sending systemd `READY=1`, the broker recovers its
 durable webhook/delivery journals and completes a bounded remote-main reconciliation for every
 project. An unavailable or divergent startup source therefore fails closed under systemd restart.
 
@@ -508,11 +518,14 @@ work, periodic fetches cannot enter the shared fetch slot; a newly committed wak
 active periodic network fetch, and periodic work never queues ahead of a waiting webhook fetch.
 Periodic fetches have a two-second network bound, while webhook fetches retain the full one-minute
 provider bound. Once pack promotion starts it completes instead of leaving an ambiguous canonical
-object state. A missed webhook is recovered by the 30-second reconciliation loop with at most five
-seconds of deterministic startup jitter, keeping the fallback below one minute without synchronized
-fetch bursts. On restart, wake-ups for a removed project or a project rebound to a different GitHub
-repository are retired before ingress binds; accepted-source and completed-delivery audit history is
-retained. Rewinds or divergence cannot bypass the existing accepted-head guard and enter
+object state. A production fetch starts only with room for two bounded 1 GiB staging copies plus the
+larger of a 4 GiB or five-percent filesystem emergency reserve; the resulting floor is 6 GiB without
+borrowing the separate build/deploy safety budgets. A missed webhook is recovered by the 30-second
+reconciliation loop with at most five seconds of deterministic startup jitter, keeping the fallback
+below one minute without synchronized fetch bursts. On restart, wake-ups for a removed project or a
+project rebound to a different GitHub repository are retired before ingress binds; accepted-source
+and completed-delivery audit history is retained. Rewinds or divergence cannot bypass the existing
+accepted-head guard and enter
 `source_diverged_needs_owner`; a direct-push SSH front door is not installed by this slice.
 
 After each accepted ready head, the broker runs fixed `git archive` itself and atomically publishes

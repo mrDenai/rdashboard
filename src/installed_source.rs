@@ -605,8 +605,11 @@ pub(crate) fn load_source_signing_key_from(
     let credential_uid = path_metadata.uid();
     if path_metadata.file_type().is_symlink()
         || !path_metadata.file_type().is_file()
-        || credential_uid != 0 && credential_uid != config.source_uid
-        || path_metadata.permissions().mode() & 0o077 != 0
+        || !valid_source_credential_permissions(
+            credential_uid,
+            config.source_uid,
+            path_metadata.permissions().mode(),
+        )
         || path_metadata.len() != 32
     {
         return Err(InstalledSourceError::UnsafeCredential);
@@ -692,8 +695,11 @@ fn read_stable_source_credential(
     let credential_uid = path_metadata.uid();
     if path_metadata.file_type().is_symlink()
         || !path_metadata.file_type().is_file()
-        || credential_uid != 0 && credential_uid != source_uid
-        || path_metadata.permissions().mode() & 0o077 != 0
+        || !valid_source_credential_permissions(
+            credential_uid,
+            source_uid,
+            path_metadata.permissions().mode(),
+        )
         || path_metadata.len() == 0
         || path_metadata.len() > maximum_bytes
     {
@@ -725,6 +731,19 @@ fn read_stable_source_credential(
         return Err(InstalledSourceError::UnsafeGitCredential);
     }
     Ok(bytes)
+}
+
+fn valid_source_credential_permissions(owner_uid: u32, source_uid: u32, mode: u32) -> bool {
+    if owner_uid != 0 && owner_uid != source_uid {
+        return false;
+    }
+    match mode & 0o777 {
+        0o400 | 0o600 => true,
+        // systemd presents LoadCredential files as root-owned 0440 on hosts
+        // whose credential mount grants the service access through its private mount.
+        0o440 => owner_uid == 0,
+        _ => false,
+    }
 }
 
 pub struct SourceWebhookSecretsV1 {
@@ -1147,6 +1166,16 @@ mod tests {
     }
 
     #[test]
+    fn source_credentials_accept_systemd_root_owned_read_only_mode_only() {
+        assert!(valid_source_credential_permissions(0, 997, 0o440));
+        assert!(valid_source_credential_permissions(0, 997, 0o400));
+        assert!(valid_source_credential_permissions(997, 997, 0o600));
+        assert!(!valid_source_credential_permissions(997, 997, 0o440));
+        assert!(!valid_source_credential_permissions(0, 997, 0o640));
+        assert!(!valid_source_credential_permissions(998, 997, 0o600));
+    }
+
+    #[test]
     fn source_webhook_secret_is_exact_private_and_project_bound() {
         let directory = tempdir().expect("tempdir");
         let uid = fs::metadata(directory.path()).expect("metadata").uid();
@@ -1376,6 +1405,24 @@ mod tests {
     #[test]
     fn candidate_output_directories_inherit_the_reader_group() {
         let tmpfiles = include_str!("../deploy/systemd/rdashboard-tmpfiles.conf");
+        let controls: serde_json::Value =
+            serde_json::from_str(include_str!("../config/source-projects.json"))
+                .expect("decode source project controls");
+        let source_projects = controls["projects"]
+            .as_array()
+            .expect("source project controls array");
+        for project in source_projects {
+            let project_id = project["project_id"]
+                .as_str()
+                .expect("source project identifier");
+            let expected = format!(
+                "d /var/lib/rdashboard-build/source-exports/{project_id} 2750 rdashboard-source rdashboard-build-readers -"
+            );
+            assert!(
+                tmpfiles.lines().any(|line| line == expected),
+                "source project {project_id} needs a pre-provisioned setgid handoff directory"
+            );
+        }
         for path in [
             "/var/lib/rdashboard-build/release-bundles",
             "/var/lib/rdashboard-build/release-bundles/rimg",

@@ -45,8 +45,8 @@ const STAGED_FETCHED_HAVE_REF: &str = "refs/rdashboard-haves/fetched-main";
 const STAGED_ACCEPTED_HAVE_REF: &str = "refs/rdashboard-haves/accepted-main";
 const DEFAULT_FETCH_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_FETCH_MAX_STAGING_BYTES: u64 = 1024 * 1024 * 1024;
-const DEFAULT_FETCH_EMERGENCY_BYTES: u64 = 8 * GIB;
-const DEFAULT_FETCH_EMERGENCY_PERCENT: u64 = 15;
+const DEFAULT_FETCH_EMERGENCY_BYTES: u64 = 4 * GIB;
+const DEFAULT_FETCH_EMERGENCY_PERCENT: u64 = 5;
 const OWNER_ONLY_SHARED_REPOSITORY: &str = "core.sharedRepository=0600";
 const SOURCE_CREDENTIAL_DIRECTORY: &str = "/run/credentials/rdashboard-source.service";
 type GitVersion = (u64, u64);
@@ -3322,6 +3322,20 @@ mod tests {
     use super::*;
 
     const MAX_SMALL_FETCH_STORAGE_GROWTH: u64 = 64 * 1024;
+
+    #[test]
+    fn production_fetch_reserve_fits_the_bounded_single_vps_contract() {
+        let limits = FetchLimits::PRODUCTION;
+        assert_eq!(limits.max_staging_bytes, GIB);
+        assert_eq!(limits.emergency_bytes, 4 * GIB);
+        assert_eq!(limits.emergency_percent, 5);
+        assert_eq!(
+            limits
+                .preflight_required_bytes(limits.emergency_bytes)
+                .expect("bounded production preflight"),
+            6 * GIB
+        );
+    }
 
     #[test]
     fn source_git_ssh_environment_is_fixed_identity_only_and_host_pinned() {
