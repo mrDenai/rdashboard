@@ -241,7 +241,7 @@ fn disk_reservation_preserves_the_emergency_floor() {
     let reservation = DiskReservation {
         filesystem_identity: EvidenceDigest::sha256("domain test filesystem"),
         filesystem_total_bytes: 100 * GIB,
-        filesystem_available_bytes: 25 * GIB,
+        filesystem_available_bytes: 10 * GIB,
         observed_at_ms: 1_700_000_000_000,
         backup_staging_bytes: GIB,
         build_peak_bytes: GIB,
@@ -249,13 +249,13 @@ fn disk_reservation_preserves_the_emergency_floor() {
         last_known_good_bytes: GIB,
         projected_hot_store_growth_bytes: GIB,
     };
-    assert_eq!(reservation.emergency_reserve_bytes(), 20 * GIB);
+    assert_eq!(reservation.emergency_reserve_bytes(), 5 * GIB);
     reservation
         .evaluate()
         .unwrap_or_else(|error| panic!("reservation should fit exactly: {error}"));
 
     let insufficient = DiskReservation {
-        filesystem_available_bytes: 25 * GIB - 1,
+        filesystem_available_bytes: 10 * GIB - 1,
         ..reservation
     };
     assert!(matches!(

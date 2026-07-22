@@ -57,7 +57,7 @@
           "cpu_millicores": 3000,
           "memory_max_bytes": 4294967296,
           "tasks_max": 1024,
-          "scratch_max_bytes": 6442450944,
+          "scratch_max_bytes": 4294967296,
           "scratch_max_inodes": 500000,
           "output_max_bytes": 1073741824
         }

@@ -651,6 +651,7 @@ fn verified_oci_reuses_the_exact_gate_output_on_the_same_vps() {
         .operation_state
         .as_ref()
         .unwrap_or_else(|| panic!("verification compiled state"));
+    assert_eq!(verification_state.max_bytes, 4 * 1024 * 1024 * 1024);
     assert_eq!(
         verification_state.consumer_nodes,
         vec![

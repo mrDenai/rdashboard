@@ -50,7 +50,7 @@ pub struct AuthorizedDiskReservation {
 
 impl DiskReservation {
     pub fn emergency_reserve_bytes(&self) -> u64 {
-        recovery_reserve_bytes(self.filesystem_total_bytes)
+        recovery_reserve_bytes()
     }
 
     pub fn required_bytes(&self) -> Option<u64> {

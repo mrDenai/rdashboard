@@ -258,7 +258,7 @@ pub enum RootlessOciError {
     UnsafeStateRoot,
     #[error("rootless BuildKit state is outside the fixed shared build domain")]
     InvalidStateBoundary,
-    #[error("the host filesystem has less than the required 20 GiB recovery reserve")]
+    #[error("the host filesystem has less than the required 5 GiB emergency reserve")]
     RootEmergencyReserveViolated,
     #[error("rootless BuildKit runtime root is missing or unsafe")]
     UnsafeRuntimeRoot,
@@ -334,7 +334,7 @@ impl RootlessOciError {
                 "restore the fixed shared build directory and its ownership on the host filesystem"
             }
             Self::RootEmergencyReserveViolated => {
-                "run ownership-based garbage collection without lowering the 20 GiB recovery reserve"
+                "run ownership-based garbage collection without lowering the 5 GiB emergency reserve"
             }
             Self::UnsafeRuntimeRoot | Self::UnsafeSocket | Self::SocketUnavailable => {
                 "start the reviewed rdashboard-buildkit service and verify its peer-restricted Unix socket"
@@ -1126,7 +1126,7 @@ mod tests {
                 available_bytes: 32 * 1024 * 1024 * 1024,
                 total_inodes: 100_000,
                 available_inodes: 100_000,
-                root_available_bytes: 19 * 1024 * 1024 * 1024,
+                root_available_bytes: BUILD_STORAGE_MIN_FREE_BYTES - 1,
             },
         });
         assert!(matches!(

@@ -20,17 +20,14 @@ pub const BUILDKIT_MAX_USED_BYTES: u64 = 1536 * 1024 * 1024;
 /// cleanup before admitting more replaceable data.
 pub const BUILD_STORAGE_GC_TARGET_FREE_BYTES: u64 = 30 * GIB;
 
-/// No build, deployment or backup reservation may reduce host filesystem availability below this
-/// recovery floor.
-pub const BUILD_STORAGE_MIN_FREE_BYTES: u64 = 20 * GIB;
+/// Hard emergency margin for the operating system, databases, logs and currently running services.
+/// This is deliberately separate from the 30 GiB garbage-collection target: that target describes
+/// the desired normal state, while this smaller floor only prevents a managed operation from filling
+/// the host filesystem when there is nothing replaceable left to collect.
+pub const BUILD_STORAGE_MIN_FREE_BYTES: u64 = 5 * GIB;
 
-pub const fn recovery_reserve_bytes(filesystem_total_bytes: u64) -> u64 {
-    let fifteen_percent = filesystem_total_bytes.saturating_mul(15).div_ceil(100);
-    if fifteen_percent > BUILD_STORAGE_MIN_FREE_BYTES {
-        fifteen_percent
-    } else {
-        BUILD_STORAGE_MIN_FREE_BYTES
-    }
+pub const fn recovery_reserve_bytes() -> u64 {
+    BUILD_STORAGE_MIN_FREE_BYTES
 }
 
 pub fn required_host_available_bytes(incoming_bytes: u64) -> Option<u64> {
@@ -47,11 +44,10 @@ mod tests {
 
     #[test]
     fn reserve_and_gc_thresholds_are_distinct_and_overflow_safe() {
-        assert_eq!(required_host_available_bytes(3 * GIB), Some(23 * GIB));
+        assert_eq!(required_host_available_bytes(3 * GIB), Some(8 * GIB));
         assert!(required_host_available_bytes(u64::MAX).is_none());
         assert!(should_collect(29 * GIB));
         assert!(!should_collect(BUILD_STORAGE_GC_TARGET_FREE_BYTES));
-        assert_eq!(recovery_reserve_bytes(100 * GIB), 20 * GIB);
-        assert_eq!(recovery_reserve_bytes(200 * GIB), 30 * GIB);
+        assert_eq!(recovery_reserve_bytes(), 5 * GIB);
     }
 }

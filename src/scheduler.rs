@@ -1479,14 +1479,22 @@ fn operation_state_contract(
         let node = candidate.manifest.workflow.node(consumer).ok_or(
             StoreError::CorruptWorkflowJournal("operation-state consumer absent"),
         )?;
-        let resources = candidate
+        let profile = candidate
             .manifest
             .workflow
             .profile(&node.profile_id)
-            .and_then(|profile| profile.resources.as_ref())
             .ok_or(StoreError::CorruptWorkflowJournal(
                 "operation-state resources absent",
             ))?;
+        let resources = profile
+            .resources
+            .as_ref()
+            .ok_or(StoreError::CorruptWorkflowJournal(
+                "operation-state resources absent",
+            ))?;
+        if !adapter_writes_operation_state(profile.adapter_id) {
+            continue;
+        }
         max_bytes = max_bytes.max(resources.scratch_max_bytes);
         max_inodes = max_inodes.max(resources.scratch_max_inodes);
     }
@@ -1503,6 +1511,10 @@ fn operation_state_contract(
         max_inodes.min(MAX_OPERATION_STATE_INODES),
     )
     .map_err(StoreError::from)
+}
+
+fn adapter_writes_operation_state(adapter: WorkflowAdapterIdV1) -> bool {
+    matches!(adapter, WorkflowAdapterIdV1::WorkerBareBinCiV1)
 }
 
 fn decode_bound_operation_state(

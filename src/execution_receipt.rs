@@ -352,15 +352,13 @@ pub fn capture_terminal_receipt_in(
     let process = classify_process(environment, termination.as_ref(), &resources);
     let scratch_after_bytes = directory_size(job_directory).ok();
     let filesystem_available_after_bytes = fs2::available_space(job_directory).ok();
-    let emergency_reserve = filesystem_available_after_bytes.and_then(|available| {
-        fs2::total_space(job_directory).ok().map(|total| {
-            let required = recovery_reserve_bytes(total);
-            (
-                required,
-                available.saturating_sub(required),
-                required.saturating_sub(available),
-            )
-        })
+    let emergency_reserve = filesystem_available_after_bytes.map(|available| {
+        let required = recovery_reserve_bytes();
+        (
+            required,
+            available.saturating_sub(required),
+            required.saturating_sub(available),
+        )
     });
     let storage = ExecutionStorageUsageV1 {
         scratch_before_bytes: start.scratch_before_bytes,
