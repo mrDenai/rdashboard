@@ -537,17 +537,18 @@ source admission -> host prepare
 - Persist terminal exit/signal/OOM/resource evidence before unloading the transient service; then use
   `CollectMode=inactive-or-failed`/`--collect`.
 
-The hard storage fence is not an operator-facing product choice. It means a runaway job gets an actual
-small writable box. When that box reaches its byte or inode limit, only that attempt fails with a
-classified quota error; it cannot consume the filesystem space reserved for the running release,
-last-known-good rollback, database, logs, or recovery. Shared caches have a separate hard ceiling and
-LRU/age policy, so four slots cannot each grow an unbounded private cache.
+The hard storage fence is not an operator-facing product choice. It is one shared project-quota-backed
+build domain, not one filesystem per storage category or worker. A runaway job can consume only the
+remaining global build quota and its operation envelope; it cannot consume the filesystem space
+reserved for the running release, last-known-good rollback, database, logs, or recovery. Shared caches
+use one LRU/age policy, so slots and repositories do not create private toolchain/cache copies.
 
 ### 4. Artifact, cache, and disk policy
 
 - One source bare repository per project and one immutable snapshot per exact SHA on each active host;
   no persistent checkout per runner or slot.
-- One content-addressed preparation/cache store per host, shared across every repository when keys are
+- One content-addressed preparation/cache store and one immutable host toolchain installation per host,
+  shared across every repository when keys are
   identical. Dependency entries are keyed by toolchain digest + lockfile digest + target platform +
   policy version; prepared-run entries additionally bind source and workflow-policy digests. Cache
   entries are untrusted, checksum-verified on read, and never deployment authority.
@@ -571,7 +572,8 @@ LRU/age policy, so four slots cannot each grow an unbounded private cache.
 
 Initial capacity targets to validate during the pilot, not promises:
 
-- preserve a 12 GiB emergency filesystem reserve at every admitted build/deploy peak;
+- begin deterministic engine/store GC below 30 GiB available and preserve a hard 20 GiB filesystem
+  reserve at every admitted build/deploy peak;
 - measure a completely cold build's scratch and inode high water before admitting local automated
   builds; required free space is the reserve plus measured/padded build, backup, image, and log peaks;
 - bound persistent workflow/source/cache state, excluding current/LKG runtime images and application
@@ -581,10 +583,9 @@ Initial capacity targets to validate during the pilot, not promises:
 - bound raw captured logs to the existing 2 GiB total / 256 MiB per project policy and 64 MiB per
   operation;
 - retain at most current + LKG + one in-progress candidate per project in the active runtime store;
-- perform a high-water cleanup before crossing 80% filesystem use and reject new build/deploy work
-  before the emergency reserve would be violated.
+- reject new build/deploy work before its measured reservation would cross the 20 GiB floor.
 
-The 12 GiB value is a recovery floor, not an assertion that a cold build fits in the remaining space.
+The 20 GiB value is a recovery floor, not an assertion that a cold build fits in the remaining space.
 If measured local cold scratch plus all simultaneous mutation peaks cannot fit above that floor, local
 automation is inadmissible until build storage/capacity is increased or an always-available dedicated
 host is introduced. Intermittent i9 capacity is not a substitute for that requirement. Do not lower the
@@ -774,7 +775,7 @@ observation through the stable production route after cutover.
 | Rare cold dependency/toolchain/native/base/schema path | 2-3 min target, explicit reason code | Cold work should be prepared ahead or reused; anything slower needs measured proof that it cannot be moved off the deploy path, not a relaxed default |
 | i9 loss before result | local fallback starts by its computed latest-start deadline | i9 can save time but cannot own required capacity or silently extend the deadline |
 | Steady shared worker/source/cache state on VPS | <= 6 GiB initially | Replaces 10 GiB runner tree plus the oversized compilation graph; exact ecosystem shares follow measurement |
-| Production filesystem emergency reserve | >= 12 GiB plus any admitted local build/mutation peak | Prevent build/deploy from consuming recovery headroom |
+| Production filesystem emergency reserve | GC target >=30 GiB; hard floor >=20 GiB after every admitted local build/mutation peak | Prevent build/deploy from consuming recovery headroom |
 | Orphaned managed resources | zero after bounded reconciler interval | Ownership ledger makes leftovers actionable |
 | Failure capsule | <= 64 KiB rendered, cause retained | Existing policy limit; raw log remains separately bounded |
 
@@ -857,7 +858,7 @@ path is redesigned; the system does not make the dashboard green by weakening `b
 | Cache poisoning or cross-repository contamination | Full content/toolchain/lockfile/policy keys, atomic single-writer publication, integrity checks, read-only consumption, COW writable state, cache never grants authority |
 | Four slots stampede the same preparation | Keyed single-flight producer; other slots join it and consume the sealed result |
 | i9 disappears or returns late | Soft registration, short leases, local latest-start deadline, idempotent receipt identity, no deployment artifact or required-only state on i9 |
-| Disk exhaustion | Hard byte/inode filesystem quota plus measured reservation and 12 GiB floor; one heavy job; engine-owned GC; fail before build |
+| Disk exhaustion | One shared hard byte/inode project quota plus measured reservation and 20 GiB floor; GC starts below 30 GiB; one heavy job; fail before build |
 | OOM/CPU starvation of production | cgroup `MemoryHigh/Max`, CPU/IO weights, task limits, global scheduler budget |
 | New push during deploy | Supersede only before mutation; serialize/reconcile mutation phases |
 | Controller compromised | Executor independently verifies signed policy/source/build/receipts; no arbitrary shell |

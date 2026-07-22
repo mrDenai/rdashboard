@@ -1,7 +1,7 @@
 [Unit]
 Description=rdashboard bounded rootless OCI BuildKit
 After=local-fs.target
-RequiresMountsFor=/var/lib/rdashboard-buildkit
+RequiresMountsFor=/var/lib/rdashboard-build
 
 [Service]
 Type=exec
@@ -28,8 +28,8 @@ ProtectKernelTunables=yes
 ProtectProc=invisible
 ProcSubset=all
 ProtectSystem=strict
-ReadWritePaths=/var/lib/rdashboard-buildkit /run/rdashboard-buildkit
-InaccessiblePaths=-/etc/rdashboard/credentials -/var/lib/rdashboard -/var/lib/rdashboard-build -/var/lib/rdashboard-executor -/var/lib/rdashboard-workflow-launcher -/run/rdashboard -/run/rdashboard-source-ingress -/run/rdashboard-source-delivery -/run/rdashboard-workflow -/run/rdashboard-workflow-launcher -/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman/podman.sock
+ReadWritePaths=/var/lib/rdashboard-build/buildkit /run/rdashboard-buildkit
+InaccessiblePaths=-/etc/rdashboard/credentials -/var/lib/rdashboard -/var/lib/rdashboard-executor -/var/lib/rdashboard-workflow-launcher -/run/rdashboard -/run/rdashboard-source-ingress -/run/rdashboard-source-delivery -/run/rdashboard-workflow -/run/rdashboard-workflow-launcher -/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman/podman.sock
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=user mnt pid ipc uts net cgroup
 RestrictRealtime=yes

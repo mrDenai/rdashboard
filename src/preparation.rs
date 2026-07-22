@@ -23,13 +23,16 @@ use crate::{
     build_source::{
         OpenedSourceArchiveV1, SourceArchiveError, SourceArchiveManifestV1, SourceArchiveReaderV1,
     },
+    build_storage::{
+        BUILD_STORAGE_MIN_FREE_BYTES, SHARED_BUILD_STORAGE_MIN_BYTES, SHARED_BUILD_STORAGE_ROOT,
+        should_collect,
+    },
     domain::{EvidenceDigest, GitCommitId, ProjectId, WorkflowLeaseV1, WorkflowNodeKindV1},
 };
 
 pub const PREPARATION_STORE_ROOT: &str = "/var/lib/rdashboard-build/preparation";
 pub const MAX_PREPARATION_STORE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 pub const MAX_PREPARATION_STORE_INODES: u64 = 100_000;
-pub const MIN_ROOT_EMERGENCY_RESERVE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
 const PREPARATION_KEY_SCHEMA_VERSION: u16 = 1;
 const PREPARATION_KEY_PURPOSE: &str = "rdashboard.preparation-key.v1";
@@ -549,7 +552,7 @@ impl PreparationStorePolicy {
         Self {
             max_bytes: MAX_PREPARATION_STORE_BYTES,
             max_inodes: MAX_PREPARATION_STORE_INODES,
-            root_emergency_reserve_bytes: MIN_ROOT_EMERGENCY_RESERVE_BYTES,
+            root_emergency_reserve_bytes: BUILD_STORAGE_MIN_FREE_BYTES,
             warm_window_ms: DEFAULT_WARM_WINDOW_MS,
         }
     }
@@ -559,7 +562,7 @@ impl PreparationStorePolicy {
             || self.max_bytes > MAX_PREPARATION_STORE_BYTES
             || self.max_inodes == 0
             || self.max_inodes > MAX_PREPARATION_STORE_INODES
-            || self.root_emergency_reserve_bytes < MIN_ROOT_EMERGENCY_RESERVE_BYTES
+            || self.root_emergency_reserve_bytes < BUILD_STORAGE_MIN_FREE_BYTES
             || self.warm_window_ms < 0
         {
             return Err(PreparationStoreError::InvalidPolicy);
@@ -570,10 +573,10 @@ impl PreparationStorePolicy {
 
 #[derive(Clone, Copy, Debug)]
 struct FilesystemBoundarySnapshot {
-    dedicated_mount: bool,
+    shared_hard_boundary: bool,
     store_total_bytes: u64,
     store_available_bytes: u64,
-    root_available_bytes: u64,
+    host_available_bytes: u64,
     allocation_granularity: u64,
 }
 
@@ -583,19 +586,16 @@ trait FilesystemBoundaryProbe: Send + Sync {
 
 #[cfg(test)]
 #[derive(Debug)]
-struct TestPreparationBoundaryProbe {
-    max_bytes: u64,
-}
+struct TestPreparationBoundaryProbe;
 
 #[cfg(test)]
 impl FilesystemBoundaryProbe for TestPreparationBoundaryProbe {
     fn inspect(&self) -> Result<FilesystemBoundarySnapshot, PreparationStoreError> {
         Ok(FilesystemBoundarySnapshot {
-            dedicated_mount: true,
-            store_total_bytes: self.max_bytes.max(1024 * 1024 * 1024),
-            store_available_bytes: self.max_bytes.max(1024 * 1024 * 1024),
-            root_available_bytes: MIN_ROOT_EMERGENCY_RESERVE_BYTES
-                .saturating_add(self.max_bytes.max(1024 * 1024 * 1024)),
+            shared_hard_boundary: true,
+            store_total_bytes: SHARED_BUILD_STORAGE_MIN_BYTES,
+            store_available_bytes: SHARED_BUILD_STORAGE_MIN_BYTES,
+            host_available_bytes: 64 * 1024 * 1024 * 1024,
             allocation_granularity: 4_096,
         })
     }
@@ -608,13 +608,17 @@ struct SystemFilesystemBoundaryProbe {
 
 impl FilesystemBoundaryProbe for SystemFilesystemBoundaryProbe {
     fn inspect(&self) -> Result<FilesystemBoundarySnapshot, PreparationStoreError> {
-        let store = fs2::statvfs(&self.root)?;
-        let root = fs2::statvfs("/")?;
+        let shared_root = Path::new(SHARED_BUILD_STORAGE_ROOT);
+        let store = fs2::statvfs(shared_root)?;
+        let host = fs2::statvfs("/")?;
+        let store_metadata = fs::metadata(&self.root)?;
+        let shared_metadata = fs::metadata(shared_root)?;
         Ok(FilesystemBoundarySnapshot {
-            dedicated_mount: is_exact_mount_point(&self.root)?,
+            shared_hard_boundary: is_exact_mount_point(shared_root)?
+                && store_metadata.dev() == shared_metadata.dev(),
             store_total_bytes: store.total_space(),
             store_available_bytes: store.available_space(),
-            root_available_bytes: root.available_space(),
+            host_available_bytes: host.available_space(),
             allocation_granularity: store.allocation_granularity(),
         })
     }
@@ -821,7 +825,7 @@ impl PreparationStore {
     /// Produces a new non-source entry directly inside bounded CAS staging.
     ///
     /// The caller supplies a conservative payload byte/inode ceiling before the producer runs. This
-    /// avoids an unaccounted external scratch copy: staging lives on the same dedicated filesystem as
+    /// avoids an unaccounted external scratch copy: staging lives in the same shared hard-bounded store as
     /// the sealed store, is covered by the admission reservation, and is removed on every failure.
     pub fn get_or_prepare_bounded_directory<F, E>(
         &self,
@@ -1137,6 +1141,7 @@ impl PreparationStore {
         self.revalidate()?;
         self.reconcile_evictions()?;
         self.cleanup_expired_pins(now_ms)?;
+        self.evict_for_host_free_space_target(now_ms)?;
         self.evict_until_admissible(estimate, now_ms)?;
         let boundary = self.probe.inspect()?;
         validate_boundary(&self.policy, boundary, estimate.bytes)?;
@@ -1157,6 +1162,30 @@ impl PreparationStore {
             bytes: estimate.bytes,
             inodes: estimate.inodes,
         })
+    }
+
+    fn evict_for_host_free_space_target(&self, now_ms: i64) -> Result<(), PreparationStoreError> {
+        if !should_collect(self.probe.inspect()?.host_available_bytes) {
+            return Ok(());
+        }
+        let pinned = self.live_pinned_keys(now_ms)?;
+        let warm_cutoff = now_ms.saturating_sub(self.policy.warm_window_ms);
+        let mut candidates = self.eviction_candidates()?;
+        candidates.retain(|candidate| {
+            !pinned.contains(&candidate.key) && candidate.last_accessed_at_ms <= warm_cutoff
+        });
+        candidates.sort_by(|left, right| {
+            left.last_accessed_at_ms
+                .cmp(&right.last_accessed_at_ms)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        for candidate in candidates {
+            self.remove_entry(candidate.kind, &candidate.key)?;
+            if !should_collect(self.probe.inspect()?.host_available_bytes) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn evict_until_admissible(
@@ -1665,10 +1694,10 @@ pub(crate) fn open_test_preparation_store(
         PreparationStorePolicy {
             max_bytes,
             max_inodes: 10_000,
-            root_emergency_reserve_bytes: MIN_ROOT_EMERGENCY_RESERVE_BYTES,
+            root_emergency_reserve_bytes: BUILD_STORAGE_MIN_FREE_BYTES,
             warm_window_ms: 0,
         },
-        Arc::new(TestPreparationBoundaryProbe { max_bytes }),
+        Arc::new(TestPreparationBoundaryProbe),
     )
 }
 
@@ -2321,9 +2350,9 @@ fn validate_boundary(
     boundary: FilesystemBoundarySnapshot,
     incoming_bytes: u64,
 ) -> Result<(), PreparationStoreError> {
-    if !boundary.dedicated_mount
+    if !boundary.shared_hard_boundary
         || boundary.allocation_granularity == 0
-        || boundary.store_total_bytes < policy.max_bytes
+        || boundary.store_total_bytes < SHARED_BUILD_STORAGE_MIN_BYTES
     {
         return Err(PreparationStoreError::InvalidFilesystemBoundary);
     }
@@ -2331,7 +2360,7 @@ fn validate_boundary(
         .root_emergency_reserve_bytes
         .checked_add(incoming_bytes)
         .ok_or(PreparationStoreError::RootEmergencyReserveViolated)?;
-    if boundary.root_available_bytes < required_root {
+    if boundary.host_available_bytes < required_root {
         return Err(PreparationStoreError::RootEmergencyReserveViolated);
     }
     Ok(())
@@ -2933,7 +2962,9 @@ pub enum PreparationStoreError {
     UntrustedLayout,
     #[error("preparation store is already open by another process")]
     StoreAlreadyOpen,
-    #[error("preparation store requires its own mounted filesystem and valid capacity facts")]
+    #[error(
+        "preparation store requires the shared bounded build filesystem and valid capacity facts"
+    )]
     InvalidFilesystemBoundary,
     #[error("preparation would violate the root filesystem emergency reserve")]
     RootEmergencyReserveViolated,
@@ -3047,18 +3078,18 @@ mod tests {
         PreparationStorePolicy {
             max_bytes,
             max_inodes,
-            root_emergency_reserve_bytes: MIN_ROOT_EMERGENCY_RESERVE_BYTES,
+            root_emergency_reserve_bytes: BUILD_STORAGE_MIN_FREE_BYTES,
             warm_window_ms,
         }
     }
 
-    fn probe(max_bytes: u64) -> Arc<TestProbe> {
+    fn probe(_max_bytes: u64) -> Arc<TestProbe> {
         Arc::new(TestProbe {
             snapshot: Mutex::new(FilesystemBoundarySnapshot {
-                dedicated_mount: true,
-                store_total_bytes: max_bytes.max(1024 * 1024 * 1024),
-                store_available_bytes: 1024 * 1024 * 1024,
-                root_available_bytes: 64 * 1024 * 1024 * 1024,
+                shared_hard_boundary: true,
+                store_total_bytes: SHARED_BUILD_STORAGE_MIN_BYTES,
+                store_available_bytes: SHARED_BUILD_STORAGE_MIN_BYTES,
+                host_available_bytes: 64 * 1024 * 1024 * 1024,
                 allocation_granularity: 4_096,
             }),
         })
@@ -3651,6 +3682,42 @@ mod tests {
     }
 
     #[test]
+    fn host_pressure_reclaims_unpinned_cas_entries_before_admitting_more_work() {
+        let directory = tempdir().expect("temp dir");
+        let root = store_root(&directory);
+        let boundary = probe(8 * 1024 * 1024);
+        let store = open_test_store(
+            &root,
+            policy(8 * 1024 * 1024, 1_000, 0),
+            Arc::clone(&boundary),
+        );
+        let first_input = input_directory(&directory, "pressure-first", b"first");
+        let first_material = dependency_material("pressure-first");
+        let first = store
+            .get_or_prepare_directory(&first_material, 10, || {
+                Ok::<_, io::Error>(first_input.clone())
+            })
+            .expect("prepare first entry");
+
+        boundary
+            .snapshot
+            .lock()
+            .expect("boundary lock")
+            .host_available_bytes = 29 * 1024 * 1024 * 1024;
+        let second_input = input_directory(&directory, "pressure-second", b"second");
+        store
+            .get_or_prepare_directory(&dependency_material("pressure-second"), 20, || {
+                Ok::<_, io::Error>(second_input.clone())
+            })
+            .expect("prepare after pressure cleanup");
+
+        assert!(
+            !first.path().exists(),
+            "replaceable CAS data is reclaimed below the 30 GiB target"
+        );
+    }
+
+    #[test]
     fn root_emergency_reserve_rejects_work_before_staging() {
         let directory = tempdir().expect("temp dir");
         let root = store_root(&directory);
@@ -3664,7 +3731,7 @@ mod tests {
             .snapshot
             .lock()
             .expect("boundary lock")
-            .root_available_bytes = MIN_ROOT_EMERGENCY_RESERVE_BYTES;
+            .host_available_bytes = BUILD_STORAGE_MIN_FREE_BYTES;
         let input = input_directory(&directory, "reserve-input", b"payload");
         assert!(matches!(
             store.get_or_prepare_directory(&dependency_material("reserve"), 10, || {

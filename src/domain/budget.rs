@@ -2,6 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::EvidenceDigest;
+use crate::build_storage::recovery_reserve_bytes;
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
 pub const CONTROL_SQLITE_CAP_BYTES: u64 = 512 * 1024 * 1024;
@@ -49,8 +50,7 @@ pub struct AuthorizedDiskReservation {
 
 impl DiskReservation {
     pub fn emergency_reserve_bytes(&self) -> u64 {
-        let fifteen_percent = self.filesystem_total_bytes.saturating_mul(15).div_ceil(100);
-        (8 * GIB).max(fifteen_percent)
+        recovery_reserve_bytes(self.filesystem_total_bytes)
     }
 
     pub fn required_bytes(&self) -> Option<u64> {

@@ -14,10 +14,15 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::domain::{EvidenceDigest, valid_workflow_identity};
+use crate::{
+    build_storage::{
+        BUILD_STORAGE_MIN_FREE_BYTES, SHARED_BUILD_STORAGE_MIN_BYTES, SHARED_BUILD_STORAGE_ROOT,
+    },
+    domain::{EvidenceDigest, valid_workflow_identity},
+};
 
 pub const ROOTLESS_OCI_POLICY_SCHEMA_VERSION: u16 = 1;
-pub const BUILDKIT_STATE_ROOT: &str = "/var/lib/rdashboard-buildkit";
+pub const BUILDKIT_STATE_ROOT: &str = "/var/lib/rdashboard-build/buildkit";
 pub const BUILDKIT_RUNTIME_ROOT: &str = "/run/rdashboard-buildkit";
 pub const BUILDKIT_SOCKET_PATH: &str = "/run/rdashboard-buildkit/buildkitd.sock";
 pub const BUILDKIT_CONFIG_PATH: &str = "/etc/rdashboard/buildkitd.toml";
@@ -36,11 +41,6 @@ const APPARMOR_USER_NAMESPACE_PATH: &str = "/proc/sys/kernel/apparmor_restrict_u
 const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 const MIN_SUBORDINATE_IDS: u64 = 65_536;
 const MIN_SUBORDINATE_ID_START: u64 = 65_536;
-const MIN_BUILDKIT_FILESYSTEM_BYTES: u64 = 1536 * 1024 * 1024;
-const MAX_BUILDKIT_FILESYSTEM_BYTES: u64 = 2560 * 1024 * 1024;
-const MIN_BUILDKIT_FILESYSTEM_INODES: u64 = 50_000;
-const MAX_BUILDKIT_FILESYSTEM_INODES: u64 = 500_000;
-const MIN_ROOT_EMERGENCY_RESERVE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 const MAX_TOOL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SUBID_BYTES: u64 = 1024 * 1024;
@@ -167,27 +167,7 @@ impl RootlessOciRuntimePolicyV1 {
             return Err(RootlessOciError::ApparmorBlocksUserNamespaces);
         }
 
-        verify_directory(
-            &layout.state_root,
-            self.daemon_uid,
-            shared_group_gid,
-            0o700,
-            DirectoryKind::State,
-        )?;
-        let boundary = layout.boundary_probe.inspect(&layout.state_root)?;
-        if !is_exact_mount_point(&layout.state_root, &layout.mountinfo)?
-            || !(MIN_BUILDKIT_FILESYSTEM_BYTES..=MAX_BUILDKIT_FILESYSTEM_BYTES)
-                .contains(&boundary.total_bytes)
-            || !(MIN_BUILDKIT_FILESYSTEM_INODES..=MAX_BUILDKIT_FILESYSTEM_INODES)
-                .contains(&boundary.total_inodes)
-            || boundary.available_bytes > boundary.total_bytes
-            || boundary.available_inodes > boundary.total_inodes
-        {
-            return Err(RootlessOciError::InvalidStateBoundary);
-        }
-        if boundary.root_available_bytes < MIN_ROOT_EMERGENCY_RESERVE_BYTES {
-            return Err(RootlessOciError::RootEmergencyReserveViolated);
-        }
+        verify_shared_storage_boundary(layout, self.daemon_uid, shared_group_gid)?;
 
         verify_directory(
             &layout.runtime_root,
@@ -201,6 +181,36 @@ impl RootlessOciRuntimePolicyV1 {
             .verify(&layout.socket, self.daemon_uid, shared_group_gid)?;
         Ok(())
     }
+}
+
+fn verify_shared_storage_boundary(
+    layout: &InstalledLayout,
+    daemon_uid: u32,
+    shared_group_gid: u32,
+) -> Result<(), RootlessOciError> {
+    verify_directory(
+        &layout.state_root,
+        daemon_uid,
+        shared_group_gid,
+        0o700,
+        DirectoryKind::State,
+    )?;
+    let boundary = layout.boundary_probe.inspect(&layout.state_root)?;
+    let state_metadata = fs::metadata(&layout.state_root)?;
+    let storage_metadata = fs::metadata(&layout.storage_root)?;
+    if !is_exact_mount_point(&layout.storage_root, &layout.mountinfo)?
+        || state_metadata.dev() != storage_metadata.dev()
+        || boundary.total_bytes < SHARED_BUILD_STORAGE_MIN_BYTES
+        || boundary.total_inodes == 0
+        || boundary.available_bytes > boundary.total_bytes
+        || boundary.available_inodes > boundary.total_inodes
+    {
+        return Err(RootlessOciError::InvalidStateBoundary);
+    }
+    if boundary.root_available_bytes < BUILD_STORAGE_MIN_FREE_BYTES {
+        return Err(RootlessOciError::RootEmergencyReserveViolated);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -250,9 +260,9 @@ pub enum RootlessOciError {
     ApparmorBlocksUserNamespaces,
     #[error("rootless BuildKit state root is missing or unsafe")]
     UnsafeStateRoot,
-    #[error("rootless BuildKit state is not on its own 1.5-2.5 GiB inode-bounded filesystem")]
+    #[error("rootless BuildKit state is outside the shared hard-bounded build storage")]
     InvalidStateBoundary,
-    #[error("the host root filesystem has less than the required 12 GiB emergency reserve")]
+    #[error("the host filesystem has less than the required 20 GiB recovery reserve")]
     RootEmergencyReserveViolated,
     #[error("rootless BuildKit runtime root is missing or unsafe")]
     UnsafeRuntimeRoot,
@@ -325,10 +335,10 @@ impl RootlessOciError {
                 "review the host AppArmor user-namespace policy before enabling rootless BuildKit"
             }
             Self::UnsafeStateRoot | Self::InvalidStateBoundary => {
-                "mount a dedicated 1.5-2.5 GiB inode-bounded filesystem at /var/lib/rdashboard-buildkit"
+                "enable and prove the one shared hard boundary at /var/lib/rdashboard-build"
             }
             Self::RootEmergencyReserveViolated => {
-                "free or add root filesystem capacity without lowering the 12 GiB recovery reserve"
+                "run ownership-based garbage collection without lowering the 20 GiB recovery reserve"
             }
             Self::UnsafeRuntimeRoot | Self::UnsafeSocket | Self::SocketUnavailable => {
                 "start the reviewed rdashboard-buildkit service and verify its peer-restricted Unix socket"
@@ -365,6 +375,7 @@ struct InstalledLayout {
     max_user_namespaces: PathBuf,
     unprivileged_userns: PathBuf,
     apparmor_userns: PathBuf,
+    storage_root: PathBuf,
     state_root: PathBuf,
     runtime_root: PathBuf,
     socket: PathBuf,
@@ -389,6 +400,7 @@ impl InstalledLayout {
             max_user_namespaces: USER_NAMESPACE_LIMIT_PATH.into(),
             unprivileged_userns: UNPRIVILEGED_USER_NAMESPACE_PATH.into(),
             apparmor_userns: APPARMOR_USER_NAMESPACE_PATH.into(),
+            storage_root: SHARED_BUILD_STORAGE_ROOT.into(),
             state_root: BUILDKIT_STATE_ROOT.into(),
             runtime_root: BUILDKIT_RUNTIME_ROOT.into(),
             socket: BUILDKIT_SOCKET_PATH.into(),
@@ -823,7 +835,7 @@ fn verify_buildkit_config(bytes: &[u8], max_parallelism: u16) -> Result<(), Root
             ],
             reserved_space: "256MB".to_owned(),
             max_used_space: "512MB".to_owned(),
-            min_free_space: "512MB".to_owned(),
+            min_free_space: "4GB".to_owned(),
         },
         BuildkitGcPolicy {
             all: true,
@@ -831,7 +843,7 @@ fn verify_buildkit_config(bytes: &[u8], max_parallelism: u16) -> Result<(), Root
             filters: Vec::new(),
             reserved_space: "256MB".to_owned(),
             max_used_space: "1536MB".to_owned(),
-            min_free_space: "512MB".to_owned(),
+            min_free_space: "4GB".to_owned(),
         },
     ];
     if config.root != BUILDKIT_STATE_ROOT
@@ -849,7 +861,7 @@ fn verify_buildkit_config(bytes: &[u8], max_parallelism: u16) -> Result<(), Root
         || !config.worker.oci.gc
         || config.worker.oci.reserved_space != "256MB"
         || config.worker.oci.max_used_space != "1536MB"
-        || config.worker.oci.min_free_space != "512MB"
+        || config.worker.oci.min_free_space != "4GB"
         || config.worker.oci.binary != BUILDKIT_RUNTIME_EXECUTABLE
         || config.worker.oci.max_parallelism != max_parallelism
         || config.worker.oci.cni_pool_size != 0
@@ -974,6 +986,84 @@ mod tests {
         path
     }
 
+    fn create_installed_layout(root: &Path, trusted_uid: u32) -> (InstalledLayout, Vec<u8>) {
+        let buildkitd = create_tool(root, "buildkitd", b"buildkitd");
+        let buildctl = create_tool(root, "buildctl", b"buildctl");
+        let rootlesskit = create_tool(root, "rootlesskit", b"rootlesskit");
+        let runtime = create_tool(root, "runc", b"runc");
+        let uid_mapping_helper = create_tool(root, "newuidmap", b"newuidmap");
+        let gid_mapping_helper = create_tool(root, "newgidmap", b"newgidmap");
+        fs::set_permissions(&uid_mapping_helper, fs::Permissions::from_mode(0o4755))
+            .expect("newuidmap mode");
+        fs::set_permissions(&gid_mapping_helper, fs::Permissions::from_mode(0o4755))
+            .expect("newgidmap mode");
+
+        let config = root.join("buildkitd.toml");
+        let config_bytes = buildkit_config_fixture();
+        fs::write(&config, &config_bytes).expect("write config");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("config mode");
+        let subordinate_users_path = root.join("subuid");
+        let subordinate_groups_path = root.join("subgid");
+        for path in [&subordinate_users_path, &subordinate_groups_path] {
+            fs::write(path, "rdashboard-buildkit:100000:65536\n").expect("write subid");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).expect("subid mode");
+        }
+        let max_user_namespaces = root.join("max_user_namespaces");
+        let unprivileged_userns = root.join("unprivileged_userns_clone");
+        let apparmor_userns = root.join("apparmor_restrict_unprivileged_userns");
+        fs::write(&max_user_namespaces, b"65536\n").expect("max user namespaces");
+        fs::write(&unprivileged_userns, b"1\n").expect("user namespace switch");
+        fs::write(&apparmor_userns, b"0\n").expect("AppArmor switch");
+        let storage_root = root.join("storage");
+        let state_root = storage_root.join("buildkit");
+        let runtime_root = root.join("run");
+        fs::create_dir(&storage_root).expect("storage root");
+        fs::create_dir(&state_root).expect("state root");
+        fs::create_dir(&runtime_root).expect("runtime root");
+        fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).expect("state mode");
+        fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o750))
+            .expect("runtime mode");
+        let socket = runtime_root.join("buildkitd.sock");
+        let mountinfo = root.join("mountinfo");
+        fs::write(
+            &mountinfo,
+            format!("1 0 0:1 / {} rw - tmpfs tmpfs rw\n", storage_root.display()),
+        )
+        .expect("mountinfo");
+
+        let layout = InstalledLayout {
+            buildkitd,
+            buildctl,
+            rootlesskit,
+            runtime,
+            newuidmap: uid_mapping_helper,
+            newgidmap: gid_mapping_helper,
+            config,
+            subuid: subordinate_users_path,
+            subgid: subordinate_groups_path,
+            max_user_namespaces,
+            unprivileged_userns,
+            apparmor_userns,
+            storage_root,
+            state_root,
+            runtime_root,
+            socket,
+            mountinfo,
+            trusted_uid,
+            boundary_probe: Box::new(FixedBoundaryProbe {
+                snapshot: FilesystemBoundarySnapshot {
+                    total_bytes: 64 * 1024 * 1024 * 1024,
+                    available_bytes: 32 * 1024 * 1024 * 1024,
+                    total_inodes: 100_000,
+                    available_inodes: 100_000,
+                    root_available_bytes: 32 * 1024 * 1024 * 1024,
+                },
+            }),
+            socket_probe: Box::new(FixedSocketProbe { ready: true }),
+        };
+        (layout, config_bytes)
+    }
+
     impl Fixture {
         fn new() -> Self {
             let directory = tempdir().expect("temporary directory");
@@ -985,79 +1075,7 @@ mod tests {
             let worker_uid = trusted_uid.checked_add(1).expect("worker UID");
             let job_account_uid = trusted_uid.checked_add(2).expect("build UID");
             let daemon_uid = trusted_uid;
-
-            let buildkitd = create_tool(root, "buildkitd", b"buildkitd");
-            let buildctl = create_tool(root, "buildctl", b"buildctl");
-            let rootlesskit = create_tool(root, "rootlesskit", b"rootlesskit");
-            let runtime = create_tool(root, "runc", b"runc");
-            let uid_mapping_helper = create_tool(root, "newuidmap", b"newuidmap");
-            let gid_mapping_helper = create_tool(root, "newgidmap", b"newgidmap");
-            fs::set_permissions(&uid_mapping_helper, fs::Permissions::from_mode(0o4755))
-                .expect("newuidmap mode");
-            fs::set_permissions(&gid_mapping_helper, fs::Permissions::from_mode(0o4755))
-                .expect("newgidmap mode");
-
-            let config = root.join("buildkitd.toml");
-            let config_bytes = buildkit_config_fixture();
-            fs::write(&config, &config_bytes).expect("write config");
-            fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("config mode");
-            let subordinate_users_path = root.join("subuid");
-            let subordinate_groups_path = root.join("subgid");
-            for path in [&subordinate_users_path, &subordinate_groups_path] {
-                fs::write(path, "rdashboard-buildkit:100000:65536\n").expect("write subid");
-                fs::set_permissions(path, fs::Permissions::from_mode(0o644)).expect("subid mode");
-            }
-            let max_user_namespaces = root.join("max_user_namespaces");
-            let unprivileged_userns = root.join("unprivileged_userns_clone");
-            let apparmor_userns = root.join("apparmor_restrict_unprivileged_userns");
-            fs::write(&max_user_namespaces, b"65536\n").expect("max user namespaces");
-            fs::write(&unprivileged_userns, b"1\n").expect("user namespace switch");
-            fs::write(&apparmor_userns, b"0\n").expect("AppArmor switch");
-            let state_root = root.join("state");
-            let runtime_root = root.join("run");
-            fs::create_dir(&state_root).expect("state root");
-            fs::create_dir(&runtime_root).expect("runtime root");
-            fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
-                .expect("state mode");
-            fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o750))
-                .expect("runtime mode");
-            let socket = runtime_root.join("buildkitd.sock");
-            let mountinfo = root.join("mountinfo");
-            fs::write(
-                &mountinfo,
-                format!("1 0 0:1 / {} rw - tmpfs tmpfs rw\n", state_root.display()),
-            )
-            .expect("mountinfo");
-
-            let layout = InstalledLayout {
-                buildkitd,
-                buildctl,
-                rootlesskit,
-                runtime,
-                newuidmap: uid_mapping_helper,
-                newgidmap: gid_mapping_helper,
-                config,
-                subuid: subordinate_users_path,
-                subgid: subordinate_groups_path,
-                max_user_namespaces,
-                unprivileged_userns,
-                apparmor_userns,
-                state_root,
-                runtime_root,
-                socket,
-                mountinfo,
-                trusted_uid,
-                boundary_probe: Box::new(FixedBoundaryProbe {
-                    snapshot: FilesystemBoundarySnapshot {
-                        total_bytes: 2 * 1024 * 1024 * 1024,
-                        available_bytes: 2 * 1024 * 1024 * 1024,
-                        total_inodes: 100_000,
-                        available_inodes: 100_000,
-                        root_available_bytes: 16 * 1024 * 1024 * 1024,
-                    },
-                }),
-                socket_probe: Box::new(FixedSocketProbe { ready: true }),
-            };
+            let (layout, config_bytes) = create_installed_layout(root, trusted_uid);
             let policy = RootlessOciRuntimePolicyV1 {
                 schema_version: ROOTLESS_OCI_POLICY_SCHEMA_VERSION,
                 daemon_uid,
@@ -1131,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_buildkit_features_and_unbounded_state_fail_closed() {
+    fn unsafe_buildkit_features_and_shared_storage_regressions_fail_closed() {
         let mut fixture = Fixture::new();
         let unsafe_config = String::from_utf8(buildkit_config_fixture())
             .expect("UTF-8 config")
@@ -1149,11 +1167,11 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.layout.boundary_probe = Box::new(FixedBoundaryProbe {
             snapshot: FilesystemBoundarySnapshot {
-                total_bytes: 3 * 1024 * 1024 * 1024,
-                available_bytes: 3 * 1024 * 1024 * 1024,
+                total_bytes: 64 * 1024 * 1024 * 1024,
+                available_bytes: 65 * 1024 * 1024 * 1024,
                 total_inodes: 100_000,
                 available_inodes: 100_000,
-                root_available_bytes: 16 * 1024 * 1024 * 1024,
+                root_available_bytes: 32 * 1024 * 1024 * 1024,
             },
         });
         assert!(matches!(
@@ -1164,11 +1182,11 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.layout.boundary_probe = Box::new(FixedBoundaryProbe {
             snapshot: FilesystemBoundarySnapshot {
-                total_bytes: 2 * 1024 * 1024 * 1024,
-                available_bytes: 2 * 1024 * 1024 * 1024,
+                total_bytes: 64 * 1024 * 1024 * 1024,
+                available_bytes: 32 * 1024 * 1024 * 1024,
                 total_inodes: 100_000,
                 available_inodes: 100_000,
-                root_available_bytes: 11 * 1024 * 1024 * 1024,
+                root_available_bytes: 19 * 1024 * 1024 * 1024,
             },
         });
         assert!(matches!(

@@ -18,6 +18,7 @@ pub mod backup_driver;
 pub mod build;
 pub mod build_attestation;
 pub mod build_source;
+pub mod build_storage;
 #[cfg(unix)]
 pub mod cargo_prefetch;
 pub mod controller;

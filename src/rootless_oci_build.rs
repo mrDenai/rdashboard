@@ -17,6 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     build::OciDigest,
+    build_storage::{
+        BUILDKIT_MAX_USED_BYTES, SHARED_BUILD_STORAGE_MIN_BYTES, SHARED_BUILD_STORAGE_ROOT,
+        required_host_available_bytes,
+    },
     domain::{
         EvidenceDigest, GitCommitId, ProjectId, WorkflowAdapterIdV1, WorkflowArtifactKindV1,
         WorkflowLeaseV1, WorkflowNodeKindV1,
@@ -34,8 +38,7 @@ pub const ROOTLESS_OCI_BUILD_PREPARED_ROOT: &str = "/prepared/source";
 pub const ROOTLESS_OCI_BUILD_DEPENDENCY_ROOT: &str = "/dependencies";
 pub const ROOTLESS_OCI_BUILD_OUTPUT_ROOT: &str = "/output";
 pub const ROOTLESS_OCI_BUILD_SOCKET_PATH: &str = "/buildkit/buildkitd.sock";
-pub const ROOTLESS_OCI_RESULT_STORE_ROOT: &str =
-    "/var/lib/rdashboard-workflow-launcher/oci-results";
+pub const ROOTLESS_OCI_RESULT_STORE_ROOT: &str = "/var/lib/rdashboard-build/oci-results";
 
 const REQUEST_PURPOSE: &str = "rdashboard.rootless-oci-build-request.v1";
 const RESULT_PURPOSE: &str = "rdashboard.rootless-oci-build-result.v1";
@@ -52,11 +55,6 @@ const MAX_DOCKERFILE_BYTES: u64 = 1024 * 1024;
 const MAX_OCI_JSON_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OCI_ENTRIES: usize = 100_000;
 const MAX_OCI_PATH_BYTES: usize = 512;
-const MIN_RESULT_FILESYSTEM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const MAX_RESULT_FILESYSTEM_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-const MIN_RESULT_FILESYSTEM_INODES: u64 = 10_000;
-const MAX_RESULT_FILESYSTEM_INODES: u64 = 100_000;
-const MIN_ROOT_EMERGENCY_RESERVE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 const MIN_STORE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STORE_ENTRIES: usize = 256;
 const SANDBOX_REQUEST_FILE_MODE: u32 = 0o444;
@@ -924,12 +922,12 @@ fn parse_buildkit_metadata(bytes: &[u8]) -> Result<(OciDigest, OciDigest), Rootl
 
 #[derive(Clone, Copy, Debug)]
 struct ResultFilesystemSnapshot {
-    dedicated_mount: bool,
+    shared_hard_boundary: bool,
     total_bytes: u64,
     available_bytes: u64,
+    host_available_bytes: u64,
     total_inodes: u64,
     available_inodes: u64,
-    root_available_bytes: u64,
 }
 
 trait ResultFilesystemProbe: Send + Sync {
@@ -949,20 +947,18 @@ impl ResultFilesystemProbe for InstalledResultFilesystemProbe {
         } else {
             stats.f_frsize
         };
-        let root_file = File::open("/")?;
-        let root_stats = rustix::fs::fstatvfs(&root_file).map_err(io::Error::from)?;
-        let root_fragment = if root_stats.f_frsize == 0 {
-            root_stats.f_bsize
-        } else {
-            root_stats.f_frsize
-        };
+        let shared_root = Path::new(SHARED_BUILD_STORAGE_ROOT);
+        let host = fs2::statvfs("/")?;
+        let result_metadata = fs::metadata(&self.root)?;
+        let shared_metadata = fs::metadata(shared_root)?;
         Ok(ResultFilesystemSnapshot {
-            dedicated_mount: is_exact_mount_point(&self.root)?,
+            shared_hard_boundary: is_exact_mount_point(shared_root)?
+                && result_metadata.dev() == shared_metadata.dev(),
             total_bytes: stats.f_blocks.saturating_mul(fragment),
             available_bytes: stats.f_bavail.saturating_mul(fragment),
+            host_available_bytes: host.available_space(),
             total_inodes: stats.f_files,
             available_inodes: stats.f_favail,
-            root_available_bytes: root_stats.f_bavail.saturating_mul(root_fragment),
         })
     }
 }
@@ -1059,11 +1055,17 @@ impl RootlessOciResultStoreV1 {
         self.verify_boundary()?;
         self.remove_project_result(&request.project_id)?;
         let snapshot = self.probe.inspect(&self.root_handle)?;
-        let required = request
+        let incoming = request
             .max_archive_bytes
             .checked_add(MIN_STORE_HEADROOM_BYTES)
+            .and_then(|bytes| bytes.checked_add(BUILDKIT_MAX_USED_BYTES))
             .ok_or(RootlessOciBuildError::StoreCapacityExceeded)?;
-        if snapshot.available_bytes < required || snapshot.available_inodes < 16 {
+        let required = required_host_available_bytes(incoming)
+            .ok_or(RootlessOciBuildError::StoreCapacityExceeded)?;
+        if snapshot.available_bytes < incoming
+            || snapshot.host_available_bytes < required
+            || snapshot.available_inodes < 16
+        {
             return Err(RootlessOciBuildError::StoreCapacityExceeded);
         }
         let staging = self.staging_path(request);
@@ -1255,18 +1257,13 @@ impl RootlessOciResultStoreV1 {
 
     fn verify_boundary(&self) -> Result<(), RootlessOciBuildError> {
         let snapshot = self.probe.inspect(&self.root_handle)?;
-        if !snapshot.dedicated_mount
-            || !(MIN_RESULT_FILESYSTEM_BYTES..=MAX_RESULT_FILESYSTEM_BYTES)
-                .contains(&snapshot.total_bytes)
-            || !(MIN_RESULT_FILESYSTEM_INODES..=MAX_RESULT_FILESYSTEM_INODES)
-                .contains(&snapshot.total_inodes)
+        if !snapshot.shared_hard_boundary
+            || snapshot.total_bytes < SHARED_BUILD_STORAGE_MIN_BYTES
+            || snapshot.total_inodes == 0
             || snapshot.available_bytes > snapshot.total_bytes
             || snapshot.available_inodes > snapshot.total_inodes
         {
             return Err(RootlessOciBuildError::InvalidStoreBoundary);
-        }
-        if snapshot.root_available_bytes < MIN_ROOT_EMERGENCY_RESERVE_BYTES {
-            return Err(RootlessOciBuildError::RootEmergencyReserveViolated);
         }
         Ok(())
     }
@@ -1864,10 +1861,8 @@ pub enum RootlessOciBuildError {
     StoreAlreadyOpen,
     #[error("rootless OCI result store lock is poisoned")]
     StoreLockPoisoned,
-    #[error("rootless OCI results require their own 4-6 GiB inode-bounded filesystem")]
+    #[error("rootless OCI results are outside the shared hard-bounded build storage")]
     InvalidStoreBoundary,
-    #[error("root filesystem emergency reserve is below 12 GiB")]
-    RootEmergencyReserveViolated,
     #[error("rootless OCI result store does not have enough bounded capacity")]
     StoreCapacityExceeded,
     #[error("rootless OCI workflow contract is invalid: {0}")]
@@ -1902,7 +1897,6 @@ impl RootlessOciBuildError {
                 "rootless_oci_result_store_invalid"
             }
             Self::InvalidStoreBoundary => "rootless_oci_result_store_unbounded",
-            Self::RootEmergencyReserveViolated => "root_emergency_reserve_violated",
             Self::StoreCapacityExceeded => "rootless_oci_result_store_full",
             Self::Workflow(_) => "rootless_oci_workflow_contract_invalid",
             Self::Json(_) => "rootless_oci_json_invalid",
@@ -2198,17 +2192,18 @@ mod tests {
     #[derive(Clone, Copy)]
     struct FixedResultFilesystemProbe {
         available_bytes: u64,
+        host_available_bytes: u64,
     }
 
     impl ResultFilesystemProbe for FixedResultFilesystemProbe {
         fn inspect(&self, _root: &File) -> Result<ResultFilesystemSnapshot, RootlessOciBuildError> {
             Ok(ResultFilesystemSnapshot {
-                dedicated_mount: true,
-                total_bytes: MIN_RESULT_FILESYSTEM_BYTES,
+                shared_hard_boundary: true,
+                total_bytes: 64 * 1024 * 1024 * 1024,
                 available_bytes: self.available_bytes,
-                total_inodes: MIN_RESULT_FILESYSTEM_INODES,
-                available_inodes: MIN_RESULT_FILESYSTEM_INODES,
-                root_available_bytes: MIN_ROOT_EMERGENCY_RESERVE_BYTES,
+                host_available_bytes: self.host_available_bytes,
+                total_inodes: 1_000_000,
+                available_inodes: 1_000_000,
             })
         }
     }
@@ -2233,7 +2228,8 @@ mod tests {
             metadata.uid(),
             metadata.gid(),
             Box::new(FixedResultFilesystemProbe {
-                available_bytes: MIN_RESULT_FILESYSTEM_BYTES,
+                available_bytes: 32 * 1024 * 1024 * 1024,
+                host_available_bytes: 64 * 1024 * 1024 * 1024,
             }),
         )
         .expect("open result store");
@@ -2297,9 +2293,45 @@ mod tests {
             metadata.gid(),
             Box::new(FixedResultFilesystemProbe {
                 available_bytes: request.max_archive_bytes,
+                host_available_bytes: 64 * 1024 * 1024 * 1024,
             }),
         )
         .expect("open result store");
+        assert!(matches!(
+            store.prepare(&request),
+            Err(RootlessOciBuildError::StoreCapacityExceeded)
+        ));
+        assert!(!store.staging_path(&request).exists());
+        assert!(!store.request_path(&request).exists());
+    }
+
+    #[test]
+    fn result_store_reserves_engine_and_archive_peak_above_the_host_floor() {
+        let directory = tempdir().expect("temporary directory");
+        let root = directory.path().join("oci-results");
+        fs::create_dir(&root).expect("result root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("result root mode");
+        let metadata = fs::metadata(&root).expect("result root metadata");
+        let request = RootlessOciBuildRequestV1::from_policy(&lease(), &policy()).expect("request");
+        let peak = request
+            .max_archive_bytes
+            .checked_add(MIN_STORE_HEADROOM_BYTES)
+            .and_then(|bytes| bytes.checked_add(BUILDKIT_MAX_USED_BYTES))
+            .expect("bounded peak");
+        let required = required_host_available_bytes(peak).expect("required host capacity");
+        let store = RootlessOciResultStoreV1::open_with_probe(
+            root,
+            metadata.uid(),
+            metadata.gid(),
+            metadata.uid(),
+            metadata.gid(),
+            Box::new(FixedResultFilesystemProbe {
+                available_bytes: 32 * 1024 * 1024 * 1024,
+                host_available_bytes: required - 1,
+            }),
+        )
+        .expect("open result store");
+
         assert!(matches!(
             store.prepare(&request),
             Err(RootlessOciBuildError::StoreCapacityExceeded)
@@ -2348,9 +2380,7 @@ mod tests {
             crate::rootless_oci::BUILDKIT_SOCKET_PATH,
             "/run/rdashboard-buildkit/buildkitd.sock"
         );
-        assert!(
-            ROOTLESS_OCI_RESULT_STORE_ROOT.starts_with("/var/lib/rdashboard-workflow-launcher/")
-        );
+        assert!(ROOTLESS_OCI_RESULT_STORE_ROOT.starts_with("/var/lib/rdashboard-build/"));
         assert_eq!(
             fs::metadata(".").expect("workspace metadata").uid(),
             fs::metadata(".").expect("workspace metadata").uid()

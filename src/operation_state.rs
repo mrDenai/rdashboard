@@ -17,16 +17,17 @@ use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{
-    EvidenceDigest, GitCommitId, ProjectId, WorkflowLeaseV1, WorkflowNodeId,
-    WorkflowOperationStateV1,
+use crate::{
+    build_storage::{
+        SHARED_BUILD_STORAGE_MIN_BYTES, SHARED_BUILD_STORAGE_ROOT, required_host_available_bytes,
+    },
+    domain::{
+        EvidenceDigest, GitCommitId, ProjectId, WorkflowLeaseV1, WorkflowNodeId,
+        WorkflowOperationStateV1,
+    },
 };
 
 pub const WORKFLOW_OPERATION_STATE_ROOT: &str = "/var/lib/rdashboard-build/operations";
-pub const MIN_OPERATION_FILESYSTEM_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-pub const MAX_OPERATION_FILESYSTEM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-pub const MIN_OPERATION_FILESYSTEM_INODES: u64 = 100_000;
-pub const MAX_OPERATION_FILESYSTEM_INODES: u64 = 1_000_000;
 
 const RECORD_FILE: &str = "record.jcs";
 const DATA_DIRECTORY: &str = "data";
@@ -38,7 +39,6 @@ const MAX_RECORDS: usize = 1_024;
 const MAX_RETAINED_TERMINAL_RECORDS: usize = 512;
 const MAX_INACTIVE_STATE_IDLE_MS: i64 = 60 * 60 * 1_000;
 const MAX_OPERATION_STATE_DEPTH: u16 = 64;
-const MIN_ADMISSION_BYTES: u64 = 64 * 1024 * 1024;
 const MIN_ADMISSION_INODES: u64 = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -505,9 +505,10 @@ struct StateUsage {
 
 #[derive(Clone, Copy, Debug)]
 struct FilesystemBoundarySnapshot {
-    dedicated_mount: bool,
+    shared_hard_boundary: bool,
     total_bytes: u64,
     available_bytes: u64,
+    host_available_bytes: u64,
     total_inodes: u64,
     available_inodes: u64,
 }
@@ -541,10 +542,16 @@ impl FilesystemBoundaryProbe for SystemFilesystemBoundaryProbe {
         } else {
             stats.f_frsize
         };
+        let shared_root = Path::new(SHARED_BUILD_STORAGE_ROOT);
+        let host = fs2::statvfs("/")?;
+        let root_metadata = fs::metadata(&self.root)?;
+        let shared_metadata = fs::metadata(shared_root)?;
         Ok(FilesystemBoundarySnapshot {
-            dedicated_mount: is_exact_mount_point(&self.root)?,
+            shared_hard_boundary: is_exact_mount_point(shared_root)?
+                && root_metadata.dev() == shared_metadata.dev(),
             total_bytes: stats.f_blocks.saturating_mul(fragment_size),
             available_bytes: stats.f_bavail.saturating_mul(fragment_size),
+            host_available_bytes: host.available_space(),
             total_inodes: stats.f_files,
             available_inodes: stats.f_favail,
         })
@@ -633,13 +640,14 @@ impl WorkflowOperationStateStoreV1 {
         )?;
         let _guard = self.lock()?;
         self.revalidate()?;
-        let boundary = self.probe.inspect(&self.root_lock)?;
-        validate_boundary(boundary)?;
         self.reconcile_inactive_records(now_ms)?;
         let capacity = self.probe.inspect(&self.root_lock)?;
         validate_boundary(capacity)?;
-        if capacity.available_bytes < MIN_ADMISSION_BYTES
-            || capacity.available_inodes < MIN_ADMISSION_INODES
+        let required_bytes = required_host_available_bytes(state.max_bytes)
+            .ok_or(WorkflowOperationStateError::FilesystemCapacityExceeded)?;
+        if capacity.available_bytes < state.max_bytes
+            || capacity.host_available_bytes < required_bytes
+            || capacity.available_inodes < MIN_ADMISSION_INODES.max(state.max_inodes)
         {
             return Err(WorkflowOperationStateError::FilesystemCapacityExceeded);
         }
@@ -1198,11 +1206,9 @@ fn required_state(
 fn validate_boundary(
     boundary: FilesystemBoundarySnapshot,
 ) -> Result<(), WorkflowOperationStateError> {
-    if !boundary.dedicated_mount
-        || !(MIN_OPERATION_FILESYSTEM_BYTES..=MAX_OPERATION_FILESYSTEM_BYTES)
-            .contains(&boundary.total_bytes)
-        || !(MIN_OPERATION_FILESYSTEM_INODES..=MAX_OPERATION_FILESYSTEM_INODES)
-            .contains(&boundary.total_inodes)
+    if !boundary.shared_hard_boundary
+        || boundary.total_bytes < SHARED_BUILD_STORAGE_MIN_BYTES
+        || boundary.total_inodes == 0
         || boundary.available_bytes > boundary.total_bytes
         || boundary.available_inodes > boundary.total_inodes
     {
@@ -1580,7 +1586,7 @@ pub enum WorkflowOperationStateError {
     UnsafePath,
     #[error("workflow operation-state path changed while open")]
     PathChanged,
-    #[error("workflow operation-state requires its own bounded filesystem")]
+    #[error("workflow operation-state requires the shared bounded build filesystem")]
     InvalidFilesystemBoundary,
     #[error("workflow operation-state filesystem has insufficient free capacity")]
     FilesystemCapacityExceeded,
@@ -1690,11 +1696,12 @@ mod tests {
 
     fn valid_boundary() -> FilesystemBoundarySnapshot {
         FilesystemBoundarySnapshot {
-            dedicated_mount: true,
-            total_bytes: MIN_OPERATION_FILESYSTEM_BYTES,
-            available_bytes: MIN_OPERATION_FILESYSTEM_BYTES,
-            total_inodes: MIN_OPERATION_FILESYSTEM_INODES,
-            available_inodes: MIN_OPERATION_FILESYSTEM_INODES,
+            shared_hard_boundary: true,
+            total_bytes: 64 * 1024 * 1024 * 1024,
+            available_bytes: 32 * 1024 * 1024 * 1024,
+            host_available_bytes: 64 * 1024 * 1024 * 1024,
+            total_inodes: 1_000_000,
+            available_inodes: 1_000_000,
         }
     }
 
@@ -2189,16 +2196,15 @@ mod tests {
     fn filesystem_boundary_is_hard_bounded_by_bytes_and_inodes() {
         for invalid in [
             FilesystemBoundarySnapshot {
-                dedicated_mount: false,
+                shared_hard_boundary: false,
                 ..valid_boundary()
             },
             FilesystemBoundarySnapshot {
-                total_bytes: MAX_OPERATION_FILESYSTEM_BYTES + 1,
+                available_bytes: valid_boundary().total_bytes + 1,
                 ..valid_boundary()
             },
             FilesystemBoundarySnapshot {
-                total_inodes: MAX_OPERATION_FILESYSTEM_INODES + 1,
-                available_inodes: MAX_OPERATION_FILESYSTEM_INODES + 1,
+                available_inodes: valid_boundary().total_inodes + 1,
                 ..valid_boundary()
             },
         ] {

@@ -1,4 +1,4 @@
-root = "/var/lib/rdashboard-buildkit"
+root = "/var/lib/rdashboard-build/buildkit"
 insecure-entitlements = []
 
 [grpc]
@@ -23,7 +23,7 @@ insecure-entitlements = []
   gc = true
   reservedSpace = "256MB"
   maxUsedSpace = "1536MB"
-  minFreeSpace = "512MB"
+  minFreeSpace = "4GB"
   binary = "/usr/libexec/rdashboard/runc"
   max-parallelism = 1
   cniPoolSize = 0
@@ -33,10 +33,10 @@ insecure-entitlements = []
     filters = ["type==source.local", "type==exec.cachemount"]
     reservedSpace = "256MB"
     maxUsedSpace = "512MB"
-    minFreeSpace = "512MB"
+    minFreeSpace = "4GB"
 
   [[worker.oci.gcpolicy]]
     all = true
     reservedSpace = "256MB"
     maxUsedSpace = "1536MB"
-    minFreeSpace = "512MB"
+    minFreeSpace = "4GB"

@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    build_storage::recovery_reserve_bytes,
     domain::{
         EvidenceDigest, ExecutionCleanupReceiptV1, ExecutionCleanupStateV1, ExecutionIoUsageV1,
         ExecutionMemoryEventsV1, ExecutionProcessOutcomeV1, ExecutionReceiptError,
         ExecutionResourceUsageV1, ExecutionResultV1, ExecutionStorageUsageV1,
-        ExecutionTerminalReceiptV1, GIB,
+        ExecutionTerminalReceiptV1,
     },
     phase6::{AuthorizedPhaseSpecV1, FixedAdapterRequestV1, Phase6ContractError},
     self_update::CURRENT_ADAPTER_RECEIPT_EXECUTABLE,
@@ -353,7 +354,7 @@ pub fn capture_terminal_receipt_in(
     let filesystem_available_after_bytes = fs2::available_space(job_directory).ok();
     let emergency_reserve = filesystem_available_after_bytes.and_then(|available| {
         fs2::total_space(job_directory).ok().map(|total| {
-            let required = (8 * GIB).max(total.saturating_mul(15).div_ceil(100));
+            let required = recovery_reserve_bytes(total);
             (
                 required,
                 available.saturating_sub(required),

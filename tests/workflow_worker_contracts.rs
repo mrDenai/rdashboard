@@ -76,7 +76,7 @@ fn dependency_fetcher_has_one_public_registry_route_and_no_worker_state() {
 }
 
 #[test]
-fn rootless_buildkit_is_offline_separate_and_hard_bounded() {
+fn rootless_buildkit_is_offline_shared_and_hard_bounded() {
     let service = include_str!("../deploy/systemd/rdashboard-buildkit.service");
     let lines = service.lines().collect::<Vec<_>>();
     for required in [
@@ -102,10 +102,11 @@ fn rootless_buildkit_is_offline_separate_and_hard_bounded() {
     }
     assert!(service.contains("rootlesskit --net=host --propagation=rslave"));
     assert!(service.contains("/etc/rdashboard/buildkitd.toml"));
-    assert!(service.contains("/var/lib/rdashboard-buildkit"));
+    assert!(service.contains("/var/lib/rdashboard-build/buildkit"));
     assert!(service.contains("/etc/rdashboard/credentials"));
     assert!(service.contains("/var/lib/rdashboard-build"));
     assert!(service.contains("/run/docker.sock"));
+    assert!(!service.contains("SupplementaryGroups=rdashboard-build-readers"));
     assert!(service.contains("/run/containerd"));
     assert!(service.contains("/run/podman/podman.sock"));
     assert!(!service.contains("LoadCredential="));
@@ -116,7 +117,7 @@ fn rootless_buildkit_is_offline_separate_and_hard_bounded() {
         "rootless = true",
         "noProcessSandbox = false",
         "maxUsedSpace = \"1536MB\"",
-        "minFreeSpace = \"512MB\"",
+        "minFreeSpace = \"4GB\"",
         "max-parallelism = 1",
         "cniPoolSize = 0",
     ] {
@@ -125,10 +126,17 @@ fn rootless_buildkit_is_offline_separate_and_hard_bounded() {
     assert!(config.contains("[worker.containerd]\n  enabled = false"));
 
     let tmpfiles = include_str!("../deploy/systemd/rdashboard-tmpfiles.conf");
+    assert!(
+        tmpfiles
+            .lines()
+            .any(|line| line == "d /var/lib/rdashboard-build 0711 root root -")
+    );
     assert!(tmpfiles.lines().any(|line| {
-        line == "d /var/lib/rdashboard-buildkit 0700 rdashboard-buildkit rdashboard-build -"
+        line == "d /var/lib/rdashboard-build/buildkit 0700 rdashboard-buildkit rdashboard-build -"
     }));
-    assert!(tmpfiles.lines().any(|line| {
-        line == "d /var/lib/rdashboard-workflow-launcher/oci-results 0700 root root -"
-    }));
+    assert!(
+        tmpfiles
+            .lines()
+            .any(|line| { line == "d /var/lib/rdashboard-build/oci-results 0700 root root -" })
+    );
 }

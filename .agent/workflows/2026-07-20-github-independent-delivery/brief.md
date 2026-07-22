@@ -442,3 +442,45 @@ Normalized instruction:
   attempt. Do not implement that by extending the temporary GitHub path.
 - Legacy Sartuli master deletion and off-host backup remain deferred; no runner retirement, broad
   cache cleanup, repository push or failure/reboot drill is authorized.
+
+### U028 — 2026-07-22
+
+Faithful English rendering:
+
+No additional 32 GB storage will be added. Explain why four separately bounded filesystems are
+needed.
+
+Normalized correction:
+
+- Do not make new storage capacity or four independent filesystems a prerequisite for the delivery
+  migration.
+- Re-evaluate the storage model instead of carrying the prior per-store physical-filesystem design
+  forward literally.
+
+Supersedes: the storage-provisioning requirement recorded after U027.
+
+### U029 — 2026-07-22
+
+Faithful English rendering:
+
+Most disk space is currently occupied by build caches and other residue that should disappear after
+deployment moves to `rdashboard`. Build tools must be shared across deployments: `rimg`, `rdashboard`
+and `telegram-gateway` all need Rust tooling, so build what is needed once rather than keeping three
+copies. This must save both rebuild time and disk space. The applications themselves, especially Rust
+applications, are small. Run them in Docker images only where useful; otherwise do not containerize
+them. They must not occupy much disk, and 20-30 GB must remain free at all times.
+
+Normalized architecture and acceptance criteria:
+
+- Use one host-level shared build-tool/toolchain layer and content-addressed dependency inputs across
+  all Rust projects; do not keep repository- or runner-specific compiler/tool copies.
+- Keep project-specific state limited to exact source, bounded incremental operation output and the
+  small final runtime artifact. Reuse shared immutable inputs rather than rebuilding them per image.
+- Containerization is a deployment choice, not a build-cache ownership mechanism. Use a minimal
+  runtime image only when the service benefits from it; native services may run without Docker.
+- Replace the four-filesystem proposal with one coherent storage budget and deterministic ownership,
+  retention and garbage collection.
+- The system must preserve 20-30 GB of free disk space continuously; activation must fail closed
+  before violating the configured reserve.
+
+Supersedes: U028's open storage-model question and the earlier per-store filesystem requirement.

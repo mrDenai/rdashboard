@@ -213,21 +213,20 @@ measured CPU/RAM/IO capacity. The worker accepts 1-16 slots, but that protocol m
 installation default. It has no network namespace, capabilities, Docker/containerd/Podman socket,
 credential, controller state or production volume.
 
-Mount a dedicated filesystem at `/var/lib/rdashboard-build/preparation` before starting the worker.
-Its total size must be at least 6 GiB; using an approximately 8 GiB filesystem leaves metadata margin
-while the store itself still refuses more than 6 GiB or 100,000 inodes. Keep at least 12 GiB free on
-the host root filesystem. The worker refuses startup when this path is not the exact mount point, the
-filesystem is too small, ownership/mode is wrong, the store exceeds either cap, or the root reserve is
-missing. The tmpfiles entry creates the mode-`0700` mountpoint, but it does not create or mount the
-filesystem; installation must provide and persist that hard boundary first.
+Mount one shared hard-bounded filesystem at `/var/lib/rdashboard-build` before starting any build
+service. It must provide at least 16 GiB. Preparation CAS, operation state, BuildKit state and OCI
+results use owned child directories on this same filesystem; its root is mode `0711` so services can
+traverse only to an explicitly permitted child without listing or reading sibling stores. Projects share immutable toolchains and
+content-addressed dependencies instead of keeping private copies. The preparation CAS itself still
+refuses more than 6 GiB or 100,000 inodes, and every operation contract still limits accounted
+target/cache data to at most 6 GiB/500,000 inodes.
 
-Mount a second dedicated filesystem at `/var/lib/rdashboard-build/operations` before starting the
-launcher. It must be an exact 6-8 GiB mount with 100,000-1,000,000 total inodes, owned by root and mode
-`0700`; startup fails closed outside those byte/inode bounds. This is the hard fallback fence when
-project quotas are unavailable: repository code can exhaust only this small operation domain, never
-the VPS root filesystem. Each operation contract additionally limits accounted target/cache bytes and
-inodes to at most 6 GiB/500,000, and the launcher rechecks that bound before reuse and after exit. The
-tmpfiles entry creates only the mountpoint and does not format or mount storage.
+The worker and launcher refuse startup unless `/var/lib/rdashboard-build` is the exact hard boundary,
+their child is on that filesystem and ownership/mode is correct. New work is rejected unless its
+conservative maximum still leaves at least 20 GiB free on `/`; replaceable preparation entries begin
+LRU reclamation below the 30 GiB free-space target. The tmpfiles entries create owned children only;
+installation must provide and persist the one shared boundary first. Do not create separate build
+filesystems per service or project.
 
 `source_tree_v1` remains deliberately offline and is valid only for a dependency-free repository or
 one whose complete gate dependencies are already vendored in the source tree. The additional

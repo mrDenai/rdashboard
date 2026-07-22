@@ -54,10 +54,11 @@ manual mode until they meet the target; the plan does not obtain speed by skippi
   deadline, or supplies the release/OCI artifact.
 - No workflow code receives production secrets, the production Docker socket, controller/executor/
   source authority sockets, host networking, production volumes or caller-selected root commands.
-- Preserve at least 12 GiB of filesystem recovery headroom in addition to the measured admitted
-  operation peak. Initial persistent workflow/source/cache state is capped at 6 GiB; disposable
-  BuildKit state starts at a measured 1-2 GiB ceiling. These are activation limits to validate, not
-  permission to delete current state.
+- Preserve at least 20 GiB of host-filesystem recovery headroom after the measured admitted operation
+  peak, and begin deterministic reclamation below the 30 GiB target. One shared hard-bounded build
+  store holds repository-independent toolchains, content-addressed inputs, operation state, BuildKit
+  state and OCI results; projects do not receive private cache filesystems. These are activation
+  limits to validate, not permission to delete current state.
 
 ## Existing seams to preserve
 
@@ -109,7 +110,7 @@ Implementation progress:
 | 4k. Generic stateful OCI mutation adapter for Telegram gateway | In progress | Three local sub-slices now make Kamal, backup-pipeline paths/credentials, and atomic online SQLite base capture project-scoped while preserving exact rimg behavior. Gateway capture reads its live WAL database through SQLite Online Backup, has crash-safe immutable replay evidence, and grants no source-volume writes. Remaining work is the generic phase/release policy plus an explicit initial adoption contract for the already-running gateway. Source remains `auto_deploy=false`; no production activation or drills. |
 | 4l. Bound unchanged-source retention and onboard inactive rimg source | Completed locally | Production discovery found periodic TTL re-attestation of unchanged disabled heads had created about 1.8 GiB of duplicate source exports. The broker now refreshes only an enabled undelivered expired head, retains the current delivered outbox marker across pruning, and keeps delivered or disabled generations stable. The exact private rimg source/workflow/data/health/migration contract and setgid handoff path are cataloged with `auto_deploy=false`; Titanium remains an explicit sealed-input blocker. Bare `bin/ci` and independent review passed. Push, production install and duplicate-export reclamation remain pending. |
 | 4m. Activate and prove the production source contour | Completed | Exact `9a42d94` controller, source, dispatcher and loopback ingress now serve `rdashboard`, `rimg` and `telegram-gateway` with `auto_deploy=false`. The controller health contract is green and records fresh healthy samples for both managed runtime projects. The three accepted sequences remained `248 / 1 / 269` beyond the 120-second TTL, ingress health returned 204 and no warning-or-higher journal event appeared. After a typed dry inventory, 1,028 obsolete duplicate exports totaling 2,021,510,064 file bytes were removed while the current six `.tar`/`.jcs` files and the complete ledger history were retained. No public bridge, project deployment, runner retirement or broad cache deletion was activated. |
-| 4n. Activate bounded worker storage and artifact-native rimg inputs | Blocked on host storage; design in progress | Production has only one 75 GB disk/root filesystem and 14.3 GB available, with no LVM/free device. The existing hard fences require separate preparation (about 8 GiB), operations (6-8 GiB), BuildKit (1.5-2.5 GiB) and OCI-result (4-6 GiB) filesystems while retaining at least 12 GiB free on root. Add a separate 32 GB volume or equivalent unallocated disk extent before installing the missing worker/build identities and units. Locally, replace the current unsealed `native` context plus duplicate Rust compilation with one sealed Titanium artifact, one verified release binary and minimal final OCI assembly; do not add a temporary Docker-compatible shadow path. |
+| 4n. Activate shared worker storage and artifact-native rimg inputs | In progress; no added disk required | Live ownership evidence shows duplicated GitHub runner trees (8.16 GB) and container/build state dominate disk while the rimg and Telegram gateway application images are about 187 MB and 22 MB. Replace the four exact-mount requirements with one project-quota-backed `/var/lib/rdashboard-build` domain shared by every repository. Start engine/store GC below 30 GiB free and reject any new reservation that could cross the hard 20 GiB floor. The current ext4 root supports project quotas in its kernel and systemd 259, but the filesystem feature and `prjquota` mount option are not enabled yet; activation remains fail-closed until that one host boundary is proven. Locally, bind one host Rust toolchain and content-addressed dependency/native inputs, disable disposable debug/incremental accumulation, reuse one verified release binary from the gate, and perform only minimal final OCI assembly when a container is useful. |
 | 5-11 | Pending | Dependency-ordered behind the unfinished local/runtime boundaries; external activation gates remain unchanged. |
 | 12. `rdashboard` A/B self-update | In progress | Slice 12a locally implements the inactive signed release, immutable store, root journal, SQLite backup, A/B switch, health proof, crash replay and rollback foundation. Slice 12b adds serial verification-to-native packaging on one VPS operation state, a fixed unprivileged producer, independent root validation/signing and atomic complete-directory handoff. Slice 12c migrates the complete application payload to one atomic `current/bin` slot and adds the stable root recovery CLI. Slice 12d adds the inactive exact `rdashboard` source/workflow catalog and a terminal self-update handoff graph that cannot also enter the generic executor mutation path. Slice 12e is implementing one generated launcher/bootstrap policy bundle plus crash-safe first-slot provisioning. Failure drills and explicit activation remain. |
 
@@ -142,12 +143,16 @@ Implementation ledger:
   rimg repository/export directories were created directly for source activation. Creating the missing
   identities, dedicated storage/quota boundary and inactive generic worker/build services is the next
   activation slice; this source slice grants no build or deploy authority.
-- The 4n live preflight found no safe storage layout on the current device. `/dev/vda1` is the sole
-  writable persistent filesystem and has 14,306,525,184 bytes available; there is no LVM/free device.
-  The four minimum hard-fenced filesystems consume about 19.5 GiB before filesystem overhead while the
-  root-reserve contract independently requires 12 GiB free. Loop files on the current root would
-  violate that reserve. Provision at least a separate 24 GiB extent; a 32 GB volume is the operational
-  recommendation and leaves margin for filesystem metadata and measured high water.
+- The 4n live preflight found `/dev/vda1` is the sole writable persistent filesystem and currently has
+  about 14.3 GB available. The active build residue is not application state: four runner trees use
+  8,158,277,632 bytes, Docker images use about 10.89 GB, and BuildKit cache uses about 3.76 GB, while
+  `/var/lib/rdashboard-build` itself uses less than 10 MB. The rimg and Telegram gateway application
+  images are only about 187 MB and 22 MB. No new volume or loop filesystem is justified.
+- Production runs ext4 without the `quota`/`project` features or `prjquota` mount option. The kernel
+  has quota/quotactl support and systemd 259 supports `StateDirectoryQuota=`, so the one-host-boundary
+  path is an ext4 project quota on `/var/lib/rdashboard-build`, not four filesystems. Enabling and
+  proving that filesystem feature is a later explicit host mutation; local implementation and
+  artifact work continue without weakening startup admission.
 - The rimg build preflight also rejected treating the present `Dockerfile.runtime` as the final path:
   it requests an external Dockerfile frontend, consumes an unsealed `native` context and compiles the
   Rust release again after bare `bin/ci`. The permanent integration must bind one sealed Titanium
@@ -308,12 +313,13 @@ Implementation ledger:
   New leases bind the exact source sequence and accepted attestation while legacy persisted leases
   remain canonically decodable but cannot start new work; the source reader selects that exact
   immutable export instead of a mutable latest publication.
-- Its dedicated-filesystem CAS uses typed policy-bound keys for exact source, dependency and prepared
+- This historical slice first used a dedicated-filesystem CAS. It uses typed policy-bound keys for exact source, dependency and prepared
   run objects; one producer serves concurrent same-key callers; staging is atomically published and
   recursively sealed; every open revalidates ownership, layout and content hashes; and symlinks,
   hard links, special files and unsafe paths fail closed. Conservative byte/inode reservations,
-  a 6 GiB initial ceiling, 100,000-inode ceiling, 12 GiB root-filesystem emergency reserve, exact
-  mountpoint check, bounded durable pins and cold LRU enforce the storage fence.
+  a 6 GiB initial ceiling, 100,000-inode ceiling, then-current 12 GiB root-filesystem reserve, exact
+  mountpoint check, bounded durable pins and cold LRU enforced that storage fence. U028-U029 supersede
+  the per-component mount and reserve values with one shared store and the 30/20 GiB policy.
 - Startup removes orphan staging, finishes interrupted publications, rebuilds missing access records
   and resumes interrupted evictions from a durable journal. The eviction marker is persisted before
   the first destructive unlink, so a crash after manifest removal is distinguished from an incomplete
@@ -727,12 +733,13 @@ Observable outcome:
   `PreparedRun(source, dependencies, workflow policy, generated inputs)`. Matching requests join one
   producer. Consumers mount shared entries read-only and receive only operation-owned COW/scratch/log
   state.
-- The selected host storage backend enforces both bytes and inodes. Installation probes the live
-  filesystem once: use project quotas when supported; otherwise mount a pre-sized dedicated worker
-  filesystem. Activation fails closed if neither hard boundary can be proven. Preflight estimates and
-  `du` sampling supplement but never replace enforcement.
+- One shared host storage domain enforces both bytes and inodes for preparation CAS, operation state,
+  final-assembly cache and candidate output. Prefer a project quota on `/var/lib/rdashboard-build`;
+  activation fails closed unless the single hard boundary is proven. Category accounting and
+  preflight estimates guide GC but do not create four physically isolated capacity pools.
 - Shared CAS eviction is sealed-entry LRU/age based, pins in-flight/current/LKG/warm-window entries and
-  refuses admission before the 6 GiB ceiling or 12 GiB emergency reserve is violated. Every transient
+  begins reclaim below the 30 GiB free-space target. Admission refuses work whose measured reservation
+  could cross the 20 GiB hard floor. Every transient
   unit, scratch tree, COW upper, rootless integration container/volume and OCI staging file has a
   durable ownership/cleanup receipt and startup reconciliation.
 - Networked lockfile prefetch is a separate fixed step with allowlisted registries, integrity pins,
@@ -949,7 +956,7 @@ Verification and activation gate:
   correct shadow/manual attempts spanning at least 7 days, a current bare/distributed conformance
   receipt for every deployed step/input, every normal source acceptance <=3 seconds (p95 <=3 seconds),
   at least one deliberately dropped-webhook acceptance <=60 seconds, one successful rollback drill,
-  zero unresolved cleanup receipts, the 12 GiB reserve and every normal warm end-to-end attempt below
+  zero unresolved cleanup receipts, the 30 GiB cleanup target/20 GiB hard reserve and every normal warm end-to-end attempt below
   60 seconds (p95 <=50 seconds). A failed gate resets the acceptance window after its root cause is
   fixed.
 
@@ -1080,8 +1087,8 @@ Observable outcome:
   as current, LKG, application data, shared warm input or unreferenced before its owning engine removes
   it. Raw Docker/containerd directories are never deleted.
 - Current + LKG + candidate remain per project, the off-host recovery copy is verified, shared worker
-  state remains <=6 GiB, BuildKit remains within its measured 1-2 GiB bound, the filesystem reserve is
-  >=12 GiB plus admitted peaks, and at least 14 GiB is measurably reclaimed without counting
+  state remains within its measured global quota, disposable final-assembly state remains small, the
+  filesystem reserve is >=20 GiB after every admitted peak, and at least 14 GiB is measurably reclaimed without counting
   application data.
 
 Likely boundaries:
@@ -1175,7 +1182,8 @@ These are action boundaries, not unresolved architecture choices:
   rollback, restart and recovery gates without relying on i9 or GitHub Actions.
 - No project is auto-enabled while its exact gate remains multi-minute or its resource high water,
   rollback, cleanup or failure evidence is unproven.
-- Normal workflow state is within the installed disk/cgroup budgets, the 12 GiB reserve is preserved,
+- Normal workflow state is within the installed disk/cgroup budgets, the 20 GiB hard reserve is preserved
+  and GC starts below the 30 GiB target,
   managed orphan count returns to zero, and legacy runner/cache reclamation is measured rather than
   assumed.
 - The dashboard shows accepted source, queue/preparation/verification/build/cutover/soak/cleanup

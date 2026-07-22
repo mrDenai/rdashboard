@@ -7,8 +7,9 @@ Docker or Podman. Native self-release has a separate installed client, policy, s
 atomic handoff store; enabling it does not enable OCI, and neither adapter invokes an optional
 repository packaging script.
 
-Install reviewed, root-owned `buildkitd`, `buildctl`, `rootlesskit` and `runc` binaries at the fixed
-paths under `/usr/libexec/rdashboard`. Bind their SHA-256 values and the SHA-256 of the installed
+Install one reviewed, root-owned copy of `buildkitd`, `buildctl`, `rootlesskit` and `runc` at the fixed
+paths under `/usr/libexec/rdashboard`; projects never carry private copies of these tools. Bind their
+SHA-256 values and the SHA-256 of the installed
 `/etc/rdashboard/buildkitd.toml` to the launcher policy. The dedicated `rdashboard-buildkit` account
 must differ from the controller worker and transient build accounts, use `rdashboard-build` as its
 service group, and own non-overlapping ranges of at least 65,536 IDs in both `/etc/subuid` and
@@ -16,31 +17,31 @@ service group, and own non-overlapping ranges of at least 65,536 IDs in both `/e
 otherwise a setuid mapping helper could expose a reserved host identity through an unrelated account.
 `newuidmap` and `newgidmap` must remain root-owned mode `04755`.
 
-Before the service is started, mount a dedicated filesystem at `/var/lib/rdashboard-buildkit`. The
-launcher accepts only a 1.5-2.5 GiB filesystem with 50,000-500,000 inodes, owned by the BuildKit UID,
-group `rdashboard-build`, mode `0700`. This filesystem is the hard fence; BuildKit garbage collection
-is an additional policy, not the capacity boundary. Root filesystem free space must remain at least
-12 GiB.
+Before any build service starts, provide one hard-bounded filesystem at
+`/var/lib/rdashboard-build`. It must be at least 16 GiB and contains the preparation CAS, operation
+state, BuildKit state and OCI results for every project. Their child directories keep distinct owners
+and modes; the mode-`0711` root permits traversal without granting BuildKit the source-reader group.
+They share capacity so toolchains and content-addressed inputs are stored once. Do not
+mount a filesystem per component or per project. The host root filesystem must retain 20 GiB after an
+admitted write; replaceable CAS data starts LRU reclamation below the 30 GiB target.
 
-Before the OCI adapter is admitted, also mount a dedicated filesystem at
-`/var/lib/rdashboard-workflow-launcher/oci-results`. The launcher accepts only a root-owned mode-`0700`
-4-6 GiB filesystem with 10,000-100,000 inodes while `/` still has at least 12 GiB free. An individual
-policy may admit at most a 3 GiB OCI archive. One atomically promoted pre-release result is retained per
-project; a newer pre-mutation attempt replaces the older pre-release result, and the filesystem is the
-hard cross-project bound. BuildKit cache, operation state and OCI result bytes therefore have distinct
-owners and limits rather than sharing an unbounded Docker data root.
+BuildKit owns `/var/lib/rdashboard-build/buildkit`, group `rdashboard-build`, mode `0700`. Its own GC
+keeps at most 1.5 GB and begins reclaiming when the shared store has less than 4 GB free; these are
+cache controls, while the one shared filesystem remains the hard aggregate bound. OCI results live at
+the root-owned mode-`0700` `/var/lib/rdashboard-build/oci-results`. An individual policy may admit at
+most a 3 GiB OCI archive, and one atomically promoted pre-release result is retained per project.
 
 Install `rdashboard-buildkitd.toml` as `/etc/rdashboard/buildkitd.toml`, root-owned mode `0644`. The
 service inherits a private systemd network namespace, and RootlessKit's `--net=host` therefore means
 the service's isolated namespace rather than the VPS network. BuildKit receives no production
 credentials, application state, Docker/containerd/Podman socket, source store or executor socket.
 The OCI worker uses process sandboxing, permits no insecure entitlements, runs one build vertex at a
-time and keeps at most 1.5 GB before garbage collection on the smaller hard-bounded filesystem.
+time and keeps at most 1.5 GB before garbage collection in the shared hard-bounded store.
 
-Start `rdashboard-buildkit.service` and mount the bounded result store before installing a launcher
-policy that allows the OCI adapter.
+Start `rdashboard-buildkit.service` only after the shared build filesystem is mounted and its child
+ownership is installed, then install a launcher policy that allows the OCI adapter.
 On launcher startup the read-only preflight verifies pinned binaries and configuration, subordinate ID
-ranges, kernel/AppArmor user-namespace switches, exact storage bounds, the 12 GiB recovery reserve,
+ranges, kernel/AppArmor user-namespace switches, the exact shared storage boundary, the 20 GiB recovery reserve,
 runtime ownership and a live peer-restricted mode-`0660` Unix socket. Failure is logged with a stable
 `reason_code`, a concise summary and a specific remediation. Do not enable the OCI adapter by removing
 a check or lowering a boundary; leave the adapter absent while fixing the host.
