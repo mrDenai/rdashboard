@@ -9,8 +9,8 @@ use std::{
 };
 
 use rdashboard::dependency_fetch::{
-    BoundDependencyFetchSocketV1, CratesIoHttpFetcherV1, DEPENDENCY_FETCH_SOCKET_PATH,
-    DependencyFetchServerConfigV1, serve_dependency_fetch_until,
+    BoundDependencyFetchSocketV1, DEPENDENCY_FETCH_SOCKET_PATH, DependencyFetchServerConfigV1,
+    PublicDependencyHttpFetcherV1, serve_dependency_fetch_until,
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -36,7 +36,7 @@ async fn main() -> Result<(), DynError> {
     if fetcher_uid == worker_uid {
         return Err(DependencyFetcherServiceError::IdentityCollision.into());
     }
-    let handler = Arc::new(CratesIoHttpFetcherV1::new(HTTP_REQUEST_TIMEOUT)?);
+    let handler = Arc::new(PublicDependencyHttpFetcherV1::new(HTTP_REQUEST_TIMEOUT)?);
     let config =
         DependencyFetchServerConfigV1::new(worker_uid, MAX_CONNECTIONS, SERVER_REQUEST_TIMEOUT)?;
     let socket_path = Path::new(DEPENDENCY_FETCH_SOCKET_PATH);
@@ -58,7 +58,7 @@ async fn main() -> Result<(), DynError> {
         socket = %socket.path().display(),
         worker_uid,
         max_connections = MAX_CONNECTIONS,
-        "fixed crates.io dependency fetcher listening"
+        "fixed public dependency fetcher listening"
     );
     serve_dependency_fetch_until(listener, handler, config, shutdown_signal()?).await?;
     Ok(())

@@ -30,7 +30,11 @@ use crate::{
     domain::{
         EvidenceDigest, WorkflowAdapterIdV1, WorkflowArtifactKindV1, WorkflowCleanupReceiptV1,
         WorkflowCleanupResultV1, WorkflowHostPreparationAdapterV1, WorkflowLeaseV1,
-        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1,
+        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowOciBaseInputV1,
+    },
+    oci_base::{
+        OciBaseError, OciRegistryObjectV1, materialize_oci_base_layouts, maximum_oci_base_inodes,
+        oci_base_plan_digest,
     },
     preparation::{
         MAX_PREPARATION_STORE_BYTES, MAX_PREPARATION_STORE_INODES, PREPARED_RUN_COMPOSITION_FILE,
@@ -130,19 +134,49 @@ impl WorkflowHostPreparerV1 {
         F: FnMut(&CargoRegistryPackageV1) -> Result<Vec<u8>, E>,
         E: std::fmt::Display,
     {
-        self.prepare_cargo_crates_io_cancellable(lease, now_ms, fetch, || false)
+        self.prepare_cargo_crates_io_and_oci_cancellable(
+            lease,
+            now_ms,
+            fetch,
+            |_| Err::<Vec<u8>, _>("OCI fetch is unavailable"),
+            || false,
+        )
     }
 
     pub fn prepare_cargo_crates_io_cancellable<F, E, C>(
         &self,
         lease: &WorkflowLeaseV1,
         now_ms: i64,
-        mut fetch: F,
+        fetch: F,
         cancelled: C,
     ) -> Result<WorkflowHostPreparationResultV1, WorkflowWorkerError>
     where
         F: FnMut(&CargoRegistryPackageV1) -> Result<Vec<u8>, E>,
         E: std::fmt::Display,
+        C: FnMut() -> bool,
+    {
+        self.prepare_cargo_crates_io_and_oci_cancellable(
+            lease,
+            now_ms,
+            fetch,
+            |_| Err::<Vec<u8>, _>("OCI fetch is unavailable"),
+            cancelled,
+        )
+    }
+
+    pub fn prepare_cargo_crates_io_and_oci_cancellable<FC, EC, FO, EO, C>(
+        &self,
+        lease: &WorkflowLeaseV1,
+        now_ms: i64,
+        mut fetch_crate: FC,
+        mut fetch_oci: FO,
+        mut cancelled: C,
+    ) -> Result<WorkflowHostPreparationResultV1, WorkflowWorkerError>
+    where
+        FC: FnMut(&CargoRegistryPackageV1) -> Result<Vec<u8>, EC>,
+        EC: std::fmt::Display,
+        FO: FnMut(&OciRegistryObjectV1) -> Result<Vec<u8>, EO>,
+        EO: std::fmt::Display,
         C: FnMut() -> bool,
     {
         let context = self.source_context(
@@ -158,16 +192,28 @@ impl WorkflowHostPreparerV1 {
         let plan = CargoLockPlanV1::parse(&lockfile)?;
         let package_count = u64::try_from(plan.packages().len())
             .map_err(|_| WorkflowWorkerError::SourcePayloadTooLarge)?;
-        let maximum_dependency_inodes = package_count
+        let cargo_dependency_inodes = package_count
             .checked_mul(CARGO_VENDOR_INODES_PER_PACKAGE)
             .and_then(|inodes| inodes.checked_add(2))
-            .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?
-            .min(context.maximum_payload_inodes.saturating_mul(4) / 5);
-        if maximum_dependency_inodes < 3 {
+            .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?;
+        let maximum_dependency_inodes = cargo_dependency_inodes
+            .checked_add(maximum_oci_base_inodes(context.oci_bases.len())?)
+            .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?;
+        if maximum_dependency_inodes > context.maximum_payload_inodes {
             return Err(WorkflowWorkerError::SourcePayloadTooLarge);
         }
+        let oci_plan_digest = oci_base_plan_digest(&context.oci_bases)?;
+        let toolchain_digest = if let Some(oci_plan_digest) = &oci_plan_digest {
+            EvidenceDigest::sha256(serde_jcs::to_vec(&DependencyLayoutV1 {
+                purpose: DEPENDENCY_LAYOUT_PURPOSE,
+                cargo_layout_digest: cargo_vendor_layout_digest(),
+                oci_plan_digest,
+            })?)
+        } else {
+            cargo_vendor_layout_digest()
+        };
         let dependency_material = PreparationKeyMaterialV1::DependencySnapshot {
-            toolchain_digest: cargo_vendor_layout_digest(),
+            toolchain_digest,
             lockfile_digest: plan.lockfile_digest().clone(),
             platform: context.platform.clone(),
             workflow_policy_digest: lease.workflow_policy_digest.clone(),
@@ -184,9 +230,18 @@ impl WorkflowHostPreparerV1 {
                     context.policy_digest.clone(),
                     context.maximum_payload_bytes,
                     maximum_dependency_inodes,
-                    |package| fetch(package),
-                    cancelled,
-                )
+                    |package| fetch_crate(package),
+                    &mut cancelled,
+                )?;
+                materialize_oci_base_layouts(
+                    payload,
+                    &context.oci_bases,
+                    context.maximum_payload_bytes,
+                    maximum_dependency_inodes,
+                    |object| fetch_oci(object),
+                    &mut cancelled,
+                )?;
+                Ok::<_, WorkflowWorkerError>(())
             },
         )?;
         let generated_input_digest =
@@ -196,6 +251,7 @@ impl WorkflowHostPreparerV1 {
                 host_preparation_policy_digest: context.policy_digest.clone(),
                 lockfile_digest: plan.lockfile_digest().clone(),
                 package_plan_digest: plan.package_plan_digest().clone(),
+                oci_base_plan_digest: oci_plan_digest,
             })?);
         self.finish_prepared_run(lease, now_ms, context, &dependency, generated_input_digest)
     }
@@ -261,6 +317,7 @@ impl WorkflowHostPreparerV1 {
             maximum_payload_inodes,
             policy_digest: policy.digest()?,
             platform: policy.platform.clone(),
+            oci_bases: policy.oci_bases.clone(),
             _source_pin: source_pin,
         })
     }
@@ -353,6 +410,7 @@ struct SourcePreparationContextV1 {
     maximum_payload_inodes: u64,
     policy_digest: EvidenceDigest,
     platform: String,
+    oci_bases: Vec<WorkflowOciBaseInputV1>,
     _source_pin: PreparationPinGuardV1,
 }
 
@@ -412,6 +470,17 @@ struct PreparedCargoInputV1 {
     host_preparation_policy_digest: EvidenceDigest,
     lockfile_digest: EvidenceDigest,
     package_plan_digest: EvidenceDigest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oci_base_plan_digest: Option<EvidenceDigest>,
+}
+
+const DEPENDENCY_LAYOUT_PURPOSE: &str = "rdashboard.cargo-and-oci-dependency-layout.v1";
+
+#[derive(Serialize)]
+struct DependencyLayoutV1<'a> {
+    purpose: &'static str,
+    cargo_layout_digest: EvidenceDigest,
+    oci_plan_digest: &'a EvidenceDigest,
 }
 
 #[derive(Serialize)]
@@ -570,18 +639,30 @@ impl WorkflowWorkerLauncherClientV1 for WorkflowLauncherClientV1 {
 }
 
 pub trait WorkflowDependencyFetcherV1: Send + Sync {
-    fn fetch<'a>(
+    fn fetch_crate<'a>(
         &'a self,
         package: &'a CargoRegistryPackageV1,
+    ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>>;
+
+    fn fetch_oci_object<'a>(
+        &'a self,
+        object: &'a OciRegistryObjectV1,
     ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>>;
 }
 
 impl WorkflowDependencyFetcherV1 for DependencyFetchClientV1 {
-    fn fetch<'a>(
+    fn fetch_crate<'a>(
         &'a self,
         package: &'a CargoRegistryPackageV1,
     ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>> {
         Box::pin(self.fetch_crate(package))
+    }
+
+    fn fetch_oci_object<'a>(
+        &'a self,
+        object: &'a OciRegistryObjectV1,
+    ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>> {
+        Box::pin(self.fetch_oci_object(object))
     }
 }
 
@@ -823,18 +904,32 @@ impl WorkflowWorkerRuntimeV1 {
                 let fetcher = self.dependency_fetcher.as_ref().map(Arc::clone);
                 fetcher.map(|fetcher| {
                     let runtime = tokio::runtime::Handle::current();
-                    let mut fetch_cancel = cancel.clone();
+                    let mut crate_fetch_cancel = cancel.clone();
+                    let mut oci_fetch_cancel = cancel.clone();
                     tokio::task::spawn_blocking(move || {
-                        preparer.prepare_cargo_crates_io_cancellable(
+                        preparer.prepare_cargo_crates_io_and_oci_cancellable(
                             &lease,
                             prepared_at_ms,
                             |package| {
                                 runtime.block_on(async {
                                     tokio::select! {
-                                        result = fetcher.fetch(package) => {
+                                        result = fetcher.fetch_crate(package) => {
                                             result.map_err(WorkflowDependencyFetchError::Client)
                                         }
-                                        changed = fetch_cancel.changed() => {
+                                        changed = crate_fetch_cancel.changed() => {
+                                            let _ = changed;
+                                            Err(WorkflowDependencyFetchError::Cancelled)
+                                        }
+                                    }
+                                })
+                            },
+                            |object| {
+                                runtime.block_on(async {
+                                    tokio::select! {
+                                        result = fetcher.fetch_oci_object(object) => {
+                                            result.map_err(WorkflowDependencyFetchError::Client)
+                                        }
+                                        changed = oci_fetch_cancel.changed() => {
                                             let _ = changed;
                                             Err(WorkflowDependencyFetchError::Cancelled)
                                         }
@@ -1849,6 +1944,8 @@ pub enum WorkflowWorkerError {
     RequiredSourceFileInvalid,
     #[error("Cargo dependency preparation failed: {0}")]
     CargoPrefetch(#[from] CargoPrefetchError),
+    #[error("OCI base dependency preparation failed: {0}")]
+    OciBase(#[from] OciBaseError),
     #[error("workflow launch status does not match the active lease")]
     InvalidLaunchStatus,
     #[error("workflow launch status disappeared before terminal evidence")]
@@ -1894,6 +1991,7 @@ impl WorkflowWorkerError {
             Self::RequiredSourceFileMissing => "required_source_file_missing",
             Self::RequiredSourceFileInvalid => "required_source_file_invalid",
             Self::CargoPrefetch(_) => "cargo_dependency_preparation_failed",
+            Self::OciBase(_) => "oci_base_preparation_failed",
             Self::InvalidLaunchStatus => "invalid_launch_status",
             Self::LaunchStatusLost => "launch_status_lost",
             Self::CleanupStatusLost => "cleanup_status_lost",
@@ -1991,6 +2089,14 @@ mod tests {
         expires_at_ms: i64,
         adapter: WorkflowHostPreparationAdapterV1,
     ) -> PreparationFixture {
+        preparation_fixture_for_manifest(leased_at_ms, expires_at_ms, manifest_for_adapter(adapter))
+    }
+
+    fn preparation_fixture_for_manifest(
+        leased_at_ms: i64,
+        expires_at_ms: i64,
+        manifest: ProjectManifestV2,
+    ) -> PreparationFixture {
         let directory = tempdir().expect("temp directory");
         let store_root = directory.path().join("preparation");
         fs::create_dir(&store_root).expect("create preparation root");
@@ -2012,11 +2118,15 @@ mod tests {
             source_metadata.gid(),
         )
         .expect("open source publisher");
-        let manifest = manifest_for_adapter(adapter);
         let workflow_policy_digest = manifest.workflow_policy_digest().expect("workflow digest");
         let source_sha = GitCommitId::from_str(&"a".repeat(40)).expect("source SHA");
         let source_attestation_digest = EvidenceDigest::sha256("source attestation");
-        let cargo_archive = (adapter == WorkflowHostPreparationAdapterV1::CargoCratesIoV1)
+        let cargo_archive = manifest
+            .host_preparation
+            .as_ref()
+            .is_some_and(|policy| {
+                policy.adapter_id == WorkflowHostPreparationAdapterV1::CargoCratesIoV1
+            })
             .then(test_cargo_crate_archive);
         publisher
             .publish(
@@ -2318,7 +2428,7 @@ mod tests {
     }
 
     impl WorkflowDependencyFetcherV1 for BlockingDependencyFetcher {
-        fn fetch<'a>(
+        fn fetch_crate<'a>(
             &'a self,
             _package: &'a CargoRegistryPackageV1,
         ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>> {
@@ -2329,6 +2439,13 @@ mod tests {
                 started.notify_one();
                 std::future::pending::<Result<Vec<u8>, DependencyFetchClientError>>().await
             })
+        }
+
+        fn fetch_oci_object<'a>(
+            &'a self,
+            _object: &'a OciRegistryObjectV1,
+        ) -> BoxFuture<'a, Result<Vec<u8>, DependencyFetchClientError>> {
+            Box::pin(async { Err(DependencyFetchClientError::InvalidOciObject) })
         }
     }
 
@@ -2787,6 +2904,108 @@ mod tests {
         assert_eq!(
             fs::metadata(payload.join("vendor/demo-crate-1.2.3/src/lib.rs"))
                 .expect("vendored crate metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o444
+        );
+    }
+
+    #[test]
+    fn cargo_and_oci_preparation_publish_one_replayable_dependency_snapshot() {
+        let config = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
+        let layer = b"exact layer".to_vec();
+        let config_digest = format!("sha256:{}", EvidenceDigest::sha256(&config))
+            .parse::<crate::domain::WorkflowOciDigest>()
+            .expect("config digest");
+        let layer_digest = format!("sha256:{}", EvidenceDigest::sha256(&layer))
+            .parse::<crate::domain::WorkflowOciDigest>()
+            .expect("layer digest");
+        let manifest_bytes = format!(
+            "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{}\",\"size\":{}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{}\",\"size\":{}}}]}}",
+            config_digest.as_str(),
+            config.len(),
+            layer_digest.as_str(),
+            layer.len()
+        )
+        .into_bytes();
+        let manifest_digest = format!("sha256:{}", EvidenceDigest::sha256(&manifest_bytes))
+            .parse::<crate::domain::WorkflowOciDigest>()
+            .expect("manifest digest");
+        let base = WorkflowOciBaseInputV1 {
+            source: format!(
+                "docker.io/library/debian:trixie-slim@{}",
+                manifest_digest.as_str()
+            ),
+            layout_name: "debian-trixie".to_owned(),
+            manifest_digest: manifest_digest.clone(),
+        };
+        let mut manifest = manifest_for_adapter(WorkflowHostPreparationAdapterV1::CargoCratesIoV1);
+        manifest
+            .host_preparation
+            .as_mut()
+            .expect("host preparation")
+            .oci_bases = vec![base];
+        manifest.validate().expect("Cargo and OCI manifest");
+        let fixture = preparation_fixture_for_manifest(100, 15_100, manifest);
+        let crate_archive = fixture.cargo_archive.clone().expect("Cargo archive");
+        let crate_fetches = AtomicUsize::new(0);
+        let oci_fetches = AtomicUsize::new(0);
+        let first = fixture
+            .preparer
+            .prepare_cargo_crates_io_and_oci_cancellable(
+                &fixture.lease,
+                200,
+                |_| {
+                    crate_fetches.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, io::Error>(crate_archive.clone())
+                },
+                |object| {
+                    oci_fetches.fetch_add(1, Ordering::SeqCst);
+                    if object.digest == manifest_digest {
+                        Ok::<_, io::Error>(manifest_bytes.clone())
+                    } else if object.digest == config_digest {
+                        Ok(config.clone())
+                    } else if object.digest == layer_digest {
+                        Ok(layer.clone())
+                    } else {
+                        Err(io::Error::other("unexpected OCI object"))
+                    }
+                },
+                || false,
+            )
+            .expect("prepare Cargo and OCI dependencies");
+        let replayed = fixture
+            .preparer
+            .prepare_cargo_crates_io_and_oci_cancellable(
+                &fixture.lease,
+                201,
+                |_| Err::<Vec<u8>, _>(io::Error::other("unexpected crate refetch")),
+                |_| Err::<Vec<u8>, _>(io::Error::other("unexpected OCI refetch")),
+                || false,
+            )
+            .expect("replay sealed dependencies");
+        assert_eq!(first, replayed);
+        assert_eq!(crate_fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(oci_fetches.load(Ordering::SeqCst), 3);
+
+        let dependency = fixture
+            .preparer
+            .store()
+            .open_pinned(
+                PreparationObjectKindV1::DependencySnapshot,
+                &first.dependency_snapshot_key,
+                Uuid::new_v4(),
+                1_000,
+                300,
+            )
+            .expect("open dependency snapshot");
+        let layout = dependency.payload_path().join("oci-layouts/debian-trixie");
+        crate::oci_base::validate_oci_layout(&layout, manifest_digest.as_str())
+            .expect("validate prepared OCI layout");
+        assert_eq!(
+            fs::metadata(layout.join("index.json"))
+                .expect("sealed index")
                 .permissions()
                 .mode()
                 & 0o7777,

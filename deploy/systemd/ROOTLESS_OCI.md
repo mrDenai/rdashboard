@@ -106,6 +106,13 @@ fetch it on demand. The source name must match the digest-pinned `FROM` referenc
 layout manifest digest is the same pinned linux/amd64 manifest. Dockerfiles that request an external
 `# syntax=` frontend fail before `buildctl`
 starts. No secret, SSH mount, entitlement, registry output or external cache argument can be supplied.
+The `cargo_crates_io_v1` host-preparation policy may declare the same sorted exact Docker Hub base
+inputs. The isolated public dependency fetcher derives only the fixed anonymous-token and registry
+routes plus the registry-issued HTTPS blob redirect to Docker's public CDN, while the worker verifies
+the exact manifest/config/layer graph and publishes the canonical layout under
+`oci-layouts/<layout_name>` in the content-addressed dependency snapshot. The build client
+revalidates that layout and its complete blob set against installed `base_inputs` before starting
+BuildKit.
 `local_inputs` name exact root-owned, non-group/world-writable subtrees below the single
 `/var/lib/rdashboard-build/toolchains` store. The launcher exposes only that store read-only; project
 Dockerfiles do not install their own Rust, Cargo or native compiler stack. For rimg the additional

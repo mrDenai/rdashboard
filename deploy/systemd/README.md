@@ -247,9 +247,16 @@ to the exact worker UID over its mode-`0660` Unix socket. It cannot read source 
 CAS, controller/launcher state, credentials or container sockets. The worker verifies every archive
 checksum again, rejects links and unsafe archive paths, generates Cargo directory-source checksums and
 publishes one immutable `DependencySnapshot`; matching requests therefore fetch and unpack once per
-host. Verification jobs remain networkless and receive the sealed vendor directory read-only through
-Cargo's fixed offline source replacement. Installing these files does not enable either service or
-activate a manifest. The catalog `ralert` manifest remains inactive under `source_tree_v1`.
+host. A Cargo preparation policy may additionally name sorted exact `docker.io` manifest-digest base
+inputs. For those inputs the same isolated process derives only the fixed Docker Hub registry and
+anonymous-token URLs, follows at most the registry-issued HTTPS blob redirect to Docker's public CDN,
+returns the exact manifest/config/layer objects, and the worker verifies every descriptor, byte count,
+SHA-256 and the `linux/amd64` config before publishing a canonical OCI layout inside that same snapshot.
+Other redirects, foreign layer URLs, mutable-only references, alternate registry hosts and private DNS
+results fail closed. Verification and release-build jobs remain networkless and
+receive the sealed vendor and OCI-layout directories read-only. Installing these files does not enable
+either service or activate a manifest. The catalog `ralert` manifest remains inactive under
+`source_tree_v1`.
 
 Installing the binary, service, environment file or mount does not enable or start shadow work,
 change `auto_deploy`, or grant production mutation authority. Before activation, verify the mount and

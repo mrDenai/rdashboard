@@ -43,7 +43,7 @@ fn generic_worker_service_is_shared_non_root_and_storage_bounded() {
 }
 
 #[test]
-fn dependency_fetcher_has_one_public_registry_route_and_no_worker_state() {
+fn dependency_fetcher_has_fixed_public_routes_and_no_worker_state() {
     let service = include_str!("../deploy/systemd/rdashboard-dependency-fetcher.service");
     let lines = service.lines().collect::<Vec<_>>();
     for required in [

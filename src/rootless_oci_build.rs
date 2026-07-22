@@ -25,6 +25,7 @@ use crate::{
         EvidenceDigest, GitCommitId, ProjectId, VerifiedOciOutputPolicy, WorkflowAdapterIdV1,
         WorkflowArtifactKindV1, WorkflowLeaseV1, WorkflowNodeKindV1,
     },
+    oci_base::validate_oci_layout,
     rootless_oci::BUILDCTL_EXECUTABLE,
     self_update::CURRENT_ROOTLESS_OCI_BUILD_EXECUTABLE,
 };
@@ -688,7 +689,10 @@ fn execute_rootless_oci_build(
     let request = RootlessOciBuildRequestV1::decode_canonical(&request_bytes)?;
     validate_dockerfile_frontend(prepared_root, &request.dockerfile_path)?;
     for input in &request.base_inputs {
-        validate_read_only_directory(&dependency_root.join(&input.dependency_path))?;
+        let layout = dependency_root.join(&input.dependency_path);
+        validate_read_only_directory(&layout)?;
+        validate_oci_layout(&layout, input.manifest_digest.as_str())
+            .map_err(|_| RootlessOciBuildError::UnsafeInput)?;
     }
     for input in &request.local_inputs {
         validate_root_owned_read_only_subdirectory(toolchain_root, &input.toolchain_path)?;

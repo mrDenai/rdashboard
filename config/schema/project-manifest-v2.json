@@ -404,6 +404,12 @@
         "adapter_id": {
           "$ref": "#/$defs/WorkflowHostPreparationAdapterV1"
         },
+        "oci_bases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WorkflowOciBaseInputV1"
+          }
+        },
         "platform": {
           "type": "string"
         },
@@ -497,6 +503,26 @@
         "depends_on",
         "input_contracts",
         "output_contract"
+      ]
+    },
+    "WorkflowOciBaseInputV1": {
+      "type": "object",
+      "properties": {
+        "layout_name": {
+          "type": "string"
+        },
+        "manifest_digest": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "layout_name",
+        "manifest_digest"
       ]
     },
     "WorkflowPolicyV1": {

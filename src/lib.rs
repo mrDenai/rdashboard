@@ -68,6 +68,8 @@ pub mod notifier_socket;
 #[cfg(unix)]
 pub mod observer;
 #[cfg(unix)]
+pub mod oci_base;
+#[cfg(unix)]
 pub mod oci_handoff;
 #[cfg(unix)]
 pub mod operation_state;

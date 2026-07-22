@@ -374,7 +374,14 @@
   "host_preparation": {
     "schema_version": 1,
     "adapter_id": "cargo_crates_io_v1",
-    "platform": "linux-x86_64"
+    "platform": "linux-x86_64",
+    "oci_bases": [
+      {
+        "source": "docker.io/library/debian:trixie-slim@sha256:9bb8a3626890e084ab54e888fdd7c4b6d2f119071cd4c5dc5fecb4d73062aa5f",
+        "layout_name": "debian-trixie",
+        "manifest_digest": "sha256:9bb8a3626890e084ab54e888fdd7c4b6d2f119071cd4c5dc5fecb4d73062aa5f"
+      }
+    ]
   },
   "health_checks": [
     {

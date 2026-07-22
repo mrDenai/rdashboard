@@ -1,5 +1,5 @@
 [Unit]
-Description=rdashboard fixed public crates.io dependency fetcher
+Description=rdashboard fixed public dependency fetcher
 After=network-online.target
 Before=rdashboard-worker.service
 Wants=network-online.target

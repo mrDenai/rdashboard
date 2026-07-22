@@ -328,6 +328,10 @@ fn rimg_contract_records_native_build_state_and_fenced_migration_without_activat
         vec!["migration"]
     );
 
+    assert_rimg_host_preparation(&manifest);
+}
+
+fn assert_rimg_host_preparation(manifest: &ProjectManifestV2) {
     let preparation = manifest
         .workflow
         .nodes
@@ -342,13 +346,24 @@ fn rimg_contract_records_native_build_state_and_fenced_migration_without_activat
             .network_class,
         WorkflowNetworkClassV1::DependencyEgress
     );
+    let host_preparation = manifest
+        .host_preparation
+        .as_ref()
+        .unwrap_or_else(|| panic!("rimg host preparation is required"));
     assert_eq!(
-        manifest
-            .host_preparation
-            .as_ref()
-            .unwrap_or_else(|| panic!("rimg host preparation is required"))
-            .adapter_id,
+        host_preparation.adapter_id,
         WorkflowHostPreparationAdapterV1::CargoCratesIoV1
+    );
+    assert_eq!(host_preparation.oci_bases.len(), 1);
+    let base = &host_preparation.oci_bases[0];
+    assert_eq!(
+        base.source,
+        "docker.io/library/debian:trixie-slim@sha256:9bb8a3626890e084ab54e888fdd7c4b6d2f119071cd4c5dc5fecb4d73062aa5f"
+    );
+    assert_eq!(base.layout_name, "debian-trixie");
+    assert_eq!(
+        base.manifest_digest.as_str(),
+        "sha256:9bb8a3626890e084ab54e888fdd7c4b6d2f119071cd4c5dc5fecb4d73062aa5f"
     );
 }
 

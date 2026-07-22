@@ -253,18 +253,163 @@ pub enum WorkflowHostPreparationAdapterV1 {
     SourceTreeV1,
 }
 
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct WorkflowOciDigest(String);
+
+impl WorkflowOciDigest {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn hex(&self) -> &str {
+        self.0
+            .strip_prefix("sha256:")
+            .expect("validated workflow OCI digests always use sha256")
+    }
+
+    fn validate(value: &str) -> bool {
+        value.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    }
+}
+
+impl FromStr for WorkflowOciDigest {
+    type Err = WorkflowContractError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if Self::validate(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(WorkflowContractError::InvalidHostPreparationPolicy)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowOciDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOciBaseInputV1 {
+    pub source: String,
+    pub layout_name: String,
+    pub manifest_digest: WorkflowOciDigest,
+}
+
+impl WorkflowOciBaseInputV1 {
+    pub fn validate(&self) -> Result<(), WorkflowContractError> {
+        let Some((reference, digest)) = self.source.rsplit_once('@') else {
+            return Err(WorkflowContractError::InvalidHostPreparationPolicy);
+        };
+        let Some(repository_reference) = reference.strip_prefix("docker.io/") else {
+            return Err(WorkflowContractError::InvalidHostPreparationPolicy);
+        };
+        if digest != self.manifest_digest.as_str()
+            || !valid_workflow_token(&self.layout_name, 64)
+            || !valid_docker_hub_repository_reference(repository_reference)
+        {
+            return Err(WorkflowContractError::InvalidHostPreparationPolicy);
+        }
+        Ok(())
+    }
+
+    pub fn repository(&self) -> &str {
+        let reference = self
+            .source
+            .strip_prefix("docker.io/")
+            .and_then(|source| source.rsplit_once('@').map(|(reference, _)| reference))
+            .expect("validated workflow OCI sources use docker.io and an exact digest");
+        let last_slash = reference.rfind('/').map_or(0, |index| index + 1);
+        match reference[last_slash..].rfind(':') {
+            Some(index) => &reference[..last_slash + index],
+            None => reference,
+        }
+    }
+
+    pub fn dependency_path(&self) -> String {
+        format!("oci-layouts/{}", self.layout_name)
+    }
+}
+
+fn valid_docker_hub_repository_reference(value: &str) -> bool {
+    if value.is_empty() || value.len() > 255 || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return false;
+    }
+    let last_slash = value.rfind('/').map_or(0, |index| index + 1);
+    let (repository, tag) = match value[last_slash..].rfind(':') {
+        Some(index) => (
+            &value[..last_slash + index],
+            Some(&value[last_slash + index + 1..]),
+        ),
+        None => (value, None),
+    };
+    !repository.is_empty()
+        && repository.split('/').all(|component| {
+            let bytes = component.as_bytes();
+            !component.is_empty()
+                && component.len() <= 128
+                && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && component.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-')
+                })
+        })
+        && tag.is_none_or(|tag| {
+            !tag.is_empty()
+                && tag.len() <= 128
+                && tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowHostPreparationPolicyV1 {
     pub schema_version: u16,
     pub adapter_id: WorkflowHostPreparationAdapterV1,
     pub platform: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oci_bases: Vec<WorkflowOciBaseInputV1>,
 }
 
 impl WorkflowHostPreparationPolicyV1 {
     pub fn validate(&self) -> Result<(), WorkflowContractError> {
         if self.schema_version != WORKFLOW_HOST_PREPARATION_SCHEMA_VERSION
             || !valid_workflow_token(&self.platform, 64)
+            || self.oci_bases.len() > 16
+            || !self.oci_bases.windows(2).all(|pair| pair[0] < pair[1])
+            || self.oci_bases.iter().any(|base| base.validate().is_err())
+            || self
+                .oci_bases
+                .iter()
+                .map(|base| &base.source)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.oci_bases.len()
+            || self
+                .oci_bases
+                .iter()
+                .map(|base| &base.layout_name)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.oci_bases.len()
+            || (self.adapter_id == WorkflowHostPreparationAdapterV1::SourceTreeV1
+                && !self.oci_bases.is_empty())
         {
             return Err(WorkflowContractError::InvalidHostPreparationPolicy);
         }
