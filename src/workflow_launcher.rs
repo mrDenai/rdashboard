@@ -3294,6 +3294,9 @@ mod tests {
             rootlesskit_sha256: EvidenceDigest::sha256("rootlesskit"),
             runtime_sha256: EvidenceDigest::sha256("runc"),
             buildkit_config_sha256: EvidenceDigest::sha256("buildkitd.toml"),
+            rootlesskit_apparmor_profile_sha256: EvidenceDigest::sha256(include_bytes!(
+                "../deploy/systemd/usr.libexec.rdashboard.rootlesskit"
+            )),
             max_parallelism: 1,
         });
         policy.rootless_oci_builds = vec![RootlessOciBuildPolicyV1 {

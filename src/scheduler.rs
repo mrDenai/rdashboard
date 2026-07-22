@@ -9,13 +9,13 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        EvidenceDigest, GitCommitId, OperationKind, ProjectId, ProjectManifestV2,
-        WorkflowAdapterIdV1, WorkflowArtifactKindV1, WorkflowCacheClassV1,
-        WorkflowCleanupReceiptV1, WorkflowCleanupResultV1, WorkflowExecutionProfileV1,
-        WorkflowLeaseInputV1, WorkflowLeaseV1, WorkflowNodeActivationV1, WorkflowNodeId,
-        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowOperationStateV1,
-        WorkflowProfileId, WorkflowReductionInputV1, WorkflowReductionReceiptV1,
-        WorkflowWorkerPoolV1, valid_workflow_identity,
+        EvidenceDigest, GitCommitId, ProjectId, ProjectManifestV2, WorkflowAdapterIdV1,
+        WorkflowArtifactKindV1, WorkflowCacheClassV1, WorkflowCleanupReceiptV1,
+        WorkflowCleanupResultV1, WorkflowExecutionProfileV1, WorkflowLeaseInputV1, WorkflowLeaseV1,
+        WorkflowNodeActivationV1, WorkflowNodeId, WorkflowNodeKindV1, WorkflowNodeOutcomeV1,
+        WorkflowNodeReceiptV1, WorkflowOperationStateV1, WorkflowProfileId,
+        WorkflowReductionInputV1, WorkflowReductionReceiptV1, WorkflowWorkerPoolV1,
+        valid_workflow_identity,
     },
     store::{ControlStore, StoreError},
 };
@@ -31,6 +31,7 @@ pub enum WorkflowTriggerChannelV1 {
     GithubWebhook,
     SourceReconciliation,
     DirectPush,
+    ManualShadow,
 }
 
 impl WorkflowTriggerChannelV1 {
@@ -39,6 +40,33 @@ impl WorkflowTriggerChannelV1 {
             Self::GithubWebhook => "github_webhook",
             Self::SourceReconciliation => "source_reconciliation",
             Self::DirectPush => "direct_push",
+            Self::ManualShadow => "manual_shadow",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowExecutionModeV1 {
+    Deploy,
+    Shadow,
+}
+
+impl WorkflowExecutionModeV1 {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deploy => "deploy",
+            Self::Shadow => "shadow",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "deploy" => Ok(Self::Deploy),
+            "shadow" => Ok(Self::Shadow),
+            _ => Err(StoreError::CorruptWorkflowJournal(
+                "workflow execution mode",
+            )),
         }
     }
 }
@@ -48,7 +76,7 @@ pub struct WorkflowAdmissionV1 {
     pub project_id: ProjectId,
     pub workflow_policy_digest: EvidenceDigest,
     pub source_sha: GitCommitId,
-    pub operation_kind: OperationKind,
+    pub execution_mode: WorkflowExecutionModeV1,
     pub source_sequence: u64,
     pub source_attestation_digest: EvidenceDigest,
     pub trigger_channel: WorkflowTriggerChannelV1,
@@ -208,6 +236,7 @@ pub struct WorkflowAttemptSnapshotV1 {
     pub source_attestation_digest: EvidenceDigest,
     pub preparation_key: EvidenceDigest,
     pub priority: u8,
+    pub execution_mode: WorkflowExecutionModeV1,
     pub state: WorkflowAttemptStateV1,
     pub mutation_state: WorkflowMutationStateV1,
     pub cleanup_state: WorkflowCleanupStateV1,
@@ -382,13 +411,14 @@ impl DurableWorkflowScheduler {
                     operation_kind, source_sequence, source_attestation_digest,
                     manifest_json, priority, state, superseded_by_request_id,
                     created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, 'deploy', ?5, ?6, ?7, ?8,
-                    'active', NULL, ?9, ?9)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    'active', NULL, ?10, ?10)",
                 params![
                     request_id.to_string(),
                     admission.project_id.as_str(),
                     admission.workflow_policy_digest.as_str(),
                     admission.source_sha.as_str(),
+                    admission.execution_mode.as_str(),
                     to_i64(admission.source_sequence, "source sequence")?,
                     admission.source_attestation_digest.as_str(),
                     manifest_json,
@@ -400,6 +430,7 @@ impl DurableWorkflowScheduler {
             let waiting_for_mutation = supersede_pre_mutation_attempts(
                 transaction,
                 &admission.project_id,
+                admission.execution_mode,
                 request_id,
                 admitted_at_ms,
             )?;
@@ -451,11 +482,14 @@ fn validate_admission(
     {
         return Err(StoreError::WorkflowPolicyMismatch);
     }
-    if admission.operation_kind != OperationKind::Deploy
-        || admission.source_sequence == 0
+    if admission.source_sequence == 0
         || admitted_at_ms < 0
         || admission.priority > 3
         || !valid_delivery_id(&admission.delivery_id)
+        || (admission.execution_mode == WorkflowExecutionModeV1::Shadow
+            && admission.trigger_channel != WorkflowTriggerChannelV1::ManualShadow)
+        || (admission.execution_mode == WorkflowExecutionModeV1::Deploy
+            && admission.trigger_channel == WorkflowTriggerChannelV1::ManualShadow)
     {
         return Err(StoreError::InvalidWorkflowSchedulerInput("admission"));
     }
@@ -467,6 +501,17 @@ fn valid_delivery_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'/' | b'\\'))
+}
+
+const fn shadow_executes(kind: WorkflowNodeKindV1) -> bool {
+    matches!(
+        kind,
+        WorkflowNodeKindV1::SourceAdmission
+            | WorkflowNodeKindV1::HostPrepare
+            | WorkflowNodeKindV1::Verification
+            | WorkflowNodeKindV1::ReleaseBuild
+            | WorkflowNodeKindV1::DeterministicReduce
+    )
 }
 
 fn replayed_trigger(
@@ -526,11 +571,12 @@ fn find_stable_request(
         .query_row(
             "SELECT request_id FROM workflow_requests
              WHERE project_id = ?1 AND workflow_policy_digest = ?2
-               AND source_sha = ?3 AND operation_kind = 'deploy'",
+               AND source_sha = ?3 AND operation_kind = ?4",
             params![
                 admission.project_id.as_str(),
                 admission.workflow_policy_digest.as_str(),
                 admission.source_sha.as_str(),
+                admission.execution_mode.as_str(),
             ],
             |row| row.get::<_, String>(0),
         )
@@ -590,6 +636,7 @@ fn update_project_head(
 fn supersede_pre_mutation_attempts(
     transaction: &Transaction<'_>,
     project_id: &ProjectId,
+    execution_mode: WorkflowExecutionModeV1,
     new_request_id: Uuid,
     recorded_at_ms: i64,
 ) -> Result<bool, StoreError> {
@@ -600,12 +647,17 @@ fn supersede_pre_mutation_attempts(
          JOIN workflow_requests AS request ON request.request_id = attempt.request_id
          WHERE request.project_id = ?1
            AND request.request_id != ?2
+           AND request.operation_kind = ?3
            AND attempt.state IN ('queued', 'waiting_for_mutation', 'running', 'needs_reconcile')
          ORDER BY attempt.created_at_ms ASC",
     )?;
     let rows = statement
         .query_map(
-            params![project_id.as_str(), new_request_id.to_string()],
+            params![
+                project_id.as_str(),
+                new_request_id.to_string(),
+                execution_mode.as_str(),
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -685,7 +737,7 @@ fn supersede_pre_mutation_attempts(
             recorded_at_ms,
         )?;
     }
-    Ok(waiting_for_mutation)
+    Ok(execution_mode == WorkflowExecutionModeV1::Deploy && waiting_for_mutation)
 }
 
 fn create_attempt(
@@ -730,6 +782,16 @@ fn create_attempt(
                 Some(admission.source_attestation_digest.as_str()),
                 Some(created_at_ms),
             ),
+            kind if admission.execution_mode == WorkflowExecutionModeV1::Shadow
+                && !shadow_executes(kind) =>
+            {
+                (
+                    WorkflowNodeStateV1::Cancelled,
+                    None,
+                    None,
+                    Some(created_at_ms),
+                )
+            }
             WorkflowNodeKindV1::HostPrepare if !waiting_for_mutation => {
                 (WorkflowNodeStateV1::Ready, None, None, None)
             }
@@ -1153,8 +1215,9 @@ fn expire_one_lease(
         return Err(StoreError::WorkflowLeaseConflict);
     }
     let context = load_attempt_context(transaction, parse_uuid(attempt_id, "expired attempt ID")?)?;
-    let uncertain_delivery =
-        node_kind.is_mutation() || is_self_update_handoff_release(&context.manifest, node_kind);
+    let uncertain_delivery = context.execution_mode == WorkflowExecutionModeV1::Deploy
+        && (node_kind.is_mutation()
+            || is_self_update_handoff_release(&context.manifest, node_kind));
     if uncertain_delivery {
         expire_mutation_lease(transaction, attempt_id, node_id, now_ms)?;
     } else {
@@ -1310,8 +1373,9 @@ fn claim_next_transaction(
 }
 
 fn candidate_requires_exclusive_delivery(candidate: &ReadyCandidate<'_>) -> bool {
-    candidate.node.kind.is_mutation()
-        || is_self_update_handoff_release(&candidate.manifest, candidate.node.kind)
+    candidate.execution_mode == WorkflowExecutionModeV1::Deploy
+        && (candidate.node.kind.is_mutation()
+            || is_self_update_handoff_release(&candidate.manifest, candidate.node.kind))
 }
 
 fn is_self_update_handoff_release(
@@ -1667,6 +1731,7 @@ struct ReadyCandidate<'a> {
     workflow_policy_digest: EvidenceDigest,
     preparation_key: EvidenceDigest,
     lease_generation: u32,
+    execution_mode: WorkflowExecutionModeV1,
     manifest: ProjectManifestV2,
     node: &'a crate::domain::WorkflowNodeV1,
     profile: &'a WorkflowExecutionProfileV1,
@@ -1683,6 +1748,7 @@ struct ReadyCandidateOwned {
     workflow_policy_digest: EvidenceDigest,
     preparation_key: EvidenceDigest,
     lease_generation: u32,
+    execution_mode: WorkflowExecutionModeV1,
     manifest: ProjectManifestV2,
     node_id: WorkflowNodeId,
 }
@@ -1702,6 +1768,7 @@ struct ReadyCandidateStorageRow {
     worker_pool: String,
     lease_generation: i64,
     manifest_json: String,
+    operation_kind: String,
 }
 
 impl ReadyCandidateOwned {
@@ -1722,6 +1789,7 @@ impl ReadyCandidateOwned {
             workflow_policy_digest: self.workflow_policy_digest.clone(),
             preparation_key: self.preparation_key.clone(),
             lease_generation: self.lease_generation,
+            execution_mode: self.execution_mode,
             manifest: self.manifest.clone(),
             node,
             profile,
@@ -1746,6 +1814,7 @@ fn load_ready_candidates(
             continue;
         }
         let manifest = ProjectManifestV2::decode_canonical(row.manifest_json.as_bytes())?;
+        let execution_mode = WorkflowExecutionModeV1::parse(&row.operation_kind)?;
         let persisted_policy =
             parse_digest(&row.workflow_policy_digest, "candidate policy digest")?;
         if manifest.project_id != project_id
@@ -1770,6 +1839,12 @@ fn load_ready_candidates(
                 "candidate manifest binding",
             ));
         }
+        if execution_mode == WorkflowExecutionModeV1::Shadow && !shadow_executes(manifest_node.kind)
+        {
+            return Err(StoreError::CorruptWorkflowJournal(
+                "shadow workflow exposed a mutation candidate",
+            ));
+        }
         if verification_feeds_shared_release_output(&manifest, manifest_node)
             && !worker.pools.contains(&WorkflowWorkerPoolV1::VpsRequired)
         {
@@ -1792,6 +1867,7 @@ fn load_ready_candidates(
                 preparation_key: parse_digest(&row.preparation_key, "preparation key")?,
                 lease_generation: u32::try_from(row.lease_generation)
                     .map_err(|_| StoreError::CorruptWorkflowJournal("lease generation"))?,
+                execution_mode,
                 manifest,
                 node_id,
             },
@@ -1824,7 +1900,7 @@ fn read_ready_candidate_rows(
                 request.source_attestation_digest, request.workflow_policy_digest,
                 attempt.preparation_key, node.node_id, node.node_kind,
                 node.profile_id, node.worker_pool,
-                node.lease_generation, request.manifest_json
+                node.lease_generation, request.manifest_json, request.operation_kind
          FROM workflow_nodes AS node
          JOIN workflow_attempts AS attempt ON attempt.attempt_id = node.attempt_id
          JOIN workflow_requests AS request ON request.request_id = attempt.request_id
@@ -1852,6 +1928,7 @@ fn read_ready_candidate_rows(
                 worker_pool: row.get(11)?,
                 lease_generation: row.get(12)?,
                 manifest_json: row.get(13)?,
+                operation_kind: row.get(14)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2140,10 +2217,10 @@ impl DurableWorkflowScheduler {
             let reduction = WorkflowReductionReceiptV1::new(
                 context.request_id,
                 attempt_id,
-                context.project_id,
-                context.source_sha,
-                context.workflow_policy_digest,
-                context.preparation_key,
+                context.project_id.clone(),
+                context.source_sha.clone(),
+                context.workflow_policy_digest.clone(),
+                context.preparation_key.clone(),
                 reduce_node.node_id.clone(),
                 collected.inputs,
                 reduced_at_ms,
@@ -2191,7 +2268,9 @@ impl DurableWorkflowScheduler {
                 Some(&reduction.receipt_digest),
                 reduced_at_ms,
             )?;
-            if context.manifest.workflow.delivery_mode
+            if context.execution_mode == WorkflowExecutionModeV1::Shadow {
+                complete_shadow_workflow(transaction, &context, reduced_at_ms)?;
+            } else if context.manifest.workflow.delivery_mode
                 == crate::domain::WorkflowDeliveryModeV1::SelfUpdateHandoff
             {
                 complete_workflow(transaction, attempt_id, reduced_at_ms)?;
@@ -2917,6 +2996,70 @@ fn fail_terminal_workflow(
     Ok(())
 }
 
+fn complete_shadow_workflow(
+    transaction: &Transaction<'_>,
+    context: &AttemptContext,
+    recorded_at_ms: i64,
+) -> Result<(), StoreError> {
+    if context.execution_mode != WorkflowExecutionModeV1::Shadow
+        || context.mutation_state != WorkflowMutationStateV1::NotStarted
+    {
+        return Err(StoreError::WorkflowStateConflict);
+    }
+    let mut statement =
+        transaction.prepare("SELECT node_kind, state FROM workflow_nodes WHERE attempt_id = ?1")?;
+    let rows = statement
+        .query_map([context.attempt_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (node_kind, state) in rows {
+        let node_kind = parse_node_kind(&node_kind)?;
+        let state = WorkflowNodeStateV1::parse(&state)?;
+        let expected = if shadow_executes(node_kind) {
+            WorkflowNodeStateV1::Succeeded
+        } else {
+            WorkflowNodeStateV1::Cancelled
+        };
+        if state != expected {
+            return Err(StoreError::WorkflowStateConflict);
+        }
+    }
+    if unresolved_cleanup_count(transaction, context.attempt_id)? != 0 {
+        return Err(StoreError::WorkflowStateConflict);
+    }
+    let mutation_locks = transaction.query_row(
+        "SELECT COUNT(*) FROM workflow_mutation_locks WHERE attempt_id = ?1",
+        [context.attempt_id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if mutation_locks != 0 {
+        return Err(StoreError::CorruptWorkflowJournal(
+            "shadow workflow acquired a mutation lock",
+        ));
+    }
+    let changed = transaction.execute(
+        "UPDATE workflow_attempts
+         SET state = 'succeeded', cleanup_state = 'complete',
+             updated_at_ms = ?2, terminal_at_ms = ?2
+         WHERE attempt_id = ?1 AND state = 'running' AND mutation_state = 'not_started'",
+        params![context.attempt_id.to_string(), recorded_at_ms],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::WorkflowStateConflict);
+    }
+    let changed = transaction.execute(
+        "UPDATE workflow_requests SET state = 'terminal', updated_at_ms = ?2
+         WHERE request_id = ?1 AND operation_kind = 'shadow' AND state = 'active'",
+        params![context.request_id.to_string(), recorded_at_ms],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::WorkflowStateConflict);
+    }
+    Ok(())
+}
+
 fn complete_workflow(
     transaction: &Transaction<'_>,
     attempt_id: Uuid,
@@ -2982,6 +3125,7 @@ struct AttemptContext {
     source_attestation_digest: EvidenceDigest,
     preparation_key: EvidenceDigest,
     priority: u8,
+    execution_mode: WorkflowExecutionModeV1,
     attempt_state: WorkflowAttemptStateV1,
     mutation_state: WorkflowMutationStateV1,
     cleanup_state: WorkflowCleanupStateV1,
@@ -3016,10 +3160,8 @@ fn load_attempt_context(
     attempt_id: Uuid,
 ) -> Result<AttemptContext, StoreError> {
     let row = read_attempt_context_row(connection, attempt_id)?;
-    if row.operation_kind != "deploy"
-        || row.created_at_ms < 0
-        || row.updated_at_ms < row.created_at_ms
-    {
+    let execution_mode = WorkflowExecutionModeV1::parse(&row.operation_kind)?;
+    if row.created_at_ms < 0 || row.updated_at_ms < row.created_at_ms {
         return Err(StoreError::CorruptWorkflowJournal(
             "attempt timestamps or kind",
         ));
@@ -3064,6 +3206,7 @@ fn load_attempt_context(
         preparation_key: preparation_key_value,
         priority: u8::try_from(row.priority)
             .map_err(|_| StoreError::CorruptWorkflowJournal("request priority"))?,
+        execution_mode,
         attempt_state: WorkflowAttemptStateV1::parse(&row.attempt_state)?,
         mutation_state: WorkflowMutationStateV1::parse(&row.mutation_state)?,
         cleanup_state: WorkflowCleanupStateV1::parse(&row.cleanup_state)?,
@@ -3211,6 +3354,7 @@ fn load_attempt_snapshot(
         source_attestation_digest: context.source_attestation_digest,
         preparation_key: context.preparation_key,
         priority: context.priority,
+        execution_mode: context.execution_mode,
         state: context.attempt_state,
         mutation_state: context.mutation_state,
         cleanup_state: context.cleanup_state,

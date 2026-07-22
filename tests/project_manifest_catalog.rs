@@ -257,6 +257,22 @@ fn rimg_contract_records_native_build_state_and_fenced_migration_without_activat
         "ssh://git@github.com/mrDenai/rimg.git"
     );
     assert_eq!(manifest.build.kind, BuildKind::Oci);
+    for profile_id in ["host-prepare", "bare-bin-ci", "oci-release-build"] {
+        let profile = manifest
+            .workflow
+            .execution_profiles
+            .iter()
+            .find(|profile| profile.profile_id.as_str() == profile_id)
+            .unwrap_or_else(|| panic!("rimg {profile_id} profile is required"));
+        assert_eq!(
+            profile
+                .resources
+                .as_ref()
+                .unwrap_or_else(|| panic!("rimg {profile_id} resources are required"))
+                .memory_max_bytes,
+            6 * 1024 * 1024 * 1024
+        );
+    }
     assert_eq!(
         manifest
             .build

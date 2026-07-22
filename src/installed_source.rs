@@ -1403,6 +1403,25 @@ mod tests {
     }
 
     #[test]
+    fn source_runtime_transports_are_provisioned_without_build_identities() {
+        let source_tmpfiles = include_str!("../deploy/systemd/rdashboard-source-tmpfiles.conf");
+        assert_eq!(
+            source_tmpfiles.lines().collect::<Vec<_>>(),
+            [
+                "d /run/rdashboard-source-ingress 2750 rdashboard-source rdashboard-source-ingress -",
+                "d /run/rdashboard-source-delivery 2750 rdashboard-source rdashboard -",
+            ]
+        );
+
+        let build_tmpfiles = include_str!("../deploy/systemd/rdashboard-tmpfiles.conf");
+        assert!(
+            !build_tmpfiles
+                .lines()
+                .any(|line| line.starts_with("d /run/rdashboard-source-"))
+        );
+    }
+
+    #[test]
     fn candidate_output_directories_inherit_the_reader_group() {
         let tmpfiles = include_str!("../deploy/systemd/rdashboard-tmpfiles.conf");
         let controls: serde_json::Value =
@@ -1432,12 +1451,6 @@ mod tests {
             let expected = format!("d {path} 2750 rdashboard-build rdashboard-build-readers -");
             assert!(tmpfiles.lines().any(|line| line == expected));
         }
-        assert!(tmpfiles.lines().any(|line| {
-            line == "d /run/rdashboard-source-ingress 2750 rdashboard-source rdashboard-source-ingress -"
-        }));
-        assert!(tmpfiles.lines().any(|line| {
-            line == "d /run/rdashboard-source-delivery 2750 rdashboard-source rdashboard -"
-        }));
     }
 
     #[test]

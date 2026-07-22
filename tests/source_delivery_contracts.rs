@@ -13,14 +13,15 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::SigningKey;
 use rdashboard::{
     domain::{
-        EvidenceDigest, GitCommitId, InstalledPolicyIdentity, ProjectManifestV2, ReleaseClass,
+        EvidenceDigest, GitCommitId, InstalledPolicyIdentity, ProjectId, ProjectManifestV2,
+        ReleaseClass,
     },
     installed_source::{
         InstalledSourceConfigInputV1, InstalledSourceConfigV1, InstalledSourceProjectInputV1,
         InstalledSourceProjectV1,
     },
     installed_workflow::InstalledWorkflowCatalogV1,
-    scheduler::DurableWorkflowScheduler,
+    scheduler::{DurableWorkflowScheduler, WorkflowExecutionModeV1},
     source::{
         DeterministicSourceRepository, DurableSourceBroker, GitSourceProjectConfig,
         InstalledSourceProjectPolicy, SourceAttestationError, SourceError, SourceStore,
@@ -28,8 +29,9 @@ use rdashboard::{
     source_delivery::{SourceWorkflowAdmitterV1, SourceWorkflowDeliveryError},
     source_delivery_socket::{
         BoundSourceDeliverySocketV1, BrokerSourceDeliveryHandlerV1, SourceDeliveryClientError,
-        SourceDeliveryClientV1, SourceDeliveryServerConfigV1, SourceDeliverySocketError,
-        serve_source_delivery_connection, serve_source_delivery_until,
+        SourceDeliveryClientV1, SourceDeliveryClockError, SourceDeliveryClockV1,
+        SourceDeliveryServerConfigV1, SourceDeliverySocketError, serve_source_delivery_connection,
+        serve_source_delivery_until,
     },
     store::ControlStore,
 };
@@ -171,6 +173,15 @@ fn outbox_statuses(path: &Path) -> Vec<String> {
                 .collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_else(|error| panic!("source outbox statuses: {error}"))
+}
+
+#[derive(Clone, Copy)]
+struct FixedDeliveryClock(i64);
+
+impl SourceDeliveryClockV1 for FixedDeliveryClock {
+    fn now_ms(&self) -> Result<i64, SourceDeliveryClockError> {
+        Ok(self.0)
+    }
 }
 
 #[test]
@@ -442,6 +453,96 @@ fn disabling_auto_deploy_revokes_pending_delivery_before_socket_bind() {
 }
 
 #[test]
+fn disabled_project_can_admit_only_a_fresh_non_mutating_shadow() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let manifest = manifest();
+    let signing_key = signing_key();
+    let disabled = source_config(&manifest, &signing_key, false);
+    let repository = repository(&manifest);
+    repository
+        .insert_commit(&manifest.project_id, &commit('a'), None)
+        .and_then(|()| repository.set_remote_head(&manifest.project_id, commit('a')))
+        .unwrap_or_else(|error| panic!("insert source commit: {error}"));
+    let broker = broker(
+        SourceStore::open(directory.path().join("source.sqlite"))
+            .unwrap_or_else(|error| panic!("source store: {error}")),
+        repository,
+        disabled.projects[0].source_policy(),
+        &signing_key,
+        100,
+    );
+    broker
+        .process_direct_push(
+            &manifest.project_id,
+            "shadow-source",
+            "refs/heads/main",
+            None,
+            commit('a'),
+            101,
+        )
+        .unwrap_or_else(|error| panic!("accept shadow source: {error}"));
+    assert!(
+        broker
+            .pending_outbox(1)
+            .unwrap_or_else(|error| panic!("disabled outbox: {error}"))
+            .is_empty()
+    );
+    let shadow = broker
+        .current_shadow_entry(&manifest.project_id, 102)
+        .unwrap_or_else(|error| panic!("current shadow source: {error}"));
+    let admitter = workflow_admitter(
+        &directory.path().join("control.sqlite"),
+        manifest.clone(),
+        disabled,
+    );
+    let outcome = admitter
+        .admit_shadow(&shadow, 103)
+        .unwrap_or_else(|error| panic!("admit shadow: {error}"));
+    assert!(outcome.created());
+    assert_eq!(
+        outcome.attempt().execution_mode,
+        WorkflowExecutionModeV1::Shadow
+    );
+    assert!(
+        outcome
+            .attempt()
+            .nodes
+            .iter()
+            .filter(|node| node.kind.is_mutation())
+            .all(|node| node.state == rdashboard::scheduler::WorkflowNodeStateV1::Cancelled)
+    );
+
+    let enabled = source_config(&manifest, &signing_key, true);
+    let enabled_admitter = workflow_admitter(
+        &directory.path().join("enabled-control.sqlite"),
+        manifest.clone(),
+        enabled,
+    );
+    assert!(matches!(
+        enabled_admitter.admit_shadow(&shadow, 104),
+        Err(SourceWorkflowDeliveryError::ShadowRequiresAutoDeployDisabled(project))
+            if project == manifest.project_id
+    ));
+    assert!(matches!(
+        broker.current_shadow_entry(&manifest.project_id, 200_000),
+        Err(SourceError::Attestation(SourceAttestationError::Expired))
+    ));
+    broker
+        .refresh_shadow_head(&manifest.project_id, 200_001)
+        .unwrap_or_else(|error| panic!("refresh explicit shadow source: {error}"));
+    let refreshed = broker
+        .current_shadow_entry(&manifest.project_id, 200_002)
+        .unwrap_or_else(|error| panic!("read refreshed shadow source: {error}"));
+    assert_eq!(refreshed.source_sequence, 2);
+    assert!(
+        broker
+            .pending_outbox(1)
+            .unwrap_or_else(|error| panic!("shadow refresh outbox: {error}"))
+            .is_empty()
+    );
+}
+
+#[test]
 fn scheduler_admission_rejects_signature_policy_and_repository_substitution() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
     let manifest = manifest();
@@ -588,7 +689,10 @@ async fn source_delivery_socket_authenticates_both_peers_and_round_trips_ack() {
     let mut bound = BoundSourceDeliverySocketV1::bind(&socket_path, source_owner, controller_group)
         .unwrap_or_else(|error| panic!("bind delivery socket: {error}"));
     let listener = bound.take_listener();
-    let handler = Arc::new(BrokerSourceDeliveryHandlerV1::system(broker.clone()));
+    let handler = Arc::new(BrokerSourceDeliveryHandlerV1::new(
+        broker.clone(),
+        FixedDeliveryClock(102),
+    ));
     let server_config = SourceDeliveryServerConfigV1::new(source_owner, 4, Duration::from_secs(2))
         .unwrap_or_else(|error| panic!("source delivery server config: {error}"));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -607,6 +711,7 @@ async fn source_delivery_socket_authenticates_both_peers_and_round_trips_ack() {
         .await
         .unwrap_or_else(|error| panic!("pending through socket: {error}"));
     assert_eq!(entries.len(), 1);
+    assert_current_shadow(&client, &manifest.project_id).await;
     client
         .acknowledge(&entries[0])
         .await
@@ -642,7 +747,10 @@ async fn source_delivery_socket_authenticates_both_peers_and_round_trips_ack() {
     let wrong_uid = source_owner.saturating_add(1);
     let error = serve_source_delivery_connection(
         server_stream,
-        Arc::new(BrokerSourceDeliveryHandlerV1::system(broker)),
+        Arc::new(BrokerSourceDeliveryHandlerV1::new(
+            broker,
+            FixedDeliveryClock(102),
+        )),
         &SourceDeliveryServerConfigV1::new(wrong_uid, 1, Duration::from_secs(1))
             .unwrap_or_else(|error| panic!("wrong-UID server config: {error}")),
     )
@@ -652,6 +760,15 @@ async fn source_delivery_socket_authenticates_both_peers_and_round_trips_ack() {
         error,
         SourceDeliverySocketError::UnauthorizedPeer { .. }
     ));
+}
+
+async fn assert_current_shadow(client: &SourceDeliveryClientV1, project_id: &ProjectId) {
+    let shadow = client
+        .current_shadow(project_id)
+        .await
+        .unwrap_or_else(|error| panic!("current shadow through socket: {error}"));
+    assert_eq!(&shadow.project_id, project_id);
+    assert_eq!(shadow.attestation.payload.head, commit('a'));
 }
 
 #[test]

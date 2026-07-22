@@ -15,13 +15,13 @@ use std::{
 use ed25519_dalek::SigningKey;
 use rdashboard::{
     domain::{
-        AbsolutePolicyPath, EvidenceDigest, GitCommitId, HttpEndpoint, OperationKind, ProjectId,
+        AbsolutePolicyPath, EvidenceDigest, GitCommitId, HttpEndpoint, ProjectId,
         ProjectManifestV2, RemoteUrl, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
         WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
     },
     scheduler::{
         DurableWorkflowScheduler, WorkflowAdmissionV1, WorkflowCleanupReasonV1,
-        WorkflowTriggerChannelV1, WorkflowWorkerRegistrationV1,
+        WorkflowExecutionModeV1, WorkflowTriggerChannelV1, WorkflowWorkerRegistrationV1,
     },
     store::ControlStore,
     worker_socket::{
@@ -85,7 +85,7 @@ fn admission(
             .unwrap_or_else(|error| panic!("policy digest: {error}")),
         source_sha: GitCommitId::from_str(&sha_byte.to_string().repeat(40))
             .unwrap_or_else(|error| panic!("source SHA: {error}")),
-        operation_kind: OperationKind::Deploy,
+        execution_mode: WorkflowExecutionModeV1::Deploy,
         source_sequence: sequence,
         source_attestation_digest: digest(format!("attestation-{delivery_id}")),
         trigger_channel: WorkflowTriggerChannelV1::GithubWebhook,

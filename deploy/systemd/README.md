@@ -42,6 +42,11 @@ Activation order is fail-closed:
 5. Verify authorized browser access, then verify direct-origin and missing/invalid-token requests
    cannot retrieve the dashboard or API.
 
+The controller unit explicitly wants and orders itself after the bridge socket, so every controller
+boot transaction includes the private listener rather than relying only on the socket's enable
+symlink. Keep the socket enabled as well; the controller remains loopback-only and never replaces the
+bridge by listening on a public or all-interface address.
+
 Removing the Kamal Proxy host route and disabling the bridge socket closes external reachability
 without changing the observation services or their local data.
 
@@ -384,7 +389,11 @@ Git repositories, source ledger, webhook HMAC secrets and attestation key.
 `rdashboard` controller identity runs the signed-outbox dispatcher. Create those non-login users and
 groups plus `rdashboard-build-readers`, install `rdashboard-source.service`,
 `rdashboard-source-ingress.service`, both `rdashboard-source-ingress-bridge` units and
-`rdashboard-source-dispatcher.service`, then apply `rdashboard-tmpfiles.conf`. Repository checkout
+`rdashboard-source-dispatcher.service`, install `rdashboard-source-tmpfiles.conf` under
+`/usr/lib/tmpfiles.d/`, then apply that source-specific tmpfiles configuration before starting any
+source unit. It creates the two volatile cross-service transport directories on every boot without
+depending on the still-inactive worker/BuildKit identities referenced by `rdashboard-tmpfiles.conf`.
+The full shared-build tmpfiles configuration is installed only with that contour. Repository checkout
 alone installs or enables nothing.
 
 The source StateDirectory and repository root are owner-only. Neither the controller, ingress nor
@@ -448,6 +457,21 @@ Keep `auto_deploy=false` until the complete worker/build/deploy path for that pr
 activation review. Each project gets its remote URL and workflow-policy digest from the installed
 manifest, so adding or removing a repository is one exact catalog-and-controls change, not a new
 worker implementation.
+
+An explicitly authorized non-mutating activation check uses the same installed source and workflow
+policies without enabling automatic deployment:
+
+```sh
+sudo -u rdashboard /var/lib/rdashboard-bootstrap/current/bin/rdashboard-source-dispatcher shadow rimg
+```
+
+The source service returns only its current, unblocked, unexpired signed head. The dispatcher rejects
+the command unless it runs as the installed controller UID and `auto_deploy` is still false. The
+durable scheduler records a distinct `shadow` request, runs source preparation, verification, release
+build and deterministic reduction, then succeeds with every reservation/backup/migration/health/
+cutover/observation/rollback node already terminally cancelled. The command prints a canonical
+admission receipt; it does not fake safety by stopping the executor and the same source SHA remains
+independently deployable later.
 
 Install these root-owned mode-`0600` credentials under `/etc/rdashboard/credentials`:
 

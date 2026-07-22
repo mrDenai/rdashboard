@@ -39,7 +39,7 @@
         "timeout_ms": 900000,
         "resources": {
           "cpu_millicores": 3000,
-          "memory_max_bytes": 4294967296,
+          "memory_max_bytes": 6442450944,
           "tasks_max": 1024,
           "scratch_max_bytes": 6442450944,
           "scratch_max_inodes": 500000,
@@ -55,7 +55,7 @@
         "timeout_ms": 900000,
         "resources": {
           "cpu_millicores": 3000,
-          "memory_max_bytes": 4294967296,
+          "memory_max_bytes": 6442450944,
           "tasks_max": 1024,
           "scratch_max_bytes": 4294967296,
           "scratch_max_inodes": 500000,
@@ -71,7 +71,7 @@
         "timeout_ms": 900000,
         "resources": {
           "cpu_millicores": 3000,
-          "memory_max_bytes": 4294967296,
+          "memory_max_bytes": 6442450944,
           "tasks_max": 1024,
           "scratch_max_bytes": 8589934592,
           "scratch_max_inodes": 1000000,

@@ -248,7 +248,7 @@ fn control_store_rejects_unknown_schema_versions_at_open() {
         ControlStore::open(&path),
         Err(StoreError::UnsupportedControlSchemaVersion {
             actual: 99,
-            supported: 4
+            supported: 5
         })
     ));
 }
@@ -296,7 +296,7 @@ fn control_store_migrates_v1_to_the_durable_workflow_journal() {
             |row| row.get(0),
         )
         .unwrap_or_else(|error| panic!("read migrated version: {error}"));
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let scheduler_tables: i64 = inspected
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
@@ -345,7 +345,7 @@ fn control_store_migrates_v2_cleanup_debt_atomically() {
             |row| row.get(0),
         )
         .unwrap_or_else(|error| panic!("read migrated version: {error}"));
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let cleanup_table: i64 = inspected
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
@@ -390,8 +390,64 @@ fn control_store_migrates_v3_operation_state_binding_atomically() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap_or_else(|error| panic!("inspect operation-state migration: {error}"));
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     assert_eq!(binding_table, 1);
+}
+
+#[test]
+fn control_store_migrates_v4_requests_and_triggers_without_losing_bindings() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("v4-control.sqlite");
+    let (manifest, admission) = workflow_web_fixture();
+    let scheduler = rdashboard::scheduler::DurableWorkflowScheduler::new(
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("create control store: {error}")),
+    );
+    let created = scheduler
+        .admit(&manifest, &admission, 1)
+        .unwrap_or_else(|error| panic!("seed v4 workflow: {error}"));
+    let attempt_id = created.attempt().attempt_id;
+    drop(scheduler);
+
+    let legacy = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("open simulated v4 store: {error}"));
+    legacy
+        .execute(
+            "UPDATE controller_meta SET integer_value = 4 WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap_or_else(|error| panic!("downgrade schema marker: {error}"));
+    drop(legacy);
+
+    let migrated =
+        ControlStore::open(&path).unwrap_or_else(|error| panic!("migrate v4 store: {error}"));
+    let scheduler = rdashboard::scheduler::DurableWorkflowScheduler::new(migrated);
+    let restored = scheduler
+        .attempt(attempt_id)
+        .unwrap_or_else(|error| panic!("read migrated attempt: {error}"))
+        .unwrap_or_else(|| panic!("migrated attempt missing"));
+    assert_eq!(restored.request_id, created.attempt().request_id);
+    assert_eq!(
+        restored.execution_mode,
+        rdashboard::scheduler::WorkflowExecutionModeV1::Deploy
+    );
+    drop(scheduler);
+
+    let inspected = rusqlite::Connection::open(&path)
+        .unwrap_or_else(|error| panic!("inspect migrated v4 store: {error}"));
+    let version: i64 = inspected
+        .query_row(
+            "SELECT integer_value FROM controller_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("read migrated version: {error}"));
+    let foreign_key_violations: i64 = inspected
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|error| panic!("inspect migrated foreign keys: {error}"));
+    assert_eq!(version, 5);
+    assert_eq!(foreign_key_violations, 0);
 }
 
 #[test]
@@ -1082,7 +1138,7 @@ fn workflow_web_fixture() -> (
             .unwrap_or_else(|error| panic!("workflow policy digest: {error}")),
         source_sha: GitCommitId::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .unwrap_or_else(|error| panic!("source SHA: {error}")),
-        operation_kind: rdashboard::domain::OperationKind::Deploy,
+        execution_mode: rdashboard::scheduler::WorkflowExecutionModeV1::Deploy,
         source_sequence: 1,
         source_attestation_digest: EvidenceDigest::sha256("workflow web attestation"),
         trigger_channel: rdashboard::scheduler::WorkflowTriggerChannelV1::GithubWebhook,
@@ -1178,6 +1234,7 @@ async fn workflow_overview_serializes_the_exact_browser_contract() {
     assert_eq!(attempt["project_id"], "ralert");
     assert_eq!(attempt["source_sha"], admission.source_sha.as_str());
     assert_eq!(attempt["priority"], 2);
+    assert_eq!(attempt["execution_mode"], "deploy");
     assert!(attempt["attempt_id"].as_str().is_some());
     assert!(
         populated["generated_at_ms"]
@@ -1197,6 +1254,7 @@ async fn workflow_overview_serializes_the_exact_browser_contract() {
             "attempt_number",
             "cleanup_state",
             "created_at_ms",
+            "execution_mode",
             "mutation_state",
             "nodes",
             "preparation_key",

@@ -27,9 +27,12 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    domain::EvidenceDigest,
+    domain::{EvidenceDigest, ProjectId},
     protocol::{FrameError, NORMAL_FRAME_MAX_BYTES, read_frame, write_frame},
-    source::{DurableSourceBroker, SourceError, SourceOutboxEntryV1, SourceRepository},
+    source::{
+        DurableSourceBroker, SourceError, SourceOutboxEntryV1, SourceRepository,
+        SourceShadowEntryV1,
+    },
     unix_time_ms,
 };
 
@@ -76,6 +79,7 @@ impl SourceDeliveryRequestEnvelopeV1 {
             SourceDeliveryRequestV1::Pending { .. } => {
                 Err(SourceDeliveryValidationError::InvalidPendingLimit)
             }
+            SourceDeliveryRequestV1::CurrentShadow { .. } => Ok(()),
             SourceDeliveryRequestV1::Acknowledge {
                 outbox_sequence, ..
             } if *outbox_sequence > 0 => Ok(()),
@@ -94,6 +98,9 @@ pub enum SourceDeliveryRequestV1 {
     },
     Pending {
         limit: u8,
+    },
+    CurrentShadow {
+        project_id: ProjectId,
     },
     Acknowledge {
         outbox_sequence: u64,
@@ -117,6 +124,9 @@ pub enum SourceDeliveryResponseV1 {
     },
     Pending {
         entries: Vec<SourceOutboxEntryV1>,
+    },
+    CurrentShadow {
+        entry: Box<SourceShadowEntryV1>,
     },
     Acknowledged,
     Rejected {
@@ -145,6 +155,12 @@ pub trait SourceOutboxReaderV1: Send + Sync {
         attestation_digest: &EvidenceDigest,
         acknowledged_at_ms: i64,
     ) -> Result<(), SourceError>;
+
+    fn current_shadow_entry(
+        &self,
+        project_id: &ProjectId,
+        observed_at_ms: i64,
+    ) -> Result<SourceShadowEntryV1, SourceError>;
 }
 
 impl<R: SourceRepository> SourceOutboxReaderV1 for DurableSourceBroker<R> {
@@ -164,6 +180,14 @@ impl<R: SourceRepository> SourceOutboxReaderV1 for DurableSourceBroker<R> {
             attestation_digest,
             acknowledged_at_ms,
         )
+    }
+
+    fn current_shadow_entry(
+        &self,
+        project_id: &ProjectId,
+        observed_at_ms: i64,
+    ) -> Result<SourceShadowEntryV1, SourceError> {
+        DurableSourceBroker::current_shadow_entry(self, project_id, observed_at_ms)
     }
 }
 
@@ -267,6 +291,30 @@ where
                     Ok(entries) => {
                         Self::response(&request, SourceDeliveryResponseV1::Pending { entries })
                     }
+                    Err(error) => source_rejection(&request, &error),
+                }
+            }
+            SourceDeliveryRequestV1::CurrentShadow { project_id } => {
+                let observed_at_ms = match self.clock.now_ms() {
+                    Ok(now_ms) if now_ms >= 0 => now_ms,
+                    _ => {
+                        return Self::rejected(
+                            &request,
+                            SourceDeliveryRejectionCodeV1::ClockUnavailable,
+                            true,
+                        );
+                    }
+                };
+                match self
+                    .gateway
+                    .current_shadow_entry(project_id, observed_at_ms)
+                {
+                    Ok(entry) => Self::response(
+                        &request,
+                        SourceDeliveryResponseV1::CurrentShadow {
+                            entry: Box::new(entry),
+                        },
+                    ),
                     Err(error) => source_rejection(&request, &error),
                 }
             }
@@ -398,6 +446,29 @@ impl SourceDeliveryClientV1 {
             .await?
         {
             SourceDeliveryResponseV1::Acknowledged => Ok(()),
+            SourceDeliveryResponseV1::Rejected { code, retryable } => {
+                Err(SourceDeliveryClientError::Rejected { code, retryable })
+            }
+            _ => self.wrong_response(),
+        }
+    }
+
+    pub async fn current_shadow(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<SourceShadowEntryV1, SourceDeliveryClientError> {
+        self.ensure_negotiated().await?;
+        match self
+            .exchange(SourceDeliveryRequestV1::CurrentShadow {
+                project_id: project_id.clone(),
+            })
+            .await?
+        {
+            SourceDeliveryResponseV1::CurrentShadow { entry }
+                if entry.project_id == *project_id && entry.validate().is_ok() =>
+            {
+                Ok(*entry)
+            }
             SourceDeliveryResponseV1::Rejected { code, retryable } => {
                 Err(SourceDeliveryClientError::Rejected { code, retryable })
             }

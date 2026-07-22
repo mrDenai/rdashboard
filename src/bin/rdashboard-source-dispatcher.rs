@@ -1,6 +1,7 @@
-use std::{collections::BTreeSet, path::Path, time::Duration};
+use std::{collections::BTreeSet, path::Path, str::FromStr as _, time::Duration};
 
 use rdashboard::{
+    domain::ProjectId,
     installed_source::load_installed_source_config,
     installed_workflow::InstalledWorkflowCatalogV1,
     scheduler::DurableWorkflowScheduler,
@@ -10,6 +11,7 @@ use rdashboard::{
     store::{ControlStore, StoreError},
     unix_time_ms,
 };
+use serde::Serialize;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -24,10 +26,24 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
-    if std::env::args_os().len() != 1 {
+    init_tracing()?;
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if arguments.len() == 3 && arguments[1].to_str() == Some("shadow") {
+        let project_id = arguments[2]
+            .to_str()
+            .ok_or(DispatcherError::InvalidInvocation)
+            .and_then(|value| {
+                ProjectId::from_str(value).map_err(|_| DispatcherError::InvalidInvocation)
+            })?;
+        return run_shadow(project_id).await;
+    }
+    if arguments.len() != 1 {
         return Err(DispatcherError::InvalidInvocation.into());
     }
-    init_tracing()?;
+    run_service().await
+}
+
+async fn run_service() -> Result<(), DynError> {
     let source_config = load_installed_source_config()?;
     let workflow_catalog =
         InstalledWorkflowCatalogV1::load_root_owned_for_group(source_config.controller_gid)?;
@@ -60,6 +76,56 @@ async fn main() -> Result<(), DynError> {
             }
         }
     }
+}
+
+async fn run_shadow(project_id: ProjectId) -> Result<(), DynError> {
+    let source_config = load_installed_source_config()?;
+    if rustix::process::geteuid().as_raw() != source_config.controller_uid {
+        return Err(DispatcherError::WrongIdentity.into());
+    }
+    let workflow_catalog =
+        InstalledWorkflowCatalogV1::load_root_owned_for_group(source_config.controller_gid)?;
+    let scheduler =
+        DurableWorkflowScheduler::new(ControlStore::open(Path::new(CONTROL_STORE_PATH))?);
+    let admitter =
+        SourceWorkflowAdmitterV1::new(scheduler, workflow_catalog, source_config.clone())?;
+    let client = SourceDeliveryClientV1::new(
+        source_config.delivery_socket_path.clone(),
+        source_config.source_uid,
+        REQUEST_TIMEOUT,
+    )?;
+    let entry = client.current_shadow(&project_id).await?;
+    let admitted_at_ms = unix_time_ms()?;
+    let outcome = admitter.admit_shadow(&entry, admitted_at_ms)?;
+    let attempt = outcome.attempt();
+    let receipt = ShadowAdmissionReceiptV1 {
+        purpose: "rdashboard.workflow-shadow-admission.v1",
+        schema_version: 1,
+        project_id: &attempt.project_id,
+        source_sha: attempt.source_sha.as_str(),
+        source_sequence: attempt.source_sequence,
+        attempt_id: attempt.attempt_id,
+        created: outcome.created(),
+        admitted_at_ms,
+    };
+    println!(
+        "{}",
+        String::from_utf8(serde_jcs::to_vec(&receipt)?)
+            .map_err(|_| DispatcherError::InvalidReceiptEncoding)?
+    );
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ShadowAdmissionReceiptV1<'a> {
+    purpose: &'static str,
+    schema_version: u16,
+    project_id: &'a ProjectId,
+    source_sha: &'a str,
+    source_sequence: u64,
+    attempt_id: uuid::Uuid,
+    created: bool,
+    admitted_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +240,10 @@ async fn shutdown_signal() {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 enum DispatcherError {
-    #[error("source dispatcher accepts no command-line arguments")]
+    #[error("source dispatcher accepts either no arguments or: shadow <project-id>")]
     InvalidInvocation,
+    #[error("manual shadow admission must run as the installed rdashboard controller identity")]
+    WrongIdentity,
+    #[error("manual shadow admission receipt is not UTF-8")]
+    InvalidReceiptEncoding,
 }

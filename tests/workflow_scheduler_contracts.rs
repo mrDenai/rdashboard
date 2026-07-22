@@ -3,16 +3,16 @@ use std::{collections::BTreeSet, str::FromStr};
 use rdashboard::{
     domain::{
         AbsolutePolicyPath, BuildKind, EvidenceDigest, GitCommitId, HttpEndpoint, ManifestError,
-        OperationKind, ProjectId, ProjectManifestV2, RemoteUrl, WorkflowAdapterIdV1,
-        WorkflowArtifactKindV1, WorkflowCleanupReceiptV1, WorkflowCleanupResultV1,
-        WorkflowNodeKindV1, WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
+        ProjectId, ProjectManifestV2, RemoteUrl, WorkflowAdapterIdV1, WorkflowArtifactKindV1,
+        WorkflowCleanupReceiptV1, WorkflowCleanupResultV1, WorkflowNodeKindV1,
+        WorkflowNodeOutcomeV1, WorkflowNodeReceiptV1, WorkflowWorkerPoolV1,
     },
     installed_workflow::InstalledWorkflowCatalogV1,
     scheduler::{
         DurableWorkflowScheduler, WorkflowAdmissionV1, WorkflowAttemptStateV1,
-        WorkflowCleanupReasonV1, WorkflowCleanupStateV1, WorkflowJournalReaderV1,
-        WorkflowMutationStateV1, WorkflowNodeStateV1, WorkflowTriggerChannelV1,
-        WorkflowWorkerRegistrationV1,
+        WorkflowCleanupReasonV1, WorkflowCleanupStateV1, WorkflowExecutionModeV1,
+        WorkflowJournalReaderV1, WorkflowMutationStateV1, WorkflowNodeStateV1,
+        WorkflowTriggerChannelV1, WorkflowWorkerRegistrationV1,
     },
     store::{ControlStore, StoreError},
 };
@@ -120,7 +120,7 @@ fn admission(
             .unwrap_or_else(|error| panic!("policy digest: {error}")),
         source_sha: GitCommitId::from_str(&sha_byte.to_string().repeat(40))
             .unwrap_or_else(|error| panic!("source SHA fixture: {error}")),
-        operation_kind: OperationKind::Deploy,
+        execution_mode: WorkflowExecutionModeV1::Deploy,
         source_sequence: sequence,
         source_attestation_digest: digest(format!("attestation-{delivery_id}")),
         trigger_channel: channel,
@@ -205,13 +205,19 @@ fn complete_reduction(
     assert_eq!(prepare.node_kind, WorkflowNodeKindV1::HostPrepare);
     commit_success(scheduler, &prepare, "prepare");
 
-    let build = claim(scheduler, &worker, start_ms + 20);
-    assert_eq!(build.node_kind, WorkflowNodeKindV1::ReleaseBuild);
-    commit_success(scheduler, &build, "release-build");
-
-    let verification = claim(scheduler, &worker, start_ms + 40);
-    assert_eq!(verification.node_kind, WorkflowNodeKindV1::Verification);
-    commit_success(scheduler, &verification, "verification");
+    let mut completed = BTreeSet::new();
+    for (offset, label) in [(20, "first"), (40, "second")] {
+        let lease = claim(scheduler, &worker, start_ms + offset);
+        assert!(completed.insert(lease.node_kind));
+        commit_success(scheduler, &lease, label);
+    }
+    assert_eq!(
+        completed,
+        BTreeSet::from([
+            WorkflowNodeKindV1::Verification,
+            WorkflowNodeKindV1::ReleaseBuild,
+        ])
+    );
 
     let reduction = scheduler
         .reduce_attempt(prepare.attempt_id, start_ms + 60)
@@ -1689,4 +1695,86 @@ fn workflow_overview_is_bounded_ordered_and_consistent_after_reopen() {
             .collect::<Vec<_>>(),
         vec![second.attempt().attempt_id, first.attempt().attempt_id]
     );
+}
+
+#[test]
+fn shadow_stops_after_reduction_and_the_same_source_can_still_deploy() {
+    let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let path = directory.path().join("shadow-control.sqlite");
+    let store = ControlStore::open(&path)
+        .unwrap_or_else(|error| panic!("open shadow control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = rimg_manifest();
+    let mut shadow = admission(
+        &manifest,
+        'a',
+        1,
+        WorkflowTriggerChannelV1::ManualShadow,
+        "shadow-source-a",
+    );
+    shadow.execution_mode = WorkflowExecutionModeV1::Shadow;
+    let admitted = scheduler
+        .admit(&manifest, &shadow, 10)
+        .unwrap_or_else(|error| panic!("admit shadow: {error}"));
+    assert!(admitted.created());
+    assert_eq!(
+        admitted.attempt().execution_mode,
+        WorkflowExecutionModeV1::Shadow
+    );
+    assert!(admitted.attempt().nodes.iter().all(|node| {
+        if matches!(
+            node.kind,
+            WorkflowNodeKindV1::SourceAdmission
+                | WorkflowNodeKindV1::HostPrepare
+                | WorkflowNodeKindV1::Verification
+                | WorkflowNodeKindV1::ReleaseBuild
+                | WorkflowNodeKindV1::DeterministicReduce
+        ) {
+            node.state != WorkflowNodeStateV1::Cancelled
+        } else {
+            node.state == WorkflowNodeStateV1::Cancelled
+        }
+    }));
+
+    let (attempt_id, _) = complete_reduction(&scheduler, 20);
+    let completed = scheduler
+        .attempt(attempt_id)
+        .unwrap_or_else(|error| panic!("read completed shadow: {error}"))
+        .unwrap_or_else(|| panic!("completed shadow missing"));
+    assert_eq!(completed.state, WorkflowAttemptStateV1::Succeeded);
+    assert_eq!(
+        completed.mutation_state,
+        WorkflowMutationStateV1::NotStarted
+    );
+    assert!(
+        scheduler
+            .claim_next(&executor_worker(), 100, 1_000)
+            .unwrap_or_else(|error| panic!("claim after shadow: {error}"))
+            .is_none(),
+        "a completed shadow must never expose a privileged executor node"
+    );
+
+    let deploy = scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                'a',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "deploy-source-a",
+            ),
+            110,
+        )
+        .unwrap_or_else(|error| panic!("admit deploy after shadow: {error}"));
+    assert!(deploy.created());
+    assert_ne!(deploy.attempt().request_id, completed.request_id);
+    assert_eq!(
+        deploy.attempt().execution_mode,
+        WorkflowExecutionModeV1::Deploy
+    );
+    assert!(deploy.attempt().nodes.iter().any(|node| {
+        node.kind == WorkflowNodeKindV1::ResourceReservation
+            && node.state == WorkflowNodeStateV1::Blocked
+    }));
 }

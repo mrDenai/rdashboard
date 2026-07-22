@@ -11,7 +11,7 @@ use crate::domain::{DashboardEvent, EVENT_PROTOCOL_VERSION, EventEnvelope};
 use super::{StoreError, lock_connection, verify_sqlite_version};
 
 const EVENT_HISTORY_LIMIT: i64 = 512;
-const CONTROL_SCHEMA_VERSION: i64 = 4;
+const CONTROL_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct ControlStore {
@@ -129,7 +129,7 @@ impl ControlStore {
                 project_id TEXT NOT NULL,
                 workflow_policy_digest TEXT NOT NULL,
                 source_sha TEXT NOT NULL,
-                operation_kind TEXT NOT NULL CHECK(operation_kind IN ('deploy')),
+                operation_kind TEXT NOT NULL CHECK(operation_kind IN ('deploy', 'shadow')),
                 source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
                 source_attestation_digest TEXT NOT NULL,
                 manifest_json TEXT NOT NULL,
@@ -154,7 +154,7 @@ impl ControlStore {
 
             CREATE TABLE IF NOT EXISTS workflow_triggers (
                 channel TEXT NOT NULL CHECK(channel IN (
-                    'github_webhook', 'source_reconciliation', 'direct_push'
+                    'github_webhook', 'source_reconciliation', 'direct_push', 'manual_shadow'
                 )),
                 delivery_id TEXT NOT NULL,
                 payload_digest TEXT NOT NULL,
@@ -320,8 +320,15 @@ impl ControlStore {
             ) VALUES (1, NULL, 0);
             ",
         )?;
-        initialize_control_schema_version(&transaction)?;
+        let migration_from = initialize_control_schema_version(&transaction)?;
         validate_control_schema(&transaction)?;
+        transaction.commit()?;
+        if let Some(version) = migration_from {
+            migrate_control_schema_v5(&mut connection, version)?;
+        }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_control_schema(&transaction)?;
+        validate_control_schema_version(&transaction)?;
         transaction.commit()?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -606,7 +613,9 @@ impl ControlStore {
     }
 }
 
-fn initialize_control_schema_version(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+fn initialize_control_schema_version(
+    transaction: &Transaction<'_>,
+) -> Result<Option<i64>, StoreError> {
     let version = transaction
         .query_row(
             "SELECT integer_value FROM controller_meta WHERE key = 'schema_version'",
@@ -615,14 +624,8 @@ fn initialize_control_schema_version(transaction: &Transaction<'_>) -> Result<()
         )
         .optional()?;
     match version {
-        Some(CONTROL_SCHEMA_VERSION) => Ok(()),
-        Some(1..=3) => {
-            transaction.execute(
-                "UPDATE controller_meta SET integer_value = ?1 WHERE key = 'schema_version'",
-                [CONTROL_SCHEMA_VERSION],
-            )?;
-            Ok(())
-        }
+        Some(CONTROL_SCHEMA_VERSION) => Ok(None),
+        Some(actual @ 1..=4) => Ok(Some(actual)),
         Some(actual) => Err(StoreError::UnsupportedControlSchemaVersion {
             actual,
             supported: CONTROL_SCHEMA_VERSION,
@@ -633,9 +636,114 @@ fn initialize_control_schema_version(transaction: &Transaction<'_>) -> Result<()
                  VALUES ('schema_version', ?1)",
                 [CONTROL_SCHEMA_VERSION],
             )?;
-            Ok(())
+            Ok(None)
         }
     }
+}
+
+fn validate_control_schema_version(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let actual = transaction.query_row(
+        "SELECT integer_value FROM controller_meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if actual == CONTROL_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedControlSchemaVersion {
+            actual,
+            supported: CONTROL_SCHEMA_VERSION,
+        })
+    }
+}
+
+fn migrate_control_schema_v5(
+    connection: &mut Connection,
+    actual_version: i64,
+) -> Result<(), StoreError> {
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let migration = (|| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE workflow_requests_v5 (
+                request_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                workflow_policy_digest TEXT NOT NULL,
+                source_sha TEXT NOT NULL,
+                operation_kind TEXT NOT NULL CHECK(operation_kind IN ('deploy', 'shadow')),
+                source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+                source_attestation_digest TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 3),
+                state TEXT NOT NULL CHECK(state IN ('active', 'superseded', 'terminal')),
+                superseded_by_request_id TEXT REFERENCES workflow_requests_v5(request_id),
+                created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+                updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+                UNIQUE(project_id, workflow_policy_digest, source_sha, operation_kind),
+                CHECK((state = 'superseded') = (superseded_by_request_id IS NOT NULL))
+             ) STRICT;
+             INSERT INTO workflow_requests_v5(
+                request_id, project_id, workflow_policy_digest, source_sha, operation_kind,
+                source_sequence, source_attestation_digest, manifest_json, priority, state,
+                superseded_by_request_id, created_at_ms, updated_at_ms
+             )
+             SELECT request_id, project_id, workflow_policy_digest, source_sha, operation_kind,
+                source_sequence, source_attestation_digest, manifest_json, priority, state,
+                superseded_by_request_id, created_at_ms, updated_at_ms
+             FROM workflow_requests;
+             CREATE TEMP TABLE workflow_triggers_v4 AS SELECT * FROM workflow_triggers;
+             DROP TABLE workflow_triggers;
+             DROP TABLE workflow_requests;
+             ALTER TABLE workflow_requests_v5 RENAME TO workflow_requests;
+             CREATE INDEX workflow_requests_project_state
+                ON workflow_requests(project_id, state, created_at_ms);
+             CREATE TABLE workflow_triggers (
+                channel TEXT NOT NULL CHECK(channel IN (
+                    'github_webhook', 'source_reconciliation', 'direct_push', 'manual_shadow'
+                )),
+                delivery_id TEXT NOT NULL,
+                payload_digest TEXT NOT NULL,
+                request_id TEXT NOT NULL REFERENCES workflow_requests(request_id),
+                received_at_ms INTEGER NOT NULL CHECK(received_at_ms >= 0),
+                PRIMARY KEY(channel, delivery_id)
+             ) STRICT;
+             INSERT INTO workflow_triggers(
+                channel, delivery_id, payload_digest, request_id, received_at_ms
+             ) SELECT channel, delivery_id, payload_digest, request_id, received_at_ms
+               FROM workflow_triggers_v4;
+             DROP TABLE workflow_triggers_v4;",
+        )?;
+        let changed = transaction.execute(
+            "UPDATE controller_meta SET integer_value = ?1
+             WHERE key = 'schema_version' AND integer_value = ?2",
+            params![CONTROL_SCHEMA_VERSION, actual_version],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::CorruptControlSchema("schema_version"));
+        }
+        transaction.commit()?;
+        Ok::<(), StoreError>(())
+    })();
+    let foreign_key_check = if migration.is_ok() {
+        connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(Some)
+            .map_err(StoreError::from)
+    } else {
+        Ok(None)
+    };
+    let restore = connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(StoreError::from);
+    migration?;
+    restore?;
+    let violations = foreign_key_check?.ok_or(StoreError::CorruptControlSchema("foreign_keys"))?;
+    if violations != 0 {
+        return Err(StoreError::CorruptControlSchema("foreign_keys"));
+    }
+    Ok(())
 }
 
 fn validate_control_schema(transaction: &Transaction<'_>) -> Result<(), StoreError> {

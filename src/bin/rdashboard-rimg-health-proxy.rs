@@ -518,6 +518,7 @@ mod unix {
                 env!("CARGO_MANIFEST_DIR"),
                 "/deploy/systemd/rdashboard-rimg-health.env"
             ));
+            assert!(controller.contains("rdashboard-kamal-bridge.socket"));
             let operator_environment = controller
                 .find("EnvironmentFile=-/etc/rdashboard/controller.env")
                 .expect("operator environment is optional");

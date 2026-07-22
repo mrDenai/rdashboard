@@ -19,7 +19,7 @@ use crate::{
     domain::{EvidenceDigest, valid_workflow_identity},
 };
 
-pub const ROOTLESS_OCI_POLICY_SCHEMA_VERSION: u16 = 1;
+pub const ROOTLESS_OCI_POLICY_SCHEMA_VERSION: u16 = 2;
 pub const BUILDKIT_STATE_ROOT: &str = "/var/lib/rdashboard-build/buildkit";
 pub const BUILDKIT_RUNTIME_ROOT: &str = "/run/rdashboard-buildkit";
 pub const BUILDKIT_SOCKET_PATH: &str = "/run/rdashboard-buildkit/buildkitd.sock";
@@ -28,6 +28,8 @@ pub const BUILDKITD_EXECUTABLE: &str = "/usr/libexec/rdashboard/buildkitd";
 pub const BUILDCTL_EXECUTABLE: &str = "/usr/libexec/rdashboard/buildctl";
 pub const ROOTLESSKIT_EXECUTABLE: &str = "/usr/libexec/rdashboard/rootlesskit";
 pub const BUILDKIT_RUNTIME_EXECUTABLE: &str = "/usr/libexec/rdashboard/runc";
+pub const ROOTLESSKIT_APPARMOR_PROFILE_PATH: &str =
+    "/etc/apparmor.d/usr.libexec.rdashboard.rootlesskit";
 
 const NEWUIDMAP_EXECUTABLE: &str = "/usr/bin/newuidmap";
 const NEWGIDMAP_EXECUTABLE: &str = "/usr/bin/newgidmap";
@@ -36,10 +38,15 @@ const SUBGID_PATH: &str = "/etc/subgid";
 const USER_NAMESPACE_LIMIT_PATH: &str = "/proc/sys/user/max_user_namespaces";
 const UNPRIVILEGED_USER_NAMESPACE_PATH: &str = "/proc/sys/kernel/unprivileged_userns_clone";
 const APPARMOR_USER_NAMESPACE_PATH: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+const APPARMOR_LOADED_PROFILES_PATH: &str = "/sys/kernel/security/apparmor/profiles";
+const ROOTLESSKIT_APPARMOR_PROFILE: &[u8] =
+    include_bytes!("../deploy/systemd/usr.libexec.rdashboard.rootlesskit");
 const MIN_SUBORDINATE_IDS: u64 = 65_536;
 const MIN_SUBORDINATE_ID_START: u64 = 65_536;
 const MAX_TOOL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_APPARMOR_PROFILE_BYTES: u64 = 64 * 1024;
+const MAX_LOADED_APPARMOR_PROFILES_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SUBID_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,6 +60,7 @@ pub struct RootlessOciRuntimePolicyV1 {
     pub rootlesskit_sha256: EvidenceDigest,
     pub runtime_sha256: EvidenceDigest,
     pub buildkit_config_sha256: EvidenceDigest,
+    pub rootlesskit_apparmor_profile_sha256: EvidenceDigest,
     pub max_parallelism: u16,
 }
 
@@ -161,7 +169,7 @@ impl RootlessOciRuntimePolicyV1 {
         }
         if layout.apparmor_userns.try_exists()? && read_kernel_switch(&layout.apparmor_userns)? != 0
         {
-            return Err(RootlessOciError::ApparmorBlocksUserNamespaces);
+            verify_rootlesskit_apparmor_profile(layout, &self.rootlesskit_apparmor_profile_sha256)?;
         }
 
         verify_shared_storage_boundary(layout, self.daemon_uid, shared_group_gid)?;
@@ -178,6 +186,26 @@ impl RootlessOciRuntimePolicyV1 {
             .verify(&layout.socket, self.daemon_uid, shared_group_gid)?;
         Ok(())
     }
+}
+
+fn verify_rootlesskit_apparmor_profile(
+    layout: &InstalledLayout,
+    expected_digest: &EvidenceDigest,
+) -> Result<(), RootlessOciError> {
+    let profile = read_stable_regular(
+        &layout.apparmor_profile,
+        layout.trusted_uid,
+        0o644,
+        MAX_APPARMOR_PROFILE_BYTES,
+        StableFileKind::AppArmorProfile,
+    )?;
+    if EvidenceDigest::sha256(&profile) != *expected_digest {
+        return Err(RootlessOciError::ApparmorProfileDigestMismatch);
+    }
+    if profile != ROOTLESSKIT_APPARMOR_PROFILE {
+        return Err(RootlessOciError::UnsafeApparmorProfile);
+    }
+    layout.apparmor_profile_probe.verify_loaded()
 }
 
 fn verify_shared_storage_boundary(
@@ -244,6 +272,12 @@ pub enum RootlessOciError {
     ConfigDigestMismatch,
     #[error("installed BuildKit configuration violates the fixed rootless boundary")]
     InvalidConfig,
+    #[error("installed rootlesskit AppArmor profile is missing or unsafe")]
+    UnsafeApparmorProfile,
+    #[error("installed rootlesskit AppArmor profile does not match its pinned SHA-256")]
+    ApparmorProfileDigestMismatch,
+    #[error("the exact rootlesskit AppArmor profile is not loaded in the kernel")]
+    ApparmorProfileNotLoaded,
     #[error("installed {0} file is missing or unsafe")]
     UnsafeSubordinateIdFile(&'static str),
     #[error("installed {0} file contains an unsafe subordinate-ID layout")]
@@ -252,8 +286,6 @@ pub enum RootlessOciError {
     InsufficientSubordinateIds(&'static str),
     #[error("unprivileged user namespaces are disabled")]
     UserNamespacesDisabled,
-    #[error("AppArmor blocks unprivileged user namespaces")]
-    ApparmorBlocksUserNamespaces,
     #[error("rootless BuildKit state root is missing or unsafe")]
     UnsafeStateRoot,
     #[error("rootless BuildKit state is outside the fixed shared build domain")]
@@ -282,11 +314,13 @@ impl RootlessOciError {
             Self::UnsafeConfig => "rootless_oci_config_unsafe",
             Self::ConfigDigestMismatch => "rootless_oci_config_digest_mismatch",
             Self::InvalidConfig => "rootless_oci_config_invalid",
+            Self::UnsafeApparmorProfile => "rootless_oci_apparmor_profile_unsafe",
+            Self::ApparmorProfileDigestMismatch => "rootless_oci_apparmor_profile_digest_mismatch",
+            Self::ApparmorProfileNotLoaded => "rootless_oci_apparmor_profile_not_loaded",
             Self::UnsafeSubordinateIdFile(_) => "rootless_oci_subid_file_unsafe",
             Self::UnsafeSubordinateIdLayout(_) => "rootless_oci_subid_layout_unsafe",
             Self::InsufficientSubordinateIds(_) => "rootless_oci_subid_range_missing",
             Self::UserNamespacesDisabled => "rootless_oci_userns_disabled",
-            Self::ApparmorBlocksUserNamespaces => "rootless_oci_apparmor_userns_blocked",
             Self::UnsafeStateRoot => "rootless_oci_state_root_unsafe",
             Self::InvalidStateBoundary => "rootless_oci_state_boundary_invalid",
             Self::RootEmergencyReserveViolated => "rootless_oci_root_reserve_violated",
@@ -327,8 +361,10 @@ impl RootlessOciError {
             Self::UserNamespacesDisabled => {
                 "enable a positive user.max_user_namespaces and, when present, kernel.unprivileged_userns_clone=1"
             }
-            Self::ApparmorBlocksUserNamespaces => {
-                "review the host AppArmor user-namespace policy before enabling rootless BuildKit"
+            Self::UnsafeApparmorProfile
+            | Self::ApparmorProfileDigestMismatch
+            | Self::ApparmorProfileNotLoaded => {
+                "install the reviewed exact-path rootlesskit AppArmor profile and load it without disabling the host-wide user-namespace restriction"
             }
             Self::UnsafeStateRoot | Self::InvalidStateBoundary => {
                 "restore the fixed shared build directory and its ownership on the host filesystem"
@@ -371,6 +407,7 @@ struct InstalledLayout {
     max_user_namespaces: PathBuf,
     unprivileged_userns: PathBuf,
     apparmor_userns: PathBuf,
+    apparmor_profile: PathBuf,
     storage_root: PathBuf,
     state_root: PathBuf,
     runtime_root: PathBuf,
@@ -378,6 +415,7 @@ struct InstalledLayout {
     trusted_uid: u32,
     boundary_probe: Box<dyn FilesystemBoundaryProbe>,
     socket_probe: Box<dyn SocketProbe>,
+    apparmor_profile_probe: Box<dyn AppArmorProfileProbe>,
 }
 
 impl InstalledLayout {
@@ -395,6 +433,7 @@ impl InstalledLayout {
             max_user_namespaces: USER_NAMESPACE_LIMIT_PATH.into(),
             unprivileged_userns: UNPRIVILEGED_USER_NAMESPACE_PATH.into(),
             apparmor_userns: APPARMOR_USER_NAMESPACE_PATH.into(),
+            apparmor_profile: ROOTLESSKIT_APPARMOR_PROFILE_PATH.into(),
             storage_root: SHARED_BUILD_STORAGE_ROOT.into(),
             state_root: BUILDKIT_STATE_ROOT.into(),
             runtime_root: BUILDKIT_RUNTIME_ROOT.into(),
@@ -402,6 +441,9 @@ impl InstalledLayout {
             trusted_uid: 0,
             boundary_probe: Box::new(SystemFilesystemBoundaryProbe),
             socket_probe: Box::new(SystemSocketProbe),
+            apparmor_profile_probe: Box::new(SystemAppArmorProfileProbe {
+                loaded_profiles_path: APPARMOR_LOADED_PROFILES_PATH.into(),
+            }),
         }
     }
 }
@@ -428,6 +470,10 @@ trait SocketProbe: std::fmt::Debug + Send + Sync {
     ) -> Result<(), RootlessOciError>;
 }
 
+trait AppArmorProfileProbe: std::fmt::Debug + Send + Sync {
+    fn verify_loaded(&self) -> Result<(), RootlessOciError>;
+}
+
 #[derive(Debug)]
 struct SystemSocketProbe;
 
@@ -439,6 +485,29 @@ impl SocketProbe for SystemSocketProbe {
         client_group_gid: u32,
     ) -> Result<(), RootlessOciError> {
         verify_socket(path, socket_owner_uid, client_group_gid)
+    }
+}
+
+#[derive(Debug)]
+struct SystemAppArmorProfileProbe {
+    loaded_profiles_path: PathBuf,
+}
+
+impl AppArmorProfileProbe for SystemAppArmorProfileProbe {
+    fn verify_loaded(&self) -> Result<(), RootlessOciError> {
+        let bytes = fs::read(&self.loaded_profiles_path)
+            .map_err(|_| RootlessOciError::ApparmorProfileNotLoaded)?;
+        if bytes.len() > usize::try_from(MAX_LOADED_APPARMOR_PROFILES_BYTES).unwrap_or(usize::MAX) {
+            return Err(RootlessOciError::ApparmorProfileNotLoaded);
+        }
+        let profiles =
+            std::str::from_utf8(&bytes).map_err(|_| RootlessOciError::ApparmorProfileNotLoaded)?;
+        let expected = format!("{ROOTLESSKIT_EXECUTABLE} (unconfined)");
+        if profiles.lines().any(|line| line == expected) {
+            Ok(())
+        } else {
+            Err(RootlessOciError::ApparmorProfileNotLoaded)
+        }
     }
 }
 
@@ -468,6 +537,7 @@ impl FilesystemBoundaryProbe for SystemFilesystemBoundaryProbe {
 #[derive(Clone, Copy)]
 enum StableFileKind {
     Config,
+    AppArmorProfile,
     Subuid,
     Subgid,
 }
@@ -476,6 +546,7 @@ impl StableFileKind {
     const fn error(self) -> RootlessOciError {
         match self {
             Self::Config => RootlessOciError::UnsafeConfig,
+            Self::AppArmorProfile => RootlessOciError::UnsafeApparmorProfile,
             Self::Subuid => RootlessOciError::UnsafeSubordinateIdFile("subuid"),
             Self::Subgid => RootlessOciError::UnsafeSubordinateIdFile("subgid"),
         }
@@ -917,6 +988,21 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct FixedAppArmorProfileProbe {
+        loaded: bool,
+    }
+
+    impl AppArmorProfileProbe for FixedAppArmorProfileProbe {
+        fn verify_loaded(&self) -> Result<(), RootlessOciError> {
+            if self.loaded {
+                Ok(())
+            } else {
+                Err(RootlessOciError::ApparmorProfileNotLoaded)
+            }
+        }
+    }
+
     struct Fixture {
         _directory: tempfile::TempDir,
         layout: InstalledLayout,
@@ -961,6 +1047,10 @@ mod tests {
         fs::write(&max_user_namespaces, b"65536\n").expect("max user namespaces");
         fs::write(&unprivileged_userns, b"1\n").expect("user namespace switch");
         fs::write(&apparmor_userns, b"0\n").expect("AppArmor switch");
+        let apparmor_profile = root.join("usr.libexec.rdashboard.rootlesskit");
+        fs::write(&apparmor_profile, ROOTLESSKIT_APPARMOR_PROFILE).expect("AppArmor profile");
+        fs::set_permissions(&apparmor_profile, fs::Permissions::from_mode(0o644))
+            .expect("AppArmor profile mode");
         let storage_root = root.join("storage");
         let state_root = storage_root.join("buildkit");
         let runtime_root = root.join("run");
@@ -985,6 +1075,7 @@ mod tests {
             max_user_namespaces,
             unprivileged_userns,
             apparmor_userns,
+            apparmor_profile,
             storage_root,
             state_root,
             runtime_root,
@@ -1000,6 +1091,7 @@ mod tests {
                 },
             }),
             socket_probe: Box::new(FixedSocketProbe { ready: true }),
+            apparmor_profile_probe: Box::new(FixedAppArmorProfileProbe { loaded: true }),
         };
         (layout, config_bytes)
     }
@@ -1025,6 +1117,9 @@ mod tests {
                 rootlesskit_sha256: EvidenceDigest::sha256(b"rootlesskit"),
                 runtime_sha256: EvidenceDigest::sha256(b"runc"),
                 buildkit_config_sha256: EvidenceDigest::sha256(&config_bytes),
+                rootlesskit_apparmor_profile_sha256: EvidenceDigest::sha256(
+                    ROOTLESSKIT_APPARMOR_PROFILE,
+                ),
                 max_parallelism: 1,
             };
             Self {
@@ -1172,9 +1267,26 @@ mod tests {
 
         let fixture = Fixture::new();
         fs::write(&fixture.layout.apparmor_userns, b"1\n").expect("block user namespaces");
+        fixture
+            .verify()
+            .expect("the exact loaded profile permits only rootlesskit user namespaces");
+
+        let mut fixture = Fixture::new();
+        fs::write(&fixture.layout.apparmor_userns, b"1\n").expect("restrict user namespaces");
+        fixture.layout.apparmor_profile_probe =
+            Box::new(FixedAppArmorProfileProbe { loaded: false });
         assert!(matches!(
             fixture.verify(),
-            Err(RootlessOciError::ApparmorBlocksUserNamespaces)
+            Err(RootlessOciError::ApparmorProfileNotLoaded)
+        ));
+
+        let fixture = Fixture::new();
+        fs::write(&fixture.layout.apparmor_userns, b"1\n").expect("restrict user namespaces");
+        fs::write(&fixture.layout.apparmor_profile, b"unsafe profile\n")
+            .expect("replace AppArmor profile");
+        assert!(matches!(
+            fixture.verify(),
+            Err(RootlessOciError::ApparmorProfileDigestMismatch)
         ));
 
         let mut fixture = Fixture::new();

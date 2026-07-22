@@ -1,14 +1,14 @@
 use crate::{
-    domain::{OperationKind, ProjectId},
+    domain::ProjectId,
     installed_source::{InstalledSourceConfigV1, InstalledSourceError, InstalledSourceProjectV1},
     installed_workflow::{InstalledWorkflowCatalogV1, InstalledWorkflowProjectV1},
     scheduler::{
         DurableWorkflowScheduler, WorkflowAdmissionOutcomeV1, WorkflowAdmissionV1,
-        WorkflowTriggerChannelV1,
+        WorkflowExecutionModeV1, WorkflowTriggerChannelV1,
     },
     source::{
         GitSourceProjectConfig, SourceAttestationError, SourceAttestationVerifier, SourceChannel,
-        SourceError, SourceOutboxEntryV1,
+        SourceError, SourceOutboxEntryV1, SourceShadowEntryV1,
     },
     store::StoreError,
 };
@@ -94,13 +94,71 @@ impl SourceWorkflowAdmitterV1 {
             project_id: payload.project_id.clone(),
             workflow_policy_digest: workflow_project.workflow_policy_digest.clone(),
             source_sha: payload.head.clone(),
-            operation_kind: OperationKind::Deploy,
+            execution_mode: WorkflowExecutionModeV1::Deploy,
             source_sequence: payload.sequence,
             source_attestation_digest: entry.attestation_digest.clone(),
             trigger_channel: trigger_channel(payload.accepted_via),
             delivery_id: entry.scheduler_delivery_id(),
             payload_digest: entry.attestation_digest.clone(),
             priority: trigger_priority(payload.accepted_via),
+        };
+        self.scheduler
+            .admit(&workflow_project.manifest, &admission, admitted_at_ms)
+            .map_err(SourceWorkflowDeliveryError::Scheduler)
+    }
+
+    pub fn admit_shadow(
+        &self,
+        entry: &SourceShadowEntryV1,
+        admitted_at_ms: i64,
+    ) -> Result<WorkflowAdmissionOutcomeV1, SourceWorkflowDeliveryError> {
+        if admitted_at_ms < 0 || admitted_at_ms < entry.observed_at_ms {
+            return Err(SourceWorkflowDeliveryError::InvalidAdmissionTime);
+        }
+        entry.validate()?;
+        let payload = self.verifier.verify(&entry.attestation, admitted_at_ms)?;
+        if payload.project_id != entry.project_id
+            || payload.sequence != entry.source_sequence
+            || entry.attestation.digest()? != entry.attestation_digest
+        {
+            return Err(SourceWorkflowDeliveryError::AttestationBindingMismatch);
+        }
+        let source_project = self
+            .source_config
+            .project(&payload.project_id)
+            .ok_or_else(|| {
+                SourceWorkflowDeliveryError::SourceProjectMissing(payload.project_id.clone())
+            })?;
+        if source_project.auto_deploy {
+            return Err(
+                SourceWorkflowDeliveryError::ShadowRequiresAutoDeployDisabled(
+                    payload.project_id.clone(),
+                ),
+            );
+        }
+        let workflow_project = self
+            .workflow_catalog
+            .project(&payload.project_id)
+            .ok_or_else(|| {
+                SourceWorkflowDeliveryError::WorkflowProjectMissing(payload.project_id.clone())
+            })?;
+        validate_project_binding(source_project, workflow_project)?;
+        if payload.repository_identity != source_project.repository_identity
+            || payload.installed_policy != source_project.installed_policy
+        {
+            return Err(SourceWorkflowDeliveryError::AttestationBindingMismatch);
+        }
+        let admission = WorkflowAdmissionV1 {
+            project_id: payload.project_id.clone(),
+            workflow_policy_digest: workflow_project.workflow_policy_digest.clone(),
+            source_sha: payload.head.clone(),
+            execution_mode: WorkflowExecutionModeV1::Shadow,
+            source_sequence: payload.sequence,
+            source_attestation_digest: entry.attestation_digest.clone(),
+            trigger_channel: WorkflowTriggerChannelV1::ManualShadow,
+            delivery_id: entry.scheduler_delivery_id(),
+            payload_digest: entry.attestation_digest.clone(),
+            priority: 1,
         };
         self.scheduler
             .admit(&workflow_project.manifest, &admission, admitted_at_ms)
@@ -167,6 +225,8 @@ pub enum SourceWorkflowDeliveryError {
     WorkflowProjectMissing(ProjectId),
     #[error("automatic workflow delivery is disabled for source project {0}")]
     AutoDeployDisabled(ProjectId),
+    #[error("shadow workflow admission requires auto_deploy=false for source project {0}")]
+    ShadowRequiresAutoDeployDisabled(ProjectId),
     #[error("source project {0} does not bind the installed workflow policy")]
     InstalledPolicyMismatch(ProjectId),
     #[error("source project {0} does not bind the installed workflow repository")]

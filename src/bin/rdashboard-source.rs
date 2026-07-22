@@ -130,9 +130,13 @@ async fn serve_broker(
         config.controller_gid,
     )?;
     let delivery_listener = delivery_socket.take_listener();
-    let delivery_handler = Arc::new(BrokerSourceDeliveryHandlerV1::system(ArcBroker(
+    let delivery_gateway = SourceDeliveryBroker::new(
         Arc::clone(&broker),
-    )));
+        export_repository.clone(),
+        source_exports.clone(),
+        config.clone(),
+    );
+    let delivery_handler = Arc::new(BrokerSourceDeliveryHandlerV1::system(delivery_gateway));
     let delivery_server_config = config.delivery_server_config()?;
     let mut ingress_socket = BoundSourceIngressSocketV1::bind(
         &config.ingress_socket_path,
@@ -258,6 +262,30 @@ async fn monitor_reconciliation_coordinator(
 struct ArcBroker(Arc<InstalledBroker>);
 
 #[derive(Clone, Debug)]
+struct SourceDeliveryBroker {
+    broker: Arc<InstalledBroker>,
+    repository: GitSourceRepository,
+    source_exports: SourceArchivePublisherV1,
+    config: InstalledSourceConfigV1,
+}
+
+impl SourceDeliveryBroker {
+    const fn new(
+        broker: Arc<InstalledBroker>,
+        repository: GitSourceRepository,
+        source_exports: SourceArchivePublisherV1,
+        config: InstalledSourceConfigV1,
+    ) -> Self {
+        Self {
+            broker,
+            repository,
+            source_exports,
+            config,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct SourceWakeups(Arc<BTreeMap<String, Arc<Notify>>>);
 
 impl SourceWakeups {
@@ -370,12 +398,12 @@ impl SourceSnapshotReaderV1 for ArcBroker {
     }
 }
 
-impl SourceOutboxReaderV1 for ArcBroker {
+impl SourceOutboxReaderV1 for SourceDeliveryBroker {
     fn pending_outbox(
         &self,
         limit: usize,
     ) -> Result<Vec<rdashboard::source::SourceOutboxEntryV1>, rdashboard::source::SourceError> {
-        self.0.pending_outbox(limit)
+        self.broker.pending_outbox(limit)
     }
 
     fn acknowledge_outbox(
@@ -384,8 +412,26 @@ impl SourceOutboxReaderV1 for ArcBroker {
         attestation_digest: &rdashboard::domain::EvidenceDigest,
         acknowledged_at_ms: i64,
     ) -> Result<(), rdashboard::source::SourceError> {
-        self.0
+        self.broker
             .acknowledge_outbox(outbox_sequence, attestation_digest, acknowledged_at_ms)
+    }
+
+    fn current_shadow_entry(
+        &self,
+        project_id: &rdashboard::domain::ProjectId,
+        observed_at_ms: i64,
+    ) -> Result<rdashboard::source::SourceShadowEntryV1, rdashboard::source::SourceError> {
+        self.broker
+            .refresh_shadow_head(project_id, observed_at_ms)?;
+        publish_source_export(
+            &self.broker,
+            &self.repository,
+            &self.source_exports,
+            &self.config,
+            project_id,
+            observed_at_ms,
+        )?;
+        self.broker.current_shadow_entry(project_id, observed_at_ms)
     }
 }
 

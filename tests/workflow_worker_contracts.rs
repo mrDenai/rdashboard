@@ -91,7 +91,7 @@ fn rootless_buildkit_is_offline_shared_and_resource_bounded() {
         "AmbientCapabilities=",
         "DevicePolicy=closed",
         "Delegate=yes",
-        "MemoryMax=4G",
+        "MemoryMax=6G",
         "MemorySwapMax=0",
         "CPUQuota=300%",
     ] {

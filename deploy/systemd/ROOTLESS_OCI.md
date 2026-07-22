@@ -10,7 +10,15 @@ repository packaging script.
 Install one reviewed, root-owned copy of `buildkitd`, `buildctl`, `rootlesskit` and `runc` at the fixed
 paths under `/usr/libexec/rdashboard`; projects never carry private copies of these tools. Bind their
 SHA-256 values and the SHA-256 of the installed
-`/etc/rdashboard/buildkitd.toml` to the launcher policy. The dedicated `rdashboard-buildkit` account
+`/etc/rdashboard/buildkitd.toml` to the launcher policy. Keep
+`kernel.apparmor_restrict_unprivileged_userns=1`: install
+`usr.libexec.rdashboard.rootlesskit` as the root-owned mode-`0644`
+`/etc/apparmor.d/usr.libexec.rdashboard.rootlesskit`, load it with
+`apparmor_parser -r`, and bind its SHA-256 to the same launcher policy. The reviewed profile attaches
+the `unconfined` AppArmor exception only to the exact fixed rootlesskit executable and explicitly
+allows it to create the user namespace needed by BuildKit. This preserves the host-wide restriction
+for other unprofiled applications; it is not an AppArmor sandbox for RootlessKit. Do not replace this
+with a host-wide sysctl override. The dedicated `rdashboard-buildkit` account
 must differ from the controller worker and transient build accounts, use `rdashboard-build` as its
 service group, and own non-overlapping ranges of at least 65,536 IDs in both `/etc/subuid` and
 `/etc/subgid`. Every range in both host files must start at 65,536 or higher and no ranges may overlap;
@@ -43,9 +51,13 @@ time and keeps at most 1.5 GB before garbage collection in the shared store.
 
 Start `rdashboard-buildkit.service` only after the shared directory hierarchy and child ownership are
 installed, then install a launcher policy that allows the OCI adapter.
+The service has a 6 GiB memory ceiling, matching rimg's 6 GiB preparation, gate and final-image
+profiles on the resized production host. This is a cgroup ceiling rather than preallocated resident
+memory; other services retain the unused capacity.
 On launcher startup the read-only preflight verifies pinned binaries and configuration, subordinate ID
 ranges, kernel/AppArmor user-namespace switches, the exact shared storage boundary, the 5 GiB emergency margin,
-runtime ownership and a live peer-restricted mode-`0660` Unix socket. Failure is logged with a stable
+the exact root-owned profile bytes, its loaded `unconfined` kernel profile, runtime ownership and a
+live peer-restricted mode-`0660` Unix socket. Failure is logged with a stable
 `reason_code`, a concise summary and a specific remediation. Do not enable the OCI adapter by removing
 a check or lowering a boundary; leave the adapter absent while fixing the host.
 
@@ -54,7 +66,7 @@ the placeholders:
 
 ```json
 "rootless_oci": {
-  "schema_version": 1,
+  "schema_version": 2,
   "daemon_uid": 996,
   "daemon_user": "rdashboard-buildkit",
   "buildkitd_sha256": "<64 lowercase hex>",
@@ -62,6 +74,7 @@ the placeholders:
   "rootlesskit_sha256": "<64 lowercase hex>",
   "runtime_sha256": "<64 lowercase hex>",
   "buildkit_config_sha256": "<64 lowercase hex>",
+  "rootlesskit_apparmor_profile_sha256": "<64 lowercase hex>",
   "max_parallelism": 1
 },
 "rootless_oci_builds": [{

@@ -1,0 +1,5 @@
+abi <abi/4.0>,
+
+/usr/libexec/rdashboard/rootlesskit flags=(unconfined) {
+  allow userns create,
+}

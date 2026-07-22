@@ -2477,6 +2477,37 @@ pub struct SourceOutboxEntryV1 {
     pub enqueued_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceShadowEntryV1 {
+    pub schema_version: u16,
+    pub project_id: ProjectId,
+    pub source_sequence: u64,
+    pub attestation: SignedAcceptedHeadV1,
+    pub attestation_digest: EvidenceDigest,
+    pub observed_at_ms: i64,
+}
+
+impl SourceShadowEntryV1 {
+    pub fn validate(&self) -> Result<(), SourceError> {
+        if self.schema_version != 1
+            || self.source_sequence == 0
+            || self.observed_at_ms < self.attestation.payload.accepted_at_ms
+            || self.observed_at_ms >= self.attestation.payload.expires_at_ms
+            || self.project_id != self.attestation.payload.project_id
+            || self.source_sequence != self.attestation.payload.sequence
+            || self.attestation_digest != self.attestation.digest()?
+        {
+            return Err(SourceError::CorruptLedger("source shadow entry"));
+        }
+        Ok(())
+    }
+
+    pub fn scheduler_delivery_id(&self) -> String {
+        format!("shadow-{}", self.attestation_digest)
+    }
+}
+
 impl SourceOutboxEntryV1 {
     pub fn validate(&self) -> Result<(), SourceError> {
         if self.schema_version != SOURCE_OUTBOX_SCHEMA_VERSION
@@ -2520,6 +2551,7 @@ struct CandidateIngress<'a> {
     payload_digest: EvidenceDigest,
     installed_policy: &'a InstalledSourceProjectPolicy,
     now_ms: i64,
+    refresh_expired_same_head: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2673,6 +2705,49 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
     pub fn pending_outbox(&self, limit: usize) -> Result<Vec<SourceOutboxEntryV1>, SourceError> {
         self.require_current_lease()?;
         self.store.pending_outbox(limit)
+    }
+
+    pub fn current_shadow_entry(
+        &self,
+        project_id: &ProjectId,
+        observed_at_ms: i64,
+    ) -> Result<SourceShadowEntryV1, SourceError> {
+        if observed_at_ms < 0 {
+            return Err(SourceError::TimeRange);
+        }
+        let _coordination = self.lock_coordination(project_id)?;
+        let snapshot = self.store.snapshot(project_id)?;
+        if snapshot.state != SourceProjectState::Ready
+            || snapshot.head.is_none()
+            || snapshot.blocked_sha == snapshot.head
+        {
+            return Err(SourceError::HeadNotCurrent);
+        }
+        let attestation = snapshot.attestation.ok_or(SourceError::HeadNotCurrent)?;
+        let attestation_digest = snapshot
+            .attestation_digest
+            .ok_or(SourceError::HeadNotCurrent)?;
+        let payload = self.verifier.verify(&attestation, observed_at_ms)?;
+        let installed_policy = self.policy(project_id)?;
+        if payload.project_id != *project_id
+            || payload.head != snapshot.head.expect("checked present")
+            || payload.sequence != snapshot.sequence
+            || attestation.digest()? != attestation_digest
+            || payload.installed_policy != installed_policy.installed_policy
+            || payload.repository_identity != installed_policy.repository_identity
+        {
+            return Err(SourceError::HeadNotCurrent);
+        }
+        let entry = SourceShadowEntryV1 {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            source_sequence: payload.sequence,
+            attestation,
+            attestation_digest,
+            observed_at_ms,
+        };
+        entry.validate()?;
+        Ok(entry)
     }
 
     pub fn acknowledge_outbox(
@@ -3088,6 +3163,7 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
                 payload_digest: wakeup.payload_digest.clone(),
                 installed_policy,
                 now_ms,
+                refresh_expired_same_head: false,
             };
             let result = self.process_github_candidate(&candidate, &wakeup.announced_head);
             let outcome = match result {
@@ -3172,6 +3248,7 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
                 payload_digest: payload_digest.clone(),
                 installed_policy,
                 now_ms,
+                refresh_expired_same_head: false,
             };
             self.process_github_candidate(&candidate, &announced_head)
         })();
@@ -3229,8 +3306,28 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
         project_id: &ProjectId,
         now_ms: i64,
     ) -> Result<SourceIngressOutcome, SourceError> {
+        self.reconcile_remote_main_with(project_id, now_ms, false)
+    }
+
+    pub fn refresh_shadow_head(
+        &self,
+        project_id: &ProjectId,
+        now_ms: i64,
+    ) -> Result<SourceIngressOutcome, SourceError> {
+        self.reconcile_remote_main_with(project_id, now_ms, true)
+    }
+
+    fn reconcile_remote_main_with(
+        &self,
+        project_id: &ProjectId,
+        now_ms: i64,
+        refresh_expired_same_head: bool,
+    ) -> Result<SourceIngressOutcome, SourceError> {
         let _coordination = self.lock_coordination(project_id)?;
         let installed_policy = self.policy(project_id)?;
+        if refresh_expired_same_head && installed_policy.auto_deploy {
+            return Err(SourceError::ShadowRequiresAutoDeployDisabled);
+        }
         let fetched_head = self
             .repository
             .fetch_remote_main_reconciliation(project_id)?;
@@ -3243,7 +3340,7 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             .as_ref()
             .is_some_and(|attestation| now_ms >= attestation.payload.expires_at_ms);
         let payload_digest = EvidenceDigest::sha256(format!(
-            "reconcile.v3\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "reconcile.v4\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             project_id,
             fetched_head,
             installed_policy.repository_identity,
@@ -3262,7 +3359,8 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
                 .divergence_evidence_digest
                 .as_ref()
                 .map_or("-", EvidenceDigest::as_str),
-            attestation_expired
+            attestation_expired,
+            refresh_expired_same_head
         ));
         let delivery_id = format!("reconcile-{payload_digest}");
         let delivery_claim = match self.store.reserve_delivery(
@@ -3284,6 +3382,7 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             payload_digest: payload_digest.clone(),
             installed_policy,
             now_ms,
+            refresh_expired_same_head,
         });
         match result {
             Ok(outcome) => self.store.finish_delivery(
@@ -3346,6 +3445,7 @@ impl<R: SourceRepository> DurableSourceBroker<R> {
             payload_digest: payload_digest.clone(),
             installed_policy,
             now_ms,
+            refresh_expired_same_head: false,
         });
         match result {
             Ok(outcome) => self.store.finish_delivery(
@@ -3660,9 +3760,11 @@ fn existing_same_head_delivery(
     let expired_attestation_must_be_delivered = expired
         && ingress.installed_policy.auto_deploy
         && outbox_status != Some(SourceOutboxStatus::Delivered);
+    let explicit_shadow_refresh = expired && ingress.refresh_expired_same_head;
     if attestation.payload.installed_policy != ingress.installed_policy.installed_policy
         || attestation.payload.repository_identity != ingress.installed_policy.repository_identity
         || expired_attestation_must_be_delivered
+        || explicit_shadow_refresh
     {
         return Ok(None);
     }
@@ -4251,6 +4353,8 @@ pub enum SourceError {
     OutboxEntryMissing,
     #[error("source outbox acknowledgement conflicts with durable state")]
     OutboxAcknowledgementConflict,
+    #[error("manual source shadow requires auto_deploy=false")]
+    ShadowRequiresAutoDeployDisabled,
     #[error("webhook secret must contain at least 16 bytes")]
     WebhookSecretTooShort,
     #[error("GitHub webhook signature is invalid")]
