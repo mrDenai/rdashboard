@@ -25,7 +25,9 @@ ProtectHostname=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
-ProtectProc=invisible
+# RootlessKit's setuid mapping helpers must inspect the just-created user namespace
+# through /proc/<pid>; hidepid makes that process disappear before uid_map is written.
+ProtectProc=default
 ProcSubset=all
 ProtectSystem=strict
 ReadWritePaths=/var/lib/rdashboard-build/buildkit /run/rdashboard-buildkit
@@ -35,7 +37,10 @@ RestrictNamespaces=user mnt pid ipc uts net cgroup
 RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+# The service starts without ambient host capabilities. Keep the bounding set intact
+# so the fixed setuid mapping helpers and root inside the child user namespace can
+# acquire the capabilities their namespace lifecycle requires.
+CapabilityBoundingSet=~
 AmbientCapabilities=
 DevicePolicy=closed
 Delegate=yes

@@ -24,6 +24,14 @@ service group, and own non-overlapping ranges of at least 65,536 IDs in both `/e
 `/etc/subgid`. Every range in both host files must start at 65,536 or higher and no ranges may overlap;
 otherwise a setuid mapping helper could expose a reserved host identity through an unrelated account.
 `newuidmap` and `newgidmap` must remain root-owned mode `04755`.
+The BuildKit unit deliberately uses `ProtectProc=default`: both mapping helpers must open the
+just-created RootlessKit child under `/proc/<pid>` before its UID/GID maps exist, and `hidepid`
+therefore breaks the namespace handshake rather than adding useful isolation. The unit also resets
+`CapabilityBoundingSet=~` while keeping `AmbientCapabilities=` empty. The service account receives no
+ambient host capability; the intact bounding set is required by the fixed setuid mapping helpers and
+by root inside the child user namespace. Those child capabilities do not grant root in the host user
+namespace. The fixed executable hashes, AppArmor exception, private network, strict filesystem paths
+and empty ambient set remain the host boundary.
 
 Before any build service starts, create `/var/lib/rdashboard-build` on the existing host filesystem.
 The backing filesystem must be at least 16 GiB and the directory contains the preparation CAS,
