@@ -486,11 +486,7 @@ mod tests {
         fs::create_dir(&cargo_home).expect("create Cargo home");
         let lock = b"version = 4\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n";
         let plan = rdashboard::cargo_prefetch::CargoLockPlanV1::parse(lock).expect("lock plan");
-        let manifest = CargoDependencyManifestV1::new(
-            &plan,
-            rdashboard::domain::EvidenceDigest::sha256("workflow policy"),
-        )
-        .expect("dependency manifest");
+        let manifest = CargoDependencyManifestV1::new(&plan).expect("dependency manifest");
         fs::write(
             dependency.join(CARGO_DEPENDENCY_MANIFEST_FILE),
             manifest.canonical_bytes().expect("canonical manifest"),

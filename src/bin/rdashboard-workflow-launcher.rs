@@ -9,6 +9,7 @@ use rdashboard::{
     operation_state::WorkflowOperationStateStoreV1,
     rootless_oci_build::RootlessOciResultStoreV1,
     self_release_build::{SelfReleaseHandoffStoreV1, load_installed_self_release_signing_key},
+    titanium::{TITANIUM_REGISTRY_ROOT, TitaniumRegistryV1},
     unix_time_ms,
     workflow_launcher::{
         SystemdWorkflowLaunchRuntimeV1, WORKFLOW_LAUNCHER_JOB_ROOT, WorkflowLaunchJournalV1,
@@ -47,6 +48,7 @@ async fn main() -> Result<(), DynError> {
         return Err(preflight.into());
     }
     let preparation_reader = installed_preparation_reader(policy.worker_uid)?;
+    let titanium = installed_titanium_registry()?;
     let now_ms = unix_time_ms()?;
     let journal = WorkflowLaunchJournalV1::open_root_owned(
         WORKFLOW_LAUNCHER_JOB_ROOT,
@@ -90,6 +92,7 @@ async fn main() -> Result<(), DynError> {
     let supervisor = Arc::new(WorkflowLaunchSupervisorV1::new(
         policy.clone(),
         preparation_reader,
+        titanium,
         journal,
         operation_states,
         Arc::new(SystemdWorkflowLaunchRuntimeV1::new(
@@ -125,6 +128,14 @@ async fn main() -> Result<(), DynError> {
     );
     serve_launcher_until(listener, handler, server_config, shutdown_signal()).await?;
     Ok(())
+}
+
+fn installed_titanium_registry()
+-> Result<Arc<TitaniumRegistryV1>, rdashboard::titanium::TitaniumRegistryError> {
+    Ok(Arc::new(TitaniumRegistryV1::open_existing(
+        TITANIUM_REGISTRY_ROOT,
+        0,
+    )?))
 }
 
 fn init_tracing() -> Result<(), DynError> {

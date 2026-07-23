@@ -401,8 +401,20 @@
     "WorkflowHostPreparationPolicyV1": {
       "type": "object",
       "properties": {
+        "abi": {
+          "type": "string"
+        },
         "adapter_id": {
           "$ref": "#/$defs/WorkflowHostPreparationAdapterV1"
+        },
+        "build_environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "cpu_baseline": {
+          "type": "string"
         },
         "oci_bases": {
           "type": "array",
@@ -418,13 +430,24 @@
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0
+        },
+        "toolchain_interface": {
+          "type": "string"
+        },
+        "toolchain_root": {
+          "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
         "schema_version",
         "adapter_id",
-        "platform"
+        "platform",
+        "cpu_baseline",
+        "abi",
+        "toolchain_root",
+        "toolchain_interface",
+        "build_environment"
       ]
     },
     "WorkflowNetworkClassV1": {

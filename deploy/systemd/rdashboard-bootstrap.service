@@ -1,7 +1,7 @@
 [Unit]
 Description=rdashboard persistent A/B self-update supervisor
 After=local-fs.target
-Before=rdashboard-source.service rdashboard-observer.service rdashboard-executor.service rdashboard-workflow-launcher.service rdashboard-workflow-gateway.service rdashboard-dependency-fetcher.service rdashboard-buildkit.service rdashboard-worker.service rdashboard-source-dispatcher.service rdashboard-source-ingress.service rdashboard-source-ingress-bridge.service rdashboard-rimg-health.service rdashboard.service
+Before=rdashboard-native-release-recovery.service rdashboard-source.service rdashboard-observer.service rdashboard-executor.service rdashboard-workflow-launcher.service rdashboard-workflow-gateway.service rdashboard-dependency-fetcher.service rdashboard-buildkit.service rdashboard-worker.service rdashboard-source-dispatcher.service rdashboard-source-ingress.service rdashboard-source-ingress-bridge.service rdashboard-rimg-health.service rdashboard.service
 RequiresMountsFor=/var/lib/rdashboard-bootstrap /var/lib/rdashboard-build/self-releases
 
 [Service]

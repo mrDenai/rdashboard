@@ -27,23 +27,23 @@ use crate::{
         BUILD_STORAGE_MIN_FREE_BYTES, SHARED_BUILD_STORAGE_MIN_BYTES, SHARED_BUILD_STORAGE_ROOT,
         should_collect,
     },
-    domain::{EvidenceDigest, GitCommitId, ProjectId, WorkflowLeaseV1, WorkflowNodeKindV1},
+    domain::{EvidenceDigest, WorkflowLeaseV1, WorkflowNodeKindV1},
 };
 
 pub const PREPARATION_STORE_ROOT: &str = "/var/lib/rdashboard-build/preparation";
 pub const MAX_PREPARATION_STORE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 pub const MAX_PREPARATION_STORE_INODES: u64 = 100_000;
 
-const PREPARATION_KEY_SCHEMA_VERSION: u16 = 1;
-const PREPARATION_KEY_PURPOSE: &str = "rdashboard.preparation-key.v1";
+const PREPARATION_KEY_SCHEMA_VERSION: u16 = 2;
+const PREPARATION_KEY_PURPOSE: &str = "rdashboard.preparation-key.v2";
 const PREPARATION_ENTRY_SCHEMA_VERSION: u16 = 1;
 const PREPARATION_ENTRY_PURPOSE: &str = "rdashboard.preparation-entry.v1";
 const PREPARATION_PIN_SCHEMA_VERSION: u16 = 1;
 const PREPARATION_PIN_PURPOSE: &str = "rdashboard.preparation-pin.v1";
 const PREPARATION_ACCESS_SCHEMA_VERSION: u16 = 1;
 const PREPARATION_ACCESS_PURPOSE: &str = "rdashboard.preparation-access.v1";
-const PREPARED_RUN_COMPOSITION_SCHEMA_VERSION: u16 = 1;
-const PREPARED_RUN_COMPOSITION_PURPOSE: &str = "rdashboard.prepared-run-composition.v1";
+const PREPARED_RUN_COMPOSITION_SCHEMA_VERSION: u16 = 2;
+const PREPARED_RUN_COMPOSITION_PURPOSE: &str = "rdashboard.prepared-run-composition.v2";
 pub const PREPARED_RUN_COMPOSITION_FILE: &str = ".rdashboard-prepared-run.jcs";
 pub const PREPARED_RUN_SOURCE_DIRECTORY: &str = "source";
 const MAX_ENTRY_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -83,25 +83,19 @@ impl PreparationObjectKindV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PreparationKeyMaterialV1 {
     SourceSnapshot {
-        project_id: ProjectId,
-        source_sha: GitCommitId,
-        source_sequence: u64,
-        source_attestation_digest: EvidenceDigest,
-        workflow_policy_digest: EvidenceDigest,
         repository_identity: EvidenceDigest,
         archive_digest: EvidenceDigest,
         archive_bytes: u64,
     },
     DependencySnapshot {
-        toolchain_digest: EvidenceDigest,
+        dependency_layout_digest: EvidenceDigest,
         lockfile_digest: EvidenceDigest,
         platform: String,
-        workflow_policy_digest: EvidenceDigest,
     },
     PreparedRun {
         source_snapshot_key: EvidenceDigest,
         dependency_snapshot_key: EvidenceDigest,
-        workflow_policy_digest: EvidenceDigest,
+        toolchain_artifact_digest: EvidenceDigest,
         generated_input_digest: EvidenceDigest,
     },
 }
@@ -135,13 +129,8 @@ impl PreparationKeyMaterialV1 {
 
     fn validate(&self) -> Result<(), PreparationStoreError> {
         match self {
-            Self::SourceSnapshot {
-                source_sequence,
-                archive_bytes,
-                ..
-            } if *source_sequence == 0
-                || *archive_bytes == 0
-                || *archive_bytes > MAX_PREPARATION_STORE_BYTES =>
+            Self::SourceSnapshot { archive_bytes, .. }
+                if *archive_bytes == 0 || *archive_bytes > MAX_PREPARATION_STORE_BYTES =>
             {
                 Err(PreparationStoreError::InvalidKeyMaterial)
             }
@@ -167,7 +156,7 @@ pub struct PreparedRunCompositionV1 {
     pub prepared_run_key: EvidenceDigest,
     pub source_snapshot_key: EvidenceDigest,
     pub dependency_snapshot_key: EvidenceDigest,
-    pub workflow_policy_digest: EvidenceDigest,
+    pub toolchain_artifact_digest: EvidenceDigest,
     pub generated_input_digest: EvidenceDigest,
     document_digest: EvidenceDigest,
 }
@@ -179,7 +168,7 @@ struct PreparedRunCompositionPayload<'a> {
     prepared_run_key: &'a EvidenceDigest,
     source_snapshot_key: &'a EvidenceDigest,
     dependency_snapshot_key: &'a EvidenceDigest,
-    workflow_policy_digest: &'a EvidenceDigest,
+    toolchain_artifact_digest: &'a EvidenceDigest,
     generated_input_digest: &'a EvidenceDigest,
 }
 
@@ -188,7 +177,7 @@ impl PreparedRunCompositionV1 {
         let PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key,
             dependency_snapshot_key,
-            workflow_policy_digest,
+            toolchain_artifact_digest,
             generated_input_digest,
         } = material
         else {
@@ -200,7 +189,7 @@ impl PreparedRunCompositionV1 {
             prepared_run_key: material.key()?,
             source_snapshot_key: source_snapshot_key.clone(),
             dependency_snapshot_key: dependency_snapshot_key.clone(),
-            workflow_policy_digest: workflow_policy_digest.clone(),
+            toolchain_artifact_digest: toolchain_artifact_digest.clone(),
             generated_input_digest: generated_input_digest.clone(),
             document_digest: EvidenceDigest::sha256([]),
         };
@@ -227,7 +216,7 @@ impl PreparedRunCompositionV1 {
         let material = PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key: self.source_snapshot_key.clone(),
             dependency_snapshot_key: self.dependency_snapshot_key.clone(),
-            workflow_policy_digest: self.workflow_policy_digest.clone(),
+            toolchain_artifact_digest: self.toolchain_artifact_digest.clone(),
             generated_input_digest: self.generated_input_digest.clone(),
         };
         if self.purpose != PREPARED_RUN_COMPOSITION_PURPOSE
@@ -248,7 +237,7 @@ impl PreparedRunCompositionV1 {
                 prepared_run_key: &self.prepared_run_key,
                 source_snapshot_key: &self.source_snapshot_key,
                 dependency_snapshot_key: &self.dependency_snapshot_key,
-                workflow_policy_digest: &self.workflow_policy_digest,
+                toolchain_artifact_digest: &self.toolchain_artifact_digest,
                 generated_input_digest: &self.generated_input_digest,
             },
         )?))
@@ -745,6 +734,7 @@ impl PreparationStore {
             &lease.project_id,
             &lease.source_sha,
             source_identity.sequence,
+            &source_identity.attestation_digest,
         )?;
         if opened.manifest.source_attestation_digest != source_identity.attestation_digest
             || opened.manifest.installed_policy.digest != lease.workflow_policy_digest
@@ -760,21 +750,13 @@ impl PreparationStore {
             return Ok(entry);
         }
 
-        let manifest_bytes = opened.manifest.canonical_bytes()?;
         let estimate = estimate_payload(
-            opened
-                .manifest
-                .archive_bytes
-                .checked_add(
-                    u64::try_from(manifest_bytes.len())
-                        .map_err(|_| PreparationStoreError::PayloadTooLarge)?,
-                )
-                .ok_or(PreparationStoreError::PayloadTooLarge)?,
-            6,
+            opened.manifest.archive_bytes,
+            5,
             self.probe.inspect()?.allocation_granularity,
         )?;
         let reservation = self.reserve(estimate, now_ms)?;
-        let stage = self.stage_source_snapshot(kind, &key, opened, &manifest_bytes, now_ms)?;
+        let stage = self.stage_source_snapshot(kind, &key, opened, now_ms)?;
         self.commit_stage(kind, &key, &stage, &reservation, now_ms)
     }
 
@@ -1001,14 +983,13 @@ impl PreparationStore {
         kind: PreparationObjectKindV1,
         key: &EvidenceDigest,
         opened: OpenedSourceArchiveV1,
-        source_manifest_bytes: &[u8],
         now_ms: i64,
     ) -> Result<PathBuf, PreparationStoreError> {
         let stage = self.create_stage()?;
         let result = (|| {
             let payload = stage.join("payload");
             create_directory(&payload, 0o700)?;
-            let mut entries = Vec::with_capacity(2);
+            let mut entries = Vec::with_capacity(1);
             let archive_entry = write_payload_reader(
                 &payload,
                 Path::new("source.tar"),
@@ -1018,17 +999,6 @@ impl PreparationStore {
                 false,
             )?;
             entries.push(archive_entry);
-            let manifest_digest = EvidenceDigest::sha256(source_manifest_bytes);
-            entries.push(write_payload_reader(
-                &payload,
-                Path::new("source-manifest.jcs"),
-                io::Cursor::new(source_manifest_bytes),
-                u64::try_from(source_manifest_bytes.len())
-                    .map_err(|_| PreparationStoreError::PayloadTooLarge)?,
-                &manifest_digest,
-                false,
-            )?);
-            entries.sort_by(compare_manifest_entries);
             seal_stage(
                 &stage,
                 &PreparationEntryManifestV1::new(kind, key.clone(), entries, now_ms)?,
@@ -1745,11 +1715,6 @@ fn source_key_material(
         return Err(PreparationStoreError::SourceLeaseMismatch);
     }
     Ok(PreparationKeyMaterialV1::SourceSnapshot {
-        project_id: manifest.project_id.clone(),
-        source_sha: manifest.head.clone(),
-        source_sequence: manifest.sequence,
-        source_attestation_digest: manifest.source_attestation_digest.clone(),
-        workflow_policy_digest: manifest.installed_policy.digest.clone(),
         repository_identity: manifest.repository_identity.clone(),
         archive_digest: manifest.archive_sha256.clone(),
         archive_bytes: manifest.archive_bytes,
@@ -3004,7 +2969,8 @@ mod tests {
     use crate::{
         build_source::{SourceArchiveInputV1, SourceArchivePublisherV1},
         domain::{
-            InstalledPolicyIdentity, ProjectManifestV2, WorkflowNodeKindV1, WorkflowWorkerPoolV1,
+            GitCommitId, InstalledPolicyIdentity, ProjectManifestV2, WorkflowNodeKindV1,
+            WorkflowWorkerPoolV1,
         },
     };
 
@@ -3063,10 +3029,9 @@ mod tests {
 
     fn dependency_material(label: &str) -> PreparationKeyMaterialV1 {
         PreparationKeyMaterialV1::DependencySnapshot {
-            toolchain_digest: EvidenceDigest::sha256(format!("toolchain-{label}")),
+            dependency_layout_digest: EvidenceDigest::sha256(format!("layout-{label}")),
             lockfile_digest: EvidenceDigest::sha256(format!("lockfile-{label}")),
             platform: "linux-x86_64".to_owned(),
-            workflow_policy_digest: EvidenceDigest::sha256(format!("policy-{label}")),
         }
     }
 
@@ -3167,7 +3132,7 @@ mod tests {
     }
 
     #[test]
-    fn preparation_keys_are_deterministic_typed_and_policy_bound() {
+    fn preparation_keys_are_deterministic_typed_and_policy_independent() {
         let dependency = dependency_material("same");
         assert_eq!(
             dependency.key().expect("first key"),
@@ -3178,21 +3143,24 @@ mod tests {
             dependency_material("other").key().expect("other key")
         );
         let source_key = EvidenceDigest::sha256("source");
+        let toolchain = EvidenceDigest::sha256("toolchain");
         let prepared = PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key: source_key.clone(),
             dependency_snapshot_key: dependency.key().expect("dependency key"),
-            workflow_policy_digest: EvidenceDigest::sha256("policy-same"),
+            toolchain_artifact_digest: toolchain.clone(),
             generated_input_digest: EvidenceDigest::sha256("generated"),
         };
-        let changed_policy = PreparationKeyMaterialV1::PreparedRun {
+        let same_content_under_another_policy = PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key: source_key,
             dependency_snapshot_key: dependency.key().expect("dependency key"),
-            workflow_policy_digest: EvidenceDigest::sha256("changed-policy"),
+            toolchain_artifact_digest: toolchain,
             generated_input_digest: EvidenceDigest::sha256("generated"),
         };
-        assert_ne!(
+        assert_eq!(
             prepared.key().expect("prepared key"),
-            changed_policy.key().expect("policy-bound key")
+            same_content_under_another_policy
+                .key()
+                .expect("policy-independent key")
         );
     }
 
@@ -3233,7 +3201,7 @@ mod tests {
         let prepared_material = PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key: source.manifest.key.clone(),
             dependency_snapshot_key: dependency.manifest.key.clone(),
-            workflow_policy_digest: EvidenceDigest::sha256("workflow policy"),
+            toolchain_artifact_digest: EvidenceDigest::sha256("composition toolchain"),
             generated_input_digest: EvidenceDigest::sha256("prepared layout"),
         };
         let prepared_input = directory.path().join("prepared-input");

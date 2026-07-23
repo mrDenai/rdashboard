@@ -1,0 +1,35 @@
+[Unit]
+Description=Recover interrupted rdashboard-managed native release activations
+Requires=rdashboard-bootstrap.service
+After=local-fs.target rdashboard-bootstrap.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/rdashboard-bootstrap/current/bin/rdashboard-native-release recover-installed
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=-/etc/rdashboard/native-runtimes /var/lib/rdashboard-build/titanium
+ReadWritePaths=/var/lib/rdashboard-managed /var/lib/rdashboard-build/titanium/roots
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

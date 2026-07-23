@@ -45,6 +45,10 @@ use crate::{
         SelfReleaseBuildPolicyV1, SelfReleaseBuildRequestV1, SelfReleaseHandoffStoreV1,
     },
     self_update::CURRENT_WORKFLOW_JOB_EXECUTABLE,
+    titanium::{
+        TitaniumArtifactKindV1, TitaniumRegistryError, TitaniumRegistryV1, TitaniumRootKindV1,
+        TitaniumRootRecordV1, TitaniumRootTargetV1,
+    },
     workflow_execution_grant::{
         VerifiedWorkflowExecutionGrantV1, WorkflowExecutionGrantError,
         WorkflowExecutionGrantVerificationKeyV1, WorkflowExecutionGrantVerifierV1,
@@ -56,6 +60,7 @@ pub const WORKFLOW_LAUNCHER_POLICY_PATH: &str = "/etc/rdashboard/workflow-launch
 pub const WORKFLOW_LAUNCHER_JOB_ROOT: &str = "/var/lib/rdashboard-workflow-launcher/jobs";
 pub const WORKFLOW_JOB_EXECUTABLE: &str = CURRENT_WORKFLOW_JOB_EXECUTABLE;
 pub const SYSTEMD_RUN_EXECUTABLE: &str = "/usr/bin/systemd-run";
+pub const WORKFLOW_TITANIUM_TOOLCHAIN_ROOT: &str = "/toolchain";
 
 const ENV_EXECUTABLE: &str = "/usr/bin/env";
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
@@ -288,6 +293,9 @@ pub struct AuthorizedWorkflowLaunchV1 {
     pub job_directory: PathBuf,
     pub prepared_run_path: PathBuf,
     pub dependency_snapshot_path: PathBuf,
+    pub toolchain_artifact_digest: EvidenceDigest,
+    pub toolchain_path: PathBuf,
+    pub toolchain_components: Vec<(String, PathBuf)>,
     pub operation_state_path: Option<PathBuf>,
     pub oci_build_request: Option<RootlessOciBuildRequestV1>,
     pub self_release_build_request: Option<SelfReleaseBuildRequestV1>,
@@ -299,6 +307,7 @@ impl AuthorizedWorkflowLaunchV1 {
     pub fn authorize(
         policy: &WorkflowLauncherPolicyV1,
         preparation_reader: &PreparationStoreReaderV1,
+        titanium: &TitaniumRegistryV1,
         lease: &WorkflowLeaseV1,
         execution_grant: &str,
         now_ms: i64,
@@ -311,13 +320,29 @@ impl AuthorizedWorkflowLaunchV1 {
         let prepared = preparation_reader
             .open_entry(PreparationObjectKindV1::PreparedRun, prepared_run_key)?;
         let composition = prepared.prepared_run_composition()?;
-        if composition.workflow_policy_digest != lease.workflow_policy_digest {
-            return Err(WorkflowLauncherError::PreparedRunMismatch);
+        let build_contract = lease
+            .host_preparation
+            .as_ref()
+            .ok_or(WorkflowLauncherError::UnsupportedLease)?;
+        let installed_toolchain = titanium.installed_artifact(
+            &build_contract.toolchain_root,
+            TitaniumArtifactKindV1::CompilerToolchain,
+            &build_contract.platform,
+            &build_contract.toolchain_interface,
+        )?;
+        if installed_toolchain.artifact_digest != composition.toolchain_artifact_digest {
+            return Err(WorkflowLauncherError::UnsupportedLease);
         }
         let dependency = preparation_reader.open_entry(
             PreparationObjectKindV1::DependencySnapshot,
             &composition.dependency_snapshot_key,
         )?;
+        let toolchain_path = titanium.artifact_payload_path(
+            &composition.toolchain_artifact_digest,
+            TitaniumArtifactKindV1::CompilerToolchain,
+        )?;
+        let toolchain_components =
+            titanium.toolchain_component_payloads(&composition.toolchain_artifact_digest)?;
         let compact_lease_id = lease.lease_id.simple();
         let unit_name = unit_name(lease);
         let job_directory = Path::new(WORKFLOW_LAUNCHER_JOB_ROOT)
@@ -353,6 +378,8 @@ impl AuthorizedWorkflowLaunchV1 {
             &unit_name,
             &prepared_run_path,
             &dependency_snapshot_path,
+            &toolchain_path,
+            &toolchain_components,
             operation_state_path.as_deref(),
             oci_build_request.as_ref(),
             self_release_build_request.as_ref(),
@@ -364,6 +391,9 @@ impl AuthorizedWorkflowLaunchV1 {
             job_directory,
             prepared_run_path,
             dependency_snapshot_path,
+            toolchain_artifact_digest: composition.toolchain_artifact_digest,
+            toolchain_path,
+            toolchain_components,
             operation_state_path,
             oci_build_request,
             self_release_build_request,
@@ -1920,6 +1950,7 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
 pub struct WorkflowLaunchSupervisorV1 {
     policy: WorkflowLauncherPolicyV1,
     preparation_reader: PreparationStoreReaderV1,
+    titanium: Arc<TitaniumRegistryV1>,
     journal: WorkflowLaunchJournalV1,
     operation_states: Arc<dyn WorkflowOperationStateManagerV1>,
     runtime: Arc<dyn WorkflowLaunchRuntimeV1>,
@@ -1929,6 +1960,7 @@ impl WorkflowLaunchSupervisorV1 {
     pub fn new(
         policy: WorkflowLauncherPolicyV1,
         preparation_reader: PreparationStoreReaderV1,
+        titanium: Arc<TitaniumRegistryV1>,
         journal: WorkflowLaunchJournalV1,
         operation_states: Arc<dyn WorkflowOperationStateManagerV1>,
         runtime: Arc<dyn WorkflowLaunchRuntimeV1>,
@@ -1940,6 +1972,7 @@ impl WorkflowLaunchSupervisorV1 {
         Ok(Self {
             policy,
             preparation_reader,
+            titanium,
             journal,
             operation_states,
             runtime,
@@ -1970,6 +2003,7 @@ impl WorkflowLaunchSupervisorV1 {
         let launch = AuthorizedWorkflowLaunchV1::authorize(
             &self.policy,
             &self.preparation_reader,
+            &self.titanium,
             lease,
             execution_grant,
             now_ms,
@@ -1980,15 +2014,8 @@ impl WorkflowLaunchSupervisorV1 {
         if !is_new {
             return Ok(status);
         }
-        if let Some(expected_state) = &lease.operation_state {
-            let operation_state = self.operation_states.acquire(lease, now_ms)?;
-            if launch.operation_state_path.as_ref() != Some(&operation_state.data_path)
-                || expected_state.state_key != operation_state.state_key
-            {
-                return Err(WorkflowLaunchSupervisorError::OperationStatePathMismatch);
-            }
-        } else if launch.operation_state_path.is_some() {
-            return Err(WorkflowLaunchSupervisorError::OperationStatePathMismatch);
+        if let Some(rejected) = self.pin_launch_inputs(&launch, lease, now_ms)? {
+            return Ok(rejected);
         }
         let (process_sender, process_receiver) =
             std::sync::mpsc::sync_channel::<Box<dyn WorkflowLaunchProcessV1>>(1);
@@ -2015,20 +2042,22 @@ impl WorkflowLaunchSupervisorV1 {
                 }
             }),
         ) {
-            return Ok(self.journal.mark_spawn_rejected(
+            let status = self.journal.mark_spawn_rejected(
                 lease,
                 WorkflowLaunchRuntimeError::WaiterSpawn(error).evidence_digest(),
                 now_ms,
-            )?);
+            )?;
+            self.remove_active_toolchain_root(lease)?;
+            return Ok(status);
         }
         let process = match self.runtime.spawn(&launch) {
             Ok(process) => process,
             Err(error) => {
-                return Ok(self.journal.mark_spawn_rejected(
-                    lease,
-                    error.evidence_digest(),
-                    now_ms,
-                )?);
+                let status =
+                    self.journal
+                        .mark_spawn_rejected(lease, error.evidence_digest(), now_ms)?;
+                self.remove_active_toolchain_root(lease)?;
+                return Ok(status);
             }
         };
         let running = match self.journal.mark_running(lease, now_ms) {
@@ -2091,6 +2120,7 @@ impl WorkflowLaunchSupervisorV1 {
         validate_launcher_cleanup_lease(&self.policy, lease)?;
         let (status, needs_runtime) = self.journal.begin_cleanup(lease, now_ms)?;
         if !needs_runtime {
+            self.remove_active_toolchain_root(lease)?;
             return Ok(status);
         }
         let unit_was_loaded = self.runtime.terminate(&unit_name(lease))?;
@@ -2106,9 +2136,73 @@ impl WorkflowLaunchSupervisorV1 {
             // They still need to be stoppable and journalled as clean during a rolling upgrade.
             None
         };
-        Ok(self
-            .journal
-            .finish_cleanup(lease, unit_was_loaded, operation_state, now_ms)?)
+        let status =
+            self.journal
+                .finish_cleanup(lease, unit_was_loaded, operation_state, now_ms)?;
+        self.remove_active_toolchain_root(lease)?;
+        Ok(status)
+    }
+
+    fn remove_active_toolchain_root(
+        &self,
+        lease: &WorkflowLeaseV1,
+    ) -> Result<(), TitaniumRegistryError> {
+        self.titanium
+            .remove_root(TitaniumRootKindV1::ActiveOperation, &unit_name(lease))
+    }
+
+    fn pin_launch_inputs(
+        &self,
+        launch: &AuthorizedWorkflowLaunchV1,
+        lease: &WorkflowLeaseV1,
+        now_ms: i64,
+    ) -> Result<Option<WorkflowLaunchStatusV1>, WorkflowLaunchSupervisorError> {
+        let toolchain_root = TitaniumRootRecordV1::new(
+            TitaniumRootKindV1::ActiveOperation,
+            launch.unit_name.clone(),
+            vec![TitaniumRootTargetV1::Artifact {
+                digest: launch.toolchain_artifact_digest.clone(),
+            }],
+        )?;
+        if let Err(error) = self.titanium.set_root(&toolchain_root) {
+            tracing::error!(
+                reason_code = "titanium_toolchain_pin_failed",
+                unit_name = %launch.unit_name,
+                summary = %error,
+                "exact Titanium toolchain could not be pinned for workflow launch"
+            );
+            return Ok(Some(self.journal.mark_spawn_rejected(
+                lease,
+                EvidenceDigest::sha256("rdashboard.titanium-toolchain-pin-failed.v1"),
+                now_ms,
+            )?));
+        }
+        let Some(expected_state) = &lease.operation_state else {
+            if launch.operation_state_path.is_some() {
+                self.remove_active_toolchain_root(lease)?;
+                return Err(WorkflowLaunchSupervisorError::OperationStatePathMismatch);
+            }
+            return Ok(None);
+        };
+        let operation_state = match self.operation_states.acquire(lease, now_ms) {
+            Ok(state) => state,
+            Err(error) => {
+                self.remove_active_toolchain_root(lease)?;
+                return Err(error.into());
+            }
+        };
+        if launch.operation_state_path.as_ref() != Some(&operation_state.data_path)
+            || expected_state.state_key != operation_state.state_key
+        {
+            self.operation_states.release(
+                lease,
+                WorkflowOperationStateOutcomeV1::Unknown,
+                now_ms,
+            )?;
+            self.remove_active_toolchain_root(lease)?;
+            return Err(WorkflowLaunchSupervisorError::OperationStatePathMismatch);
+        }
+        Ok(None)
     }
 }
 
@@ -2556,6 +2650,8 @@ pub enum WorkflowLaunchSupervisorError {
     OperationState(#[from] WorkflowOperationStateError),
     #[error("workflow launch runtime failed: {0}")]
     Runtime(#[from] WorkflowLaunchRuntimeError),
+    #[error("workflow launch Titanium registry failed: {0}")]
+    Titanium(#[from] TitaniumRegistryError),
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2565,6 +2661,8 @@ fn transient_unit_arguments(
     unit_name: &str,
     prepared_run_path: &Path,
     dependency_snapshot_path: &Path,
+    toolchain_path: &Path,
+    toolchain_components: &[(String, PathBuf)],
     operation_state_path: Option<&Path>,
     oci_build_request: Option<&RootlessOciBuildRequestV1>,
     self_release_build_request: Option<&SelfReleaseBuildRequestV1>,
@@ -2730,8 +2828,8 @@ fn transient_unit_arguments(
         arguments.extend([
             "--property=ReadWritePaths=/job".to_owned(),
             format!(
-                "--property=BindReadOnlyPaths={}:{ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT}",
-                crate::build_storage::SHARED_TOOLCHAIN_STORE_ROOT
+                "--property=BindReadOnlyPaths={}:{WORKFLOW_TITANIUM_TOOLCHAIN_ROOT}",
+                toolchain_path.display()
             ),
             format!(
                 "--property=BindPaths={}:/operation",
@@ -2740,24 +2838,50 @@ fn transient_unit_arguments(
             "--".to_owned(),
             ENV_EXECUTABLE.to_owned(),
             "-i".to_owned(),
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_owned(),
+            format!(
+                "PATH={WORKFLOW_TITANIUM_TOOLCHAIN_ROOT}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+            ),
             "HOME=/nonexistent".to_owned(),
             "TMPDIR=/job/tmp".to_owned(),
             "CARGO_HOME=/job/cargo-home".to_owned(),
             "CARGO_INCREMENTAL=0".to_owned(),
             "CARGO_NET_OFFLINE=true".to_owned(),
             "CARGO_TARGET_DIR=/operation/target".to_owned(),
-            "RUSTFLAGS=-C target-cpu=native -C link-arg=-fuse-ld=lld".to_owned(),
-            "TITANIUM_CPU_FLAGS=-march=native -O3 -fno-plt -fstack-clash-protection".to_owned(),
             "CCACHE_DIR=/operation/ccache".to_owned(),
             "CCACHE_TEMPDIR=/job/ccache-tmp".to_owned(),
-            format!("RDASHBOARD_TOOLCHAIN_ROOT={ROOTLESS_OCI_BUILD_TOOLCHAIN_ROOT}"),
+            format!("RDASHBOARD_TOOLCHAIN_ROOT={WORKFLOW_TITANIUM_TOOLCHAIN_ROOT}"),
             "RDASHBOARD_PREPARED_ROOT=/prepared".to_owned(),
             "RDASHBOARD_DEPENDENCY_ROOT=/dependencies".to_owned(),
             "RDASHBOARD_OPERATION_ROOT=/operation".to_owned(),
             WORKFLOW_JOB_EXECUTABLE.to_owned(),
             adapter.to_owned(),
         ]);
+        let build_contract = lease
+            .host_preparation
+            .as_ref()
+            .ok_or(WorkflowLauncherError::UnsupportedLease)?;
+        let environment_insertion = arguments
+            .iter()
+            .position(|argument| argument == "HOME=/nonexistent")
+            .ok_or(WorkflowLauncherError::UnsupportedLease)?;
+        arguments.splice(
+            environment_insertion..environment_insertion,
+            build_contract
+                .build_environment
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
+        let component_bindings = toolchain_components.iter().map(|(mount, path)| {
+            format!(
+                "--property=BindReadOnlyPaths={}:{WORKFLOW_TITANIUM_TOOLCHAIN_ROOT}/{mount}",
+                path.display()
+            )
+        });
+        let insertion = arguments
+            .iter()
+            .position(|argument| argument == "--")
+            .ok_or(WorkflowLauncherError::UnsupportedLease)?;
+        arguments.splice(insertion..insertion, component_bindings);
     }
     Ok(arguments)
 }
@@ -2834,6 +2958,8 @@ pub enum WorkflowLauncherError {
     RootlessOciBuild(#[from] RootlessOciBuildError),
     #[error("workflow launcher self-release build contract failed: {0}")]
     SelfReleaseBuild(#[from] SelfReleaseBuildError),
+    #[error("workflow launcher Titanium registry failed: {0}")]
+    Titanium(#[from] TitaniumRegistryError),
 }
 
 pub fn installed_preparation_reader(
@@ -2877,6 +3003,10 @@ mod tests {
         self_update::{
             InstalledSelfUpdatePolicyInputV1, InstalledSelfUpdatePolicyV1, SelfUpdateFilePolicyV1,
         },
+        titanium::{
+            TITANIUM_TOOLCHAIN_DESCRIPTOR_FILE, TitaniumAcquisitionClassV1,
+            TitaniumToolchainDescriptorV1,
+        },
         workflow_execution_grant::WorkflowExecutionGrantSignerV1,
     };
 
@@ -2884,6 +3014,7 @@ mod tests {
         _directory: TempDir,
         _store: PreparationStore,
         reader: PreparationStoreReaderV1,
+        titanium: Arc<TitaniumRegistryV1>,
         policy: WorkflowLauncherPolicyV1,
         lease: WorkflowLeaseV1,
         signer: WorkflowExecutionGrantSignerV1,
@@ -2893,11 +3024,50 @@ mod tests {
     }
 
     fn fixture() -> LauncherFixture {
-        fixture_with_composition_policy_mismatch(false)
+        fixture_with_prepared_run()
+    }
+
+    fn prepared_toolchain_digest(fixture: &LauncherFixture) -> EvidenceDigest {
+        fixture
+            .reader
+            .open_entry(
+                PreparationObjectKindV1::PreparedRun,
+                required_prepared_run_key(&fixture.lease).expect("prepared key"),
+            )
+            .expect("prepared run")
+            .prepared_run_composition()
+            .expect("prepared composition")
+            .toolchain_artifact_digest
+    }
+
+    fn assert_active_toolchain_root(fixture: &LauncherFixture) {
+        assert_eq!(
+            fixture
+                .titanium
+                .read_root(
+                    TitaniumRootKindV1::ActiveOperation,
+                    &unit_name(&fixture.lease),
+                )
+                .expect("active toolchain root")
+                .targets,
+            vec![TitaniumRootTargetV1::Artifact {
+                digest: prepared_toolchain_digest(fixture),
+            }]
+        );
+    }
+
+    fn assert_active_toolchain_root_removed(fixture: &LauncherFixture) {
+        assert!(matches!(
+            fixture.titanium.read_root(
+                TitaniumRootKindV1::ActiveOperation,
+                &unit_name(&fixture.lease),
+            ),
+            Err(TitaniumRegistryError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
     }
 
     #[allow(clippy::too_many_lines)]
-    fn fixture_with_composition_policy_mismatch(mismatched: bool) -> LauncherFixture {
+    fn fixture_with_prepared_run() -> LauncherFixture {
         let directory = tempdir().expect("temporary directory");
         let preparation_root = directory.path().join("preparation");
         fs::create_dir(&preparation_root).expect("create preparation root");
@@ -2912,6 +3082,45 @@ mod tests {
         );
         let store = open_test_preparation_store(&preparation_root, owner_uid, 32 * 1024 * 1024)
             .expect("open preparation store");
+        let titanium_root = directory.path().join("titanium");
+        fs::create_dir(&titanium_root).expect("create Titanium root");
+        fs::set_permissions(&titanium_root, fs::Permissions::from_mode(0o755))
+            .expect("protect Titanium root");
+        let titanium = Arc::new(
+            TitaniumRegistryV1::open_for_owner(&titanium_root, owner_uid)
+                .expect("open Titanium registry"),
+        );
+        let toolchain_input = directory.path().join("toolchain-input");
+        fs::create_dir(&toolchain_input).expect("create toolchain input");
+        fs::create_dir(toolchain_input.join("bin")).expect("create toolchain bin");
+        for executable in ["cargo", "rustc"] {
+            let path = toolchain_input.join("bin").join(executable);
+            fs::write(&path, executable.as_bytes()).expect("write toolchain executable");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("make toolchain executable");
+        }
+        let descriptor = TitaniumToolchainDescriptorV1::new(
+            "rust-v1".to_owned(),
+            "linux-x86_64".to_owned(),
+            vec!["cargo".to_owned(), "rustc".to_owned()],
+            Vec::new(),
+        )
+        .expect("toolchain descriptor");
+        fs::write(
+            toolchain_input.join(TITANIUM_TOOLCHAIN_DESCRIPTOR_FILE),
+            descriptor.canonical_bytes().expect("canonical descriptor"),
+        )
+        .expect("write toolchain descriptor");
+        let toolchain = titanium
+            .publish_installed_toolchain(
+                &toolchain_input,
+                "rust-1.96.1-znver3-linux-x86_64-gnu-v1".to_owned(),
+                TitaniumAcquisitionClassV1::ControlledSourceBuild,
+                "linux-x86_64".to_owned(),
+                Vec::new(),
+                EvidenceDigest::sha256("test toolchain provenance"),
+            )
+            .expect("publish Titanium toolchain");
         let manifest: ProjectManifestV2 =
             serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
                 .expect("manifest");
@@ -2921,10 +3130,9 @@ mod tests {
         fs::write(dependency_input.join("source-tree.jcs"), b"{}")
             .expect("write dependency marker");
         let dependency_material = PreparationKeyMaterialV1::DependencySnapshot {
-            toolchain_digest: EvidenceDigest::sha256("source-tree toolchain"),
+            dependency_layout_digest: EvidenceDigest::sha256("source-tree layout"),
             lockfile_digest: EvidenceDigest::sha256("source-tree lockfile"),
             platform: "linux-x86_64".to_owned(),
-            workflow_policy_digest: workflow_policy_digest.clone(),
         };
         let dependency = store
             .get_or_prepare_directory(&dependency_material, 99, || {
@@ -2946,11 +3154,7 @@ mod tests {
         let material = PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key: EvidenceDigest::sha256("source"),
             dependency_snapshot_key: dependency.manifest.key.clone(),
-            workflow_policy_digest: if mismatched {
-                EvidenceDigest::sha256("other installed workflow policy")
-            } else {
-                workflow_policy_digest.clone()
-            },
+            toolchain_artifact_digest: toolchain.artifact_digest,
             generated_input_digest: EvidenceDigest::sha256("generated input"),
         };
         fs::write(
@@ -3006,7 +3210,7 @@ mod tests {
             preparation_key,
             node,
             profile,
-            None,
+            manifest.host_preparation.clone(),
             vec![WorkflowLeaseInputV1 {
                 node_id: "prepare".parse().expect("prepare node ID"),
                 artifact_kind: WorkflowArtifactKindV1::PreparedRun,
@@ -3066,6 +3270,7 @@ mod tests {
             _directory: directory,
             _store: store,
             reader,
+            titanium,
             policy,
             lease,
             signer,
@@ -3436,7 +3641,7 @@ mod tests {
             fixture.lease.preparation_key.clone(),
             &node,
             &profile,
-            None,
+            fixture.lease.host_preparation.clone(),
             vec![
                 fixture.lease.input_artifacts[0].clone(),
                 WorkflowLeaseInputV1 {
@@ -3488,7 +3693,7 @@ mod tests {
             fixture.lease.preparation_key.clone(),
             node,
             profile,
-            None,
+            fixture.lease.host_preparation.clone(),
             fixture.lease.input_artifacts.clone(),
             fixture.lease.expected_input_digest.clone(),
             fixture.lease.worker_id.clone(),
@@ -3501,6 +3706,7 @@ mod tests {
 
     fn verified_oci_lease(fixture: &LauncherFixture) -> WorkflowLeaseV1 {
         let base = oci_lease(fixture);
+        let host_preparation = base.host_preparation.clone();
         let node = crate::domain::WorkflowNodeV1 {
             node_id: "release-build".parse().expect("release node ID"),
             display_name: "Package verified OCI release".to_owned(),
@@ -3558,7 +3764,7 @@ mod tests {
             base.preparation_key,
             &node,
             &profile,
-            None,
+            host_preparation,
             vec![
                 base.input_artifacts[0].clone(),
                 WorkflowLeaseInputV1 {
@@ -3613,6 +3819,7 @@ mod tests {
         let launch = AuthorizedWorkflowLaunchV1::authorize(
             &fixture.policy,
             &fixture.reader,
+            &fixture.titanium,
             &fixture.lease,
             &grant,
             101,
@@ -3637,6 +3844,13 @@ mod tests {
         assert!(launch.arguments.iter().any(|argument| {
             argument.starts_with("--property=BindReadOnlyPaths=")
                 && argument.ends_with(":/dependencies")
+        }));
+        assert!(launch.arguments.iter().any(|argument| {
+            argument
+                == &format!(
+                    "--property=BindReadOnlyPaths={}:{WORKFLOW_TITANIUM_TOOLCHAIN_ROOT}",
+                    launch.toolchain_path.display()
+                )
         }));
         assert!(launch.arguments.iter().any(|argument| {
             argument.starts_with("--property=BindPaths=") && argument.ends_with(":/operation")
@@ -3664,18 +3878,20 @@ mod tests {
             [
                 ENV_EXECUTABLE,
                 "-i",
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+                "PATH=/toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+                "CFLAGS=-march=znver3 -O3 -fno-plt -fstack-clash-protection",
+                "CXXFLAGS=-march=znver3 -O3 -fno-plt -fstack-clash-protection",
+                "RUSTFLAGS=-C target-cpu=znver3 -C link-arg=-fuse-ld=lld",
+                "TITANIUM_CPU_FLAGS=-march=znver3 -O3 -fno-plt -fstack-clash-protection",
                 "HOME=/nonexistent",
                 "TMPDIR=/job/tmp",
                 "CARGO_HOME=/job/cargo-home",
                 "CARGO_INCREMENTAL=0",
                 "CARGO_NET_OFFLINE=true",
                 "CARGO_TARGET_DIR=/operation/target",
-                "RUSTFLAGS=-C target-cpu=native -C link-arg=-fuse-ld=lld",
-                "TITANIUM_CPU_FLAGS=-march=native -O3 -fno-plt -fstack-clash-protection",
                 "CCACHE_DIR=/operation/ccache",
                 "CCACHE_TEMPDIR=/job/ccache-tmp",
-                "RDASHBOARD_TOOLCHAIN_ROOT=/toolchains",
+                "RDASHBOARD_TOOLCHAIN_ROOT=/toolchain",
                 "RDASHBOARD_PREPARED_ROOT=/prepared",
                 "RDASHBOARD_DEPENDENCY_ROOT=/dependencies",
                 "RDASHBOARD_OPERATION_ROOT=/operation",
@@ -3683,13 +3899,22 @@ mod tests {
                 "bare-bin-ci-v1",
             ]
         );
+    }
 
+    #[test]
+    fn authorization_rejects_a_grant_for_a_different_lease() {
+        let fixture = fixture();
+        let grant = fixture
+            .signer
+            .issue(&fixture.lease, 101, Uuid::from_u128(21))
+            .expect("execution grant");
         let mut mismatched = fixture.lease.clone();
         mismatched.host_id = "other-vps".to_owned();
         assert!(matches!(
             AuthorizedWorkflowLaunchV1::authorize(
                 &fixture.policy,
                 &fixture.reader,
+                &fixture.titanium,
                 &mismatched,
                 &grant,
                 101,
@@ -3708,9 +3933,15 @@ mod tests {
             .signer
             .issue(&lease, 101, Uuid::from_u128(33))
             .expect("execution grant");
-        let launch =
-            AuthorizedWorkflowLaunchV1::authorize(&policy, &fixture.reader, &lease, &grant, 101)
-                .expect("authorize OCI launch");
+        let launch = AuthorizedWorkflowLaunchV1::authorize(
+            &policy,
+            &fixture.reader,
+            &fixture.titanium,
+            &lease,
+            &grant,
+            101,
+        )
+        .expect("authorize OCI launch");
         let request = launch.oci_build_request.as_ref().expect("OCI request");
         assert_eq!(request.lease_digest, lease.lease_digest);
         assert!(launch.operation_state_path.is_none());
@@ -3772,9 +4003,15 @@ mod tests {
             .signer
             .issue(&lease, 101, Uuid::from_u128(53))
             .expect("execution grant");
-        let launch =
-            AuthorizedWorkflowLaunchV1::authorize(&policy, &fixture.reader, &lease, &grant, 101)
-                .expect("authorize verified OCI launch");
+        let launch = AuthorizedWorkflowLaunchV1::authorize(
+            &policy,
+            &fixture.reader,
+            &fixture.titanium,
+            &lease,
+            &grant,
+            101,
+        )
+        .expect("authorize verified OCI launch");
         let request = launch.oci_build_request.as_ref().expect("OCI request");
         assert!(request.verified_output.is_some());
         assert_eq!(request.local_inputs.len(), 1);
@@ -3810,9 +4047,15 @@ mod tests {
             .signer
             .issue(&lease, 101, Uuid::from_u128(43))
             .expect("execution grant");
-        let launch =
-            AuthorizedWorkflowLaunchV1::authorize(&policy, &fixture.reader, &lease, &grant, 101)
-                .expect("authorize self-release launch");
+        let launch = AuthorizedWorkflowLaunchV1::authorize(
+            &policy,
+            &fixture.reader,
+            &fixture.titanium,
+            &lease,
+            &grant,
+            101,
+        )
+        .expect("authorize self-release launch");
         let request = launch
             .self_release_build_request
             .as_ref()
@@ -3884,6 +4127,7 @@ mod tests {
         let supervisor = WorkflowLaunchSupervisorV1::new(
             policy,
             fixture.reader.clone(),
+            fixture.titanium.clone(),
             journal,
             fixture.operation_states.clone(),
             runtime,
@@ -3926,26 +4170,6 @@ mod tests {
     }
 
     #[test]
-    fn authorization_rejects_a_prepared_run_from_another_workflow_policy() {
-        let fixture = fixture_with_composition_policy_mismatch(true);
-        let grant = fixture
-            .signer
-            .issue(&fixture.lease, 101, Uuid::from_u128(22))
-            .expect("execution grant");
-
-        assert!(matches!(
-            AuthorizedWorkflowLaunchV1::authorize(
-                &fixture.policy,
-                &fixture.reader,
-                &fixture.lease,
-                &grant,
-                101,
-            ),
-            Err(WorkflowLauncherError::PreparedRunMismatch)
-        ));
-    }
-
-    #[test]
     fn waiter_failure_precedes_any_runtime_effect() {
         let fixture = fixture();
         let journal = WorkflowLaunchJournalV1::open(
@@ -3959,6 +4183,7 @@ mod tests {
         let supervisor = WorkflowLaunchSupervisorV1::new(
             fixture.policy.clone(),
             fixture.reader.clone(),
+            fixture.titanium.clone(),
             journal,
             fixture.operation_states.clone(),
             runtime.clone(),
@@ -4014,6 +4239,7 @@ mod tests {
         let supervisor = WorkflowLaunchSupervisorV1::new(
             fixture.policy.clone(),
             fixture.reader.clone(),
+            fixture.titanium.clone(),
             journal,
             fixture.operation_states.clone(),
             runtime.clone(),
@@ -4056,6 +4282,7 @@ mod tests {
         let supervisor = WorkflowLaunchSupervisorV1::new(
             fixture.policy.clone(),
             fixture.reader.clone(),
+            fixture.titanium.clone(),
             journal,
             fixture.operation_states.clone(),
             runtime.clone(),
@@ -4070,6 +4297,7 @@ mod tests {
             .expect("launch");
         assert_eq!(running.state, WorkflowLaunchStateV1::Running);
         assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
+        assert_active_toolchain_root(&fixture);
 
         let renewed = fixture.lease.renewed(20_000).expect("renew lease");
         let renewed_grant = fixture
@@ -4141,6 +4369,7 @@ mod tests {
             .expect("replay cleanup");
         assert_eq!(replayed_cleanup, cleaned);
         assert_eq!(runtime.terminate_count.load(Ordering::SeqCst), 1);
+        assert_active_toolchain_root_removed(&fixture);
         assert_eq!(fixture.operation_states.counts(), (1, 1));
     }
 
@@ -4167,6 +4396,7 @@ mod tests {
         let launch = AuthorizedWorkflowLaunchV1::authorize(
             &fixture.policy,
             &fixture.reader,
+            &fixture.titanium,
             &fixture.lease,
             &grant,
             101,

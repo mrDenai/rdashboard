@@ -15,7 +15,7 @@ pub const WORKFLOW_LEASE_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_NODE_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_CLEANUP_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const WORKFLOW_REDUCTION_RECEIPT_SCHEMA_VERSION: u16 = 1;
-pub const WORKFLOW_HOST_PREPARATION_SCHEMA_VERSION: u16 = 1;
+pub const WORKFLOW_HOST_PREPARATION_SCHEMA_VERSION: u16 = 2;
 pub const WORKFLOW_OPERATION_STATE_SCHEMA_VERSION: u16 = 1;
 
 const MAX_WORKFLOW_NODES: usize = 64;
@@ -383,6 +383,11 @@ pub struct WorkflowHostPreparationPolicyV1 {
     pub schema_version: u16,
     pub adapter_id: WorkflowHostPreparationAdapterV1,
     pub platform: String,
+    pub cpu_baseline: String,
+    pub abi: String,
+    pub toolchain_root: String,
+    pub toolchain_interface: String,
+    pub build_environment: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oci_bases: Vec<WorkflowOciBaseInputV1>,
 }
@@ -391,6 +396,18 @@ impl WorkflowHostPreparationPolicyV1 {
     pub fn validate(&self) -> Result<(), WorkflowContractError> {
         if self.schema_version != WORKFLOW_HOST_PREPARATION_SCHEMA_VERSION
             || !valid_workflow_token(&self.platform, 64)
+            || !valid_workflow_token(&self.cpu_baseline, 64)
+            || !valid_workflow_token(&self.abi, 64)
+            || !valid_workflow_token(&self.toolchain_root, 128)
+            || !valid_workflow_token(&self.toolchain_interface, 128)
+            || self.build_environment.len() > 32
+            || self.build_environment.iter().any(|(name, value)| {
+                !valid_build_environment_name(name)
+                    || reserved_build_environment_name(name)
+                    || value.is_empty()
+                    || value.len() > 4_096
+                    || value.contains('\0')
+            })
             || self.oci_bases.len() > 16
             || !self.oci_bases.windows(2).all(|pair| pair[0] < pair[1])
             || self.oci_bases.iter().any(|base| base.validate().is_err())
@@ -429,6 +446,30 @@ impl WorkflowHostPreparationPolicyV1 {
             WorkflowHostPreparationAdapterV1::SourceTreeV1 => WorkflowNetworkClassV1::Offline,
         }
     }
+}
+
+fn valid_build_environment_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && value.as_bytes()[0].is_ascii_uppercase()
+}
+
+fn reserved_build_environment_name(value: &str) -> bool {
+    matches!(
+        value,
+        "PATH"
+            | "HOME"
+            | "TMPDIR"
+            | "CARGO_HOME"
+            | "CARGO_TARGET_DIR"
+            | "CCACHE_DIR"
+            | "CCACHE_TEMPDIR"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+    ) || value.starts_with("RDASHBOARD_")
 }
 
 #[derive(
@@ -1253,9 +1294,14 @@ impl WorkflowLeaseV1 {
             || !profile_matches_kind(&profile, self.node_kind)
             || profile.validate().is_err()
             || self.host_preparation.as_ref().is_some_and(|policy| {
-                self.node_kind != WorkflowNodeKindV1::HostPrepare
-                    || policy.validate().is_err()
-                    || self.network_class != policy.required_network_class()
+                !matches!(
+                    self.node_kind,
+                    WorkflowNodeKindV1::HostPrepare
+                        | WorkflowNodeKindV1::Verification
+                        | WorkflowNodeKindV1::ReleaseBuild
+                ) || policy.validate().is_err()
+                    || self.node_kind == WorkflowNodeKindV1::HostPrepare
+                        && self.network_class != policy.required_network_class()
             })
             || self.operation_state.as_ref().is_some_and(|state| {
                 !matches!(

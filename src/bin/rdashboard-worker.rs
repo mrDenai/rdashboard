@@ -6,6 +6,7 @@ use rdashboard::{
     domain::WorkflowWorkerPoolV1,
     preparation::{PREPARATION_STORE_ROOT, PreparationStore},
     scheduler::WorkflowWorkerRegistrationV1,
+    titanium::{TITANIUM_REGISTRY_ROOT, TitaniumRegistryV1},
     worker_socket::WorkflowWorkerClientV1,
     workflow_launcher_socket::WorkflowLauncherClientV1,
     workflow_worker::{
@@ -57,9 +58,11 @@ async fn main() -> Result<(), DynError> {
     let source_reader =
         SourceArchiveReaderV1::open(BUILD_SOURCE_EXPORT_ROOT, source_uid, build_reader_gid)?;
     let preparation_store = PreparationStore::open_for_owner(PREPARATION_STORE_ROOT, worker_uid)?;
+    let titanium_registry = TitaniumRegistryV1::open_existing(TITANIUM_REGISTRY_ROOT, 0)?;
     let preparer = Arc::new(WorkflowHostPreparerV1::new(
         preparation_store,
         source_reader,
+        titanium_registry,
     ));
     let mut runtime = WorkflowWorkerRuntimeV1::new(
         registration.clone(),
@@ -81,6 +84,7 @@ async fn main() -> Result<(), DynError> {
         slots,
         dependency_fetcher_configured = dependency_fetcher_uid.is_some(),
         preparation_root = PREPARATION_STORE_ROOT,
+        titanium_root = TITANIUM_REGISTRY_ROOT,
         "generic workflow worker started"
     );
     runtime.run_until(shutdown).await?;

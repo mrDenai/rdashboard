@@ -334,9 +334,19 @@
     ]
   },
   "host_preparation": {
-    "schema_version": 1,
+    "schema_version": 2,
     "adapter_id": "cargo_crates_io_v1",
-    "platform": "linux-x86_64"
+    "platform": "linux-x86_64",
+    "cpu_baseline": "znver3",
+    "abi": "gnu",
+    "toolchain_root": "rust-1.96.1-znver3-linux-x86_64-gnu-v1",
+    "toolchain_interface": "rust-v1",
+    "build_environment": {
+      "CFLAGS": "-march=znver3 -O3 -fno-plt -fstack-clash-protection",
+      "CXXFLAGS": "-march=znver3 -O3 -fno-plt -fstack-clash-protection",
+      "RUSTFLAGS": "-C target-cpu=znver3 -C link-arg=-fuse-ld=lld",
+      "TITANIUM_CPU_FLAGS": "-march=znver3 -O3 -fno-plt -fstack-clash-protection"
+    }
   },
   "health_checks": [
     {

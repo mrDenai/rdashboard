@@ -25,8 +25,8 @@ const MAX_CRATE_VERSION_BYTES: usize = 128;
 const MAX_CRATE_PATH_BYTES: usize = 4_096;
 const CRATES_IO_GIT_INDEX: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SPARSE_INDEX: &str = "registry+https://index.crates.io/";
-const DEPENDENCY_MANIFEST_PURPOSE: &str = "rdashboard.cargo-crates-io-dependency.v1";
-const DEPENDENCY_MANIFEST_SCHEMA_VERSION: u16 = 1;
+const DEPENDENCY_MANIFEST_PURPOSE: &str = "rdashboard.cargo-crates-io-dependency.v2";
+const DEPENDENCY_MANIFEST_SCHEMA_VERSION: u16 = 2;
 const PACKAGE_PLAN_PURPOSE: &str = "rdashboard.cargo-crates-io-package-plan.v1";
 const CARGO_VENDOR_LAYOUT_ID: &str = "rdashboard.cargo-crates-io-vendor-layout.v1";
 const CHECKSUM_FILE: &str = ".cargo-checksum.json";
@@ -154,7 +154,7 @@ fn package_plan_digest(
     Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
         &PackagePlanPayload {
             purpose: PACKAGE_PLAN_PURPOSE,
-            schema_version: 1,
+            schema_version: DEPENDENCY_MANIFEST_SCHEMA_VERSION,
             packages,
         },
     )?))
@@ -171,7 +171,6 @@ pub struct CargoDependencyManifestV1 {
     schema_version: u16,
     pub lockfile_digest: EvidenceDigest,
     pub package_plan_digest: EvidenceDigest,
-    pub workflow_policy_digest: EvidenceDigest,
     pub vendor_layout_digest: EvidenceDigest,
     pub package_count: u32,
     document_digest: EvidenceDigest,
@@ -183,16 +182,12 @@ struct CargoDependencyManifestPayload<'a> {
     schema_version: u16,
     lockfile_digest: &'a EvidenceDigest,
     package_plan_digest: &'a EvidenceDigest,
-    workflow_policy_digest: &'a EvidenceDigest,
     vendor_layout_digest: &'a EvidenceDigest,
     package_count: u32,
 }
 
 impl CargoDependencyManifestV1 {
-    pub fn new(
-        plan: &CargoLockPlanV1,
-        workflow_policy_digest: EvidenceDigest,
-    ) -> Result<Self, CargoPrefetchError> {
+    pub fn new(plan: &CargoLockPlanV1) -> Result<Self, CargoPrefetchError> {
         let package_count = u32::try_from(plan.packages.len())
             .map_err(|_| CargoPrefetchError::TooManyRegistryPackages)?;
         let mut manifest = Self {
@@ -200,7 +195,6 @@ impl CargoDependencyManifestV1 {
             schema_version: DEPENDENCY_MANIFEST_SCHEMA_VERSION,
             lockfile_digest: plan.lockfile_digest.clone(),
             package_plan_digest: plan.package_plan_digest.clone(),
-            workflow_policy_digest,
             vendor_layout_digest: cargo_vendor_layout_digest(),
             package_count,
             document_digest: EvidenceDigest::sha256([]),
@@ -231,7 +225,6 @@ impl CargoDependencyManifestV1 {
                 schema_version: DEPENDENCY_MANIFEST_SCHEMA_VERSION,
                 lockfile_digest: &self.lockfile_digest,
                 package_plan_digest: &self.package_plan_digest,
-                workflow_policy_digest: &self.workflow_policy_digest,
                 vendor_layout_digest: &self.vendor_layout_digest,
                 package_count: self.package_count,
             },
@@ -257,7 +250,6 @@ impl CargoDependencyManifestV1 {
 pub fn materialize_cargo_dependency<F, E>(
     payload_root: &Path,
     plan: &CargoLockPlanV1,
-    workflow_policy_digest: EvidenceDigest,
     maximum_payload_bytes: u64,
     maximum_payload_inodes: u64,
     fetch: F,
@@ -269,7 +261,6 @@ where
     materialize_cargo_dependency_cancellable(
         payload_root,
         plan,
-        workflow_policy_digest,
         maximum_payload_bytes,
         maximum_payload_inodes,
         fetch,
@@ -280,7 +271,6 @@ where
 pub fn materialize_cargo_dependency_cancellable<F, E, C>(
     payload_root: &Path,
     plan: &CargoLockPlanV1,
-    workflow_policy_digest: EvidenceDigest,
     maximum_payload_bytes: u64,
     maximum_payload_inodes: u64,
     mut fetch: F,
@@ -295,7 +285,7 @@ where
         return Err(CargoPrefetchError::DependencyPayloadTooLarge);
     }
     ensure_not_cancelled(&mut cancelled)?;
-    let manifest = CargoDependencyManifestV1::new(plan, workflow_policy_digest)?;
+    let manifest = CargoDependencyManifestV1::new(plan)?;
     let manifest_bytes = manifest.canonical_bytes()?;
     let mut budget = PayloadBudget::new(maximum_payload_bytes, maximum_payload_inodes);
     budget.consume(
@@ -1105,14 +1095,9 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         let plan = CargoLockPlanV1::parse(lock.as_bytes()).expect("lock plan");
         let directory = TempDir::new().expect("temporary directory");
-        materialize_cargo_dependency(
-            directory.path(),
-            &plan,
-            EvidenceDigest::sha256("workflow policy"),
-            1024 * 1024,
-            100,
-            |_| Ok::<_, io::Error>(archive.clone()),
-        )
+        materialize_cargo_dependency(directory.path(), &plan, 1024 * 1024, 100, |_| {
+            Ok::<_, io::Error>(archive.clone())
+        })
         .expect("materialize dependency");
         let crate_root = directory.path().join("vendor/demo-crate-1.2.3");
         assert_eq!(
@@ -1157,14 +1142,9 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         let directory = TempDir::new().expect("temporary directory");
         let dependency = directory.path().join("dependency");
         fs::create_dir(&dependency).expect("create dependency root");
-        materialize_cargo_dependency(
-            &dependency,
-            &plan,
-            EvidenceDigest::sha256("workflow policy"),
-            1024 * 1024,
-            100,
-            |_| Ok::<_, io::Error>(archive.clone()),
-        )
+        materialize_cargo_dependency(&dependency, &plan, 1024 * 1024, 100, |_| {
+            Ok::<_, io::Error>(archive.clone())
+        })
         .expect("materialize dependency");
 
         let workspace = directory.path().join("workspace");
@@ -1230,7 +1210,6 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             materialize_cargo_dependency(
                 directory.path(),
                 &plan,
-                EvidenceDigest::sha256("policy"),
                 1024,
                 100,
                 |_| Ok::<_, io::Error>(archive.clone())
@@ -1246,14 +1225,9 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         };
         let directory = TempDir::new().expect("temporary directory");
         assert!(matches!(
-            materialize_cargo_dependency(
-                directory.path(),
-                &plan,
-                EvidenceDigest::sha256("policy"),
-                4,
-                100,
-                |_| Ok::<_, io::Error>(archive.clone())
-            ),
+            materialize_cargo_dependency(directory.path(), &plan, 4, 100, |_| Ok::<_, io::Error>(
+                archive.clone()
+            )),
             Err(CargoPrefetchError::DependencyPayloadTooLarge)
         ));
     }
@@ -1285,14 +1259,12 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         };
         let directory = TempDir::new().expect("temporary directory");
         assert!(matches!(
-            materialize_cargo_dependency(
-                directory.path(),
-                &plan,
-                EvidenceDigest::sha256("policy"),
-                1024 * 1024,
-                100,
-                |_| Ok::<_, io::Error>(archive.clone())
-            ),
+            materialize_cargo_dependency(directory.path(), &plan, 1024 * 1024, 100, |_| Ok::<
+                _,
+                io::Error,
+            >(
+                archive.clone()
+            )),
             Err(CargoPrefetchError::InvalidCratePath)
         ));
     }
@@ -1320,7 +1292,6 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             materialize_cargo_dependency(
                 directory.path(),
                 &plan,
-                EvidenceDigest::sha256("policy"),
                 64 * 1024,
                 16,
                 |_| Ok::<_, io::Error>(archive.clone())
@@ -1355,7 +1326,6 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             materialize_cargo_dependency_cancellable(
                 directory.path(),
                 &plan,
-                EvidenceDigest::sha256("policy"),
                 1024 * 1024,
                 100,
                 |_| Ok::<_, io::Error>(archive.clone()),

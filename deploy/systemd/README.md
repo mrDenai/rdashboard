@@ -188,7 +188,9 @@ gateway with one stable worker/host identity, runs up to the configured number o
 never creates a repository-specific service, checkout or dependency cache. A `host_prepare` lease
 copies the exact attested source archive into the shared content-addressed store once; matching leases
 join the same publication. Each `PreparedRun` has one canonical composition document binding its
-source, dependency, installed workflow policy and versioned generated-input layout. Verification pins
+source, content-derived dependency snapshot, exact Titanium toolchain artifact and versioned
+generated-input layout. The signed lease/grant authorizes that immutable composition separately; a
+policy rotation therefore does not copy identical source or dependency bytes. Verification pins
 that sealed composition and transitively protects both referenced snapshots from eviction, asks the
 root launcher to run only the installed fixed adapter, then cleans the transient unit and releases the
 pin before committing the terminal receipt. Restart cleanup obligations are served before new work by
@@ -226,7 +228,197 @@ Preparation CAS, operation state, BuildKit state and OCI results use owned child
 same domain; the shared root is mode `0711` so services can traverse only to an explicitly permitted
 child without listing or reading sibling stores. Projects share immutable toolchains and
 content-addressed dependencies instead of keeping private copies. Do not create a separate filesystem
-per service, project or cache. The preparation CAS itself refuses more than 6 GiB or 100,000 inodes,
+per service, project or cache.
+
+### Titanium registry and native release contract
+
+`/var/lib/rdashboard-build/titanium` is the single logical registry for Rust, Ruby, native libraries
+and future build ecosystems. Projects do not own a `.titanium` cache and do not select tools by a
+mutable host path. The on-disk layers are:
+
+```text
+/var/lib/rdashboard-build/titanium/
+  trees/<content-digest>/{manifest.jcs,payload/}
+  artifacts/<artifact-digest>.jcs
+  actions/<compatibility-key>.jcs
+  roots/
+    installed-artifact/<logical-name>.jcs
+    installed-toolchain/<logical-name>.jcs
+    candidate-release/<artifact-digest>.jcs
+    current-release/<project>.jcs
+    last-known-good-release/<project>.jcs
+    active-operation/<operation>.jcs
+    publication-recovery/<publication>.jcs
+    warm-action/<recipe-and-target>.jcs
+  staging/
+  registry.lock
+```
+
+`trees` deduplicates identical bytes globally. An `artifact` gives one tree a typed purpose, target,
+provenance, acquisition class and dependency closure; therefore the same bytes can be trusted for two
+different purposes without being copied or conflating their provenance. An `action` maps the complete
+compatibility input (recipe, source and dependency artifacts, compiler/linker/sysroot artifacts,
+target, CPU/ABI, normalized environment and output contract) to one output artifact. Project ID,
+attempt ID, workflow-policy version, clock time and scratch path are deliberately absent from that
+key. The signed workflow lease/grant separately authorizes whether a project may consume the action.
+
+Acquisition class is installed policy, never a filename guess. A build-only tool that cannot affect
+runtime performance may enter as `verified_upstream_prebuilt` after checksum and provenance
+verification. A compiler, linker, native runtime library or other performance-sensitive component
+enters as `controlled_source_build`. Both are immutable after publication and are reused only through
+their exact artifact digest. `installed-artifact` roots name reusable build/runtime components;
+`installed-toolchain` roots name complete language build environments. These names are immutable
+version identifiers rather than pointers: a later upgrade publishes a new name and then updates the
+project catalog. An in-flight preparation records the exact resolved artifact digest, so that catalog
+change cannot change or poison an existing action.
+
+Downloaded dependency bytes are not keyed by the compiler version. An unchanged lockfile and
+dependency layout therefore remain reusable after a Rust or Ruby upgrade; the `PreparedRun` and
+subsequent build action bind the new compiler artifact without downloading or copying those
+dependencies again.
+
+Publication copies into `staging`, verifies the complete portable tree manifest, promotes the object
+atomically and only then exposes an artifact/action document. A crash before the final seal leaves no
+readable valid object; retry removes only the invalid exact digest path and republishes it. GC walks
+all explicit roots through action inputs/outputs and artifact dependencies, then removes unreachable
+actions, artifacts and byte trees. Current, last-known-good, active-operation, recovery and installed
+toolchain closures therefore remain runnable regardless of age. Size/age thresholds decide when GC
+runs, not what it is safe to delete.
+
+Every `host_preparation` manifest names a versioned `toolchain_root`, exact interface, target, CPU
+baseline, ABI and normalized build environment. Before a production workflow can prepare that
+project, the root must exist, contain exactly one `compiler_toolchain` artifact and match the declared
+target/interface. CPU, ABI and environment become action inputs; values such as `native`, mutable
+compiler channels and inherited shell flags are not accepted as compatibility identities. The generic
+worker opens the registry read-only and fails closed on a missing, corrupt, wrong-kind or wrong-target
+closure. This is intentional: falling back to `/usr/bin` or a mutable `stable` compiler would make
+action-cache hits untrustworthy.
+
+One toolchain may reference named components without copying them. Its main payload contains the
+compiler/package-manager executables and empty mount points; `.titanium-toolchain.jcs` binds every
+mount name to an exact `build_tool`, `runtime_library` or `runtime_support` artifact. Before
+`systemd-run`, the root launcher verifies that complete closure, creates an `active-operation` root,
+bind-mounts the main payload at `/toolchain`, then mounts each exact component at its declared child
+path. For example, rimg can consume one shared Rust compiler at `/toolchain/bin` and one shared native
+library artifact at `/toolchain/rimg-native` without embedding either in the other. The fixed job sees
+only that composed view; it never sees the mutable import area or every installed toolchain. Cleanup
+removes the active root only after the transient unit and operation state are settled, so GC cannot
+remove any component while it is executing.
+
+The root-only `rdashboard-titanium` utility supplies the bounded bootstrap/maintenance surface. It
+imports only one direct child of `/var/lib/rdashboard-build/imports`, publishes and revalidates the
+tree, and creates an immutable typed installed root; callers cannot select another registry or an
+arbitrary source path. An installed root name is a version identifier, not a mutable channel: replay
+with the same bytes is idempotent, while different bytes under the same name are rejected. Upgrading
+therefore creates a new root name and changes the project catalog only after the new closure has been
+inspected. `/var/lib/rdashboard-build/imports` is a transient admission inbox, not a cache. Its parent
+is root-owned mode `0711`, and each admitted direct child must be a sealed root-owned mode-`0555`
+directory. Remove that child only after the resulting artifact/root has been inspected. For example,
+after a controlled toolchain build has produced the sealed
+`rust-1.96.1-znver3-linux-x86_64-gnu-v1` directory:
+
+```sh
+rdashboard-titanium import-toolchain \
+  rust-1.96.1-znver3-linux-x86_64-gnu-v1 linux-x86_64 controlled-source-build \
+  <provenance-sha256> rust-1.96.1-znver3-linux-x86_64-gnu-v1
+rdashboard-titanium inspect-toolchain \
+  rust-1.96.1-znver3-linux-x86_64-gnu-v1 linux-x86_64 rust-v1
+rdashboard-titanium gc
+```
+
+Additional strictly sorted dependency digests after the source name bind named toolchain components declared
+inside `.titanium-toolchain.jcs`. `import-artifact` admits reviewed `build-tool`, `runtime-library` or
+`runtime-support` trees under the same immutable-name rule. `import-release` creates a
+`candidate-release/<artifact-digest>` GC root and is a bounded
+bootstrap/recovery command for an already verified release tree; normal workflow publication uses
+the registry `publish_candidate_release_action` API so the recipe, external source content digests,
+typed dependency-snapshot artifacts, exact toolchain artifacts and verification provenance are
+recorded with the release rather than treating a manual import as a cache hit. If an admitted release
+will not be activated, run `rdashboard-titanium discard-release <artifact-digest>` before GC. Discard
+is rejected while that candidate has an active publication-recovery root.
+
+Use `verified-upstream-prebuilt` only when installed policy has classified the component as
+build-only and its upstream checksum/provenance has been independently verified. Importing a path is
+not itself permission to classify it. `gc` is safe only because the import creates the installed root
+in the same locked transaction sequence before any unreferenced sweep can run.
+
+The imported main toolchain payload is an environment root: selected executables live under `bin/`.
+Its canonical `.titanium-toolchain.jcs` declares the versioned interface, target, sorted required
+executables and sorted component mounts; import rejects a missing executable, a non-empty mount point,
+a wrong-kind component or a dependency closure that differs from the descriptor. Project manifests
+request that exact interface (the current Rust catalog uses `rust-v1`). Populate and inspect every
+`toolchain_root` referenced by the installed catalog before starting the worker or launcher; there is
+deliberately no host-tool fallback.
+
+Managed native releases use two coordinated immutable closures rather than a Docker image. A release
+tree contains project-owned files and `.titanium-release.jcs`; that descriptor binds the project,
+target, interface, entrypoint, runtime contract and named exact runtime artifacts. Activation creates
+an immutable view without copying bytes:
+
+```text
+/var/lib/rdashboard-managed/<project>/
+  views/<release-artifact-digest>/
+    release -> /var/lib/rdashboard-build/titanium/trees/<release-tree>/payload
+    runtime/<mount> -> /var/lib/rdashboard-build/titanium/trees/<runtime-tree>/payload
+  current -> views/<release-artifact-digest>
+  activation.lock
+  activation.jcs                 # present only while activation/recovery is unfinished
+```
+
+The installed service always executes
+`/var/lib/rdashboard-managed/<project>/current/release/<entrypoint>` and refers to shared libraries or
+support data through stable absolute `current/runtime/<mount>/...` paths. A dynamically linked binary
+must bind that installed path in its policy-pinned runtime contract (for example through its reviewed
+RPATH); `$ORIGIN` must not assume that executing through the `release` symlink changes the CAS
+location reported by the loader. The view changes, but the referenced CAS objects never do. A first
+deployment or upgrade performs this exact sequence under one project lock: validate the release
+closure and fixed systemd-unit hash; create the candidate and publication-recovery roots; persist the
+activation journal; materialize/verify the candidate view; atomically switch `current`; restart;
+prove the loopback health contract; atomically advance registry `current-release` and
+`last-known-good-release`; durably remove the activation journal; then remove candidate and recovery
+roots in replay-safe order. A failed candidate restores the
+previous view, restarts and proves it before reporting rollback. Every phase is replayable after a
+crash; boot recovery also finishes the narrow journal-removed/root-finalization window, and a
+divergent link/root state fails closed. If even the last-known-good view fails its health contract,
+the durable journal is intentionally retained and further activations stay blocked: discarding that
+evidence automatically would turn an unknown production state into an unaudited release decision.
+The failed recovery unit is the operator-visible alert until the service or host dependency is
+repaired and `recover` succeeds.
+
+Run `rdashboard-native-release collect-installed-views` before `rdashboard-titanium gc`. The first
+command removes only view directories not named by current/LKG roots and refuses an unfinished
+activation; the second then marks complete artifact/action dependency closures from every registry
+root and sweeps unreachable CAS objects. Release count and current byte sizes are therefore operating
+policy, not path structure or cache identity.
+
+Install and enable `rdashboard-native-release-recovery.service`; it requires the persistent
+`rdashboard-bootstrap.service`, so the atomic current self-release exists before recovery starts.
+Make each managed service declare
+`Requires=rdashboard-native-release-recovery.service` and
+`After=rdashboard-native-release-recovery.service`. Initialization, activation and recovery verify
+the resolved systemd `Requires` and `After` sets as well as the exact unit-file digest, so a service
+cannot silently bypass boot recovery. The managed service itself must also be enabled;
+this is what makes it return after a host reboot. Generate a canonical root-owned policy, initialize
+its state once, and activate only an exact release artifact:
+
+```sh
+rdashboard-native-release render-policy \
+  rimg linux-x86_64 native-service-v1 bin/rimg \
+  <runtime-contract-sha256> <installed-rimg.service-sha256> \
+  http://127.0.0.1:8080/health/ready 204 30000
+rdashboard-native-release initialize rimg
+rdashboard-native-release activate rimg <release-artifact-sha256>
+```
+
+Store the rendered canonical document at `/etc/rdashboard/native-runtimes/rimg.jcs`, owned by root
+and mode `0644`, before `initialize`. `recover-installed` is the boot-time command and touches only
+projects already initialized under `/var/lib/rdashboard-managed`. `rimg` and `telegram-gateway` remain
+on their existing catalog entries until their workflow release producers emit the complete descriptor
+and action provenance; changing JSON first would describe a build result the controller cannot yet
+publish. The native activation mechanism itself no longer depends on Docker, BuildKit, an image
+registry, Kamal or GitHub Actions.
+
+The preparation CAS itself refuses more than 6 GiB or 100,000 inodes,
 and every operation contract limits accounted target/cache data to at most 6 GiB/500,000 inodes.
 
 The worker and launcher refuse startup unless their fixed child directory remains on the same backing
@@ -568,7 +760,10 @@ a source-owned, reader-group mode-`0440` tar plus canonical manifest below
 `/var/lib/rdashboard-build/source-exports/<project>`. The manifest binds the exact head, sequence,
 source attestation, repository and installed policy to archive size and SHA-256. Symlinks, hard links,
 special Git entries and `.gitattributes` archive rewriting are rejected; the build identity never
-sees the private repository. Accepted deployable heads enter a bounded signed outbox atomically. The
+sees the private repository. The immutable tar is keyed only by head and source sequence, while each
+refreshed source attestation gets its own small digest-keyed manifest that reuses those exact tar
+bytes; readers also accept the original unversioned manifest name during migration. Accepted
+deployable heads enter a bounded signed outbox atomically. The
 dispatcher polls locally at 250 ms, retries lost acknowledgements with the same scheduler identity
 and acknowledges only after scheduler admission is durable. A newer head supersedes older pending
 delivery, while periodic reconciliation refreshes an expired current-head attestation.

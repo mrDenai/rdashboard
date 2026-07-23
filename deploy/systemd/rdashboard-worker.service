@@ -27,6 +27,7 @@ ProtectProc=invisible
 ProcSubset=pid
 ProtectSystem=strict
 ReadOnlyPaths=/var/lib/rdashboard-build/source-exports
+ReadOnlyPaths=/var/lib/rdashboard-build/titanium
 ReadWritePaths=/var/lib/rdashboard-build/preparation
 InaccessiblePaths=-/etc/rdashboard/credentials -/run/rdashboard -/run/rdashboard-source-ingress -/run/rdashboard-source-delivery -/run/docker.sock -/var/run/docker.sock -/run/containerd -/run/podman/podman.sock
 RestrictAddressFamilies=AF_UNIX

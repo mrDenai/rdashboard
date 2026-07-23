@@ -1345,7 +1345,12 @@ fn claim_next_transaction(
             candidate.preparation_key.clone(),
             candidate.node,
             candidate.profile,
-            if candidate.node.kind == WorkflowNodeKindV1::HostPrepare {
+            if matches!(
+                candidate.node.kind,
+                WorkflowNodeKindV1::HostPrepare
+                    | WorkflowNodeKindV1::Verification
+                    | WorkflowNodeKindV1::ReleaseBuild
+            ) {
                 candidate.manifest.host_preparation.clone()
             } else {
                 None

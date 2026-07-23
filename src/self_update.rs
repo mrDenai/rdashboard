@@ -47,11 +47,13 @@ pub const VERSIONED_SELF_RELEASE_BINARIES: &[&str] = &[
     "rdashboard-adapter-receipt",
     "rdashboard-dependency-fetcher",
     "rdashboard-executor",
+    "rdashboard-native-release",
     "rdashboard-observer",
     "rdashboard-rimg-health-proxy",
     "rdashboard-source",
     "rdashboard-source-dispatcher",
     "rdashboard-source-ingress",
+    "rdashboard-titanium",
     "rdashboard-worker",
     "rdashboard-workflow-gateway",
     "rdashboard-workflow-job",
@@ -3046,6 +3048,10 @@ mod tests {
     fn every_versioned_service_executes_from_the_atomic_current_slot() {
         let services = [
             (
+                "rdashboard-native-release",
+                include_str!("../deploy/systemd/rdashboard-native-release-recovery.service"),
+            ),
+            (
                 "rdashboard-dependency-fetcher",
                 include_str!("../deploy/systemd/rdashboard-dependency-fetcher.service"),
             ),
@@ -3096,7 +3102,11 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("ExecStart="))
                 .collect::<Vec<_>>();
-            assert_eq!(exec_starts, [expected.as_str()]);
+            assert_eq!(exec_starts.len(), 1);
+            assert_eq!(
+                exec_starts[0].split_ascii_whitespace().next(),
+                Some(expected.as_str())
+            );
             assert!(VERSIONED_SELF_RELEASE_BINARIES.contains(&binary));
         }
 
@@ -3119,5 +3129,13 @@ mod tests {
         assert!(!VERSIONED_SELF_RELEASE_BINARIES.contains(&"rdashboard-bootstrap"));
         assert!(!VERSIONED_SELF_RELEASE_BINARIES.contains(&"rdashboard-recovery"));
         assert!(!VERSIONED_SELF_RELEASE_BINARIES.contains(&"rdashboard-self-update-config"));
+        let native_recovery =
+            include_str!("../deploy/systemd/rdashboard-native-release-recovery.service");
+        assert!(native_recovery.contains("Requires=rdashboard-bootstrap.service"));
+        assert!(native_recovery.contains("After=local-fs.target rdashboard-bootstrap.service"));
+        assert!(
+            include_str!("../deploy/systemd/rdashboard-bootstrap.service")
+                .contains("Before=rdashboard-native-release-recovery.service ")
+        );
     }
 }

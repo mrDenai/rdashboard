@@ -337,6 +337,10 @@ fn supervisor_rejection(
         WorkflowLaunchSupervisorError::Launcher(WorkflowLauncherError::Preparation(_)) => {
             (WorkflowLauncherRejectionCodeV1::AuthorizationRejected, true)
         }
+        WorkflowLaunchSupervisorError::Launcher(WorkflowLauncherError::Titanium(_))
+        | WorkflowLaunchSupervisorError::Titanium(_) => {
+            (WorkflowLauncherRejectionCodeV1::RuntimeUnavailable, true)
+        }
         WorkflowLaunchSupervisorError::Launcher(_)
         | WorkflowLaunchSupervisorError::PolicyJournalMismatch
         | WorkflowLaunchSupervisorError::OperationStatePathMismatch => (

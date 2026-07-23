@@ -212,16 +212,25 @@ impl SourceArchiveReaderV1 {
                 .take(manifest_file.length)
                 .read_to_end(&mut bytes)?;
             let manifest = SourceArchiveManifestV1::decode_canonical(&bytes)?;
-            if manifest.project_id != *project_id
-                || name != format!("{}.jcs", archive_stem(&manifest.head, manifest.sequence))
+            let legacy_name = format!("{}.jcs", archive_stem(&manifest.head, manifest.sequence));
+            let versioned_name = format!(
+                "{}.jcs",
+                manifest_stem(
+                    &manifest.head,
+                    manifest.sequence,
+                    &manifest.source_attestation_digest,
+                )
+            );
+            if manifest.project_id != *project_id || (name != legacy_name && name != versioned_name)
             {
                 return Err(SourceArchiveError::UnexpectedPublication);
             }
             match latest.as_ref() {
                 Some((current, _)) if current.sequence > manifest.sequence => {}
-                Some((current, _)) if current.sequence == manifest.sequence => {
-                    return Err(SourceArchiveError::PublicationConflict);
-                }
+                Some((current, _))
+                    if current.sequence == manifest.sequence
+                        && (current.exported_at_ms, &current.document_digest)
+                            >= (manifest.exported_at_ms, &manifest.document_digest) => {}
                 _ => latest = Some((manifest, entry.path())),
             }
         }
@@ -234,6 +243,7 @@ impl SourceArchiveReaderV1 {
         project_id: &ProjectId,
         head: &GitCommitId,
         sequence: u64,
+        source_attestation_digest: &EvidenceDigest,
     ) -> Result<OpenedSourceArchiveV1, SourceArchiveError> {
         if sequence == 0 {
             return Err(SourceArchiveError::InvalidManifest);
@@ -241,7 +251,17 @@ impl SourceArchiveReaderV1 {
         self.validate_root()?;
         let project_root = self.root.join(project_id.as_str());
         validate_shared_directory(&project_root, self.source_uid, self.build_reader_gid, true)?;
-        let manifest_path = project_root.join(format!("{}.jcs", archive_stem(head, sequence)));
+        let versioned_manifest_path = project_root.join(format!(
+            "{}.jcs",
+            manifest_stem(head, sequence, source_attestation_digest)
+        ));
+        let manifest_path = match fs::symlink_metadata(&versioned_manifest_path) {
+            Ok(_) => versioned_manifest_path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                project_root.join(format!("{}.jcs", archive_stem(head, sequence)))
+            }
+            Err(error) => return Err(error.into()),
+        };
         let manifest_file = inspect_shared_file(
             &manifest_path,
             self.source_uid,
@@ -257,6 +277,7 @@ impl SourceArchiveReaderV1 {
         if manifest.project_id != *project_id
             || manifest.head != *head
             || manifest.sequence != sequence
+            || manifest.source_attestation_digest != *source_attestation_digest
         {
             return Err(SourceArchiveError::PublicationConflict);
         }
@@ -335,9 +356,14 @@ impl SourceArchivePublisherV1 {
         self.validate_root()?;
         validate_input(&input)?;
         let project_root = self.project_root(&input.project_id)?;
-        let stem = archive_stem(&input.head, input.sequence);
-        let archive_path = project_root.join(format!("{stem}.tar"));
-        let manifest_path = project_root.join(format!("{stem}.jcs"));
+        let archive_stem = archive_stem(&input.head, input.sequence);
+        let manifest_stem = manifest_stem(
+            &input.head,
+            input.sequence,
+            &input.source_attestation_digest,
+        );
+        let archive_path = project_root.join(format!("{archive_stem}.tar"));
+        let manifest_path = project_root.join(format!("{manifest_stem}.jcs"));
         if manifest_path.try_exists()? {
             return self.reopen_exact(&input, &archive_path, &manifest_path);
         }
@@ -350,12 +376,12 @@ impl SourceArchivePublisherV1 {
                 MAX_SOURCE_ARCHIVE_BYTES,
             )?
         } else {
-            self.write_archive(&project_root, &archive_path, &stem, write_archive)?
+            self.write_archive(&project_root, &archive_path, &archive_stem, write_archive)?
         };
         let archive_sha256 = hash_open_file(&archive_identity.file)?;
         let manifest =
             SourceArchiveManifestV1::new(input, archive_sha256, archive_identity.length)?;
-        Self::write_manifest(&project_root, &manifest_path, &stem, &manifest)?;
+        Self::write_manifest(&project_root, &manifest_path, &manifest_stem, &manifest)?;
         sync_directory(&project_root)?;
         self.reopen_exact_manifest(&archive_path, &manifest_path)
     }
@@ -516,6 +542,18 @@ fn archive_stem(head: &GitCommitId, sequence: u64) -> String {
     format!("{}-{sequence}", head.as_str())
 }
 
+fn manifest_stem(
+    head: &GitCommitId,
+    sequence: u64,
+    source_attestation_digest: &EvidenceDigest,
+) -> String {
+    format!(
+        "{}-{}",
+        archive_stem(head, sequence),
+        source_attestation_digest.as_str()
+    )
+}
+
 fn validate_shared_directory(
     path: &Path,
     owner_uid: u32,
@@ -664,16 +702,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn source_archive_handoff_is_atomic_replayable_and_reader_verified() {
+    fn handoff_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        SourceArchivePublisherV1,
+        SourceArchiveReaderV1,
+    ) {
         let directory = tempdir().expect("temp dir");
         let root = directory.path().join("source-exports");
         fs::create_dir(&root).expect("create source export root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o2750))
             .expect("set source export root mode");
-        let metadata = fs::metadata(&root).expect("source export root metadata");
-        let handoff_writer = SourceArchivePublisherV1::open(&root, metadata.uid(), metadata.gid())
+        let metadata = fs::metadata(&root).expect("source root metadata");
+        let publisher = SourceArchivePublisherV1::open(&root, metadata.uid(), metadata.gid())
             .expect("open source publisher");
+        let reader = SourceArchiveReaderV1::open(&root, metadata.uid(), metadata.gid())
+            .expect("open source reader");
+        (directory, root, publisher, reader)
+    }
+
+    #[test]
+    fn source_archive_handoff_versions_refreshed_attestations_without_copying_the_archive() {
+        let (_directory, root, handoff_writer, reader) = handoff_fixture();
         let expected = input(9);
         let manifest = handoff_writer
             .publish(expected.clone(), |archive| {
@@ -692,12 +742,33 @@ mod tests {
             .expect("replay source publication");
         assert_eq!(replayed, manifest);
 
-        let reader = SourceArchiveReaderV1::open(&root, metadata.uid(), metadata.gid())
-            .expect("open source reader");
+        let mut conflicting = expected.clone();
+        conflicting.repository_identity = EvidenceDigest::sha256("other repository");
+        assert!(matches!(
+            handoff_writer.publish(conflicting, |_| {
+                panic!("a conflicting replay rewrote the archive")
+            }),
+            Err(SourceArchiveError::PublicationConflict)
+        ));
+
+        let mut refreshed = expected.clone();
+        refreshed.source_attestation_digest = EvidenceDigest::sha256("refreshed attestation");
+        refreshed.exported_at_ms += 1;
+        let refreshed_manifest = handoff_writer
+            .publish(refreshed.clone(), |_| {
+                panic!("an attestation refresh rewrote the immutable archive")
+            })
+            .expect("publish refreshed attestation");
+        assert_eq!(refreshed_manifest.archive_sha256, manifest.archive_sha256);
+        assert_ne!(
+            refreshed_manifest.source_attestation_digest,
+            manifest.source_attestation_digest
+        );
+
         let mut opened = reader
             .latest(&expected.project_id)
             .expect("read latest source archive");
-        assert_eq!(opened.manifest, manifest);
+        assert_eq!(opened.manifest, refreshed_manifest);
         let mut bytes = Vec::new();
         opened
             .archive
@@ -705,9 +776,50 @@ mod tests {
             .expect("read source archive bytes");
         assert_eq!(bytes, b"exact tar bytes");
 
-        let manifest_path = root.join("rimg").join(format!(
+        let original = reader
+            .exact(
+                &expected.project_id,
+                &expected.head,
+                expected.sequence,
+                &expected.source_attestation_digest,
+            )
+            .expect("read original attestation");
+        assert_eq!(original.manifest, manifest);
+        let refreshed_opened = reader
+            .exact(
+                &refreshed.project_id,
+                &refreshed.head,
+                refreshed.sequence,
+                &refreshed.source_attestation_digest,
+            )
+            .expect("read refreshed attestation");
+        assert_eq!(refreshed_opened.manifest, refreshed_manifest);
+
+        let project_root = root.join("rimg");
+        let archive_count = fs::read_dir(&project_root)
+            .expect("read project handoff")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("tar")
+            })
+            .count();
+        let manifest_count = fs::read_dir(&project_root)
+            .expect("read project handoff")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("jcs")
+            })
+            .count();
+        assert_eq!(archive_count, 1);
+        assert_eq!(manifest_count, 2);
+
+        let manifest_path = project_root.join(format!(
             "{}.jcs",
-            archive_stem(&expected.head, expected.sequence)
+            manifest_stem(
+                &refreshed.head,
+                refreshed.sequence,
+                &refreshed.source_attestation_digest,
+            )
         ));
         fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o640))
             .expect("make manifest permissive");
@@ -715,5 +827,40 @@ mod tests {
             reader.latest(&expected.project_id),
             Err(SourceArchiveError::UntrustedFile)
         ));
+    }
+
+    #[test]
+    fn source_archive_reader_accepts_the_legacy_unversioned_manifest() {
+        let (_directory, root, publisher, reader) = handoff_fixture();
+        let expected = input(9);
+        let manifest = publisher
+            .publish(expected.clone(), |archive| {
+                archive.write_all(b"legacy source archive")
+            })
+            .expect("publish source archive");
+        let project_root = root.join("rimg");
+        let versioned = project_root.join(format!(
+            "{}.jcs",
+            manifest_stem(
+                &expected.head,
+                expected.sequence,
+                &expected.source_attestation_digest,
+            )
+        ));
+        let legacy = project_root.join(format!(
+            "{}.jcs",
+            archive_stem(&expected.head, expected.sequence)
+        ));
+        fs::rename(versioned, legacy).expect("simulate legacy manifest name");
+
+        let opened = reader
+            .exact(
+                &expected.project_id,
+                &expected.head,
+                expected.sequence,
+                &expected.source_attestation_digest,
+            )
+            .expect("read legacy source archive");
+        assert_eq!(opened.manifest, manifest);
     }
 }

@@ -42,6 +42,7 @@ use crate::{
         PreparationStoreError, PreparedEntryV1, PreparedRunCompositionV1,
     },
     scheduler::{WorkflowCleanupObligationV1, WorkflowWorkerRegistrationV1},
+    titanium::{TitaniumArtifactKindV1, TitaniumRegistryError, TitaniumRegistryV1},
     unix_time_ms,
     worker_socket::{
         WorkflowWorkerAssignmentV1, WorkflowWorkerClientError, WorkflowWorkerClientV1,
@@ -53,9 +54,9 @@ use crate::{
 
 const MAX_SOURCE_PATH_BYTES: usize = 4_096;
 const DEPENDENCY_MARKER_FILE: &str = "source-tree.jcs";
-const DEPENDENCY_MARKER_PURPOSE: &str = "rdashboard.source-tree-dependency.v1";
-const PREPARED_SOURCE_INPUT_PURPOSE: &str = "rdashboard.prepared-source-input.v1";
-const PREPARED_CARGO_INPUT_PURPOSE: &str = "rdashboard.prepared-cargo-input.v1";
+const DEPENDENCY_MARKER_PURPOSE: &str = "rdashboard.source-tree-dependency.v2";
+const PREPARED_SOURCE_INPUT_PURPOSE: &str = "rdashboard.prepared-source-input.v2";
+const PREPARED_CARGO_INPUT_PURPOSE: &str = "rdashboard.prepared-cargo-input.v2";
 const PREPARATION_EVIDENCE_PURPOSE: &str = "rdashboard.host-preparation-evidence.v1";
 const PREPARATION_CLEANUP_PURPOSE: &str = "rdashboard.host-preparation-cleanup.v1";
 const WORKER_FAILURE_PURPOSE: &str = "rdashboard.workflow-worker-failure.v1";
@@ -69,13 +70,37 @@ type HostPreparationTask =
 pub struct WorkflowHostPreparerV1 {
     store: PreparationStore,
     source_reader: SourceArchiveReaderV1,
+    toolchains: HostToolchainResolverV1,
+}
+
+#[derive(Clone)]
+enum HostToolchainResolverV1 {
+    Registry(TitaniumRegistryV1),
+    #[cfg(test)]
+    Fixed(EvidenceDigest),
 }
 
 impl WorkflowHostPreparerV1 {
-    pub const fn new(store: PreparationStore, source_reader: SourceArchiveReaderV1) -> Self {
+    pub const fn new(
+        store: PreparationStore,
+        source_reader: SourceArchiveReaderV1,
+        titanium_registry: TitaniumRegistryV1,
+    ) -> Self {
         Self {
             store,
             source_reader,
+            toolchains: HostToolchainResolverV1::Registry(titanium_registry),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(store: PreparationStore, source_reader: SourceArchiveReaderV1) -> Self {
+        Self {
+            store,
+            source_reader,
+            toolchains: HostToolchainResolverV1::Fixed(EvidenceDigest::sha256(
+                "rdashboard.test-toolchain-artifact.v1",
+            )),
         }
     }
 
@@ -94,15 +119,15 @@ impl WorkflowHostPreparerV1 {
             WorkflowHostPreparationAdapterV1::SourceTreeV1,
         )?;
         let dependency_material = PreparationKeyMaterialV1::DependencySnapshot {
-            toolchain_digest: EvidenceDigest::sha256("rdashboard.source-tree.no-toolchain.v1"),
+            dependency_layout_digest: EvidenceDigest::sha256(
+                "rdashboard.source-tree-dependency-layout.v1",
+            ),
             lockfile_digest: EvidenceDigest::sha256("rdashboard.source-tree.no-lockfile.v1"),
             platform: context.platform.clone(),
-            workflow_policy_digest: lease.workflow_policy_digest.clone(),
         };
         let marker = SourceTreeDependencyMarkerV1 {
             purpose: DEPENDENCY_MARKER_PURPOSE,
-            schema_version: 1,
-            host_preparation_policy_digest: context.policy_digest.clone(),
+            schema_version: 2,
         };
         let marker_bytes = serde_jcs::to_vec(&marker)?;
         let marker_length = u64::try_from(marker_bytes.len())
@@ -118,8 +143,7 @@ impl WorkflowHostPreparerV1 {
         let generated_input_digest =
             EvidenceDigest::sha256(serde_jcs::to_vec(&PreparedSourceInputV1 {
                 purpose: PREPARED_SOURCE_INPUT_PURPOSE,
-                schema_version: 1,
-                host_preparation_policy_digest: context.policy_digest.clone(),
+                schema_version: 2,
             })?);
         self.finish_prepared_run(lease, now_ms, context, &dependency, generated_input_digest)
     }
@@ -203,20 +227,16 @@ impl WorkflowHostPreparerV1 {
             return Err(WorkflowWorkerError::SourcePayloadTooLarge);
         }
         let oci_plan_digest = oci_base_plan_digest(&context.oci_bases)?;
-        let toolchain_digest = if let Some(oci_plan_digest) = &oci_plan_digest {
+        let dependency_layout_digest =
             EvidenceDigest::sha256(serde_jcs::to_vec(&DependencyLayoutV1 {
                 purpose: DEPENDENCY_LAYOUT_PURPOSE,
                 cargo_layout_digest: cargo_vendor_layout_digest(),
-                oci_plan_digest,
-            })?)
-        } else {
-            cargo_vendor_layout_digest()
-        };
+                oci_plan_digest: oci_plan_digest.as_ref(),
+            })?);
         let dependency_material = PreparationKeyMaterialV1::DependencySnapshot {
-            toolchain_digest,
+            dependency_layout_digest,
             lockfile_digest: plan.lockfile_digest().clone(),
             platform: context.platform.clone(),
-            workflow_policy_digest: lease.workflow_policy_digest.clone(),
         };
         let dependency = self.store.get_or_prepare_bounded_directory(
             &dependency_material,
@@ -227,7 +247,6 @@ impl WorkflowHostPreparerV1 {
                 materialize_cargo_dependency_cancellable(
                     payload,
                     &plan,
-                    context.policy_digest.clone(),
                     context.maximum_payload_bytes,
                     maximum_dependency_inodes,
                     |package| fetch_crate(package),
@@ -247,13 +266,30 @@ impl WorkflowHostPreparerV1 {
         let generated_input_digest =
             EvidenceDigest::sha256(serde_jcs::to_vec(&PreparedCargoInputV1 {
                 purpose: PREPARED_CARGO_INPUT_PURPOSE,
-                schema_version: 1,
-                host_preparation_policy_digest: context.policy_digest.clone(),
+                schema_version: 2,
                 lockfile_digest: plan.lockfile_digest().clone(),
                 package_plan_digest: plan.package_plan_digest().clone(),
                 oci_base_plan_digest: oci_plan_digest,
             })?);
         self.finish_prepared_run(lease, now_ms, context, &dependency, generated_input_digest)
+    }
+
+    fn toolchain_artifact_digest(
+        &self,
+        policy: &crate::domain::WorkflowHostPreparationPolicyV1,
+    ) -> Result<EvidenceDigest, WorkflowWorkerError> {
+        match &self.toolchains {
+            HostToolchainResolverV1::Registry(registry) => Ok(registry
+                .installed_artifact(
+                    &policy.toolchain_root,
+                    TitaniumArtifactKindV1::CompilerToolchain,
+                    &policy.platform,
+                    &policy.toolchain_interface,
+                )?
+                .artifact_digest),
+            #[cfg(test)]
+            HostToolchainResolverV1::Fixed(digest) => Ok(digest.clone()),
+        }
     }
 
     fn source_context(
@@ -309,13 +345,14 @@ impl WorkflowHostPreparerV1 {
             maximum_payload_bytes,
             maximum_payload_inodes,
         )?;
+        let toolchain_artifact_digest = self.toolchain_artifact_digest(policy)?;
         Ok(SourcePreparationContextV1 {
             source,
             source_archive,
             inventory,
             maximum_payload_bytes,
             maximum_payload_inodes,
-            policy_digest: policy.digest()?,
+            toolchain_artifact_digest,
             platform: policy.platform.clone(),
             oci_bases: policy.oci_bases.clone(),
             _source_pin: source_pin,
@@ -351,7 +388,7 @@ impl WorkflowHostPreparerV1 {
         let prepared_material = PreparationKeyMaterialV1::PreparedRun {
             source_snapshot_key: context.source.manifest.key.clone(),
             dependency_snapshot_key: dependency.manifest.key.clone(),
-            workflow_policy_digest: lease.workflow_policy_digest.clone(),
+            toolchain_artifact_digest: context.toolchain_artifact_digest.clone(),
             generated_input_digest,
         };
         let composition_bytes =
@@ -408,7 +445,7 @@ struct SourcePreparationContextV1 {
     inventory: SourceTarInventoryV1,
     maximum_payload_bytes: u64,
     maximum_payload_inodes: u64,
-    policy_digest: EvidenceDigest,
+    toolchain_artifact_digest: EvidenceDigest,
     platform: String,
     oci_bases: Vec<WorkflowOciBaseInputV1>,
     _source_pin: PreparationPinGuardV1,
@@ -453,21 +490,18 @@ impl WorkflowHostPreparationResultV1 {
 struct SourceTreeDependencyMarkerV1 {
     purpose: &'static str,
     schema_version: u16,
-    host_preparation_policy_digest: EvidenceDigest,
 }
 
 #[derive(Serialize)]
 struct PreparedSourceInputV1 {
     purpose: &'static str,
     schema_version: u16,
-    host_preparation_policy_digest: EvidenceDigest,
 }
 
 #[derive(Serialize)]
 struct PreparedCargoInputV1 {
     purpose: &'static str,
     schema_version: u16,
-    host_preparation_policy_digest: EvidenceDigest,
     lockfile_digest: EvidenceDigest,
     package_plan_digest: EvidenceDigest,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -480,7 +514,8 @@ const DEPENDENCY_LAYOUT_PURPOSE: &str = "rdashboard.cargo-and-oci-dependency-lay
 struct DependencyLayoutV1<'a> {
     purpose: &'static str,
     cargo_layout_digest: EvidenceDigest,
-    oci_plan_digest: &'a EvidenceDigest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oci_plan_digest: Option<&'a EvidenceDigest>,
 }
 
 #[derive(Serialize)]
@@ -1962,6 +1997,8 @@ pub enum WorkflowWorkerError {
     Workflow(#[from] crate::domain::WorkflowContractError),
     #[error("preparation store failed: {0}")]
     Preparation(#[from] PreparationStoreError),
+    #[error("Titanium registry failed: {0}")]
+    Titanium(#[from] TitaniumRegistryError),
     #[error("workflow gateway failed: {0}")]
     Gateway(#[from] WorkflowWorkerClientError),
     #[error("workflow launcher failed: {0}")]
@@ -1999,6 +2036,7 @@ impl WorkflowWorkerError {
             Self::WorkerStopping => "worker_stopping",
             Self::ClockUnavailable => "clock_unavailable",
             Self::Preparation(_) => "preparation_store_failed",
+            Self::Titanium(_) => "titanium_registry_failed",
             Self::Gateway(_) => "workflow_gateway_failed",
             Self::Launcher(_) => "workflow_launcher_failed",
             Self::Join(_) => "worker_task_failed",
@@ -2186,7 +2224,7 @@ mod tests {
         .expect("host preparation lease");
         PreparationFixture {
             directory,
-            preparer: WorkflowHostPreparerV1::new(store, source_reader),
+            preparer: WorkflowHostPreparerV1::new_for_test(store, source_reader),
             lease,
             cargo_archive,
         }
@@ -2800,10 +2838,6 @@ mod tests {
         assert_eq!(
             composition.dependency_snapshot_key,
             first.dependency_snapshot_key
-        );
-        assert_eq!(
-            composition.workflow_policy_digest,
-            fixture.lease.workflow_policy_digest
         );
         let prepared_source = prepared.payload_path().join(PREPARED_RUN_SOURCE_DIRECTORY);
         assert_eq!(

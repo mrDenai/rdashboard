@@ -60,6 +60,8 @@ pub mod kamal_adapter;
 pub mod metrics;
 #[cfg(unix)]
 pub mod mutation_admission;
+#[cfg(unix)]
+pub mod native_release;
 pub mod notification_delivery;
 pub mod notification_planner;
 pub mod notifications;
@@ -110,6 +112,8 @@ pub mod source_ingress_socket;
 #[cfg(unix)]
 pub mod source_socket;
 pub mod store;
+#[cfg(unix)]
+pub mod titanium;
 pub mod web;
 #[cfg(unix)]
 pub mod worker_socket;
