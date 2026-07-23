@@ -150,8 +150,10 @@ prune terminal tombstones back to the newest 512. A non-active partial operation
 consumer for one hour is failed and stripped on the next admission before capacity is checked, so a
 superseded attempt cannot pin a multi-gigabyte target indefinitely.
 
-Generate the native launcher addition and bootstrap policy as one digest-bound bundle with the stable
-`rdashboard-self-update-config`; never type their duplicated key, runtime or payload fields by hand.
+Generate the base launcher plus gateway/worker environments as one digest-bound workflow bootstrap
+bundle, then generate the native launcher addition and bootstrap policy as a second digest-bound
+bundle with the stable `rdashboard-self-update-config`; never type their duplicated identity, key,
+runtime or payload fields by hand.
 The same root-only tool initializes the first immutable slot from the exact fixed initial payload and
 publishes LKG before `current`, which removes the startup cycle created by moving the launcher itself
 below `current/bin`. The full inactive procedure and fixed paths are in `SELF_UPDATE.md`. Repository
@@ -262,11 +264,12 @@ target, CPU/ABI, normalized environment and output contract) to one output artif
 attempt ID, workflow-policy version, clock time and scratch path are deliberately absent from that
 key. The signed workflow lease/grant separately authorizes whether a project may consume the action.
 
-Acquisition class is installed policy, never a filename guess. A build-only tool that cannot affect
-runtime performance may enter as `verified_upstream_prebuilt` after checksum and provenance
-verification. A compiler, linker, native runtime library or other performance-sensitive component
-enters as `controlled_source_build`. Both are immutable after publication and are reused only through
-their exact artifact digest. `installed-artifact` roots name reusable build/runtime components;
+Acquisition class is installed policy, never a filename guess. A reviewed upstream compiler, linker
+or other build-only tool may enter as `verified_upstream_prebuilt` after its official checksum and
+provenance are verified; its exact artifact digest still participates in every action identity. A
+locally tuned compiler or linker, and every native runtime library whose produced bytes determine
+runtime performance or quality, enters as `controlled_source_build`. Both are immutable after
+publication and are reused only through their exact artifact digest. `installed-artifact` roots name reusable build/runtime components;
 `installed-toolchain` roots name complete language build environments. These names are immutable
 version identifiers rather than pointers: a later upgrade publishes a new name and then updates the
 project catalog. An in-flight preparation records the exact resolved artifact digest, so that catalog
@@ -313,14 +316,19 @@ with the same bytes is idempotent, while different bytes under the same name are
 therefore creates a new root name and changes the project catalog only after the new closure has been
 inspected. `/var/lib/rdashboard-build/imports` is a transient admission inbox, not a cache. Its parent
 is root-owned mode `0711`, and each admitted direct child must be a sealed root-owned mode-`0555`
-directory. Remove that child only after the resulting artifact/root has been inspected. For example,
-after a controlled toolchain build has produced the sealed
-`rust-1.96.1-znver3-linux-x86_64-gnu-v1` directory:
+directory. Remove that child only after the resulting artifact/root has been inspected. The fixed
+`deploy/titanium/bootstrap-rust-v1` command assembles the initial shared `rust-v1` closure once. It
+verifies the published SHA-256 values for the exact official Rust 1.96.1, Zig 0.16.0 and Node 22.22.2
+archives, imports Node and Zig as reusable build-tool components, creates the Rust toolchain
+descriptor with their exact artifact digests, imports the immutable toolchain and then removes only
+its three fixed admission-inbox directories. Zig supplies the pinned C/C++ compiler, archiver,
+linker and glibc 2.39 sysroot; Node is pinned for the JavaScript portion of `bin/ci`. Consequently
+`cc`, `ar`, `ranlib` or `node` cannot silently fall through to a mutable host package while the
+action key still claims the same toolchain. Run the command from the exact reviewed source checkout,
+then inspect the installed root:
 
 ```sh
-rdashboard-titanium import-toolchain \
-  rust-1.96.1-znver3-linux-x86_64-gnu-v1 linux-x86_64 controlled-source-build \
-  <provenance-sha256> rust-1.96.1-znver3-linux-x86_64-gnu-v1
+sudo deploy/titanium/bootstrap-rust-v1
 rdashboard-titanium inspect-toolchain \
   rust-1.96.1-znver3-linux-x86_64-gnu-v1 linux-x86_64 rust-v1
 rdashboard-titanium gc
@@ -348,7 +356,9 @@ executables and sorted component mounts; import rejects a missing executable, a 
 a wrong-kind component or a dependency closure that differs from the descriptor. Project manifests
 request that exact interface (the current Rust catalog uses `rust-v1`). Populate and inspect every
 `toolchain_root` referenced by the installed catalog before starting the worker or launcher; there is
-deliberately no host-tool fallback.
+deliberately no host-tool fallback for the Rust compiler, Cargo subcommands, C/C++ compilation,
+archive construction, linking or Node verification. The fixed `rust-v1` interface rejects a closure
+that omits any of those executable surfaces.
 
 Managed native releases use two coordinated immutable closures rather than a Docker image. A release
 tree contains project-owned files and `.titanium-release.jcs`; that descriptor binds the project,

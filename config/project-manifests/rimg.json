@@ -380,9 +380,14 @@
     "toolchain_root": "rust-1.96.1-znver3-linux-x86_64-gnu-v1",
     "toolchain_interface": "rust-v1",
     "build_environment": {
+      "AR": "/toolchain/bin/ar",
+      "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "/toolchain/bin/cc",
+      "CC": "/toolchain/bin/cc",
       "CFLAGS": "-march=znver3 -O3 -fno-plt -fstack-clash-protection",
+      "CXX": "/toolchain/bin/c++",
       "CXXFLAGS": "-march=znver3 -O3 -fno-plt -fstack-clash-protection",
-      "RUSTFLAGS": "-C target-cpu=znver3 -C link-arg=-fuse-ld=lld",
+      "RANLIB": "/toolchain/bin/ranlib",
+      "RUSTFLAGS": "-C target-cpu=znver3",
       "TITANIUM_CPU_FLAGS": "-march=znver3 -O3 -fno-plt -fstack-clash-protection"
     },
     "oci_bases": [

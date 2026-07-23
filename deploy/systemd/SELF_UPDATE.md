@@ -35,15 +35,29 @@ stable `rdashboard-self-update-config` binary below `/usr/libexec/rdashboard`, k
 canonical bundle from the canonical launcher policy before its native self-release adapter is enabled:
 
 ```text
+rdashboard-self-update-config build-workflow-bootstrap KEY_EPOCH WORKER_UID BUILD_UID BUILD_GID SOURCE_UID BUILD_READER_GID DEPENDENCY_FETCHER_UID DEPENDENCY_FETCH_GID
+rdashboard-self-update-config extract-base-launcher
+rdashboard-self-update-config render-workflow-gateway
+rdashboard-self-update-config render-workflow-worker
 rdashboard-self-update-config build-policies KEY_EPOCH SELF_RELEASE_READER_GID
 rdashboard-self-update-config extract-launcher
 rdashboard-self-update-config extract-self-update
 rdashboard-self-update-config render-environment
 ```
 
+`build-workflow-bootstrap` reads the separate fixed raw 32-byte
+`/etc/rdashboard/credentials/workflow-grant-seed` and emits one canonical digest-bound bundle. Its
+three extraction commands produce the base launcher JCS, gateway environment and worker environment
+from exactly the same UID/GID set and derived public key. Install neither an environment nor a policy
+from a different bundle. Treat the seed as immutable for a key epoch: replacing it requires a strictly
+higher `KEY_EPOCH`, installation of the new verification key before the gateway signs with it, and a
+bounded retirement window for the old key. Never reuse an epoch with different seed material. Feed the
+extracted base launcher into `build-policies`; that second command
+adds only the self-release adapter and its independently derived signing authority.
+
 `build-policies` reads the base launcher policy from bounded stdin and the seed only from the fixed
-credential path. The bundle binds the derived public key, compiled runtime contract, exact 15-binary
-payload, schema version, 128 MiB archive ceiling, 15-minute publication validity, reader GID and the
+credential path. The bundle binds the derived public key, compiled runtime contract, exact complete
+versioned binary payload, schema version, 128 MiB archive ceiling, 15-minute publication validity, reader GID and the
 complete augmented launcher policy. It refuses an already configured release authority instead of
 silently rotating it. The extract commands accept only that canonical digest-bound bundle and emit
 the exact launcher JCS, bootstrap JCS or `self-update.env` line for atomic root-owned installation.

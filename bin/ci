@@ -24,6 +24,10 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v1.json
 cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v2.json
+bash -n deploy/titanium/bootstrap-rust-v1
+for wrapper in deploy/titanium/wrappers/*; do
+  sh -n "$wrapper"
+done
 node --check web/app.js
 node --test tests/browser_status.test.js
 cargo build --workspace --all-targets --all-features --release --locked

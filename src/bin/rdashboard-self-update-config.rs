@@ -30,7 +30,10 @@ use rdashboard::{
         read_current_release, read_last_known_good_release,
     },
     unix_time_ms,
-    workflow_launcher::WorkflowLauncherPolicyV1,
+    workflow_launcher::{
+        WORKFLOW_LAUNCHER_POLICY_SCHEMA_VERSION, WorkflowLauncherPolicyV1,
+        WorkflowLauncherVerificationKeyConfigV1,
+    },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -38,6 +41,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 const SELF_UPDATE_POLICY_PATH: &str = "/etc/rdashboard/self-update-policy.jcs";
 const SELF_RELEASE_SEED_PATH: &str = SELF_RELEASE_BOOTSTRAP_SIGNING_CREDENTIAL_PATH;
+const WORKFLOW_GRANT_SEED_PATH: &str = "/etc/rdashboard/credentials/workflow-grant-seed";
 const INITIAL_RELEASE_PLAN_PATH: &str = "/etc/rdashboard/initial-self-release.jcs";
 const INITIAL_RELEASE_PAYLOAD_ROOT: &str = "/usr/libexec/rdashboard/initial-release";
 const INITIAL_RELEASE_WORK_ROOT: &str = "/var/lib/rdashboard-bootstrap/.initial-release-build";
@@ -53,6 +57,12 @@ const MAX_INITIAL_PLAN_BYTES: u64 = 64 * 1024;
 const INITIAL_RELEASE_OUTPUT_STEM: &str = "initial";
 const INITIAL_RELEASE_ARCHIVE_FILE: &str = "initial.tar";
 const INITIAL_RELEASE_DESCRIPTOR_FILE: &str = "initial.jcs";
+const WORKFLOW_BOOTSTRAP_PURPOSE: &str = "rdashboard.workflow-bootstrap-bundle.v1";
+const WORKFLOW_BOOTSTRAP_SCHEMA_VERSION: u16 = 1;
+const WORKER_ID: &str = "shared-vps-worker-1";
+const HOST_ID: &str = "production-vps";
+const GRANT_ISSUER: &str = "workflow-gateway";
+const LAUNCHER_AUDIENCE: &str = "workflow-launcher";
 
 fn main() {
     match run(&std::env::args().collect::<Vec<_>>()) {
@@ -91,6 +101,23 @@ fn run(arguments: &[String]) -> Result<Vec<u8>, ConfigError> {
             let bundle = SelfUpdatePolicyBundleV1::new(launcher, &seed, key_epoch, reader_gid)?;
             bundle.canonical_bytes()
         }
+        Command::BuildWorkflowBootstrap(input) => {
+            require_root()?;
+            let seed = read_root_seed(Path::new(WORKFLOW_GRANT_SEED_PATH))?;
+            WorkflowBootstrapBundleV1::new(input, &seed)?.canonical_bytes()
+        }
+        Command::ExtractBaseLauncher => {
+            let bundle = read_workflow_bootstrap_bundle()?;
+            Ok(bundle.launcher_policy.canonical_bytes()?)
+        }
+        Command::RenderWorkflowGateway => {
+            let bundle = read_workflow_bootstrap_bundle()?;
+            Ok(bundle.gateway.render().into_bytes())
+        }
+        Command::RenderWorkflowWorker => {
+            let bundle = read_workflow_bootstrap_bundle()?;
+            Ok(bundle.worker.render().into_bytes())
+        }
         Command::ExtractLauncher => {
             let bundle = read_policy_bundle()?;
             Ok(bundle.launcher_policy.canonical_bytes()?)
@@ -123,6 +150,10 @@ fn run(arguments: &[String]) -> Result<Vec<u8>, ConfigError> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
+    BuildWorkflowBootstrap(WorkflowBootstrapInputV1),
+    ExtractBaseLauncher,
+    RenderWorkflowGateway,
+    RenderWorkflowWorker,
     BuildPolicies { key_epoch: u64, reader_gid: u32 },
     ExtractLauncher,
     ExtractSelfUpdate,
@@ -133,6 +164,32 @@ enum Command {
 
 fn parse_command(arguments: &[String]) -> Result<Command, ConfigError> {
     match arguments {
+        [
+            _,
+            command,
+            key_epoch,
+            worker_user_id,
+            build_user_id,
+            build_group_id,
+            source_user_id,
+            build_reader_group_id,
+            dependency_fetcher_user_id,
+            dependency_fetch_group_id,
+        ] if command == "build-workflow-bootstrap" => {
+            Ok(Command::BuildWorkflowBootstrap(WorkflowBootstrapInputV1 {
+                key_epoch: parse_nonzero_u64(key_epoch)?,
+                worker_uid: parse_nonzero_u32(worker_user_id)?,
+                build_uid: parse_nonzero_u32(build_user_id)?,
+                build_gid: parse_nonzero_u32(build_group_id)?,
+                source_uid: parse_nonzero_u32(source_user_id)?,
+                build_reader_gid: parse_nonzero_u32(build_reader_group_id)?,
+                dependency_fetcher_uid: parse_nonzero_u32(dependency_fetcher_user_id)?,
+                dependency_fetch_gid: parse_nonzero_u32(dependency_fetch_group_id)?,
+            }))
+        }
+        [_, command] if command == "extract-base-launcher" => Ok(Command::ExtractBaseLauncher),
+        [_, command] if command == "render-workflow-gateway" => Ok(Command::RenderWorkflowGateway),
+        [_, command] if command == "render-workflow-worker" => Ok(Command::RenderWorkflowWorker),
         [_, command, key_epoch, reader_gid] if command == "build-policies" => {
             let key_epoch = key_epoch
                 .parse::<u64>()
@@ -155,6 +212,283 @@ fn parse_command(arguments: &[String]) -> Result<Command, ConfigError> {
         [_, command] if command == "initialize" => Ok(Command::Initialize),
         _ => Err(ConfigError::InvalidInvocation),
     }
+}
+
+fn parse_nonzero_u32(value: &str) -> Result<u32, ConfigError> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| ConfigError::InvalidInvocation)?;
+    if value == 0 || value == u32::MAX {
+        return Err(ConfigError::InvalidInvocation);
+    }
+    Ok(value)
+}
+
+fn parse_nonzero_u64(value: &str) -> Result<u64, ConfigError> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| ConfigError::InvalidInvocation)?;
+    if value == 0 || value > i64::MAX.unsigned_abs() {
+        return Err(ConfigError::InvalidInvocation);
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkflowBootstrapInputV1 {
+    key_epoch: u64,
+    worker_uid: u32,
+    build_uid: u32,
+    build_gid: u32,
+    source_uid: u32,
+    build_reader_gid: u32,
+    dependency_fetcher_uid: u32,
+    dependency_fetch_gid: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowGatewayEnvironmentV1 {
+    worker_uid: u32,
+    worker_id: String,
+    host_id: String,
+    grant_issuer: String,
+    launcher_audience: String,
+    grant_key_id: String,
+    grant_key_epoch: u64,
+    grant_public_key: String,
+}
+
+impl WorkflowGatewayEnvironmentV1 {
+    fn render(&self) -> String {
+        format!(
+            concat!(
+                "RDASHBOARD_WORKER_UID={}\n",
+                "RDASHBOARD_WORKER_ID={}\n",
+                "RDASHBOARD_WORKER_HOST_ID={}\n",
+                "RDASHBOARD_WORKFLOW_GRANT_ISSUER={}\n",
+                "RDASHBOARD_WORKFLOW_GRANT_LAUNCHER_AUDIENCE={}\n",
+                "RDASHBOARD_WORKFLOW_GRANT_KEY_ID={}\n",
+                "RDASHBOARD_WORKFLOW_GRANT_KEY_EPOCH={}\n",
+                "RDASHBOARD_WORKFLOW_GRANT_PUBLIC_KEY={}\n"
+            ),
+            self.worker_uid,
+            self.worker_id,
+            self.host_id,
+            self.grant_issuer,
+            self.launcher_audience,
+            self.grant_key_id,
+            self.grant_key_epoch,
+            self.grant_public_key,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowWorkerEnvironmentV1 {
+    worker_uid: u32,
+    worker_id: String,
+    host_id: String,
+    source_uid: u32,
+    build_reader_gid: u32,
+    dependency_fetcher_uid: u32,
+    dependency_fetch_gid: u32,
+}
+
+impl WorkflowWorkerEnvironmentV1 {
+    fn render(&self) -> String {
+        format!(
+            concat!(
+                "RDASHBOARD_WORKER_UID={}\n",
+                "RDASHBOARD_WORKER_ID={}\n",
+                "RDASHBOARD_WORKER_HOST_ID={}\n",
+                "RDASHBOARD_WORKER_SLOTS=1\n",
+                "RDASHBOARD_SOURCE_UID={}\n",
+                "RDASHBOARD_BUILD_READER_GID={}\n",
+                "RDASHBOARD_DEPENDENCY_FETCHER_UID={}\n",
+                "RDASHBOARD_DEPENDENCY_FETCH_GID={}\n"
+            ),
+            self.worker_uid,
+            self.worker_id,
+            self.host_id,
+            self.source_uid,
+            self.build_reader_gid,
+            self.dependency_fetcher_uid,
+            self.dependency_fetch_gid,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowBootstrapBundleV1 {
+    purpose: String,
+    schema_version: u16,
+    launcher_policy: WorkflowLauncherPolicyV1,
+    gateway: WorkflowGatewayEnvironmentV1,
+    worker: WorkflowWorkerEnvironmentV1,
+    document_digest: EvidenceDigest,
+}
+
+#[derive(Serialize)]
+struct WorkflowBootstrapBundlePayload<'a> {
+    purpose: &'static str,
+    schema_version: u16,
+    launcher_policy: &'a WorkflowLauncherPolicyV1,
+    gateway: &'a WorkflowGatewayEnvironmentV1,
+    worker: &'a WorkflowWorkerEnvironmentV1,
+}
+
+impl WorkflowBootstrapBundleV1 {
+    fn new(input: WorkflowBootstrapInputV1, seed: &[u8]) -> Result<Self, ConfigError> {
+        let identities = [
+            input.worker_uid,
+            input.build_uid,
+            input.source_uid,
+            input.dependency_fetcher_uid,
+        ];
+        if identities.into_iter().collect::<BTreeSet<_>>().len() != identities.len()
+            || input.build_gid == input.build_reader_gid
+            || input.build_gid == input.dependency_fetch_gid
+            || input.build_reader_gid == input.dependency_fetch_gid
+        {
+            return Err(ConfigError::InvalidWorkflowBootstrap);
+        }
+        let mut seed_bytes: [u8; 32] =
+            seed.try_into().map_err(|_| ConfigError::UnsafeCredential)?;
+        let signing_key = SigningKey::from_bytes(&seed_bytes);
+        seed_bytes.zeroize();
+        let public_key = signing_key.verifying_key().to_bytes();
+        let public_key_base64url = URL_SAFE_NO_PAD.encode(public_key);
+        let key_id = format!(
+            "workflow-key-{}",
+            &EvidenceDigest::sha256(public_key).as_str()[..16]
+        );
+        let launcher_policy = WorkflowLauncherPolicyV1 {
+            schema_version: WORKFLOW_LAUNCHER_POLICY_SCHEMA_VERSION,
+            worker_uid: input.worker_uid,
+            build_uid: input.build_uid,
+            build_gid: input.build_gid,
+            worker_id: WORKER_ID.to_owned(),
+            host_id: HOST_ID.to_owned(),
+            grant_issuer: GRANT_ISSUER.to_owned(),
+            launcher_audience: LAUNCHER_AUDIENCE.to_owned(),
+            minimum_grant_key_epoch: input.key_epoch,
+            grant_verification_keys: vec![WorkflowLauncherVerificationKeyConfigV1 {
+                key_id: key_id.clone(),
+                key_epoch: input.key_epoch,
+                public_key_base64url: public_key_base64url.clone(),
+                active_from_ms: 0,
+                signing_retired_at_ms: None,
+                verify_until_ms: None,
+                revoked_at_ms: None,
+            }],
+            allowed_adapters: vec![WorkflowAdapterIdV1::WorkerBareBinCiV1],
+            rootless_oci: None,
+            rootless_oci_builds: Vec::new(),
+            self_release_build: None,
+            self_release_reader_gid: None,
+            max_concurrent_jobs: 1,
+            max_journal_records: 1_024,
+        };
+        launcher_policy.validate()?;
+        let gateway = WorkflowGatewayEnvironmentV1 {
+            worker_uid: input.worker_uid,
+            worker_id: WORKER_ID.to_owned(),
+            host_id: HOST_ID.to_owned(),
+            grant_issuer: GRANT_ISSUER.to_owned(),
+            launcher_audience: LAUNCHER_AUDIENCE.to_owned(),
+            grant_key_id: key_id,
+            grant_key_epoch: input.key_epoch,
+            grant_public_key: public_key_base64url,
+        };
+        let worker = WorkflowWorkerEnvironmentV1 {
+            worker_uid: input.worker_uid,
+            worker_id: WORKER_ID.to_owned(),
+            host_id: HOST_ID.to_owned(),
+            source_uid: input.source_uid,
+            build_reader_gid: input.build_reader_gid,
+            dependency_fetcher_uid: input.dependency_fetcher_uid,
+            dependency_fetch_gid: input.dependency_fetch_gid,
+        };
+        let mut bundle = Self {
+            purpose: WORKFLOW_BOOTSTRAP_PURPOSE.to_owned(),
+            schema_version: WORKFLOW_BOOTSTRAP_SCHEMA_VERSION,
+            launcher_policy,
+            gateway,
+            worker,
+            document_digest: EvidenceDigest::sha256([]),
+        };
+        bundle.document_digest = bundle.calculate_digest()?;
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.launcher_policy.validate()?;
+        let [key] = self.launcher_policy.grant_verification_keys.as_slice() else {
+            return Err(ConfigError::InvalidWorkflowBootstrap);
+        };
+        if self.purpose != WORKFLOW_BOOTSTRAP_PURPOSE
+            || self.schema_version != WORKFLOW_BOOTSTRAP_SCHEMA_VERSION
+            || self.launcher_policy.allowed_adapters != [WorkflowAdapterIdV1::WorkerBareBinCiV1]
+            || self.launcher_policy.rootless_oci.is_some()
+            || !self.launcher_policy.rootless_oci_builds.is_empty()
+            || self.launcher_policy.self_release_build.is_some()
+            || self.launcher_policy.self_release_reader_gid.is_some()
+            || self.launcher_policy.max_concurrent_jobs != 1
+            || self.gateway.worker_uid != self.launcher_policy.worker_uid
+            || self.gateway.worker_id != self.launcher_policy.worker_id
+            || self.gateway.host_id != self.launcher_policy.host_id
+            || self.gateway.grant_issuer != self.launcher_policy.grant_issuer
+            || self.gateway.launcher_audience != self.launcher_policy.launcher_audience
+            || self.gateway.grant_key_id != key.key_id
+            || self.gateway.grant_key_epoch != key.key_epoch
+            || self.gateway.grant_public_key != key.public_key_base64url
+            || self.worker.worker_uid != self.launcher_policy.worker_uid
+            || self.worker.worker_id != self.launcher_policy.worker_id
+            || self.worker.host_id != self.launcher_policy.host_id
+            || self.worker.source_uid == self.worker.worker_uid
+            || self.worker.dependency_fetcher_uid == self.worker.worker_uid
+            || self.worker.dependency_fetcher_uid == self.worker.source_uid
+            || self.worker.build_reader_gid == self.worker.dependency_fetch_gid
+            || self.document_digest != self.calculate_digest()?
+        {
+            return Err(ConfigError::InvalidWorkflowBootstrap);
+        }
+        Ok(())
+    }
+
+    fn calculate_digest(&self) -> Result<EvidenceDigest, ConfigError> {
+        Ok(EvidenceDigest::sha256(serde_jcs::to_vec(
+            &WorkflowBootstrapBundlePayload {
+                purpose: WORKFLOW_BOOTSTRAP_PURPOSE,
+                schema_version: WORKFLOW_BOOTSTRAP_SCHEMA_VERSION,
+                launcher_policy: &self.launcher_policy,
+                gateway: &self.gateway,
+                worker: &self.worker,
+            },
+        )?))
+    }
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>, ConfigError> {
+        self.validate()?;
+        Ok(serde_jcs::to_vec(self)?)
+    }
+
+    fn decode_canonical(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let bundle: Self = serde_json::from_slice(bytes)?;
+        if serde_jcs::to_vec(&bundle)? != bytes {
+            return Err(ConfigError::NoncanonicalDocument);
+        }
+        bundle.validate()?;
+        Ok(bundle)
+    }
+}
+
+fn read_workflow_bootstrap_bundle() -> Result<WorkflowBootstrapBundleV1, ConfigError> {
+    WorkflowBootstrapBundleV1::decode_canonical(&read_stdin_bounded(MAX_POLICY_INPUT_BYTES)?)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -969,7 +1303,7 @@ fn require_root() -> Result<(), ConfigError> {
 #[derive(Debug, thiserror::Error)]
 enum ConfigError {
     #[error(
-        "usage: rdashboard-self-update-config build-policies KEY_EPOCH READER_GID|extract-launcher|extract-self-update|render-environment|build-initial-plan|initialize"
+        "usage: rdashboard-self-update-config build-workflow-bootstrap KEY_EPOCH WORKER_UID BUILD_UID BUILD_GID SOURCE_UID BUILD_READER_GID DEPENDENCY_FETCHER_UID DEPENDENCY_FETCH_GID|extract-base-launcher|render-workflow-gateway|render-workflow-worker|build-policies KEY_EPOCH READER_GID|extract-launcher|extract-self-update|render-environment|build-initial-plan|initialize"
     )]
     InvalidInvocation,
     #[error("this command requires root")]
@@ -982,6 +1316,8 @@ enum ConfigError {
     SelfReleaseAlreadyConfigured,
     #[error("the launcher and self-update policies do not form the generated exact pair")]
     PolicyMismatch,
+    #[error("the workflow bootstrap policy and environments are inconsistent")]
+    InvalidWorkflowBootstrap,
     #[error("the document is not canonical JCS")]
     NoncanonicalDocument,
     #[error("the initial self-release plan is invalid")]
@@ -1034,6 +1370,7 @@ impl ConfigError {
             Self::SelfReleaseAlreadyConfigured | Self::PolicyMismatch => {
                 "self_update_config_policy_mismatch"
             }
+            Self::InvalidWorkflowBootstrap => "self_update_config_workflow_bootstrap_invalid",
             Self::InvalidInitialPlan => "self_update_config_initial_plan_invalid",
             Self::RuntimeAlreadyUsed => "self_update_config_runtime_already_used",
             Self::UnsafeInitialState => "self_update_config_initial_state_unsafe",
@@ -1116,6 +1453,65 @@ mod tests {
             max_concurrent_jobs: 2,
             max_journal_records: 128,
         }
+    }
+
+    #[test]
+    fn workflow_bootstrap_bundle_keeps_policy_and_both_environments_in_lockstep() {
+        let input = WorkflowBootstrapInputV1 {
+            key_epoch: 3,
+            worker_uid: 1_001,
+            build_uid: 1_002,
+            build_gid: 1_003,
+            source_uid: 1_004,
+            build_reader_gid: 1_005,
+            dependency_fetcher_uid: 1_006,
+            dependency_fetch_gid: 1_007,
+        };
+        let bundle = WorkflowBootstrapBundleV1::new(input, &[29; 32])
+            .expect("build workflow bootstrap bundle");
+        let bytes = bundle.canonical_bytes().expect("canonical workflow bundle");
+        let decoded = WorkflowBootstrapBundleV1::decode_canonical(&bytes)
+            .expect("decode workflow bootstrap bundle");
+        let key = &decoded.launcher_policy.grant_verification_keys[0];
+
+        assert_eq!(decoded, bundle);
+        assert_eq!(key.key_epoch, input.key_epoch);
+        assert!(decoded.gateway.render().contains(&format!(
+            "RDASHBOARD_WORKFLOW_GRANT_PUBLIC_KEY={}\n",
+            key.public_key_base64url
+        )));
+        assert!(
+            decoded
+                .worker
+                .render()
+                .contains("RDASHBOARD_WORKER_SLOTS=1\n")
+        );
+        assert!(
+            decoded
+                .worker
+                .render()
+                .contains("RDASHBOARD_DEPENDENCY_FETCHER_UID=1006\n")
+        );
+        assert_eq!(decoded.launcher_policy.max_concurrent_jobs, 1);
+    }
+
+    #[test]
+    fn workflow_bootstrap_rejects_overlapping_service_identities() {
+        let result = WorkflowBootstrapBundleV1::new(
+            WorkflowBootstrapInputV1 {
+                key_epoch: 1,
+                worker_uid: 1_001,
+                build_uid: 1_001,
+                build_gid: 1_003,
+                source_uid: 1_004,
+                build_reader_gid: 1_005,
+                dependency_fetcher_uid: 1_006,
+                dependency_fetch_gid: 1_007,
+            },
+            &[29; 32],
+        );
+
+        assert!(matches!(result, Err(ConfigError::InvalidWorkflowBootstrap)));
     }
 
     #[test]

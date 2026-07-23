@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /toolchain/zig/zig ranlib "$@"

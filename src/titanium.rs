@@ -29,6 +29,21 @@ const TOOLCHAIN_DESCRIPTOR_PURPOSE: &str = "rdashboard.titanium-toolchain.v1";
 const RELEASE_DESCRIPTOR_PURPOSE: &str = "rdashboard.titanium-release.v1";
 pub const TITANIUM_TOOLCHAIN_DESCRIPTOR_FILE: &str = ".titanium-toolchain.jcs";
 pub const TITANIUM_RELEASE_DESCRIPTOR_FILE: &str = ".titanium-release.jcs";
+pub const RUST_V1_TOOLCHAIN_INTERFACE: &str = "rust-v1";
+pub const RUST_V1_REQUIRED_EXECUTABLES: [&str; 12] = [
+    "ar",
+    "c++",
+    "cargo",
+    "cargo-clippy",
+    "cargo-fmt",
+    "cc",
+    "clippy-driver",
+    "node",
+    "ranlib",
+    "rustc",
+    "rustdoc",
+    "rustfmt",
+];
 const SCHEMA_VERSION: u16 = 1;
 const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
@@ -122,6 +137,12 @@ impl TitaniumToolchainDescriptorV1 {
                 .collect::<BTreeSet<_>>()
                 .len()
                 != self.components.len()
+            || self.interface == RUST_V1_TOOLCHAIN_INTERFACE
+                && RUST_V1_REQUIRED_EXECUTABLES.iter().any(|required| {
+                    self.required_executables
+                        .binary_search_by(|candidate| candidate.as_str().cmp(required))
+                        .is_err()
+                })
         {
             return Err(TitaniumRegistryError::InvalidToolchainDescriptor);
         }
@@ -2694,7 +2715,7 @@ mod tests {
         let root = directory.path().join(name);
         fs::create_dir(&root).expect("toolchain root");
         fs::create_dir(root.join("bin")).expect("toolchain bin");
-        for executable in ["cargo", "rustc"] {
+        for executable in RUST_V1_REQUIRED_EXECUTABLES {
             let path = root.join("bin").join(executable);
             fs::write(&path, executable.as_bytes()).expect("toolchain executable");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
@@ -2703,7 +2724,10 @@ mod tests {
         let descriptor = TitaniumToolchainDescriptorV1::new(
             "rust-v1".to_owned(),
             "linux-x86_64".to_owned(),
-            vec!["cargo".to_owned(), "rustc".to_owned()],
+            RUST_V1_REQUIRED_EXECUTABLES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
             Vec::new(),
         )
         .expect("toolchain descriptor");
@@ -3170,6 +3194,21 @@ mod tests {
     }
 
     #[test]
+    fn rust_v1_toolchain_requires_the_complete_offline_build_surface() {
+        let descriptor = TitaniumToolchainDescriptorV1::new(
+            RUST_V1_TOOLCHAIN_INTERFACE.to_owned(),
+            "linux-x86_64".to_owned(),
+            vec!["cargo".to_owned(), "rustc".to_owned()],
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            descriptor,
+            Err(TitaniumRegistryError::InvalidToolchainDescriptor)
+        ));
+    }
+
+    #[test]
     fn installed_toolchain_resolves_to_one_exact_verified_target() {
         let (directory, registry) = registry();
         let source = toolchain_tree(&directory, "rust-toolchain");
@@ -3266,7 +3305,10 @@ mod tests {
         let descriptor = TitaniumToolchainDescriptorV1::new(
             "rust-v1".to_owned(),
             "linux-x86_64".to_owned(),
-            vec!["cargo".to_owned(), "rustc".to_owned()],
+            RUST_V1_REQUIRED_EXECUTABLES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
             vec![TitaniumToolchainComponentV1 {
                 mount: "rimg-native".to_owned(),
                 artifact_digest: native.artifact_digest.clone(),

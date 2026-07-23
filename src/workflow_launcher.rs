@@ -3093,7 +3093,7 @@ mod tests {
         let toolchain_input = directory.path().join("toolchain-input");
         fs::create_dir(&toolchain_input).expect("create toolchain input");
         fs::create_dir(toolchain_input.join("bin")).expect("create toolchain bin");
-        for executable in ["cargo", "rustc"] {
+        for executable in crate::titanium::RUST_V1_REQUIRED_EXECUTABLES {
             let path = toolchain_input.join("bin").join(executable);
             fs::write(&path, executable.as_bytes()).expect("write toolchain executable");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
@@ -3102,7 +3102,10 @@ mod tests {
         let descriptor = TitaniumToolchainDescriptorV1::new(
             "rust-v1".to_owned(),
             "linux-x86_64".to_owned(),
-            vec!["cargo".to_owned(), "rustc".to_owned()],
+            crate::titanium::RUST_V1_REQUIRED_EXECUTABLES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
             Vec::new(),
         )
         .expect("toolchain descriptor");
@@ -3879,9 +3882,14 @@ mod tests {
                 ENV_EXECUTABLE,
                 "-i",
                 "PATH=/toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+                "AR=/toolchain/bin/ar",
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/toolchain/bin/cc",
+                "CC=/toolchain/bin/cc",
                 "CFLAGS=-march=znver3 -O3 -fno-plt -fstack-clash-protection",
+                "CXX=/toolchain/bin/c++",
                 "CXXFLAGS=-march=znver3 -O3 -fno-plt -fstack-clash-protection",
-                "RUSTFLAGS=-C target-cpu=znver3 -C link-arg=-fuse-ld=lld",
+                "RANLIB=/toolchain/bin/ranlib",
+                "RUSTFLAGS=-C target-cpu=znver3",
                 "TITANIUM_CPU_FLAGS=-march=znver3 -O3 -fno-plt -fstack-clash-protection",
                 "HOME=/nonexistent",
                 "TMPDIR=/job/tmp",
