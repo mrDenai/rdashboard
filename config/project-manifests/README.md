@@ -23,13 +23,15 @@ reviewed source-side mirror must be upgraded, its dependency model must satisfy 
 `source_tree_v1` policy (or explicitly move to `cargo_crates_io_v1`), and both repositories' bare gates
 must pass; loading this controller catalog alone never enables a deploy.
 
-The `rdashboard.json` entry is also inactive. It uses the explicit `self_update_handoff` delivery mode:
+The `rdashboard.json` entry uses the explicit `self_update_handoff` delivery mode:
 the generic VPS worker prepares pinned Cargo inputs once, runs the exact bare `bin/ci`, packages the
 verified native binaries and publishes the root-validated signed handoff. Its finite graph ends at the
 controller evidence reduction and contains no privileged-executor deployment nodes, because the
 separately installed persistent bootstrap is the only A/B pointer, service-health and rollback owner.
-The source controls keep `auto_deploy=false`; installing or validating this catalog cannot create a
-release, start the bootstrap or mutate a host.
+The repository source controls opt only `rdashboard` into automatic delivery. The repository change
+alone grants no production authority: activation still requires a successful shadow of the exact
+candidate head and explicit atomic installation of the canonical controls on the host. Installing or
+validating this manifest catalog cannot create a release, start the bootstrap or mutate a host.
 
 The `rimg.json` entry records the private source, existing `Dockerfile.runtime`, one verified release
 output reused by minimal OCI assembly, two stateful paths,

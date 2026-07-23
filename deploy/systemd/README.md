@@ -642,7 +642,7 @@ Review the repository candidate `config/source-projects.json`, render it as cano
 exactly and contains only owner-controlled deployment values:
 
 ```json
-{"projects":[{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":3,"project_id":"ralert","release_class":"stateful_compatible"},{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":2,"project_id":"rdashboard","release_class":"code_only_compatible"},{"auto_deploy":false,"installed_policy_version":1,"maximum_attempts":2,"project_id":"telegram-gateway","release_class":"stateful_compatible"}],"purpose":"rdashboard.source-project-controls.v1","schema_version":1}
+{"projects":[{"auto_deploy":false,"installed_policy_version":2,"maximum_attempts":3,"project_id":"ralert","release_class":"stateful_compatible"},{"auto_deploy":true,"installed_policy_version":2,"maximum_attempts":2,"project_id":"rdashboard","release_class":"code_only_compatible"},{"auto_deploy":false,"installed_policy_version":2,"maximum_attempts":2,"project_id":"rimg","release_class":"code_only_compatible"},{"auto_deploy":false,"installed_policy_version":2,"maximum_attempts":2,"project_id":"telegram-gateway","release_class":"stateful_compatible"}],"purpose":"rdashboard.source-project-controls.v1","schema_version":1}
 ```
 
 Render the reviewed candidate without accepting trailing whitespace or noncanonical installed bytes:
@@ -656,15 +656,16 @@ Atomically install the result as `/etc/rdashboard/source-projects.jcs` with the 
 above before running the source-document build command.
 
 Keep `auto_deploy=false` until the complete worker/build/deploy path for that project has passed its
-activation review. Each project gets its remote URL and workflow-policy digest from the installed
-manifest, so adding or removing a repository is one exact catalog-and-controls change, not a new
-worker implementation.
+activation review. The repository candidate enables it only for `rdashboard`; install those controls
+only after a successful shadow of the exact candidate head. Each project gets its remote URL and
+workflow-policy digest from the installed manifest, so adding or removing a repository is one exact
+catalog-and-controls change, not a new worker implementation.
 
 An explicitly authorized non-mutating activation check uses the same installed source and workflow
 policies without enabling automatic deployment:
 
 ```sh
-sudo -u rdashboard /var/lib/rdashboard-bootstrap/current/bin/rdashboard-source-dispatcher shadow rimg
+sudo -u rdashboard /var/lib/rdashboard-bootstrap/current/bin/rdashboard-source-dispatcher shadow rdashboard
 ```
 
 The source service returns only its current, unblocked, unexpired signed head. The dispatcher rejects

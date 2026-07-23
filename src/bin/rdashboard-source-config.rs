@@ -536,7 +536,13 @@ mod tests {
         assert_eq!(config.projects[3].project_id.as_str(), "telegram-gateway");
         assert!(config.projects[2].git_ssh.is_some());
         assert!(config.projects[3].git_ssh.is_some());
-        assert!(config.projects.iter().all(|project| !project.auto_deploy));
+        let auto_deploy_projects = config
+            .projects
+            .iter()
+            .filter(|project| project.auto_deploy)
+            .map(|project| project.project_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(auto_deploy_projects, ["rdashboard"]);
     }
 
     #[test]
