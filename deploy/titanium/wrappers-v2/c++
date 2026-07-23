@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly rust_target=x86_64-unknown-linux-gnu
+readonly zig_target=x86_64-linux-gnu.2.39
+
+case "$0" in
+  /*) ;;
+  *)
+    echo "ERROR: Titanium c++ wrapper must be invoked by its absolute toolchain path." >&2
+    exit 69
+    ;;
+esac
+
+args=(-target "$zig_target")
+while (( $# > 0 )); do
+  case "$1" in
+    --)
+      args+=("$1")
+      shift
+      args+=("$@")
+      break
+      ;;
+    --target=*)
+      supplied="${1#--target=}"
+      shift
+      ;;
+    -target=*)
+      supplied="${1#-target=}"
+      shift
+      ;;
+    --target|-target)
+      if (( $# < 2 )); then
+        echo "ERROR: Titanium c++ wrapper received a target option without a value." >&2
+        exit 64
+      fi
+      supplied="$2"
+      shift 2
+      ;;
+    *)
+      args+=("$1")
+      shift
+      continue
+      ;;
+  esac
+
+  if [[ "$supplied" != "$rust_target" && "$supplied" != "$zig_target" ]]; then
+    echo "ERROR: Titanium c++ wrapper rejects unsupported target: $supplied" >&2
+    exit 64
+  fi
+done
+
+exec "${0%/*}/../zig/zig" c++ "${args[@]}"

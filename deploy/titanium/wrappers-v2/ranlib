@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$0" in
+  /*) ;;
+  *)
+    echo "ERROR: Titanium ranlib wrapper must be invoked by its absolute toolchain path." >&2
+    exit 69
+    ;;
+esac
+
+exec "${0%/*}/../zig/zig" ranlib "$@"

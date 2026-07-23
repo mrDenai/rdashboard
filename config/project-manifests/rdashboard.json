@@ -50,7 +50,7 @@
         "timeout_ms": 900000,
         "resources": {
           "cpu_millicores": 3000,
-          "memory_max_bytes": 4294967296,
+          "memory_max_bytes": 6442450944,
           "tasks_max": 1024,
           "scratch_max_bytes": 6442450944,
           "scratch_max_inodes": 500000,
@@ -142,10 +142,13 @@
     "platform": "linux-x86_64",
     "cpu_baseline": "znver3",
     "abi": "gnu",
-    "toolchain_root": "rust-1.96.1-znver3-linux-x86_64-gnu-v1",
+    "toolchain_root": "rust-1.96.1-znver3-linux-x86_64-gnu-v2",
     "toolchain_interface": "rust-v1",
     "build_environment": {
       "AR": "/toolchain/bin/ar",
+      "CARGO_BUILD_JOBS": "3",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
       "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": "/toolchain/bin/cc",
       "CC": "/toolchain/bin/cc",
       "CFLAGS": "-march=znver3 -O3 -fno-plt -fstack-clash-protection",

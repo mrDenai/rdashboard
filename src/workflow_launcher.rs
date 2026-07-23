@@ -2867,6 +2867,7 @@ fn transient_unit_arguments(
         .ok_or(WorkflowLauncherError::UnsupportedLease)?;
     let is_oci = lease.adapter_id == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1;
     let is_self_release = lease.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1;
+    let runs_repository_tests = lease.adapter_id == WorkflowAdapterIdV1::WorkerBareBinCiV1;
     if is_oci != oci_build_request.is_some()
         || is_self_release != self_release_build_request.is_some()
         || oci_build_request.is_some() && self_release_build_request.is_some()
@@ -2884,7 +2885,14 @@ fn transient_unit_arguments(
         "--working-directory=/job".to_owned(),
         format!("--property=User={}", policy.build_uid),
         format!("--property=Group={}", policy.build_gid),
-        "--property=UMask=0077".to_owned(),
+        format!(
+            "--property=UMask={}",
+            if runs_repository_tests {
+                "0022"
+            } else {
+                "0077"
+            }
+        ),
         "--property=SetLoginEnvironment=no".to_owned(),
         "--property=NoNewPrivileges=yes".to_owned(),
         "--property=PrivateDevices=yes".to_owned(),
@@ -2898,14 +2906,30 @@ fn transient_unit_arguments(
         "--property=ProtectKernelModules=yes".to_owned(),
         "--property=ProtectKernelTunables=yes".to_owned(),
         "--property=ProtectProc=invisible".to_owned(),
-        "--property=ProcSubset=pid".to_owned(),
+        format!(
+            "--property=ProcSubset={}",
+            if runs_repository_tests { "all" } else { "pid" }
+        ),
         "--property=ProtectSystem=strict".to_owned(),
-        "--property=RestrictAddressFamilies=AF_UNIX".to_owned(),
+        format!(
+            "--property=RestrictAddressFamilies={}",
+            if runs_repository_tests {
+                "AF_UNIX AF_INET"
+            } else {
+                "AF_UNIX"
+            }
+        ),
         "--property=RestrictNamespaces=yes".to_owned(),
         "--property=RestrictRealtime=yes".to_owned(),
-        "--property=RestrictSUIDSGID=yes".to_owned(),
+        format!(
+            "--property=RestrictSUIDSGID={}",
+            if runs_repository_tests { "no" } else { "yes" }
+        ),
         "--property=LockPersonality=yes".to_owned(),
-        "--property=MemoryDenyWriteExecute=yes".to_owned(),
+        format!(
+            "--property=MemoryDenyWriteExecute={}",
+            if runs_repository_tests { "no" } else { "yes" }
+        ),
         "--property=MemorySwapMax=0".to_owned(),
         "--property=CapabilityBoundingSet=".to_owned(),
         "--property=AmbientCapabilities=".to_owned(),
@@ -3257,6 +3281,27 @@ mod tests {
             ),
             Err(TitaniumRegistryError::Io(error)) if error.kind() == io::ErrorKind::NotFound
         ));
+    }
+
+    fn assert_transient_permission_contract(
+        arguments: &[String],
+        [
+            expected_umask,
+            expected_restrict_suid_sgid,
+            expected_address_families,
+            expected_proc_subset,
+            expected_memory_deny_write_execute,
+        ]: [&str; 5],
+    ) {
+        for property in [
+            format!("--property=UMask={expected_umask}"),
+            format!("--property=RestrictSUIDSGID={expected_restrict_suid_sgid}"),
+            format!("--property=RestrictAddressFamilies={expected_address_families}"),
+            format!("--property=ProcSubset={expected_proc_subset}"),
+            format!("--property=MemoryDenyWriteExecute={expected_memory_deny_write_execute}"),
+        ] {
+            assert!(arguments.contains(&property), "missing {property}");
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4090,6 +4135,10 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "--working-directory=/job")
         );
+        assert_transient_permission_contract(
+            &launch.arguments,
+            ["0022", "no", "AF_UNIX AF_INET", "all", "no"],
+        );
         assert!(launch.arguments.iter().any(|argument| {
             argument.starts_with("--property=TemporaryFileSystem=/job:")
                 && argument.contains("rw,nodev,nosuid,size=")
@@ -4178,6 +4227,10 @@ mod tests {
             101,
         )
         .expect("authorize OCI launch");
+        assert_transient_permission_contract(
+            &launch.arguments,
+            ["0077", "yes", "AF_UNIX", "pid", "yes"],
+        );
         let request = launch.oci_build_request.as_ref().expect("OCI request");
         assert_eq!(request.lease_digest, lease.lease_digest);
         assert!(launch.operation_state_path.is_none());

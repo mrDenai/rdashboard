@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 0 )); then
+  echo "ERROR: test-rust-v2-wrappers accepts no arguments." >&2
+  exit 64
+fi
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+mkdir -p "$root/target"
+work="$(mktemp -d "$root/target/titanium-wrapper-contract.XXXXXX")"
+cleanup() {
+  rm -rf -- "$work"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -p "$work/toolchain/bin" "$work/toolchain/zig" "$work/toolchain/node/bin"
+cp "$root"/deploy/titanium/wrappers-v2/* "$work/toolchain/bin/"
+chmod 0755 "$work/toolchain/bin"/*
+
+cat >"$work/toolchain/zig/zig" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TITANIUM_WRAPPER_TEST_OUTPUT:?}"
+printf '%s\n' "$@" >"$TITANIUM_WRAPPER_TEST_OUTPUT"
+SH
+cat >"$work/toolchain/node/bin/node" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TITANIUM_WRAPPER_TEST_OUTPUT:?}"
+printf '%s\n' "$@" >"$TITANIUM_WRAPPER_TEST_OUTPUT"
+SH
+chmod 0755 "$work/toolchain/zig/zig" "$work/toolchain/node/bin/node"
+
+assert_args() {
+  local output="$1"
+  shift
+  local -a actual
+  mapfile -t actual <"$output"
+  if (( ${#actual[@]} != $# )); then
+    printf 'ERROR: expected %d wrapper arguments, received %d\n' "$#" "${#actual[@]}" >&2
+    printf 'received: <%s>\n' "${actual[*]}" >&2
+    exit 1
+  fi
+  local index=0
+  for expected in "$@"; do
+    if [[ "${actual[$index]}" != "$expected" ]]; then
+      printf 'ERROR: wrapper argument %d: expected <%s>, received <%s>\n' \
+        "$index" "$expected" "${actual[$index]}" >&2
+      exit 1
+    fi
+    ((index += 1))
+  done
+}
+
+export TITANIUM_WRAPPER_TEST_OUTPUT="$work/cc.args"
+"$work/toolchain/bin/cc" \
+  --target=x86_64-unknown-linux-gnu \
+  -O2 '-DNAME=two words' source.c -- --target=aarch64-unknown-linux-gnu
+assert_args "$TITANIUM_WRAPPER_TEST_OUTPUT" \
+  cc -target x86_64-linux-gnu.2.39 -O2 '-DNAME=two words' source.c \
+  -- --target=aarch64-unknown-linux-gnu
+
+export TITANIUM_WRAPPER_TEST_OUTPUT="$work/cxx.args"
+"$work/toolchain/bin/c++" \
+  before.cc -target x86_64-linux-gnu.2.39 --target x86_64-unknown-linux-gnu -o after
+assert_args "$TITANIUM_WRAPPER_TEST_OUTPUT" \
+  c++ -target x86_64-linux-gnu.2.39 before.cc -o after
+
+export TITANIUM_WRAPPER_TEST_OUTPUT="$work/ar.args"
+"$work/toolchain/bin/ar" qc archive.a object.o
+assert_args "$TITANIUM_WRAPPER_TEST_OUTPUT" ar qc archive.a object.o
+
+export TITANIUM_WRAPPER_TEST_OUTPUT="$work/ranlib.args"
+"$work/toolchain/bin/ranlib" archive.a
+assert_args "$TITANIUM_WRAPPER_TEST_OUTPUT" ranlib archive.a
+
+export TITANIUM_WRAPPER_TEST_OUTPUT="$work/node.args"
+"$work/toolchain/bin/node" --check 'file with spaces.js'
+assert_args "$TITANIUM_WRAPPER_TEST_OUTPUT" --check 'file with spaces.js'
+
+export TITANIUM_WRAPPER_TEST_OUTPUT="$work/rejected.args"
+if "$work/toolchain/bin/cc" --target=aarch64-unknown-linux-gnu source.c 2>"$work/rejected.err"; then
+  echo "ERROR: Titanium cc wrapper accepted a foreign target." >&2
+  exit 1
+fi
+if [[ -e "$TITANIUM_WRAPPER_TEST_OUTPUT" ]]; then
+  echo "ERROR: Titanium cc wrapper invoked Zig after rejecting a foreign target." >&2
+  exit 1
+fi
+grep -Fqx \
+  'ERROR: Titanium cc wrapper rejects unsupported target: aarch64-unknown-linux-gnu' \
+  "$work/rejected.err"
+
+if "$work/toolchain/bin/c++" -target 2>"$work/missing.err"; then
+  echo "ERROR: Titanium c++ wrapper accepted a target without a value." >&2
+  exit 1
+fi
+grep -Fqx \
+  'ERROR: Titanium c++ wrapper received a target option without a value.' \
+  "$work/missing.err"

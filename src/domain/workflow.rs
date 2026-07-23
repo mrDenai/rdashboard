@@ -2122,6 +2122,16 @@ mod tests {
         ))
         .expect("decode project manifest");
         let policy = manifest.host_preparation.expect("host preparation policy");
+        for (name, value) in [
+            ("CARGO_BUILD_JOBS", "3"),
+            ("CARGO_PROFILE_DEV_DEBUG", "0"),
+            ("CARGO_PROFILE_TEST_DEBUG", "0"),
+        ] {
+            assert_eq!(
+                policy.build_environment.get(name).map(String::as_str),
+                Some(value)
+            );
+        }
 
         for name in ["ZIG_GLOBAL_CACHE_DIR", "ZIG_LOCAL_CACHE_DIR"] {
             let mut overridden = policy.clone();

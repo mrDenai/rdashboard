@@ -142,6 +142,17 @@ files to be transferred.
 Each verification source copy preserves the sealed tree's modification times and stable
 `/job/workspace` path, which lets Cargo reuse the operation target instead of invalidating it merely
 because the tmpfs workspace was recreated.
+Repository verification alone uses `UMask=0022`, permits the unprivileged build UID to exercise
+set-group-ID directory-mode validation inside its private roots, and exposes IPv4 loopback to HTTP
+fixtures. It also retains the non-process `/proc` files needed to exercise read-only Linux telemetry
+collection while `ProtectProc=invisible` continues to hide other users' process details. Its `/job`
+tmpfs and operation root remain mode `0700`, and `NoNewPrivileges`, empty capabilities and a private
+network namespace still prevent those test fixtures from granting authority or reaching the host
+network. `MemoryDenyWriteExecute` is disabled only for repository verification because that adapter
+intentionally compiles and executes native code and its pinned Node/V8 runtime requires executable
+memory transitions even for syntax checking. OCI and self-release jobs retain `UMask=0077`,
+`RestrictSUIDSGID=yes`, `ProcSubset=pid`, `MemoryDenyWriteExecute=yes` and the `AF_UNIX`-only
+address-family policy.
 
 The fixed `rdashboard-workflow-job` maps the verification adapter to repository `bin/ci`. The native
 self-release adapter never invokes a repository packaging script: after the exact verification receipt
@@ -328,20 +339,25 @@ therefore creates a new root name and changes the project catalog only after the
 inspected. `/var/lib/rdashboard-build/imports` is a transient admission inbox, not a cache. Its parent
 is root-owned mode `0711`, and each admitted direct child must be a sealed root-owned mode-`0555`
 directory. Remove that child only after the resulting artifact/root has been inspected. The fixed
-`deploy/titanium/bootstrap-rust-v1` command assembles the initial shared `rust-v1` closure once. It
-verifies the published SHA-256 values for the exact official Rust 1.96.1, Zig 0.16.0 and Node 22.22.2
-archives, imports Node and Zig as reusable build-tool components, creates the Rust toolchain
-descriptor with their exact artifact digests, imports the immutable toolchain and then removes only
+versioned `deploy/titanium/bootstrap-rust-v*` commands assemble each shared `rust-v1` interface root
+once. They verify the published SHA-256 values for the exact official Rust 1.96.1, Zig 0.16.0 and
+Node 22.22.2 archives, import Node and Zig as reusable build-tool components, create the Rust
+toolchain descriptor with their exact artifact digests, import the immutable toolchain and then remove only
 its three fixed admission-inbox directories. Zig supplies the pinned C/C++ compiler, archiver,
 linker and glibc 2.39 sysroot; Node is pinned for the JavaScript portion of `bin/ci`. Consequently
 `cc`, `ar`, `ranlib` or `node` cannot silently fall through to a mutable host package while the
-action key still claims the same toolchain. Run the command from the exact reviewed source checkout,
-then inspect the installed root:
+action key still claims the same toolchain. The v1 root remains reproducible for consumers pinned to
+it. The v2 root normalizes cc-rs's `x86_64-unknown-linux-gnu` target to Zig's pinned
+`x86_64-linux-gnu.2.39` target and rejects every foreign target before invoking the compiler. Run the
+required commands from the exact reviewed source checkout, then inspect both installed roots:
 
 ```sh
 sudo deploy/titanium/bootstrap-rust-v1
+sudo deploy/titanium/bootstrap-rust-v2
 rdashboard-titanium inspect-toolchain \
   rust-1.96.1-znver3-linux-x86_64-gnu-v1 linux-x86_64 rust-v1
+rdashboard-titanium inspect-toolchain \
+  rust-1.96.1-znver3-linux-x86_64-gnu-v2 linux-x86_64 rust-v1
 rdashboard-titanium gc
 ```
 

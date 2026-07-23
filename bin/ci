@@ -24,10 +24,30 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v1.json
 cargo run --quiet --locked --bin rdashboard-schema -- --check config/schema/project-manifest-v2.json
-bash -n deploy/titanium/bootstrap-rust-v1
+bash -n \
+  deploy/titanium/bootstrap-rust-v1 \
+  deploy/titanium/bootstrap-rust-v2 \
+  deploy/titanium/bootstrap-rust-common.bash \
+  deploy/titanium/test-rust-v2-wrappers
 for wrapper in deploy/titanium/wrappers/*; do
   sh -n "$wrapper"
 done
+for wrapper in deploy/titanium/wrappers-v2/*; do
+  bash -n "$wrapper"
+done
+deploy/titanium/test-rust-v2-wrappers
 node --check web/app.js
 node --test tests/browser_status.test.js
-cargo build --workspace --all-targets --all-features --release --locked
+release_inventory="$(
+  cargo run --quiet --locked --bin rdashboard-self-release-inventory
+)"
+mapfile -t release_binaries <<<"$release_inventory"
+if (( ${#release_binaries[@]} == 0 )); then
+  echo "ERROR: the canonical self-release binary inventory is empty." >&2
+  exit 70
+fi
+release_arguments=()
+for binary in "${release_binaries[@]}"; do
+  release_arguments+=(--bin "$binary")
+done
+cargo build --workspace --all-features --release --locked "${release_arguments[@]}"
