@@ -42,6 +42,8 @@ pub const SELF_RELEASE_REQUEST_ROOT: &str =
     "/var/lib/rdashboard-workflow-launcher/self-release-requests";
 pub const SELF_RELEASE_SIGNING_CREDENTIAL_PATH: &str =
     "/run/credentials/rdashboard-workflow-launcher.service/self-release-seed";
+pub const SELF_RELEASE_BOOTSTRAP_SIGNING_CREDENTIAL_PATH: &str =
+    "/etc/rdashboard/credentials/self-release-seed";
 
 const POLICY_PURPOSE: &str = "rdashboard.self-release-build-policy.v1";
 const REQUEST_PURPOSE: &str = "rdashboard.self-release-build-request.v1";
@@ -62,6 +64,16 @@ pub fn load_installed_self_release_signing_key(
     policy: &SelfReleaseBuildPolicyV1,
 ) -> Result<SigningKey, SelfReleaseBuildError> {
     load_self_release_signing_key(Path::new(SELF_RELEASE_SIGNING_CREDENTIAL_PATH), 0, policy)
+}
+
+pub fn load_bootstrap_self_release_signing_key(
+    policy: &SelfReleaseBuildPolicyV1,
+) -> Result<SigningKey, SelfReleaseBuildError> {
+    load_self_release_signing_key(
+        Path::new(SELF_RELEASE_BOOTSTRAP_SIGNING_CREDENTIAL_PATH),
+        0,
+        policy,
+    )
 }
 
 fn load_self_release_signing_key(

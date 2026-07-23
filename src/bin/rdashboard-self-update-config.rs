@@ -13,8 +13,8 @@ use rdashboard::{
     domain::{EvidenceDigest, GitCommitId, ProjectId, WorkflowAdapterIdV1},
     installed_workflow::{INSTALLED_WORKFLOW_CATALOG_PATH, InstalledWorkflowCatalogV1},
     self_release_build::{
-        SelfReleaseBuildPolicyV1, load_installed_self_release_signing_key,
-        versioned_self_release_binaries,
+        SELF_RELEASE_BOOTSTRAP_SIGNING_CREDENTIAL_PATH, SelfReleaseBuildPolicyV1,
+        load_bootstrap_self_release_signing_key, versioned_self_release_binaries,
     },
     self_update::{
         BuiltSelfReleaseV1, InstalledSelfUpdatePolicyInputV1, InstalledSelfUpdatePolicyV1,
@@ -37,7 +37,7 @@ use sha2::{Digest as _, Sha256};
 use zeroize::{Zeroize as _, Zeroizing};
 
 const SELF_UPDATE_POLICY_PATH: &str = "/etc/rdashboard/self-update-policy.jcs";
-const SELF_RELEASE_SEED_PATH: &str = "/etc/rdashboard/credentials/self-release-seed";
+const SELF_RELEASE_SEED_PATH: &str = SELF_RELEASE_BOOTSTRAP_SIGNING_CREDENTIAL_PATH;
 const INITIAL_RELEASE_PLAN_PATH: &str = "/etc/rdashboard/initial-self-release.jcs";
 const INITIAL_RELEASE_PAYLOAD_ROOT: &str = "/usr/libexec/rdashboard/initial-release";
 const INITIAL_RELEASE_WORK_ROOT: &str = "/var/lib/rdashboard-bootstrap/.initial-release-build";
@@ -455,7 +455,7 @@ fn initialize_installed_release() -> Result<InitialReleaseResultV1, ConfigError>
     let self_update_policy =
         load_installed_self_update_policy_from(Path::new(SELF_UPDATE_POLICY_PATH), 0)?;
     validate_installed_policy_pair(&launcher, &self_update_policy)?;
-    let signing_key = load_installed_self_release_signing_key(build_policy)?;
+    let signing_key = load_bootstrap_self_release_signing_key(build_policy)?;
     let plan = load_initial_plan(Path::new(INITIAL_RELEASE_PLAN_PATH))?;
     validate_initial_workflow_plan(&plan)?;
 
