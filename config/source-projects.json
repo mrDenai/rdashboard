@@ -4,28 +4,28 @@
   "projects": [
     {
       "project_id": "ralert",
-      "installed_policy_version": 1,
+      "installed_policy_version": 2,
       "auto_deploy": false,
       "maximum_attempts": 3,
       "release_class": "stateful_compatible"
     },
     {
       "project_id": "rdashboard",
-      "installed_policy_version": 1,
+      "installed_policy_version": 2,
       "auto_deploy": false,
       "maximum_attempts": 2,
       "release_class": "code_only_compatible"
     },
     {
       "project_id": "rimg",
-      "installed_policy_version": 1,
+      "installed_policy_version": 2,
       "auto_deploy": false,
       "maximum_attempts": 2,
       "release_class": "code_only_compatible"
     },
     {
       "project_id": "telegram-gateway",
-      "installed_policy_version": 1,
+      "installed_policy_version": 2,
       "auto_deploy": false,
       "maximum_attempts": 2,
       "release_class": "stateful_compatible"
