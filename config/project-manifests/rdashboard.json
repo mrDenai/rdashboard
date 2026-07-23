@@ -63,7 +63,7 @@
         "worker_pool": "vps_required",
         "network_class": "offline",
         "cache_class": "prepared_run",
-        "timeout_ms": 120000,
+        "timeout_ms": 900000,
         "resources": {
           "cpu_millicores": 1000,
           "memory_max_bytes": 536870912,
