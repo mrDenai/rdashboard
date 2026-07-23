@@ -92,12 +92,20 @@ fn read_signing_key(
         return Err(WorkflowExecutionAuthorityError::InvalidProcessIdentity);
     }
     let path_metadata = fs::symlink_metadata(path)?;
-    let owner_allowed =
-        path_metadata.uid() == process_uid || allow_root_owner && path_metadata.uid() == 0;
+    let mode = path_metadata.mode() & 0o777;
+    let permissions_allowed = if path_metadata.uid() == process_uid {
+        mode.trailing_zeros() >= 6
+    } else {
+        allow_root_owner
+            && systemd_credential_permissions_are_safe(
+                path_metadata.uid(),
+                path_metadata.gid(),
+                mode,
+            )
+    };
     if path_metadata.file_type().is_symlink()
         || !path_metadata.file_type().is_file()
-        || !owner_allowed
-        || path_metadata.mode() & 0o077 != 0
+        || !permissions_allowed
         || path_metadata.nlink() != 1
         || path_metadata.len() != ED25519_KEY_BYTES as u64
     {
@@ -134,6 +142,10 @@ fn read_signing_key(
     let signing_key = SigningKey::from_bytes(&seed);
     seed.zeroize();
     Ok(signing_key)
+}
+
+const fn systemd_credential_permissions_are_safe(uid: u32, gid: u32, mode: u32) -> bool {
+    uid == 0 && gid == 0 && matches!(mode, 0o400 | 0o440)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -193,5 +205,13 @@ mod tests {
             config(&key).load_from_path(&path, uid, false),
             Err(WorkflowExecutionAuthorityError::UnsafeCredential)
         ));
+    }
+
+    #[test]
+    fn systemd_root_owned_credential_permissions_are_accepted() {
+        assert!(systemd_credential_permissions_are_safe(0, 0, 0o400));
+        assert!(systemd_credential_permissions_are_safe(0, 0, 0o440));
+        assert!(!systemd_credential_permissions_are_safe(0, 1, 0o440));
+        assert!(!systemd_credential_permissions_are_safe(0, 0, 0o640));
     }
 }
