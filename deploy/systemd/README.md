@@ -428,8 +428,9 @@ and action provenance; changing JSON first would describe a build result the con
 publish. The native activation mechanism itself no longer depends on Docker, BuildKit, an image
 registry, Kamal or GitHub Actions.
 
-The preparation CAS itself refuses more than 6 GiB or 100,000 inodes,
-and every operation contract limits accounted target/cache data to at most 6 GiB/500,000 inodes.
+The preparation CAS itself refuses more than 6 GiB or 1,000,000 inodes. Every generated payload is
+further clipped by its signed execution profile, so the global store boundary cannot bypass a
+project-specific byte or inode limit.
 
 The worker and launcher refuse startup unless their fixed child directory remains on the same backing
 filesystem as `/var/lib/rdashboard-build` and ownership/mode is correct. New work is rejected unless

@@ -214,17 +214,10 @@ impl WorkflowHostPreparerV1 {
             CARGO_LOCK_MAX_BYTES,
         )?;
         let plan = CargoLockPlanV1::parse(&lockfile)?;
-        let package_count = u64::try_from(plan.packages().len())
-            .map_err(|_| WorkflowWorkerError::SourcePayloadTooLarge)?;
-        let cargo_dependency_inodes = package_count
-            .checked_mul(CARGO_VENDOR_INODES_PER_PACKAGE)
-            .and_then(|inodes| inodes.checked_add(2))
-            .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?;
-        let maximum_dependency_inodes = cargo_dependency_inodes
-            .checked_add(maximum_oci_base_inodes(context.oci_bases.len())?)
-            .ok_or(WorkflowWorkerError::SourcePayloadTooLarge)?;
+        let maximum_dependency_inodes =
+            maximum_cargo_dependency_inodes(plan.packages().len(), context.oci_bases.len())?;
         if maximum_dependency_inodes > context.maximum_payload_inodes {
-            return Err(WorkflowWorkerError::SourcePayloadTooLarge);
+            return Err(WorkflowWorkerError::DependencyPayloadTooLarge);
         }
         let oci_plan_digest = oci_base_plan_digest(&context.oci_bases)?;
         let dependency_layout_digest =
@@ -437,6 +430,20 @@ impl WorkflowHostPreparerV1 {
             prepared_run_manifest_digest: prepared.manifest.document_digest,
         })
     }
+}
+
+fn maximum_cargo_dependency_inodes(
+    package_count: usize,
+    oci_base_count: usize,
+) -> Result<u64, WorkflowWorkerError> {
+    let package_count =
+        u64::try_from(package_count).map_err(|_| WorkflowWorkerError::DependencyPayloadTooLarge)?;
+    let oci_base_inodes = maximum_oci_base_inodes(oci_base_count)?;
+    package_count
+        .checked_mul(CARGO_VENDOR_INODES_PER_PACKAGE)
+        .and_then(|inodes| inodes.checked_add(2))
+        .and_then(|inodes| inodes.checked_add(oci_base_inodes))
+        .ok_or(WorkflowWorkerError::DependencyPayloadTooLarge)
 }
 
 struct SourcePreparationContextV1 {
@@ -1971,6 +1978,8 @@ pub enum WorkflowWorkerError {
     UnsupportedSourceEntry,
     #[error("source archive exceeds the lease output or inode boundary")]
     SourcePayloadTooLarge,
+    #[error("dependency plan exceeds the preparation-store inode boundary")]
+    DependencyPayloadTooLarge,
     #[error("source archive changed between validation and extraction")]
     SourceArchiveChanged,
     #[error("required source file is missing")]
@@ -2024,6 +2033,7 @@ impl WorkflowWorkerError {
             Self::InvalidSourceArchive => "invalid_source_archive",
             Self::UnsupportedSourceEntry => "unsupported_source_entry",
             Self::SourcePayloadTooLarge => "source_payload_too_large",
+            Self::DependencyPayloadTooLarge => "dependency_payload_too_large",
             Self::SourceArchiveChanged => "source_archive_changed",
             Self::RequiredSourceFileMissing => "required_source_file_missing",
             Self::RequiredSourceFileInvalid => "required_source_file_invalid",
@@ -3675,5 +3685,30 @@ mod tests {
             SourceTarInventoryV1::inspect(&regular_path, 1, 10),
             Err(WorkflowWorkerError::SourcePayloadTooLarge)
         ));
+    }
+
+    #[test]
+    fn rdashboard_cargo_plan_fits_manifest_and_preparation_store_inode_boundaries() {
+        let plan = CargoLockPlanV1::parse(include_bytes!("../Cargo.lock"))
+            .expect("parse the repository Cargo lockfile");
+        let required_inodes = maximum_cargo_dependency_inodes(plan.packages().len(), 0)
+            .expect("calculate the conservative Cargo vendor inode boundary");
+        let manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../config/project-manifests/rdashboard.json"))
+                .expect("decode the rdashboard manifest");
+        let profile = manifest
+            .workflow
+            .execution_profiles
+            .iter()
+            .find(|profile| profile.profile_id.as_str() == "cargo-prepare")
+            .expect("rdashboard cargo preparation profile");
+        let profile_inodes = profile
+            .resources
+            .as_ref()
+            .expect("cargo preparation resources")
+            .scratch_max_inodes;
+
+        assert!(required_inodes <= profile_inodes);
+        assert!(required_inodes <= MAX_PREPARATION_STORE_INODES.saturating_sub(4));
     }
 }

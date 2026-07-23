@@ -32,7 +32,7 @@ use crate::{
 
 pub const PREPARATION_STORE_ROOT: &str = "/var/lib/rdashboard-build/preparation";
 pub const MAX_PREPARATION_STORE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-pub const MAX_PREPARATION_STORE_INODES: u64 = 100_000;
+pub const MAX_PREPARATION_STORE_INODES: u64 = 1_000_000;
 
 const PREPARATION_KEY_SCHEMA_VERSION: u16 = 2;
 const PREPARATION_KEY_PURPOSE: &str = "rdashboard.preparation-key.v2";
