@@ -50,7 +50,7 @@ fn main() -> Result<(), WorkflowJobError> {
     for directory in ["tmp", "cargo-home", "ccache-tmp", "workspace"] {
         create_private_job_directory(&Path::new(JOB_ROOT).join(directory))?;
     }
-    for directory in ["target", "ccache"] {
+    for directory in ["target", "ccache", "zig-global-cache", "zig-local-cache"] {
         create_private_job_directory(&Path::new(OPERATION_ROOT).join(directory))?;
     }
     copy_prepared_workspace(Path::new(PREPARED_SOURCE_ROOT), Path::new(WORKSPACE_ROOT))?;

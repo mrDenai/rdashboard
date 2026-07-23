@@ -124,6 +124,9 @@ tmpfs with the lease byte and inode ceilings. The sealed composition is mounted 
 repository-visible tree. A separate exact operation-owned directory is mounted at `/operation` only
 for adapters that consume the target and compiler cache. Matching compiled consumers on the VPS
 execute serially against that directory; different attempts and hosts never share writable state. A
+Rust operation keeps Cargo target, ccache and Zig linker caches in separate children of that exact
+directory, so the fixed Zig-based Titanium linker never falls back to the deliberately unwritable
+`HOME=/nonexistent` and verification-to-release reuse stays bounded by the operation lifecycle. A
 tmpfs declared by `TemporaryFileSystem=` and output/operation directories declared by `BindPaths=`
 are already writable inside their private namespace. Do not also name their namespace-only targets
 in `ReadWritePaths=`: that directive resolves host paths before the mounts exist and turns an absent

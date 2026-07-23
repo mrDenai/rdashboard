@@ -467,6 +467,8 @@ fn reserved_build_environment_name(value: &str) -> bool {
             | "CARGO_TARGET_DIR"
             | "CCACHE_DIR"
             | "CCACHE_TEMPDIR"
+            | "ZIG_GLOBAL_CACHE_DIR"
+            | "ZIG_LOCAL_CACHE_DIR"
             | "LD_PRELOAD"
             | "LD_LIBRARY_PATH"
     ) || value.starts_with("RDASHBOARD_")
@@ -2111,6 +2113,26 @@ mod tests {
             profile.profile_id == prepare_profile_id
                 || profile.network_class != WorkflowNetworkClassV1::DependencyEgress
         }));
+    }
+
+    #[test]
+    fn project_policy_cannot_override_launcher_owned_zig_cache_paths() {
+        let manifest: ProjectManifestV2 = serde_json::from_str(include_str!(
+            "../../config/project-manifests/rdashboard.json"
+        ))
+        .expect("decode project manifest");
+        let policy = manifest.host_preparation.expect("host preparation policy");
+
+        for name in ["ZIG_GLOBAL_CACHE_DIR", "ZIG_LOCAL_CACHE_DIR"] {
+            let mut overridden = policy.clone();
+            overridden
+                .build_environment
+                .insert(name.to_owned(), "/project-controlled".to_owned());
+            assert!(matches!(
+                overridden.validate(),
+                Err(WorkflowContractError::InvalidHostPreparationPolicy)
+            ));
+        }
     }
 
     #[test]
