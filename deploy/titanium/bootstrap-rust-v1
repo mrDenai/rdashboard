@@ -169,7 +169,7 @@ for wrapper in "${wrappers[@]}"; do
   install -m 0755 "$wrapper_root/$wrapper" "$toolchain_import/bin/$wrapper"
 done
 
-jq --compact-output --sort-keys --null-input \
+jq --compact-output --join-output --sort-keys --null-input \
   --arg node "$node_digest" \
   --arg zig "$zig_digest" \
   '{
