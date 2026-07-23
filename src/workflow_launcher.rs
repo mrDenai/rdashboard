@@ -2962,7 +2962,6 @@ fn transient_unit_arguments(
                 crate::rootless_oci::BUILDKIT_SOCKET_PATH
             ),
             format!("--property=BindPaths={}:/output", staging_path.display()),
-            "--property=ReadWritePaths=/job /output".to_owned(),
         ]);
         if !request.local_inputs.is_empty() {
             arguments.push(format!(
@@ -3006,7 +3005,6 @@ fn transient_unit_arguments(
                 operation_state_path.display()
             ),
             format!("--property=BindPaths={}:/output", staging_path.display()),
-            "--property=ReadWritePaths=/job /output".to_owned(),
             "--".to_owned(),
             ENV_EXECUTABLE.to_owned(),
             "-i".to_owned(),
@@ -3020,7 +3018,6 @@ fn transient_unit_arguments(
             operation_state_path.ok_or(WorkflowLauncherError::UnsupportedLease)?;
         let adapter = adapter_argument(lease.adapter_id)?;
         arguments.extend([
-            "--property=ReadWritePaths=/job".to_owned(),
             format!(
                 "--property=BindReadOnlyPaths={}:{WORKFLOW_TITANIUM_TOOLCHAIN_ROOT}",
                 toolchain_path.display()
@@ -4195,13 +4192,6 @@ mod tests {
                     RootlessOciResultStoreV1::staging_path_for(request).display()
                 )
         }));
-        let read_write_paths = launch
-            .arguments
-            .iter()
-            .filter(|argument| argument.starts_with("--property=ReadWritePaths="))
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        assert_eq!(read_write_paths, ["--property=ReadWritePaths=/job /output"]);
         assert!(!launch.arguments.iter().any(|argument| {
             argument.starts_with("--property=BindPaths=") && argument.ends_with(":/operation")
         }));

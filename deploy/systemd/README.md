@@ -124,7 +124,11 @@ tmpfs with the lease byte and inode ceilings. The sealed composition is mounted 
 repository-visible tree. A separate exact operation-owned directory is mounted at `/operation` only
 for adapters that consume the target and compiler cache. Matching compiled consumers on the VPS
 execute serially against that directory; different attempts and hosts never share writable state. A
-native self-release keeps verification and packaging on the same VPS-owned operation state, so an
+tmpfs declared by `TemporaryFileSystem=` and output/operation directories declared by `BindPaths=`
+are already writable inside their private namespace. Do not also name their namespace-only targets
+in `ReadWritePaths=`: that directive resolves host paths before the mounts exist and turns an absent
+host `/job` into a pre-execution `226/NAMESPACE` failure. A native self-release keeps verification
+and packaging on the same VPS-owned operation state, so an
 optional build-only host cannot strand the required binaries or block the release. An OCI policy
 without `verified_output` neither mounts nor allocates operation state, so its independently bounded
 build can run beside verification. A policy such as rimg with `verified_output` instead keeps the
