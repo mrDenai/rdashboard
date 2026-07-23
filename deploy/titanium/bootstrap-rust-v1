@@ -124,7 +124,10 @@ if [[ -z "$node_digest" ]]; then
   download "$node_url" "$node_sha256" "$work/node.tar.xz"
   install -d -m 0755 "$work/node-extract"
   tar --extract --xz --file="$work/node.tar.xz" --directory="$work/node-extract" --no-same-owner
-  copy_without_hardlinks "$work/node-extract/node-v22.22.2-linux-x64" "$node_import"
+  install -d -m 0755 "$node_import/bin"
+  install -m 0755 \
+    "$work/node-extract/node-v22.22.2-linux-x64/bin/node" \
+    "$node_import/bin/node"
   seal_tree "$node_import"
   node_digest="$($titanium import-artifact \
     "$node_name" "$target" build-tool verified-upstream-prebuilt \
