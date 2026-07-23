@@ -1218,8 +1218,37 @@ fn expire_one_lease(
     let uncertain_delivery = context.execution_mode == WorkflowExecutionModeV1::Deploy
         && (node_kind.is_mutation()
             || is_self_update_handoff_release(&context.manifest, node_kind));
+    let execution_deadline_expired =
+        lease.expires_at_ms == execution_deadline_ms(lease.leased_at_ms, lease.timeout_ms)?;
     if uncertain_delivery {
         expire_mutation_lease(transaction, attempt_id, node_id, now_ms)?;
+    } else if execution_deadline_expired {
+        let changed = transaction.execute(
+            "UPDATE workflow_nodes
+             SET state = 'failed', completed_at_ms = ?3
+             WHERE attempt_id = ?1 AND node_id = ?2 AND state = 'leased'",
+            params![attempt_id, node_id, now_ms],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::WorkflowStateConflict);
+        }
+        fail_terminal_workflow(
+            transaction,
+            parse_uuid(attempt_id, "expired attempt ID")?,
+            WorkflowCleanupResultV1::Pending,
+            now_ms,
+        )?;
+        append_transition(
+            transaction,
+            parse_uuid(attempt_id, "expired attempt ID")?,
+            "node",
+            node_id,
+            Some("leased"),
+            WorkflowNodeStateV1::Failed.as_str(),
+            "execution_deadline_expired",
+            Some(&lease.lease_digest),
+            now_ms,
+        )?;
     } else {
         let changed = transaction.execute(
             "UPDATE workflow_nodes SET state = 'ready'
@@ -1248,6 +1277,8 @@ fn expire_one_lease(
         "expired",
         if uncertain_delivery {
             "mutation_requires_reconciliation"
+        } else if execution_deadline_expired {
+            "execution_deadline_expired"
         } else {
             "worker_lease_expired"
         },
@@ -1643,14 +1674,7 @@ fn bounded_lease_expiry(
     lease_duration_ms: i64,
     execution_timeout_ms: u64,
 ) -> Result<i64, StoreError> {
-    let timeout_ms = i64::try_from(execution_timeout_ms)
-        .map_err(|_| StoreError::InvalidWorkflowSchedulerInput("execution timeout"))?;
-    let execution_deadline =
-        leased_at_ms
-            .checked_add(timeout_ms)
-            .ok_or(StoreError::InvalidWorkflowSchedulerInput(
-                "execution deadline",
-            ))?;
+    let execution_deadline = execution_deadline_ms(leased_at_ms, execution_timeout_ms)?;
     let requested_expiry = now_ms
         .checked_add(lease_duration_ms)
         .ok_or(StoreError::InvalidWorkflowSchedulerInput("lease expiry"))?;
@@ -1659,6 +1683,16 @@ fn bounded_lease_expiry(
         return Err(StoreError::WorkflowLeaseConflict);
     }
     Ok(expires_at_ms)
+}
+
+fn execution_deadline_ms(leased_at_ms: i64, execution_timeout_ms: u64) -> Result<i64, StoreError> {
+    let timeout_ms = i64::try_from(execution_timeout_ms)
+        .map_err(|_| StoreError::InvalidWorkflowSchedulerInput("execution timeout"))?;
+    leased_at_ms
+        .checked_add(timeout_ms)
+        .ok_or(StoreError::InvalidWorkflowSchedulerInput(
+            "execution deadline",
+        ))
 }
 
 fn persist_active_lease(

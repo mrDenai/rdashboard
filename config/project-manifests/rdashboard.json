@@ -47,7 +47,7 @@
         "worker_pool": "build_compute",
         "network_class": "offline",
         "cache_class": "prepared_run",
-        "timeout_ms": 900000,
+        "timeout_ms": 1800000,
         "resources": {
           "cpu_millicores": 3000,
           "memory_max_bytes": 6442450944,

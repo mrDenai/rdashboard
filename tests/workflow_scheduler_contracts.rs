@@ -492,6 +492,104 @@ fn fair_queue_and_lease_generation_survive_reopen() {
 }
 
 #[test]
+fn liveness_expiry_retries_but_the_execution_deadline_is_terminal() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = manifest("ralert", 1);
+    scheduler
+        .admit(
+            &manifest,
+            &admission(
+                &manifest,
+                '9',
+                1,
+                WorkflowTriggerChannelV1::GithubWebhook,
+                "ralert-expiry-boundary",
+            ),
+            1,
+        )
+        .unwrap_or_else(|error| panic!("admit workflow: {error}"));
+    let worker = build_worker();
+
+    let short = claim(&scheduler, &worker, 10);
+    let execution_timeout_ms = i64::try_from(short.timeout_ms)
+        .unwrap_or_else(|error| panic!("execution timeout: {error}"));
+    assert!(short.expires_at_ms < short.leased_at_ms + execution_timeout_ms);
+    scheduler
+        .expire_leases(short.expires_at_ms)
+        .unwrap_or_else(|error| panic!("expire liveness lease: {error}"));
+    let short_cleanup = WorkflowCleanupReceiptV1::new(
+        &short,
+        None,
+        digest("short-lease-cleanup"),
+        short.expires_at_ms + 1,
+    )
+    .unwrap_or_else(|error| panic!("short cleanup receipt: {error}"));
+    scheduler
+        .commit_cleanup_receipt(&short_cleanup, short.expires_at_ms + 2)
+        .unwrap_or_else(|error| panic!("commit short cleanup: {error}"));
+
+    let deadline = scheduler
+        .claim_next(&worker, short.expires_at_ms + 3, 900_000)
+        .unwrap_or_else(|error| panic!("claim deadline lease: {error}"))
+        .unwrap_or_else(|| panic!("expected a retried workflow lease"));
+    assert_eq!(deadline.node_id, short.node_id);
+    assert_eq!(deadline.lease_generation, short.lease_generation + 1);
+    assert_eq!(
+        deadline.expires_at_ms,
+        deadline.leased_at_ms
+            + i64::try_from(deadline.timeout_ms)
+                .unwrap_or_else(|error| panic!("deadline timeout: {error}"))
+    );
+    scheduler
+        .expire_leases(deadline.expires_at_ms)
+        .unwrap_or_else(|error| panic!("expire execution deadline: {error}"));
+
+    let failed = scheduler
+        .attempt(deadline.attempt_id)
+        .unwrap_or_else(|error| panic!("load failed attempt: {error}"))
+        .unwrap_or_else(|| panic!("failed attempt exists"));
+    assert_eq!(failed.state, WorkflowAttemptStateV1::Failed);
+    assert_eq!(failed.cleanup_state, WorkflowCleanupStateV1::Pending);
+    assert_eq!(failed.mutation_state, WorkflowMutationStateV1::NotStarted);
+    assert_eq!(
+        failed
+            .nodes
+            .iter()
+            .find(|node| node.node_id == deadline.node_id)
+            .unwrap_or_else(|| panic!("expired node"))
+            .state,
+        WorkflowNodeStateV1::Failed
+    );
+    assert!(
+        scheduler
+            .claim_next(&worker, deadline.expires_at_ms + 1, 900_000)
+            .unwrap_or_else(|error| panic!("claim after terminal deadline: {error}"))
+            .is_none()
+    );
+
+    let deadline_cleanup = WorkflowCleanupReceiptV1::new(
+        &deadline,
+        None,
+        digest("deadline-cleanup"),
+        deadline.expires_at_ms + 1,
+    )
+    .unwrap_or_else(|error| panic!("deadline cleanup receipt: {error}"));
+    let cleaned = scheduler
+        .commit_cleanup_receipt(&deadline_cleanup, deadline.expires_at_ms + 2)
+        .unwrap_or_else(|error| panic!("commit deadline cleanup: {error}"));
+    assert_eq!(cleaned.state, WorkflowAttemptStateV1::Failed);
+    assert_eq!(cleaned.cleanup_state, WorkflowCleanupStateV1::Complete);
+    assert!(
+        scheduler
+            .claim_next(&worker, deadline.expires_at_ms + 3, 900_000)
+            .unwrap_or_else(|error| panic!("claim after deadline cleanup: {error}"))
+            .is_none()
+    );
+}
+
+#[test]
 fn optional_accelerator_can_verify_but_cannot_own_required_preparation_or_release() {
     let store = ControlStore::open(":memory:")
         .unwrap_or_else(|error| panic!("open control store: {error}"));
