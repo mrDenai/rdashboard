@@ -353,6 +353,7 @@ fn supervisor_rejection(
         WorkflowLaunchSupervisorError::Journal(
             WorkflowLaunchJournalError::StateConflict | WorkflowLaunchJournalError::InvalidLocator,
         )
+        | WorkflowLaunchSupervisorError::LaunchRecordMissing
         | WorkflowLaunchSupervisorError::OperationState(
             WorkflowOperationStateError::IdentityConflict
             | WorkflowOperationStateError::TerminalState
@@ -369,7 +370,8 @@ fn supervisor_rejection(
         WorkflowLaunchSupervisorError::Journal(_) => {
             (WorkflowLauncherRejectionCodeV1::JournalUnavailable, true)
         }
-        WorkflowLaunchSupervisorError::Runtime(_)
+        WorkflowLaunchSupervisorError::StartCleanupLockPoisoned
+        | WorkflowLaunchSupervisorError::Runtime(_)
         | WorkflowLaunchSupervisorError::OperationState(_) => {
             (WorkflowLauncherRejectionCodeV1::RuntimeUnavailable, true)
         }

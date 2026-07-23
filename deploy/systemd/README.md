@@ -109,7 +109,11 @@ signing seed is present in this policy. Keep an adapter absent until its fixed e
 output contract have been installed and reviewed; a signed lease alone cannot enable it.
 
 Before systemd starts an authorized unit, the launcher atomically records the exact execution identity
-under `/var/lib/rdashboard-workflow-launcher/jobs`. A renewed lease for the same execution updates the
+under `/var/lib/rdashboard-workflow-launcher/jobs` and returns that durable `accepted` state. Complete
+PreparedRun and Titanium closure verification then continues in the launcher's bounded starter task;
+the worker polls the journal and renews the same lease while that potentially cold-disk integrity pass
+is running. Only a fully resolved launch can be pinned and passed to `systemd-run`, and an input or
+spawn failure becomes terminal journal evidence. A renewed lease for the same execution updates the
 authorization record but never starts a second unit. A launcher restart converts any accepted/running
 record into explicit `needs_reconcile` state, so an uncertain launch is stopped and cleaned rather than
 silently replayed. Cleanup is itself journaled before `systemctl stop`; exact repeats return the same

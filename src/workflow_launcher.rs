@@ -286,6 +286,32 @@ impl WorkflowLauncherPolicyV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorizedWorkflowLaunchRequestV1 {
+    lease: WorkflowLeaseV1,
+    grant: VerifiedWorkflowExecutionGrantV1,
+    unit_name: String,
+}
+
+impl AuthorizedWorkflowLaunchRequestV1 {
+    fn authorize(
+        policy: &WorkflowLauncherPolicyV1,
+        lease: &WorkflowLeaseV1,
+        execution_grant: &str,
+        now_ms: i64,
+    ) -> Result<Self, WorkflowLauncherError> {
+        validate_launcher_lease(policy, lease)?;
+        let grant = policy
+            .grant_verifier()?
+            .verify(execution_grant, lease, now_ms)?;
+        Ok(Self {
+            lease: lease.clone(),
+            grant,
+            unit_name: unit_name(lease),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizedWorkflowLaunchV1 {
     pub lease: WorkflowLeaseV1,
     pub grant: VerifiedWorkflowExecutionGrantV1,
@@ -312,11 +338,19 @@ impl AuthorizedWorkflowLaunchV1 {
         execution_grant: &str,
         now_ms: i64,
     ) -> Result<Self, WorkflowLauncherError> {
-        validate_launcher_lease(policy, lease)?;
+        let request =
+            AuthorizedWorkflowLaunchRequestV1::authorize(policy, lease, execution_grant, now_ms)?;
+        Self::resolve(policy, preparation_reader, titanium, request)
+    }
+
+    fn resolve(
+        policy: &WorkflowLauncherPolicyV1,
+        preparation_reader: &PreparationStoreReaderV1,
+        titanium: &TitaniumRegistryV1,
+        request: AuthorizedWorkflowLaunchRequestV1,
+    ) -> Result<Self, WorkflowLauncherError> {
+        let lease = &request.lease;
         let prepared_run_key = required_prepared_run_key(lease)?;
-        let grant = policy
-            .grant_verifier()?
-            .verify(execution_grant, lease, now_ms)?;
         let prepared = preparation_reader
             .open_entry(PreparationObjectKindV1::PreparedRun, prepared_run_key)?;
         let composition = prepared.prepared_run_composition()?;
@@ -344,7 +378,7 @@ impl AuthorizedWorkflowLaunchV1 {
         let toolchain_components =
             titanium.toolchain_component_payloads(&composition.toolchain_artifact_digest)?;
         let compact_lease_id = lease.lease_id.simple();
-        let unit_name = unit_name(lease);
+        let unit_name = request.unit_name;
         let job_directory = Path::new(WORKFLOW_LAUNCHER_JOB_ROOT)
             .join(format!("{compact_lease_id}-g{}", lease.lease_generation));
         let prepared_run_path = prepared.payload_path();
@@ -385,8 +419,8 @@ impl AuthorizedWorkflowLaunchV1 {
             self_release_build_request.as_ref(),
         )?;
         Ok(Self {
-            lease: lease.clone(),
-            grant,
+            lease: request.lease,
+            grant: request.grant,
             unit_name,
             job_directory,
             prepared_run_path,
@@ -695,7 +729,7 @@ struct WorkflowLaunchRecordPayload<'a> {
 
 impl WorkflowLaunchRecordV1 {
     fn accepted(
-        launch: &AuthorizedWorkflowLaunchV1,
+        launch: &AuthorizedWorkflowLaunchRequestV1,
         accepted_at_ms: i64,
     ) -> Result<Self, WorkflowLaunchJournalError> {
         let prepared_run_key = required_prepared_run_key(&launch.lease)?.clone();
@@ -992,7 +1026,7 @@ impl WorkflowLaunchJournalV1 {
 
     fn accept(
         &self,
-        launch: &AuthorizedWorkflowLaunchV1,
+        launch: &AuthorizedWorkflowLaunchRequestV1,
         accepted_at_ms: i64,
         max_concurrent_jobs: u16,
     ) -> Result<(WorkflowLaunchStatusV1, bool), WorkflowLaunchJournalError> {
@@ -1947,6 +1981,7 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
     }
 }
 
+#[derive(Clone)]
 pub struct WorkflowLaunchSupervisorV1 {
     policy: WorkflowLauncherPolicyV1,
     preparation_reader: PreparationStoreReaderV1,
@@ -1954,6 +1989,7 @@ pub struct WorkflowLaunchSupervisorV1 {
     journal: WorkflowLaunchJournalV1,
     operation_states: Arc<dyn WorkflowOperationStateManagerV1>,
     runtime: Arc<dyn WorkflowLaunchRuntimeV1>,
+    start_cleanup_lock: Arc<Mutex<()>>,
 }
 
 impl WorkflowLaunchSupervisorV1 {
@@ -1976,6 +2012,7 @@ impl WorkflowLaunchSupervisorV1 {
             journal,
             operation_states,
             runtime,
+            start_cleanup_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -1985,36 +2022,143 @@ impl WorkflowLaunchSupervisorV1 {
         execution_grant: &str,
         now_ms: i64,
     ) -> Result<WorkflowLaunchStatusV1, WorkflowLaunchSupervisorError> {
-        self.launch_with_waiter(lease, execution_grant, now_ms, |name, task| {
+        self.launch_with_starter(lease, execution_grant, now_ms, |name, task| {
             thread::Builder::new().name(name).spawn(task).map(drop)
         })
     }
 
-    fn launch_with_waiter<F>(
+    fn launch_with_starter<F>(
         &self,
         lease: &WorkflowLeaseV1,
         execution_grant: &str,
         now_ms: i64,
-        spawn_waiter: F,
+        spawn_starter: F,
     ) -> Result<WorkflowLaunchStatusV1, WorkflowLaunchSupervisorError>
     where
         F: FnOnce(String, Box<dyn FnOnce() + Send>) -> io::Result<()>,
     {
-        let launch = AuthorizedWorkflowLaunchV1::authorize(
+        let request = AuthorizedWorkflowLaunchRequestV1::authorize(
             &self.policy,
-            &self.preparation_reader,
-            &self.titanium,
             lease,
             execution_grant,
             now_ms,
         )?;
         let (status, is_new) =
             self.journal
-                .accept(&launch, now_ms, self.policy.max_concurrent_jobs)?;
+                .accept(&request, now_ms, self.policy.max_concurrent_jobs)?;
         if !is_new {
             return Ok(status);
         }
-        if let Some(rejected) = self.pin_launch_inputs(&launch, lease, now_ms)? {
+
+        let supervisor = self.clone();
+        let starter_lease = request.lease.clone();
+        let starter_name = format!("workflow-start-{}", starter_lease.lease_id.simple());
+        if let Err(error) = spawn_starter(
+            starter_name,
+            Box::new(move || supervisor.start_launch(request, now_ms)),
+        ) {
+            return Ok(self.journal.mark_spawn_rejected(
+                lease,
+                WorkflowLaunchRuntimeError::StarterSpawn(error).evidence_digest(),
+                now_ms,
+            )?);
+        }
+        Ok(status)
+    }
+
+    fn start_launch(&self, request: AuthorizedWorkflowLaunchRequestV1, now_ms: i64) {
+        let lease = request.lease.clone();
+        let launch = match AuthorizedWorkflowLaunchV1::resolve(
+            &self.policy,
+            &self.preparation_reader,
+            &self.titanium,
+            request,
+        ) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.record_start_failure(
+                    &lease,
+                    "launcher_input_authorization_failed",
+                    EvidenceDigest::sha256(
+                        "rdashboard.workflow-launch-input-authorization-failed.v1",
+                    ),
+                    now_ms,
+                    &error,
+                );
+                return;
+            }
+        };
+        if let Err(error) =
+            self.start_authorized_launch_with_waiter(&launch, now_ms, |name, task| {
+                thread::Builder::new().name(name).spawn(task).map(drop)
+            })
+        {
+            self.record_start_failure(
+                &lease,
+                "launcher_async_start_failed",
+                EvidenceDigest::sha256("rdashboard.workflow-launch-start-failed.v1"),
+                now_ms,
+                &error,
+            );
+        }
+    }
+
+    fn record_start_failure(
+        &self,
+        lease: &WorkflowLeaseV1,
+        reason_code: &'static str,
+        failure_digest: EvidenceDigest,
+        now_ms: i64,
+        error: &dyn std::fmt::Display,
+    ) {
+        tracing::error!(
+            lease_id = %lease.lease_id,
+            lease_generation = lease.lease_generation,
+            reason_code,
+            summary = %error,
+            "workflow launch failed after durable acceptance"
+        );
+        if let Err(remove_error) = self.remove_active_toolchain_root(lease) {
+            tracing::error!(
+                lease_id = %lease.lease_id,
+                summary = %remove_error,
+                "failed workflow launch retained its active Titanium root"
+            );
+        }
+        let failed_at_ms = crate::unix_time_ms().unwrap_or(now_ms).max(now_ms);
+        if let Err(journal_error) =
+            self.journal
+                .mark_spawn_rejected(lease, failure_digest, failed_at_ms)
+        {
+            tracing::error!(
+                lease_id = %lease.lease_id,
+                summary = %journal_error,
+                "failed workflow launch could not record terminal evidence"
+            );
+        }
+    }
+
+    fn start_authorized_launch_with_waiter<F>(
+        &self,
+        launch: &AuthorizedWorkflowLaunchV1,
+        now_ms: i64,
+        spawn_waiter: F,
+    ) -> Result<WorkflowLaunchStatusV1, WorkflowLaunchSupervisorError>
+    where
+        F: FnOnce(String, Box<dyn FnOnce() + Send>) -> io::Result<()>,
+    {
+        let lease = &launch.lease;
+        let _transition = self.lock_start_cleanup()?;
+        let Some(current) = self
+            .journal
+            .observe(lease.lease_id, lease.lease_generation)?
+        else {
+            return Err(WorkflowLaunchSupervisorError::LaunchRecordMissing);
+        };
+        if current.state != WorkflowLaunchStateV1::Accepted {
+            return Ok(current);
+        }
+        if let Some(rejected) = self.pin_launch_inputs(launch, lease, now_ms)? {
             return Ok(rejected);
         }
         let (process_sender, process_receiver) =
@@ -2029,7 +2173,9 @@ impl WorkflowLaunchSupervisorV1 {
                 let Ok(process) = process_receiver.recv() else {
                     return;
                 };
-                if let Ok(exit) = process.wait() {
+                if let Ok(Ok(exit)) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process.wait()))
+                {
                     let completed_at_ms = crate::unix_time_ms().unwrap_or(fallback_time);
                     let _ = journal.mark_process_exit(&wait_lease, exit, completed_at_ms);
                 } else {
@@ -2047,16 +2193,16 @@ impl WorkflowLaunchSupervisorV1 {
                 WorkflowLaunchRuntimeError::WaiterSpawn(error).evidence_digest(),
                 now_ms,
             )?;
-            self.remove_active_toolchain_root(lease)?;
+            self.settle_launch_inputs(lease, WorkflowOperationStateOutcomeV1::Failed, now_ms)?;
             return Ok(status);
         }
-        let process = match self.runtime.spawn(&launch) {
+        let process = match self.runtime.spawn(launch) {
             Ok(process) => process,
             Err(error) => {
                 let status =
                     self.journal
                         .mark_spawn_rejected(lease, error.evidence_digest(), now_ms)?;
-                self.remove_active_toolchain_root(lease)?;
+                self.settle_launch_inputs(lease, WorkflowOperationStateOutcomeV1::Failed, now_ms)?;
                 return Ok(status);
             }
         };
@@ -2069,14 +2215,19 @@ impl WorkflowLaunchSupervisorV1 {
                     WorkflowLaunchReconcileReasonV1::SupervisorUnavailable,
                     now_ms,
                 );
-                match handoff {
-                    Ok(()) => {
-                        self.runtime.terminate(&launch.unit_name)?;
-                    }
+                let containment = match handoff {
+                    Ok(()) => self.runtime.terminate(&launch.unit_name).map(drop),
                     Err(send_error) => {
-                        self.contain_unowned_process(&launch.unit_name, send_error.0)?;
+                        self.contain_unowned_process(&launch.unit_name, send_error.0)
                     }
-                }
+                };
+                let settlement = self.settle_launch_inputs(
+                    lease,
+                    WorkflowOperationStateOutcomeV1::Unknown,
+                    now_ms,
+                );
+                containment?;
+                settlement?;
                 return Err(error.into());
             }
         };
@@ -2086,7 +2237,11 @@ impl WorkflowLaunchSupervisorV1 {
                 WorkflowLaunchReconcileReasonV1::SupervisorUnavailable,
                 now_ms,
             );
-            self.contain_unowned_process(&launch.unit_name, send_error.0)?;
+            let containment = self.contain_unowned_process(&launch.unit_name, send_error.0);
+            let settlement =
+                self.settle_launch_inputs(lease, WorkflowOperationStateOutcomeV1::Unknown, now_ms);
+            containment?;
+            settlement?;
             return Ok(reconciled?);
         }
         Ok(running)
@@ -2118,6 +2273,7 @@ impl WorkflowLaunchSupervisorV1 {
         now_ms: i64,
     ) -> Result<WorkflowLaunchStatusV1, WorkflowLaunchSupervisorError> {
         validate_launcher_cleanup_lease(&self.policy, lease)?;
+        let _transition = self.lock_start_cleanup()?;
         let (status, needs_runtime) = self.journal.begin_cleanup(lease, now_ms)?;
         if !needs_runtime {
             self.remove_active_toolchain_root(lease)?;
@@ -2141,6 +2297,31 @@ impl WorkflowLaunchSupervisorV1 {
                 .finish_cleanup(lease, unit_was_loaded, operation_state, now_ms)?;
         self.remove_active_toolchain_root(lease)?;
         Ok(status)
+    }
+
+    fn lock_start_cleanup(&self) -> Result<MutexGuard<'_, ()>, WorkflowLaunchSupervisorError> {
+        self.start_cleanup_lock
+            .lock()
+            .map_err(|_| WorkflowLaunchSupervisorError::StartCleanupLockPoisoned)
+    }
+
+    fn settle_launch_inputs(
+        &self,
+        lease: &WorkflowLeaseV1,
+        outcome: WorkflowOperationStateOutcomeV1,
+        now_ms: i64,
+    ) -> Result<(), WorkflowLaunchSupervisorError> {
+        let operation_state = if lease.operation_state.is_some() {
+            self.operation_states
+                .release(lease, outcome, now_ms)
+                .map(drop)
+        } else {
+            Ok(())
+        };
+        let titanium_root = self.remove_active_toolchain_root(lease);
+        operation_state?;
+        titanium_root?;
+        Ok(())
     }
 
     fn remove_active_toolchain_root(
@@ -2548,6 +2729,8 @@ pub enum WorkflowLaunchJournalError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowLaunchRuntimeError {
+    #[error("workflow launch starter thread could not be started: {0}")]
+    StarterSpawn(io::Error),
     #[error("systemd-run could not be started: {0}")]
     Spawn(io::Error),
     #[error("systemd-run could not be waited: {0}")]
@@ -2597,6 +2780,13 @@ pub enum WorkflowLaunchRuntimeError {
 impl WorkflowLaunchRuntimeError {
     fn evidence_digest(&self) -> EvidenceDigest {
         let stable = match self {
+            Self::StarterSpawn(error) => {
+                format!(
+                    "starter-spawn:{:?}:{:?}",
+                    error.kind(),
+                    error.raw_os_error()
+                )
+            }
             Self::Spawn(error) => format!("spawn:{:?}:{:?}", error.kind(), error.raw_os_error()),
             Self::Wait(error) => format!("wait:{:?}:{:?}", error.kind(), error.raw_os_error()),
             Self::WaiterSpawn(error) => {
@@ -2640,6 +2830,10 @@ impl WorkflowLaunchRuntimeError {
 pub enum WorkflowLaunchSupervisorError {
     #[error("workflow launcher policy does not match its journal")]
     PolicyJournalMismatch,
+    #[error("workflow launch record disappeared before start")]
+    LaunchRecordMissing,
+    #[error("workflow launch start/cleanup transition lock is poisoned")]
+    StartCleanupLockPoisoned,
     #[error("workflow operation-state path does not match its authorized lease")]
     OperationStatePathMismatch,
     #[error("workflow launch authorization failed: {0}")]
@@ -3395,6 +3589,39 @@ mod tests {
                     "test process disconnected",
                 ))
             })
+        }
+
+        fn abort(self: Box<Self>) -> Result<(), WorkflowLaunchRuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PanicWaitRuntime {
+        spawn_count: AtomicUsize,
+        terminate_count: AtomicUsize,
+    }
+
+    impl WorkflowLaunchRuntimeV1 for PanicWaitRuntime {
+        fn spawn(
+            &self,
+            _launch: &AuthorizedWorkflowLaunchV1,
+        ) -> Result<Box<dyn WorkflowLaunchProcessV1>, WorkflowLaunchRuntimeError> {
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(PanicWaitProcess))
+        }
+
+        fn terminate(&self, _unit_name: &str) -> Result<bool, WorkflowLaunchRuntimeError> {
+            self.terminate_count.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    struct PanicWaitProcess;
+
+    impl WorkflowLaunchProcessV1 for PanicWaitProcess {
+        fn wait(self: Box<Self>) -> Result<WorkflowProcessExitV1, WorkflowLaunchRuntimeError> {
+            panic!("injected process waiter panic");
         }
 
         fn abort(self: Box<Self>) -> Result<(), WorkflowLaunchRuntimeError> {
@@ -4178,6 +4405,223 @@ mod tests {
     }
 
     #[test]
+    fn durable_acceptance_precedes_slow_launch_input_resolution() {
+        let fixture = fixture();
+        let journal = WorkflowLaunchJournalV1::open(
+            &fixture.journal_root,
+            fixture.owner_uid,
+            fixture.policy.max_journal_records,
+            100,
+        )
+        .expect("open journal");
+        let (runtime, exit_sender) = runtime();
+        let supervisor = WorkflowLaunchSupervisorV1::new(
+            fixture.policy.clone(),
+            fixture.reader.clone(),
+            fixture.titanium.clone(),
+            journal,
+            fixture.operation_states.clone(),
+            runtime.clone(),
+        )
+        .expect("supervisor");
+        let grant = fixture
+            .signer
+            .issue(&fixture.lease, 101, Uuid::from_u128(54))
+            .expect("grant");
+        let (starter_sender, starter_receiver) = mpsc::sync_channel(1);
+
+        let accepted = supervisor
+            .launch_with_starter(&fixture.lease, &grant, 101, move |_name, task| {
+                starter_sender
+                    .send(task)
+                    .map_err(|_| io::Error::other("starter receiver lost"))
+            })
+            .expect("durably accept before starting input resolution");
+        assert_eq!(accepted.state, WorkflowLaunchStateV1::Accepted);
+        assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 0);
+
+        let renewed = fixture.lease.renewed(20_000).expect("renew lease");
+        let renewed_grant = fixture
+            .signer
+            .issue(&renewed, 102, Uuid::from_u128(55))
+            .expect("renewed grant");
+        let replay = supervisor
+            .launch(&renewed, &renewed_grant, 102)
+            .expect("replay accepted launch");
+        assert_eq!(replay.state, WorkflowLaunchStateV1::Accepted);
+        assert_eq!(replay.lease_digest, renewed.lease_digest);
+        assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 0);
+
+        starter_receiver.recv().expect("starter task")();
+        let running = wait_for_state(
+            &supervisor,
+            renewed.lease_id,
+            renewed.lease_generation,
+            WorkflowLaunchStateV1::Running,
+        );
+        assert_eq!(running.lease_digest, renewed.lease_digest);
+        assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
+
+        exit_sender
+            .send(WorkflowProcessExitV1 {
+                exit_code: Some(0),
+                signal: None,
+                failure_digest: None,
+                output_digest: None,
+            })
+            .expect("finish process");
+        let completed = wait_for_state(
+            &supervisor,
+            renewed.lease_id,
+            renewed.lease_generation,
+            WorkflowLaunchStateV1::Succeeded,
+        );
+        let cleanup_at_ms = completed
+            .terminal
+            .expect("terminal evidence")
+            .completed_at_ms
+            .checked_add(1)
+            .expect("cleanup time");
+        supervisor
+            .cleanup(&renewed, cleanup_at_ms)
+            .expect("cleanup launch");
+    }
+
+    #[test]
+    fn cleanup_before_delayed_starter_prevents_any_late_runtime_effect() {
+        let fixture = fixture();
+        let journal = WorkflowLaunchJournalV1::open(
+            &fixture.journal_root,
+            fixture.owner_uid,
+            fixture.policy.max_journal_records,
+            100,
+        )
+        .expect("open journal");
+        let (runtime, _exit_sender) = runtime();
+        let supervisor = WorkflowLaunchSupervisorV1::new(
+            fixture.policy.clone(),
+            fixture.reader.clone(),
+            fixture.titanium.clone(),
+            journal,
+            fixture.operation_states.clone(),
+            runtime.clone(),
+        )
+        .expect("supervisor");
+        let grant = fixture
+            .signer
+            .issue(&fixture.lease, 101, Uuid::from_u128(57))
+            .expect("grant");
+        let (starter_sender, starter_receiver) = mpsc::sync_channel(1);
+
+        let accepted = supervisor
+            .launch_with_starter(&fixture.lease, &grant, 101, move |_name, task| {
+                starter_sender
+                    .send(task)
+                    .map_err(|_| io::Error::other("starter receiver lost"))
+            })
+            .expect("accept delayed launch");
+        assert_eq!(accepted.state, WorkflowLaunchStateV1::Accepted);
+        let cleaned = supervisor
+            .cleanup(&fixture.lease, 102)
+            .expect("cleanup accepted launch");
+        assert_eq!(cleaned.state, WorkflowLaunchStateV1::Cleaned);
+
+        starter_receiver.recv().expect("starter task")();
+        let replay = supervisor
+            .observe(fixture.lease.lease_id, fixture.lease.lease_generation)
+            .expect("observe launch")
+            .expect("launch record");
+        assert_eq!(replay.state, WorkflowLaunchStateV1::Cleaned);
+        assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.operation_states.counts(), (0, 1));
+        assert_active_toolchain_root_removed(&fixture);
+    }
+
+    #[test]
+    fn waiter_panic_becomes_reconciliation_debt_and_cleans_normally() {
+        let fixture = fixture();
+        let journal = WorkflowLaunchJournalV1::open(
+            &fixture.journal_root,
+            fixture.owner_uid,
+            fixture.policy.max_journal_records,
+            100,
+        )
+        .expect("open journal");
+        let runtime = Arc::new(PanicWaitRuntime::default());
+        let supervisor = WorkflowLaunchSupervisorV1::new(
+            fixture.policy.clone(),
+            fixture.reader.clone(),
+            fixture.titanium.clone(),
+            journal,
+            fixture.operation_states.clone(),
+            runtime.clone(),
+        )
+        .expect("supervisor");
+        let grant = fixture
+            .signer
+            .issue(&fixture.lease, 101, Uuid::from_u128(58))
+            .expect("grant");
+
+        let accepted = supervisor
+            .launch(&fixture.lease, &grant, 101)
+            .expect("accept launch");
+        assert_eq!(accepted.state, WorkflowLaunchStateV1::Accepted);
+        wait_for_lease_state(
+            &supervisor,
+            &fixture.lease,
+            WorkflowLaunchStateV1::NeedsReconcile,
+        );
+        let cleanup_at_ms = crate::unix_time_ms().expect("cleanup time");
+        let cleaned = supervisor
+            .cleanup(&fixture.lease, cleanup_at_ms)
+            .expect("cleanup uncertain launch");
+        assert_eq!(cleaned.state, WorkflowLaunchStateV1::Cleaned);
+        assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.terminate_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.operation_states.counts(), (1, 1));
+    }
+
+    #[test]
+    fn starter_exhaustion_records_terminal_failure_without_runtime_effect() {
+        let fixture = fixture();
+        let journal = WorkflowLaunchJournalV1::open(
+            &fixture.journal_root,
+            fixture.owner_uid,
+            fixture.policy.max_journal_records,
+            100,
+        )
+        .expect("open journal");
+        let (runtime, _exit_sender) = runtime();
+        let supervisor = WorkflowLaunchSupervisorV1::new(
+            fixture.policy.clone(),
+            fixture.reader.clone(),
+            fixture.titanium.clone(),
+            journal,
+            fixture.operation_states.clone(),
+            runtime.clone(),
+        )
+        .expect("supervisor");
+        let grant = fixture
+            .signer
+            .issue(&fixture.lease, 101, Uuid::from_u128(56))
+            .expect("grant");
+
+        let failed = supervisor
+            .launch_with_starter(&fixture.lease, &grant, 101, |_name, _task| {
+                Err(io::Error::other("injected starter exhaustion"))
+            })
+            .expect("record starter failure");
+
+        assert_eq!(failed.state, WorkflowLaunchStateV1::Failed);
+        assert_eq!(
+            failed.terminal.expect("terminal evidence").kind,
+            WorkflowLaunchTerminalKindV1::SpawnRejected
+        );
+        assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.operation_states.counts(), (0, 0));
+    }
+
+    #[test]
     fn waiter_failure_precedes_any_runtime_effect() {
         let fixture = fixture();
         let journal = WorkflowLaunchJournalV1::open(
@@ -4201,9 +4645,27 @@ mod tests {
             .signer
             .issue(&fixture.lease, 101, Uuid::from_u128(26))
             .expect("grant");
-
+        let request = AuthorizedWorkflowLaunchRequestV1::authorize(
+            &fixture.policy,
+            &fixture.lease,
+            &grant,
+            101,
+        )
+        .expect("authorize request");
+        let (_, created) = supervisor
+            .journal
+            .accept(&request, 101, fixture.policy.max_concurrent_jobs)
+            .expect("accept launch");
+        assert!(created);
+        let launch = AuthorizedWorkflowLaunchV1::resolve(
+            &fixture.policy,
+            &fixture.reader,
+            &fixture.titanium,
+            request,
+        )
+        .expect("resolve launch inputs");
         let status = supervisor
-            .launch_with_waiter(&fixture.lease, &grant, 101, |_name, _task| {
+            .start_authorized_launch_with_waiter(&launch, 101, |_name, _task| {
                 Err(io::Error::other("injected waiter exhaustion"))
             })
             .expect("record waiter failure");
@@ -4215,6 +4677,7 @@ mod tests {
         );
         assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.terminate_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.operation_states.counts(), (1, 1));
     }
 
     #[test]
@@ -4258,20 +4721,21 @@ mod tests {
             .issue(&fixture.lease, 101, Uuid::from_u128(27))
             .expect("grant");
 
-        assert!(matches!(
-            supervisor.launch(&fixture.lease, &grant, 101),
-            Err(WorkflowLaunchSupervisorError::Journal(
-                WorkflowLaunchJournalError::Io(_)
-            ))
-        ));
-        assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
-        assert_eq!(runtime.terminate_count.load(Ordering::SeqCst), 1);
+        let accepted = supervisor
+            .launch(&fixture.lease, &grant, 101)
+            .expect("durably accept launch");
+        assert_eq!(accepted.state, WorkflowLaunchStateV1::Accepted);
         for _ in 0..100 {
-            if runtime.wait_count.load(Ordering::SeqCst) == 1 {
+            if runtime.spawn_count.load(Ordering::SeqCst) == 1
+                && runtime.terminate_count.load(Ordering::SeqCst) == 1
+                && runtime.wait_count.load(Ordering::SeqCst) == 1
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.terminate_count.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.wait_count.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.abort_count.load(Ordering::SeqCst), 0);
     }
@@ -4300,9 +4764,12 @@ mod tests {
             .signer
             .issue(&fixture.lease, 101, Uuid::from_u128(22))
             .expect("grant");
-        let running = supervisor
+        let accepted = supervisor
             .launch(&fixture.lease, &grant, 101)
             .expect("launch");
+        assert_eq!(accepted.state, WorkflowLaunchStateV1::Accepted);
+        let running =
+            wait_for_lease_state(&supervisor, &fixture.lease, WorkflowLaunchStateV1::Running);
         assert_eq!(running.state, WorkflowLaunchStateV1::Running);
         assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
         assert_active_toolchain_root(&fixture);
@@ -4410,6 +4877,11 @@ mod tests {
             101,
         )
         .expect("authorization");
+        let request = AuthorizedWorkflowLaunchRequestV1 {
+            lease: launch.lease,
+            grant: launch.grant,
+            unit_name: launch.unit_name,
+        };
         {
             let journal = WorkflowLaunchJournalV1::open(
                 &fixture.journal_root,
@@ -4419,7 +4891,7 @@ mod tests {
             )
             .expect("open initial journal");
             let (_, created) = journal
-                .accept(&launch, 101, fixture.policy.max_concurrent_jobs)
+                .accept(&request, 101, fixture.policy.max_concurrent_jobs)
                 .expect("accept launch");
             assert!(created);
             journal
@@ -4458,5 +4930,13 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         panic!("workflow launch did not reach {expected:?}");
+    }
+
+    fn wait_for_lease_state(
+        supervisor: &WorkflowLaunchSupervisorV1,
+        lease: &WorkflowLeaseV1,
+        expected: WorkflowLaunchStateV1,
+    ) -> WorkflowLaunchStatusV1 {
+        wait_for_state(supervisor, lease.lease_id, lease.lease_generation, expected)
     }
 }
