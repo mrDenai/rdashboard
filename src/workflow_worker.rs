@@ -894,9 +894,16 @@ impl WorkflowWorkerRuntimeV1 {
                 }
                 if lease.node_kind == WorkflowNodeKindV1::HostPrepare {
                     self.execute_host_preparation(*lease, shutdown).await
-                } else if lease.node_kind == WorkflowNodeKindV1::Verification
-                    && lease.adapter_id == WorkflowAdapterIdV1::WorkerBareBinCiV1
-                {
+                } else if matches!(
+                    (lease.node_kind, lease.adapter_id),
+                    (
+                        WorkflowNodeKindV1::Verification,
+                        WorkflowAdapterIdV1::WorkerBareBinCiV1
+                    ) | (
+                        WorkflowNodeKindV1::ReleaseBuild,
+                        WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+                    )
+                ) {
                     self.execute_launcher_job(*lease, execution_grant, shutdown)
                         .await
                 } else {
@@ -2527,12 +2534,21 @@ mod tests {
 
     struct SuccessfulLauncher {
         cleanup_calls: AtomicUsize,
+        output_digest: Option<EvidenceDigest>,
     }
 
     impl SuccessfulLauncher {
         const fn new() -> Self {
             Self {
                 cleanup_calls: AtomicUsize::new(0),
+                output_digest: None,
+            }
+        }
+
+        fn with_output(output_digest: EvidenceDigest) -> Self {
+            Self {
+                cleanup_calls: AtomicUsize::new(0),
+                output_digest: Some(output_digest),
             }
         }
     }
@@ -2543,9 +2559,16 @@ mod tests {
             lease: WorkflowLeaseV1,
             _execution_grant: String,
         ) -> BoxFuture<'_, Result<WorkflowLaunchStatusV1, WorkflowLauncherClientError>> {
-            Box::pin(
-                async move { Ok(test_launch_status(&lease, WorkflowLaunchStateV1::Succeeded)) },
-            )
+            let output_digest = self.output_digest.clone();
+            Box::pin(async move {
+                let mut status = test_launch_status(&lease, WorkflowLaunchStateV1::Succeeded);
+                status
+                    .terminal
+                    .as_mut()
+                    .expect("successful launch terminal")
+                    .output_digest = output_digest;
+                Ok(status)
+            })
         }
 
         fn observe(
@@ -2814,6 +2837,86 @@ mod tests {
             expires_at_ms,
         )
         .expect("verification lease");
+        (lease, prepared)
+    }
+
+    fn prepare_native_release_lease(
+        fixture: &PreparationFixture,
+        leased_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> (WorkflowLeaseV1, WorkflowHostPreparationResultV1) {
+        let prepared = fixture
+            .preparer
+            .prepare_source_tree(&fixture.lease, leased_at_ms)
+            .expect("prepare source before native release");
+        let manifest: ProjectManifestV2 =
+            serde_json::from_str(include_str!("../config/project-manifests/rdashboard.json"))
+                .expect("decode rdashboard project manifest");
+        let node = manifest
+            .workflow
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .expect("native release node");
+        let profile = manifest
+            .workflow
+            .profile(&node.profile_id)
+            .expect("native release profile");
+        let source_identity = fixture
+            .lease
+            .required_source_identity()
+            .expect("source identity")
+            .clone();
+        let operation_state = crate::domain::WorkflowOperationStateV1::new(
+            fixture.lease.attempt_id,
+            &fixture.lease.project_id,
+            &fixture.lease.source_sha,
+            &fixture.lease.workflow_policy_digest,
+            &fixture.lease.preparation_key,
+            &fixture.lease.worker_id,
+            &fixture.lease.host_id,
+            vec![
+                node.node_id.clone(),
+                "verify".parse().expect("verification node ID"),
+            ],
+            1024 * 1024,
+            4_096,
+        )
+        .expect("shared native release operation state");
+        let lease = WorkflowLeaseV1::new(
+            Uuid::new_v4(),
+            1,
+            fixture.lease.request_id,
+            fixture.lease.attempt_id,
+            fixture.lease.project_id.clone(),
+            fixture.lease.source_sha.clone(),
+            source_identity.sequence,
+            source_identity.attestation_digest,
+            fixture.lease.workflow_policy_digest.clone(),
+            fixture.lease.preparation_key.clone(),
+            node,
+            profile,
+            None,
+            vec![
+                WorkflowLeaseInputV1 {
+                    node_id: "prepare".parse().expect("prepare node ID"),
+                    artifact_kind: WorkflowArtifactKindV1::PreparedRun,
+                    output_digest: prepared.prepared_run_key.clone(),
+                },
+                WorkflowLeaseInputV1 {
+                    node_id: "verify".parse().expect("verification node ID"),
+                    artifact_kind: WorkflowArtifactKindV1::VerificationReceipt,
+                    output_digest: EvidenceDigest::sha256("verification receipt"),
+                },
+            ],
+            EvidenceDigest::sha256("native release input"),
+            fixture.lease.worker_id.clone(),
+            fixture.lease.host_id.clone(),
+            leased_at_ms,
+            expires_at_ms,
+        )
+        .and_then(|lease| lease.with_operation_state(operation_state))
+        .expect("native release lease");
         (lease, prepared)
     }
 
@@ -3373,6 +3476,50 @@ mod tests {
                 .store()
                 .unpin_if_present(verification_lease.lease_id, &prepared.prepared_run_key)
                 .expect("verify pin was released")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generic_runtime_launches_native_release_and_commits_its_output() {
+        let now_ms = current_time_ms().expect("test clock");
+        let fixture = preparation_fixture(now_ms, now_ms + 15_000);
+        let (release_lease, prepared) =
+            prepare_native_release_lease(&fixture, now_ms, now_ms + 15_000);
+        let gateway = Arc::new(FakeGateway::with_assignment(
+            WorkflowWorkerAssignmentV1::Lease {
+                lease: Box::new(release_lease.clone()),
+                execution_grant: "signed-execution-grant".to_owned(),
+            },
+        ));
+        let release_output = EvidenceDigest::sha256("native release output");
+        let launcher = Arc::new(SuccessfulLauncher::with_output(release_output.clone()));
+        let shared_preparer = Arc::new(fixture.preparer.clone());
+        let runtime = WorkflowWorkerRuntimeV1::new(
+            registration(&release_lease),
+            gateway.clone(),
+            launcher.clone(),
+            Arc::clone(&shared_preparer),
+            test_runtime_config(),
+        )
+        .expect("build generic worker runtime");
+        let completion = gateway.clone();
+        runtime
+            .run_until(async move {
+                completion.completed.notified().await;
+            })
+            .await
+            .expect("run native release assignment");
+
+        let receipts = gateway.node_receipts.lock().expect("node receipt lock");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].outcome, WorkflowNodeOutcomeV1::Succeeded);
+        assert_eq!(receipts[0].output_digest, Some(release_output));
+        assert_eq!(launcher.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !shared_preparer
+                .store()
+                .unpin_if_present(release_lease.lease_id, &prepared.prepared_run_key)
+                .expect("native release pin was released")
         );
     }
 
