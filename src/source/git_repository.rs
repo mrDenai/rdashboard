@@ -528,7 +528,7 @@ impl GitSourceRepository {
         command.args([
             OsString::from("archive"),
             OsString::from("--format=tar"),
-            OsString::from(expected_head.as_str()),
+            OsString::from(format!("{}^{{tree}}", expected_head.as_str())),
         ]);
         run_command_to_file(
             command,
@@ -3458,6 +3458,27 @@ mod tests {
         remote: PathBuf,
     }
 
+    fn assert_worker_compatible_source_archive(tar_bytes: &[u8], required_path: &[u8]) {
+        assert!(
+            tar_bytes
+                .windows(required_path.len())
+                .any(|window| window == required_path)
+        );
+        let mut exported = tar::Archive::new(tar_bytes);
+        assert!(
+            exported
+                .entries()
+                .unwrap_or_else(|error| panic!("read exported entries: {error}"))
+                .all(|entry| {
+                    let entry =
+                        entry.unwrap_or_else(|error| panic!("read exported entry: {error}"));
+                    let entry_type = entry.header().entry_type();
+                    entry_type.is_file() || entry_type == tar::EntryType::Directory
+                }),
+            "source handoff must contain only entries accepted by the strict worker"
+        );
+    }
+
     #[test]
     fn durable_git_version_floor_rejects_unsupported_or_ambiguous_versions() {
         for supported in [
@@ -3630,11 +3651,7 @@ mod tests {
         archive
             .read_to_end(&mut tar_bytes)
             .unwrap_or_else(|error| panic!("read source archive: {error}"));
-        assert!(
-            tar_bytes
-                .windows(b"fixture.txt".len())
-                .any(|window| window == b"fixture.txt")
-        );
+        assert_worker_compatible_source_archive(&tar_bytes, b"fixture.txt");
     }
 
     #[test]
