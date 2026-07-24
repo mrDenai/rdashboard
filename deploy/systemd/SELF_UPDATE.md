@@ -7,9 +7,8 @@ kit and staging-host failure drills have been reviewed and installed explicitly.
 The build handoff is
 `/var/lib/rdashboard-build/self-releases/release-<manifest-sha256>/` with exactly `release.jcs` and
 `release.tar`. Naming by the signed manifest identity permits a newly attested source sequence to
-publish the same Git commit without replacing its earlier immutable handoff. Readers continue to
-accept legacy `<git-sha>/` directories during the format transition, while new publications use only
-the manifest form. The root launcher publishes the complete directory with one atomic rename after
+publish the same Git commit without replacing its earlier immutable handoff. Readers accept only this
+manifest-bound form. The root launcher publishes the complete directory with one atomic rename after
 validating the worker output and signing the exact release. Published directories are
 root-owned, grouped to the bootstrap reader GID and mode `0550`; files are mode `0440`. The handoff
 root is root-owned mode `0711`, so the build UID cannot publish a partial or caller-selected release.

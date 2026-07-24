@@ -138,7 +138,7 @@ fn scan_handoffs(
             validate_hidden_staging(&path, &name)?;
             continue;
         }
-        let binding = parse_published_handoff_name(&name)?;
+        let manifest_digest = parse_published_handoff_name(&name)?;
         let directory_identity = validate_published_directory(&path, owner_uid, reader_gid)?;
         let descriptor_path = path.join("release.jcs");
         let archive_path = path.join("release.tar");
@@ -149,7 +149,7 @@ fn scan_handoffs(
             MAX_DESCRIPTOR_BYTES,
         )?;
         let descriptor = SignedSelfReleaseV1::decode_canonical(&bytes)?;
-        if !binding.matches(&descriptor) {
+        if descriptor.manifest.manifest_digest != manifest_digest {
             return Err(SelfReleaseHandoffError::HandoffBinding);
         }
         descriptor.verify(policy, now_ms.min(descriptor.expires_at_ms))?;
@@ -166,33 +166,12 @@ fn scan_handoffs(
     Ok(candidates)
 }
 
-enum PublishedHandoffBinding {
-    LegacySource(GitCommitId),
-    Manifest(EvidenceDigest),
-}
-
-impl PublishedHandoffBinding {
-    fn matches(&self, descriptor: &SignedSelfReleaseV1) -> bool {
-        match self {
-            Self::LegacySource(source_head) => descriptor.manifest.source_head == *source_head,
-            Self::Manifest(manifest_digest) => {
-                descriptor.manifest.manifest_digest == *manifest_digest
-            }
-        }
-    }
-}
-
-fn parse_published_handoff_name(
-    name: &str,
-) -> Result<PublishedHandoffBinding, SelfReleaseHandoffError> {
-    if let Some(digest) = name.strip_prefix(PUBLISHED_RELEASE_PREFIX) {
-        return EvidenceDigest::from_str(digest)
-            .map(PublishedHandoffBinding::Manifest)
-            .map_err(|_| SelfReleaseHandoffError::UnsafeHandoff);
-    }
-    GitCommitId::from_str(name)
-        .map(PublishedHandoffBinding::LegacySource)
-        .map_err(|_| SelfReleaseHandoffError::UnsafeHandoff)
+fn parse_published_handoff_name(name: &str) -> Result<EvidenceDigest, SelfReleaseHandoffError> {
+    name.strip_prefix(PUBLISHED_RELEASE_PREFIX)
+        .ok_or(SelfReleaseHandoffError::UnsafeHandoff)
+        .and_then(|digest| {
+            EvidenceDigest::from_str(digest).map_err(|_| SelfReleaseHandoffError::UnsafeHandoff)
+        })
 }
 
 #[allow(clippy::similar_names)]

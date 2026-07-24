@@ -222,9 +222,9 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o711))
             .expect("protect handoff root");
         let source_head = GitCommitId::from_str(&"a".repeat(40)).expect("source head");
-        let published = root.join(source_head.as_str());
-        fs::create_dir(&published).expect("create publication");
-        fs::set_permissions(&published, fs::Permissions::from_mode(0o2750))
+        let staging = root.join("fixture-staging");
+        fs::create_dir(&staging).expect("create publication");
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o2750))
             .expect("prepare publication");
         let source = directory.path().join("rdashboardd");
         fs::write(&source, b"rdashboard binary").expect("write source binary");
@@ -245,8 +245,8 @@ mod tests {
             }],
         })
         .expect("self-update policy");
-        build_signed_self_release(
-            &published,
+        let built = build_signed_self_release(
+            &staging,
             "release",
             SelfReleaseManifestInputV1 {
                 source_head: source_head.clone(),
@@ -275,6 +275,11 @@ mod tests {
             gid,
         )
         .expect("build publication");
+        let published = root.join(format!(
+            "release-{}",
+            built.descriptor.manifest.manifest_digest.as_str()
+        ));
+        fs::rename(staging, &published).expect("publish manifest-bound directory");
         fs::set_permissions(&published, fs::Permissions::from_mode(0o550))
             .expect("publish directory");
         (directory, policy, uid, gid, source_head)
@@ -313,9 +318,10 @@ mod tests {
         assert_eq!(candidate.descriptor.manifest.source_head, source_head);
         assert_eq!(
             candidate.descriptor_path,
-            directory
-                .path()
-                .join(format!("handoff/{source_head}/release.jcs"))
+            directory.path().join(format!(
+                "handoff/release-{}/release.jcs",
+                candidate.descriptor.manifest.manifest_digest.as_str()
+            ))
         );
     }
 
