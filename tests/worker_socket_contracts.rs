@@ -409,7 +409,7 @@ async fn one_authenticated_socket_serves_two_projects_and_recovers_cleanup_debt(
         SchedulerWorkflowWorkerHandlerV1::new(
             scheduler.clone(),
             registration.clone(),
-            Duration::from_secs(15),
+            Duration::from_mins(2),
             clock.clone(),
             grant_signer(),
         )

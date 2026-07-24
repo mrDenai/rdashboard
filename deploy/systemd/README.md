@@ -98,6 +98,9 @@ The generic worker reaches its mode-`0660` Unix socket as the single configured 
 launcher checks peer credentials before decoding, verifies a short-lived Ed25519 grant against the
 exact canonical lease, revalidates the named sealed `PreparedRun` composition and its exact
 `DependencySnapshot`, and derives the unit name, mounts, UID/GID, command and resource limits itself.
+A renewable lease may be longer than the execution grant: the grant is capped at one minute and
+authorizes only entry into the launcher, while its signed lease digest still binds the exact longer
+lease. Renewing a lease issues a fresh short-lived grant for an idempotent launcher replay.
 A request cannot supply argv, a host path, a credential, a network mode or a systemd property.
 The launcher alone has `RestrictSUIDSGID=no` plus the narrowly bounded `CAP_FSETID`: its fixed
 self-release handoff store must set mode `2750` after transferring a staging directory to the build

@@ -117,10 +117,16 @@ impl WorkflowExecutionGrantSignerV1 {
         if nonce.is_nil()
             || issued_at_ms < lease.leased_at_ms
             || lease.expires_at_ms <= issued_at_ms
-            || lease.expires_at_ms - issued_at_ms > WORKFLOW_EXECUTION_GRANT_MAX_TTL_MS
         {
             return Err(WorkflowExecutionGrantError::InvalidLifetime);
         }
+        // The renewable scheduler lease can outlive the one-shot authority used to enter the
+        // launcher. Keep the grant short-lived and bound to the exact lease digest instead of
+        // forcing both lifetimes to be identical.
+        let expires_at_ms = issued_at_ms
+            .checked_add(WORKFLOW_EXECUTION_GRANT_MAX_TTL_MS)
+            .ok_or(WorkflowExecutionGrantError::InvalidLifetime)?
+            .min(lease.expires_at_ms);
         let payload = WorkflowExecutionGrantPayloadV1 {
             purpose: PURPOSE.to_owned(),
             schema_version: WORKFLOW_EXECUTION_GRANT_SCHEMA_VERSION,
@@ -130,7 +136,7 @@ impl WorkflowExecutionGrantSignerV1 {
             key_epoch: self.key_epoch,
             issued_at_ms,
             not_before_ms: issued_at_ms,
-            expires_at_ms: lease.expires_at_ms,
+            expires_at_ms,
             nonce,
             lease_digest: lease.lease_digest.clone(),
             lease_id: lease.lease_id,
@@ -397,7 +403,7 @@ fn payload_matches_lease(
     payload: &WorkflowExecutionGrantPayloadV1,
     lease: &WorkflowLeaseV1,
 ) -> bool {
-    payload.expires_at_ms == lease.expires_at_ms
+    payload.expires_at_ms <= lease.expires_at_ms
         && payload.lease_digest == lease.lease_digest
         && payload.lease_id == lease.lease_id
         && payload.lease_generation == lease.lease_generation
@@ -532,6 +538,10 @@ mod tests {
     };
 
     fn lease_fixture(input_artifacts: bool) -> WorkflowLeaseV1 {
+        lease_fixture_expiring_at(input_artifacts, 15_100)
+    }
+
+    fn lease_fixture_expiring_at(input_artifacts: bool, expires_at_ms: i64) -> WorkflowLeaseV1 {
         let manifest: ProjectManifestV2 =
             serde_json::from_str(include_str!("../config/project-manifests/ralert.json"))
                 .expect("manifest");
@@ -571,7 +581,7 @@ mod tests {
             "shared-vps-worker".to_owned(),
             "production-vps".to_owned(),
             100,
-            15_100,
+            expires_at_ms,
         )
         .expect("lease")
     }
@@ -636,6 +646,24 @@ mod tests {
         ));
         assert!(matches!(
             verifier(&key, None).verify(&token, &lease, lease.expires_at_ms),
+            Err(WorkflowExecutionGrantError::GrantNotActive)
+        ));
+    }
+
+    #[test]
+    fn grant_ttl_is_capped_independently_from_a_longer_renewable_lease() {
+        let key = SigningKey::from_bytes(&[18_u8; 32]);
+        let lease = lease_fixture_expiring_at(true, 120_100);
+        let token = signer(&key)
+            .issue(&lease, 100, Uuid::from_u128(8))
+            .expect("issue token for a two-minute lease");
+        let verified = verifier(&key, None)
+            .verify(&token, &lease, 101)
+            .expect("verify capped token");
+        assert_eq!(verified.claims.expires_at_ms, 60_100);
+        assert!(verified.claims.expires_at_ms < lease.expires_at_ms);
+        assert!(matches!(
+            verifier(&key, None).verify(&token, &lease, 60_100),
             Err(WorkflowExecutionGrantError::GrantNotActive)
         ));
     }

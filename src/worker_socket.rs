@@ -336,11 +336,20 @@ impl<C: WorkflowGatewayClockV1> SchedulerWorkflowWorkerHandlerV1<C> {
                         },
                     },
                 ),
-                Err(_) => Self::rejected(
-                    request,
-                    WorkflowWorkerRejectionCodeV1::GrantUnavailable,
-                    true,
-                ),
+                Err(error) => {
+                    warn!(
+                        request_id = %request.request_id,
+                        lease_id = %lease.lease_id,
+                        lease_generation = lease.lease_generation,
+                        error = %error,
+                        "workflow execution grant could not be issued"
+                    );
+                    Self::rejected(
+                        request,
+                        WorkflowWorkerRejectionCodeV1::GrantUnavailable,
+                        true,
+                    )
+                }
             },
             Ok(None) => Self::response(
                 request,
@@ -402,11 +411,20 @@ impl<C: WorkflowGatewayClockV1> SchedulerWorkflowWorkerHandlerV1<C> {
                         execution_grant,
                     },
                 ),
-                Err(_) => Self::rejected(
-                    request,
-                    WorkflowWorkerRejectionCodeV1::GrantUnavailable,
-                    true,
-                ),
+                Err(error) => {
+                    warn!(
+                        request_id = %request.request_id,
+                        lease_id = %lease.lease_id,
+                        lease_generation = lease.lease_generation,
+                        error = %error,
+                        "workflow execution grant could not be issued for a renewed lease"
+                    );
+                    Self::rejected(
+                        request,
+                        WorkflowWorkerRejectionCodeV1::GrantUnavailable,
+                        true,
+                    )
+                }
             },
             Err(error) => store_rejection(request, &error),
         }
