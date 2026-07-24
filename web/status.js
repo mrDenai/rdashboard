@@ -149,6 +149,7 @@ const workflowWorkerPools = new Set([
   "build_compute",
   "privileged_executor",
 ]);
+const workflowExecutionModes = new Set(["deploy", "shadow"]);
 const workflowIdentifierPattern = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const commitPattern = /^[0-9a-f]{40}$/;
@@ -318,6 +319,7 @@ function validWorkflowAttempt(attempt, generatedAtMs) {
     "source_attestation_digest",
     "preparation_key",
     "priority",
+    "execution_mode",
     "state",
     "mutation_state",
     "cleanup_state",
@@ -338,6 +340,7 @@ function validWorkflowAttempt(attempt, generatedAtMs) {
     || !digestPattern.test(attempt.preparation_key)
     || !safeNonnegativeInteger(attempt.priority)
     || attempt.priority > 3
+    || !workflowExecutionModes.has(attempt.execution_mode)
     || !Object.hasOwn(workflowAttemptLabels, attempt.state)
     || !Object.hasOwn(workflowMutationLabels, attempt.mutation_state)
     || !Object.hasOwn(workflowCleanupLabels, attempt.cleanup_state)

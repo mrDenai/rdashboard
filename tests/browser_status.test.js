@@ -184,6 +184,7 @@ test("workflow overview is strict and keeps recovery and cleanup visible", () =>
     source_attestation_digest: "c".repeat(64),
     preparation_key: "d".repeat(64),
     priority: 2,
+    execution_mode: "deploy",
     state: "needs_reconcile",
     mutation_state: "needs_reconcile",
     cleanup_state: "pending",
@@ -233,6 +234,14 @@ test("workflow overview is strict and keeps recovery and cleanup visible", () =>
 
   assert.equal(validWorkflowOverview({ ...overview, unexpected: true }), false);
   assert.equal(validWorkflowOverview({ ...overview, generated_at_ms: 19 }), false);
+  assert.equal(validWorkflowOverview({
+    ...overview,
+    attempts: [{ ...attempt, execution_mode: "invented" }],
+  }), false);
+  assert.equal(validWorkflowOverview({
+    ...overview,
+    attempts: [{ ...attempt, execution_mode: "shadow" }],
+  }), true);
   assert.equal(validWorkflowOverview({
     ...overview,
     attempts: [attempt, { ...attempt }],
