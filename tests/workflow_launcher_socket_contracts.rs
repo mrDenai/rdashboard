@@ -127,9 +127,12 @@ fn malformed_protocol_inputs_fail_validation() {
     assert!(service.contains("User=root\nGroup=rdashboard-worker"));
     assert!(service.contains("PrivateNetwork=yes"));
     assert!(service.contains("RestrictAddressFamilies=AF_UNIX"));
-    assert!(
-        service.contains("CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH")
-    );
+    assert!(service.contains(
+        "CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID"
+    ));
+    assert!(service.contains(
+        "AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID"
+    ));
     assert!(service.contains("/var/lib/rdashboard-build/operations"));
     assert!(service.contains("InaccessiblePaths="));
     assert!(!service.contains("ReadWritePaths=/run/docker.sock"));
