@@ -127,6 +127,7 @@ fn malformed_protocol_inputs_fail_validation() {
     assert!(service.contains("User=root\nGroup=rdashboard-worker"));
     assert!(service.contains("PrivateNetwork=yes"));
     assert!(service.contains("RestrictAddressFamilies=AF_UNIX"));
+    assert!(service.contains("RestrictSUIDSGID=no"));
     assert!(service.contains(
         "CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID"
     ));

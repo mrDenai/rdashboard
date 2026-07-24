@@ -99,6 +99,10 @@ launcher checks peer credentials before decoding, verifies a short-lived Ed25519
 exact canonical lease, revalidates the named sealed `PreparedRun` composition and its exact
 `DependencySnapshot`, and derives the unit name, mounts, UID/GID, command and resource limits itself.
 A request cannot supply argv, a host path, a credential, a network mode or a systemd property.
+The launcher alone has `RestrictSUIDSGID=no` plus the narrowly bounded `CAP_FSETID`: its fixed
+self-release handoff store must set mode `2750` after transferring a staging directory to the build
+identity. Authorized child jobs retain their separately derived `RestrictSUIDSGID` policy; no request
+can change either setting.
 
 Install `/etc/rdashboard/workflow-launcher.jcs` as canonical JCS, root-owned, mode `0600`. It contains
 schema version `1`; the exact worker/build numeric identities and stable worker/host IDs; the matching
