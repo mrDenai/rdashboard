@@ -2,7 +2,7 @@
 
 ## Controller and browser boundary
 
-Install `rdashboard.service`; its controller binary is supplied by the verified A/B release at
+Install `rdashboard.service`; its controller binary is supplied by the verified atomic release at
 `/var/lib/rdashboard-bootstrap/current/bin/rdashboardd`. The service binds only `127.0.0.1:3100` and
 reads optional browser-access settings from `/etc/rdashboard/controller.env`. For a public route, create the
 Cloudflare Access self-hosted application first, then install all three values together in that
@@ -166,7 +166,7 @@ self-release adapter never invokes a repository packaging script: after the exac
 exists, the launcher runs the installed `rdashboard-workflow-self-release-build` client against the
 same read-only operation state. The client packages only policy-listed `target/release` binaries and
 writes an unsigned typed result. Root independently validates every archive entry and digest, signs the
-release with the systemd credential, and atomically publishes the complete SHA-named handoff directory
+release with the systemd credential, and atomically publishes the complete manifest-digest-named handoff directory
 for the bootstrap reader. Install `rdashboard-workflow-self-release.conf` as a launcher drop-in only
 when the matching native policy and root-owned `self-release-seed` credential are installed; OCI-only
 and verification-only launchers do not require that credential. The generic job receives an empty,
@@ -842,8 +842,11 @@ repository path or Git command is exposed. Admitted backup and deployment effect
 separately constrained transient units.
 
 The root executor configuration accepts an optional `mutation_authority` object. Omitting it keeps
-the current read-only behavior and does not require a signing credential. When mutation authority
-is staged, the object must contain the exact action-grant issuer/audience, a bounded Ed25519 public
+the current read-only behavior and does not require a signing credential. The executor still
+initializes its owner-only `/var/lib/rdashboard-executor/security.sqlite` journal on every clean
+installation because the self-update supervisor backs up the complete installed state set even
+while mutation remains disabled. When mutation authority is staged, the object must contain the
+exact action-grant issuer/audience, a bounded Ed25519 public
 verification keyring with lifecycle timestamps and minimum epoch, plus the executor-intent
 issuer/audience, active key ID/epoch and expected public key. Public keys use canonical unpadded
 base64url encoding of exactly 32 bytes.
@@ -860,8 +863,8 @@ host's `chrony` group. The base unit already carries `rdashboard-source` for rea
 observation. These groups must exist before the unit is reloaded.
 
 Loading this authority enables the installed backup resolver plus the installed deploy
-resolver and their shared sequential worker. The service opens its root-only journal at
-`/var/lib/rdashboard-executor/security.sqlite`, acknowledges a grant only after durable
+resolver and their shared sequential worker. The already initialized root-only journal
+acknowledges a grant only after durable
 intent/grant admission, then runs the long operation outside the two-second socket request. Startup
 and a 30-second recovery scan reconstruct pending work from exact accepted records and phase
 receipts, with a fresh start time for each sequential job. On executor shutdown, the worker cancels
@@ -869,7 +872,7 @@ the blocking adapter wait and explicitly kills/stops the active transient unit; 
 before starting another queued job, and the intent-persisted journal remains replayable on the next
 start. Omitting the authority keeps mutation unavailable.
 
-The repository-built `rdashboard-adapter-receipt` executable is part of the verified A/B payload at
+The repository-built `rdashboard-adapter-receipt` executable is part of the verified release payload at
 `/var/lib/rdashboard-bootstrap/current/bin/rdashboard-adapter-receipt`. Every fixed adapter transient
 unit binds this exact path through `ExecStopPost=`. The helper runs before `systemd-run --collect` can discard the unit cgroup and
 atomically writes owner-only `terminal-receipt.jcs` evidence beside the job request. The root

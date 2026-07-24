@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read as _},
-    os::unix::fs::MetadataExt as _,
+    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::Path,
     sync::Arc,
     time::Duration,
@@ -68,11 +68,16 @@ async fn main() -> Result<(), DynError> {
         .as_ref()
         .map(RootExecutorAuthorityV1::load_system_credential)
         .transpose()?;
+    let security = open_required_security_store(Path::new(ROOT_SECURITY_STORE_PATH), 0)?;
     let adapter_cancellation = AdapterExecutionCancellationV1::default();
     let (handler, worker) = match mutation_authority {
         Some(authority) => {
-            let (handler, worker) =
-                configure_mutation_runtime(&config, authority, adapter_cancellation.clone())?;
+            let (handler, worker) = configure_mutation_runtime(
+                &config,
+                authority,
+                security,
+                adapter_cancellation.clone(),
+            )?;
             (handler, Some(worker))
         }
         None => (
@@ -130,15 +135,9 @@ async fn main() -> Result<(), DynError> {
 fn configure_mutation_runtime(
     config: &RootExecutorConfigV1,
     authority: RootExecutorAuthorityV1,
+    security: SecurityStore,
     cancellation: AdapterExecutionCancellationV1,
 ) -> Result<(ReadOnlyExecutorHandler, MutationWorkerV1), DynError> {
-    let security_path = Path::new(ROOT_SECURITY_STORE_PATH);
-    validate_private_root_directory(
-        security_path
-            .parent()
-            .ok_or_else(|| invalid_data("security store has no parent directory"))?,
-    )?;
-    let security = SecurityStore::open(security_path)?;
     let wake = Arc::new(Notify::new());
     let admission = RootMutationAdmissionV1::new(
         security.clone(),
@@ -292,16 +291,57 @@ fn validate_root_directory(path: &Path, error_message: &'static str) -> Result<(
     Ok(())
 }
 
-fn validate_private_root_directory(path: &Path) -> Result<(), DynError> {
+fn validate_private_root_directory(path: &Path, owner_uid: u32) -> Result<(), DynError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
-        || metadata.uid() != 0
+        || metadata.uid() != owner_uid
         || metadata.mode() & 0o077 != 0
     {
-        return Err(
-            invalid_data("security store directory must be root-owned and mode 0700").into(),
-        );
+        return Err(invalid_data("security store directory must be owner-only mode 0700").into());
+    }
+    Ok(())
+}
+
+fn open_required_security_store(path: &Path, owner_uid: u32) -> Result<SecurityStore, DynError> {
+    validate_private_root_directory(
+        path.parent()
+            .ok_or_else(|| invalid_data("security store has no parent directory"))?,
+        owner_uid,
+    )?;
+    let original = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            file.metadata()?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    validate_security_store_file(&original, owner_uid)?;
+    let store = SecurityStore::open(path)?;
+    let initialized = fs::symlink_metadata(path)?;
+    validate_security_store_file(&initialized, owner_uid)?;
+    if original.dev() != initialized.dev() || original.ino() != initialized.ino() {
+        return Err(invalid_data("security store changed while opening").into());
+    }
+    Ok(store)
+}
+
+fn validate_security_store_file(metadata: &fs::Metadata, owner_uid: u32) -> Result<(), DynError> {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != owner_uid
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(invalid_data(
+            "security store must be an owner-only regular file with one link",
+        )
+        .into());
     }
     Ok(())
 }
@@ -337,5 +377,38 @@ async fn shutdown_signal() {
     tokio::select! {
         () = interrupt => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    };
+
+    use tempfile::tempdir;
+
+    use super::open_required_security_store;
+
+    #[test]
+    fn read_only_startup_initializes_the_required_private_security_store() {
+        let directory = tempdir().expect("temporary directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private directory mode");
+        let owner_uid = fs::metadata(directory.path())
+            .expect("directory metadata")
+            .uid();
+        let path = directory.path().join("security.sqlite");
+
+        drop(open_required_security_store(&path, owner_uid).expect("initialize security store"));
+
+        let metadata = fs::symlink_metadata(&path).expect("security store metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.uid(), owner_uid);
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert!(metadata.len() > 0);
+        drop(open_required_security_store(&path, owner_uid).expect("reopen security store"));
     }
 }

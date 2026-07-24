@@ -48,6 +48,7 @@ pub const SELF_RELEASE_BOOTSTRAP_SIGNING_CREDENTIAL_PATH: &str =
 const POLICY_PURPOSE: &str = "rdashboard.self-release-build-policy.v1";
 const REQUEST_PURPOSE: &str = "rdashboard.self-release-build-request.v1";
 const RESULT_PURPOSE: &str = "rdashboard.self-release-build-result.v1";
+const PUBLISHED_RELEASE_PREFIX: &str = "release-";
 const ARCHIVE_FILE: &str = "release.tar";
 const DESCRIPTOR_FILE: &str = "release.jcs";
 const RESULT_FILE: &str = "result.jcs";
@@ -1091,7 +1092,10 @@ impl SelfReleaseHandoffStoreV1 {
             &self.policy.self_update_policy,
             now_ms,
         )?;
-        let final_path = self.handoff_root.join(request.source_sha.as_str());
+        let final_path = self.handoff_root.join(format!(
+            "{PUBLISHED_RELEASE_PREFIX}{}",
+            descriptor.manifest.manifest_digest.as_str()
+        ));
         if final_path.try_exists()? {
             let existing = validate_published_directory(
                 &final_path,
@@ -1181,11 +1185,9 @@ impl SelfReleaseHandoffStoreV1 {
                 self.remove_staging(&entry.path())?;
                 continue;
             }
-            let source =
-                GitCommitId::from_str(&name).map_err(|_| SelfReleaseBuildError::InvalidStore)?;
             let descriptor =
                 read_published_descriptor(&entry.path(), self.trusted_uid, self.reader_gid)?;
-            if descriptor.manifest.source_head != source {
+            if !published_directory_name_matches(&name, &descriptor) {
                 return Err(SelfReleaseBuildError::InvalidStore);
             }
             let verify_at = descriptor.expires_at_ms;
@@ -1258,6 +1260,14 @@ impl SelfReleaseHandoffStoreV1 {
             .lock()
             .map_err(|_| SelfReleaseBuildError::StoreLockPoisoned)
     }
+}
+
+fn published_directory_name_matches(name: &str, descriptor: &SignedSelfReleaseV1) -> bool {
+    if let Some(digest) = name.strip_prefix(PUBLISHED_RELEASE_PREFIX) {
+        return EvidenceDigest::from_str(digest)
+            .is_ok_and(|digest| digest == descriptor.manifest.manifest_digest);
+    }
+    GitCommitId::from_str(name).is_ok_and(|source| source == descriptor.manifest.source_head)
 }
 
 impl Drop for SelfReleaseHandoffStoreV1 {
@@ -1721,6 +1731,14 @@ mod tests {
     }
 
     fn lease() -> WorkflowLeaseV1 {
+        lease_for_source(7, "source attestation", "verification output")
+    }
+
+    fn lease_for_source(
+        source_sequence: u64,
+        source_attestation: &str,
+        verification_output: &str,
+    ) -> WorkflowLeaseV1 {
         let node = WorkflowNodeV1 {
             node_id: "release-build".parse().expect("node ID"),
             display_name: "Build signed self release".to_owned(),
@@ -1780,8 +1798,8 @@ mod tests {
             attempt_id,
             project_id,
             source_sha,
-            7,
-            digest("source attestation"),
+            source_sequence,
+            digest(source_attestation),
             workflow_policy_digest,
             preparation_key,
             &node,
@@ -1796,7 +1814,7 @@ mod tests {
                 WorkflowLeaseInputV1 {
                     node_id: "verify".parse().expect("verify node"),
                     artifact_kind: WorkflowArtifactKindV1::VerificationReceipt,
-                    output_digest: digest("verification output"),
+                    output_digest: digest(verification_output),
                 },
             ],
             digest("combined inputs"),
@@ -2020,7 +2038,10 @@ mod tests {
             published.descriptor.manifest.verification_receipt_digest,
             request.verification_receipt_digest
         );
-        let final_path = fixture.handoff.join(request.source_sha.as_str());
+        let final_path = fixture.handoff.join(format!(
+            "{PUBLISHED_RELEASE_PREFIX}{}",
+            published.descriptor.manifest.manifest_digest.as_str()
+        ));
         assert!(final_path.join(DESCRIPTOR_FILE).is_file());
         assert!(final_path.join(ARCHIVE_FILE).is_file());
         assert!(!staging.exists());
@@ -2033,6 +2054,87 @@ mod tests {
                 & 0o7777,
             0o550
         );
+    }
+
+    #[test]
+    fn root_store_keeps_distinct_attestations_of_the_same_source_commit() {
+        let policy = policy();
+        let first =
+            SelfReleaseBuildRequestV1::from_policy(&lease(), &policy).expect("first request");
+        let second = SelfReleaseBuildRequestV1::from_policy(
+            &lease_for_source(8, "refreshed source", "refreshed verification"),
+            &policy,
+        )
+        .expect("refreshed request");
+        let fixture = Fixture::new(&first);
+        let store = SelfReleaseHandoffStoreV1::open(
+            fixture.handoff.clone(),
+            fixture.request_root.clone(),
+            fixture.uid,
+            fixture.gid,
+            fixture.uid,
+            fixture.gid,
+            fixture.gid,
+            policy.clone(),
+            signing_key(),
+        )
+        .expect("open handoff store");
+
+        let mut published = Vec::new();
+        for request in [&first, &second] {
+            fs::remove_file(&fixture.request).expect("replace build request");
+            fs::write(
+                &fixture.request,
+                request.canonical_bytes().expect("request bytes"),
+            )
+            .expect("write build request");
+            fs::set_permissions(&fixture.request, fs::Permissions::from_mode(0o444))
+                .expect("protect build request");
+            execute_self_release_build(
+                &fixture.request,
+                &fixture.operation,
+                &fixture.output,
+                fixture.uid,
+            )
+            .expect("build release archive");
+            let staging = store.prepare(request).expect("prepare handoff");
+            for entry in fs::read_dir(&fixture.output).expect("built output") {
+                let entry = entry.expect("built entry");
+                fs::rename(entry.path(), staging.join(entry.file_name()))
+                    .expect("move built entry");
+            }
+            published.push(store.promote(request, 1_500).expect("publish release"));
+        }
+
+        assert_ne!(
+            published[0].descriptor.manifest.manifest_digest,
+            published[1].descriptor.manifest.manifest_digest
+        );
+        assert_eq!(
+            fs::read_dir(&fixture.handoff)
+                .expect("handoff entries")
+                .count(),
+            2
+        );
+        for release in published {
+            let path = fixture.handoff.join(format!(
+                "{PUBLISHED_RELEASE_PREFIX}{}",
+                release.descriptor.manifest.manifest_digest.as_str()
+            ));
+            assert!(path.join(DESCRIPTOR_FILE).is_file());
+            assert!(path.join(ARCHIVE_FILE).is_file());
+        }
+        let loaded = crate::self_update_handoff::load_exact_self_release_handoff(
+            &fixture.handoff,
+            &second.source_sha,
+            &policy.self_update_policy,
+            fixture.uid,
+            fixture.gid,
+            fixture.gid,
+            1_500,
+        )
+        .expect("load newest attestation for the exact source");
+        assert_eq!(loaded.descriptor.manifest.source_sequence, 8);
     }
 
     #[test]

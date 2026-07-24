@@ -1,12 +1,16 @@
-# Inactive rdashboard self-update boundary
+# rdashboard self-update boundary
 
-This repository ships the local trust and recovery boundary for `rdashboard` A/B self-update. It is
-intentionally inactive until the installed policy, first release slot, stable recovery kit and
-staging-host failure drills have been reviewed and installed explicitly.
+This repository ships the local trust and recovery boundary for atomic `rdashboard` self-update.
+First activation remains fail-closed until the installed policy, first release slot, stable recovery
+kit and staging-host failure drills have been reviewed and installed explicitly.
 
-The build handoff is `/var/lib/rdashboard-build/self-releases/<git-sha>/` with exactly
-`release.jcs` and `release.tar`. The root launcher publishes the complete directory with one atomic
-rename after validating the worker output and signing the exact release. Published directories are
+The build handoff is
+`/var/lib/rdashboard-build/self-releases/release-<manifest-sha256>/` with exactly `release.jcs` and
+`release.tar`. Naming by the signed manifest identity permits a newly attested source sequence to
+publish the same Git commit without replacing its earlier immutable handoff. Readers continue to
+accept legacy `<git-sha>/` directories during the format transition, while new publications use only
+the manifest form. The root launcher publishes the complete directory with one atomic rename after
+validating the worker output and signing the exact release. Published directories are
 root-owned, grouped to the bootstrap reader GID and mode `0550`; files are mode `0440`. The handoff
 root is root-owned mode `0711`, so the build UID cannot publish a partial or caller-selected release.
 The bootstrap ignores only structurally valid hidden launcher staging directories and rejects
@@ -63,13 +67,15 @@ silently rotating it. The extract commands accept only that canonical digest-bou
 the exact launcher JCS, bootstrap JCS or `self-update.env` line for atomic root-owned installation.
 The bundle is a review artifact, not runtime authority.
 
-Every application service executes through `/var/lib/rdashboard-bootstrap/current/bin`. The signed
+Every versioned application service executes through `/var/lib/rdashboard-bootstrap/current/bin`. The signed
 release policy requires the complete fixed application payload: controller, source path, observer,
 executor, generic worker path, health proxy and their four fixed transient-job clients. A policy that
 omits one of those binaries is rejected before work starts. `rdashboard-bootstrap`,
 `rdashboard-recovery`, source configuration/schema tools and separately hash-pinned privileged
 adapters stay in `/usr/libexec/rdashboard`; a broken application release therefore cannot replace its
-own recovery kit.
+own recovery kit. Stable host infrastructure is not part of a release pointer switch: in particular,
+the optional rootless BuildKit daemon and the socket-proxy source ingress bridge retain their own
+systemd lifecycle and are neither stopped nor required by self-update.
 
 Before a pointer switch, the supervisor uses SQLite online backup for the controller, metrics,
 integration, executor-security and source journals. Each backup is integrity-checked, hashed and
@@ -97,13 +103,14 @@ the verified current/LKG identities and complete bounded operation records. `res
 existing nonterminal coordinator operation. `restart-current` cannot select another digest and is
 blocked by any unresolved record. `restore-lkg` requires the exact `needs_reconcile` operation, its
 verified database-backup receipt and the exact installed LKG pointer; it marks the original journal
-record rolled back only after restored health succeeds. `admit` accepts no path or tag: it validates
-the fixed SHA-named handoff, installed signing policy, current source sequence and prior-attempt
-history, then enters the normal backup/switch/health/rollback coordinator. Success and failure are
+record rolled back only after restored health succeeds. `admit` accepts no path or tag: it selects the
+newest unexpired manifest-named handoff for the exact Git SHA, validates the installed signing policy,
+current source sequence and prior-attempt history, then enters the normal
+backup/switch/health/rollback coordinator. Success and failure are
 single-line JSON suitable for operator or LLM diagnosis. Restart the bootstrap only after inspecting
 the terminal result.
 
-Do not enable this unit in production yet. Activation additionally requires:
+Before the first production enable, complete all activation requirements:
 
 1. a reviewed initial versioned release with both `current` and `last-known-good` initialized before
    the migrated units are reloaded;

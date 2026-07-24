@@ -52,11 +52,9 @@ pub const SELF_UPDATE_SERVICE_ORDER: &[&str] = &[
     "rdashboard-workflow-launcher.service",
     "rdashboard-workflow-gateway.service",
     "rdashboard-dependency-fetcher.service",
-    "rdashboard-buildkit.service",
     "rdashboard-worker.service",
     "rdashboard-source-dispatcher.service",
     "rdashboard-source-ingress.service",
-    "rdashboard-source-ingress-bridge.service",
     "rdashboard.service",
 ];
 

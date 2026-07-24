@@ -17,6 +17,7 @@ pub const SELF_RELEASE_HANDOFF_ROOT: &str = "/var/lib/rdashboard-build/self-rele
 const MAX_HANDOFF_FILES: usize = 128;
 const MAX_DESCRIPTOR_BYTES: u64 = 256 * 1024;
 const MAX_RELEASE_BYTES: u64 = 512 * 1024 * 1024;
+const PUBLISHED_RELEASE_PREFIX: &str = "release-";
 
 #[derive(Clone, Debug)]
 pub struct ValidatedSelfReleaseHandoffV1 {
@@ -76,25 +77,39 @@ pub fn load_exact_self_release_handoff(
     reader_gid: u32,
     now_ms: i64,
 ) -> Result<ValidatedSelfReleaseHandoffV1, SelfReleaseHandoffError> {
-    let candidates = scan_handoffs(root, policy, owner_uid, owner_gid, reader_gid, now_ms)?;
-    let candidate = candidates
-        .iter()
-        .find(|candidate| candidate.descriptor.manifest.source_head == *source_head)
-        .cloned()
-        .ok_or(SelfReleaseHandoffError::CandidateMissing)?;
-    if now_ms > candidate.descriptor.expires_at_ms {
+    let mut candidates = scan_handoffs(root, policy, owner_uid, owner_gid, reader_gid, now_ms)?
+        .into_iter()
+        .filter(|candidate| candidate.descriptor.manifest.source_head == *source_head)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(SelfReleaseHandoffError::CandidateMissing);
+    }
+    candidates.retain(|candidate| now_ms <= candidate.descriptor.expires_at_ms);
+    if candidates.is_empty() {
         return Err(SelfReleaseHandoffError::CandidateExpired);
     }
-    if candidates.iter().any(|other| {
-        now_ms <= other.descriptor.expires_at_ms
-            && other.descriptor.manifest.source_sequence
-                == candidate.descriptor.manifest.source_sequence
-            && other.descriptor.manifest.manifest_digest
-                != candidate.descriptor.manifest.manifest_digest
+    candidates.sort_by(|left, right| {
+        left.descriptor
+            .manifest
+            .source_sequence
+            .cmp(&right.descriptor.manifest.source_sequence)
+            .then_with(|| {
+                left.descriptor
+                    .manifest
+                    .manifest_digest
+                    .cmp(&right.descriptor.manifest.manifest_digest)
+            })
+    });
+    if candidates.windows(2).any(|pair| {
+        pair[0].descriptor.manifest.source_sequence == pair[1].descriptor.manifest.source_sequence
+            && pair[0].descriptor.manifest.manifest_digest
+                != pair[1].descriptor.manifest.manifest_digest
     }) {
         return Err(SelfReleaseHandoffError::ConflictingSourceSequence);
     }
-    Ok(candidate)
+    candidates
+        .pop()
+        .ok_or(SelfReleaseHandoffError::CandidateMissing)
 }
 
 #[allow(clippy::similar_names, clippy::too_many_arguments)]
@@ -123,8 +138,7 @@ fn scan_handoffs(
             validate_hidden_staging(&path, &name)?;
             continue;
         }
-        let source_head =
-            GitCommitId::from_str(&name).map_err(|_| SelfReleaseHandoffError::UnsafeHandoff)?;
+        let binding = parse_published_handoff_name(&name)?;
         let directory_identity = validate_published_directory(&path, owner_uid, reader_gid)?;
         let descriptor_path = path.join("release.jcs");
         let archive_path = path.join("release.tar");
@@ -135,7 +149,7 @@ fn scan_handoffs(
             MAX_DESCRIPTOR_BYTES,
         )?;
         let descriptor = SignedSelfReleaseV1::decode_canonical(&bytes)?;
-        if descriptor.manifest.source_head != source_head {
+        if !binding.matches(&descriptor) {
             return Err(SelfReleaseHandoffError::HandoffBinding);
         }
         descriptor.verify(policy, now_ms.min(descriptor.expires_at_ms))?;
@@ -150,6 +164,35 @@ fn scan_handoffs(
         });
     }
     Ok(candidates)
+}
+
+enum PublishedHandoffBinding {
+    LegacySource(GitCommitId),
+    Manifest(EvidenceDigest),
+}
+
+impl PublishedHandoffBinding {
+    fn matches(&self, descriptor: &SignedSelfReleaseV1) -> bool {
+        match self {
+            Self::LegacySource(source_head) => descriptor.manifest.source_head == *source_head,
+            Self::Manifest(manifest_digest) => {
+                descriptor.manifest.manifest_digest == *manifest_digest
+            }
+        }
+    }
+}
+
+fn parse_published_handoff_name(
+    name: &str,
+) -> Result<PublishedHandoffBinding, SelfReleaseHandoffError> {
+    if let Some(digest) = name.strip_prefix(PUBLISHED_RELEASE_PREFIX) {
+        return EvidenceDigest::from_str(digest)
+            .map(PublishedHandoffBinding::Manifest)
+            .map_err(|_| SelfReleaseHandoffError::UnsafeHandoff);
+    }
+    GitCommitId::from_str(name)
+        .map(PublishedHandoffBinding::LegacySource)
+        .map_err(|_| SelfReleaseHandoffError::UnsafeHandoff)
 }
 
 #[allow(clippy::similar_names)]
