@@ -48,6 +48,7 @@ pub const VERSIONED_SELF_RELEASE_BINARIES: &[&str] = &[
     "rdashboard-dependency-fetcher",
     "rdashboard-executor",
     "rdashboard-native-release",
+    "rdashboard-notify",
     "rdashboard-observer",
     "rdashboard-rimg-health-proxy",
     "rdashboard-source",
@@ -3050,6 +3051,10 @@ mod tests {
             (
                 "rdashboard-native-release",
                 include_str!("../deploy/systemd/rdashboard-native-release-recovery.service"),
+            ),
+            (
+                "rdashboard-notify",
+                include_str!("../deploy/systemd/rdashboard-notify.service"),
             ),
             (
                 "rdashboard-dependency-fetcher",

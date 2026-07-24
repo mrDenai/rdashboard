@@ -8,7 +8,7 @@ Before=rdashboard.service
 Type=simple
 User=rdashboard-notify
 Group=rdashboard-notify
-ExecStart=/usr/libexec/rdashboard/rdashboard-notify
+ExecStart=/var/lib/rdashboard-bootstrap/current/bin/rdashboard-notify
 Environment=RDASHBOARD_NOTIFY_DATA_DIR=/var/lib/rdashboard-notify
 Environment=RDASHBOARD_NOTIFY_SOCKET=/run/rdashboard-notify/notify.sock
 EnvironmentFile=/etc/rdashboard/notifier.env

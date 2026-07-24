@@ -529,9 +529,10 @@ culprit, path, event body, stack trace, issue ID or deep link. The free provider
 incident authority and never gates collection, backup or deployment.
 
 Telegram delivery is a separate, inactive activation boundary. The controller never receives the
-gateway secret or opens the delivery database. `rdashboard-notify.service` runs the
-`/usr/libexec/rdashboard/rdashboard-notify` binary as a dedicated `rdashboard-notify` user with the
-matching dedicated group. The optional controller drop-in adds only that transport group to
+gateway secret or opens the delivery database. `rdashboard-notify.service` runs the versioned
+`/var/lib/rdashboard-bootstrap/current/bin/rdashboard-notify` binary as a dedicated
+`rdashboard-notify` user with the matching dedicated group. The optional controller drop-in adds
+only that transport group to
 `rdashboard.service`; the runtime directory is not group-writable, and every request is also bound to
 the installed controller UID through peer credentials. The notifier is not a member of `rdashboard`
 and cannot read the controller StateDirectory. It owns its mode-`0700` StateDirectory, submits a
