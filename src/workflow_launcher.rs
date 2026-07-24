@@ -561,7 +561,11 @@ impl WorkflowLaunchTerminalV1 {
                 self.exit_code.is_some() != self.signal.is_some()
                     && self.succeeded == (self.exit_code == Some(0) && self.signal.is_none())
                     && (!self.succeeded || self.failure_digest.is_none())
-                    && if lease.adapter_id == WorkflowAdapterIdV1::WorkerOciReleaseBuildV1 {
+                    && if matches!(
+                        lease.adapter_id,
+                        WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+                            | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+                    ) {
                         self.succeeded == self.output_digest.is_some()
                     } else {
                         self.output_digest.is_none()
@@ -1981,6 +1985,88 @@ impl WorkflowLaunchRuntimeV1 for SystemdWorkflowLaunchRuntimeV1 {
     }
 }
 
+fn mark_process_reconciliation(
+    journal: &WorkflowLaunchJournalV1,
+    lease: &WorkflowLeaseV1,
+    reason: WorkflowLaunchReconcileReasonV1,
+    reason_code: &'static str,
+    fallback_time: i64,
+) {
+    let reconcile_at_ms = crate::unix_time_ms().unwrap_or(fallback_time);
+    if let Err(error) = journal.mark_needs_reconcile(lease, reason, reconcile_at_ms) {
+        tracing::error!(
+            lease_id = %lease.lease_id,
+            lease_generation = lease.lease_generation,
+            reason_code,
+            error = %error,
+            "workflow process uncertainty could not be journaled"
+        );
+    }
+}
+
+fn wait_for_process_and_record(
+    journal: &WorkflowLaunchJournalV1,
+    lease: &WorkflowLeaseV1,
+    fallback_time: i64,
+    process_receiver: &std::sync::mpsc::Receiver<Box<dyn WorkflowLaunchProcessV1>>,
+) {
+    let Ok(process) = process_receiver.recv() else {
+        return;
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process.wait())) {
+        Ok(Ok(exit)) => {
+            let completed_at_ms = crate::unix_time_ms().unwrap_or(fallback_time);
+            if let Err(error) = journal.mark_process_exit(lease, exit, completed_at_ms) {
+                tracing::error!(
+                    lease_id = %lease.lease_id,
+                    lease_generation = lease.lease_generation,
+                    reason_code = "process_exit_journal_failed",
+                    error = %error,
+                    "workflow process exit could not be journaled"
+                );
+                mark_process_reconciliation(
+                    journal,
+                    lease,
+                    WorkflowLaunchReconcileReasonV1::SupervisorUnavailable,
+                    "process_exit_reconciliation_failed",
+                    fallback_time,
+                );
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                lease_id = %lease.lease_id,
+                lease_generation = lease.lease_generation,
+                reason_code = "process_wait_failed",
+                error = %error,
+                "workflow process wait became uncertain"
+            );
+            mark_process_reconciliation(
+                journal,
+                lease,
+                WorkflowLaunchReconcileReasonV1::ProcessWaitUncertain,
+                "process_wait_reconciliation_failed",
+                fallback_time,
+            );
+        }
+        Err(_) => {
+            tracing::error!(
+                lease_id = %lease.lease_id,
+                lease_generation = lease.lease_generation,
+                reason_code = "process_wait_panicked",
+                "workflow process wait panicked"
+            );
+            mark_process_reconciliation(
+                journal,
+                lease,
+                WorkflowLaunchReconcileReasonV1::ProcessWaitUncertain,
+                "process_wait_reconciliation_failed",
+                fallback_time,
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkflowLaunchSupervisorV1 {
     policy: WorkflowLauncherPolicyV1,
@@ -2170,22 +2256,12 @@ impl WorkflowLaunchSupervisorV1 {
         if let Err(error) = spawn_waiter(
             waiter_name,
             Box::new(move || {
-                let Ok(process) = process_receiver.recv() else {
-                    return;
-                };
-                if let Ok(Ok(exit)) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process.wait()))
-                {
-                    let completed_at_ms = crate::unix_time_ms().unwrap_or(fallback_time);
-                    let _ = journal.mark_process_exit(&wait_lease, exit, completed_at_ms);
-                } else {
-                    let reconcile_at_ms = crate::unix_time_ms().unwrap_or(fallback_time);
-                    let _ = journal.mark_needs_reconcile(
-                        &wait_lease,
-                        WorkflowLaunchReconcileReasonV1::ProcessWaitUncertain,
-                        reconcile_at_ms,
-                    );
-                }
+                wait_for_process_and_record(
+                    &journal,
+                    &wait_lease,
+                    fallback_time,
+                    &process_receiver,
+                );
             }),
         ) {
             let status = self.journal.mark_spawn_rejected(
@@ -4479,6 +4555,60 @@ mod tests {
     }
 
     #[test]
+    fn native_self_release_success_commits_its_typed_output() {
+        let fixture = fixture();
+        let policy = configured_self_release_policy(&fixture);
+        let lease = self_release_lease(&fixture);
+        let journal = WorkflowLaunchJournalV1::open(
+            &fixture.journal_root,
+            fixture.owner_uid,
+            policy.max_journal_records,
+            100,
+        )
+        .expect("open journal");
+        let (runtime, exit_sender) = runtime();
+        let supervisor = WorkflowLaunchSupervisorV1::new(
+            policy,
+            fixture.reader.clone(),
+            fixture.titanium.clone(),
+            journal,
+            fixture.operation_states.clone(),
+            runtime,
+        )
+        .expect("supervisor");
+        let grant = fixture
+            .signer
+            .issue(&lease, 101, Uuid::from_u128(44))
+            .expect("execution grant");
+        supervisor
+            .launch(&lease, &grant, 101)
+            .expect("launch native self release");
+        let output_digest = EvidenceDigest::sha256("signed native self release");
+        exit_sender
+            .send(WorkflowProcessExitV1 {
+                exit_code: Some(0),
+                signal: None,
+                failure_digest: None,
+                output_digest: Some(output_digest.clone()),
+            })
+            .expect("finish native self release");
+        let completed = wait_for_lease_state(&supervisor, &lease, WorkflowLaunchStateV1::Succeeded);
+        let terminal = completed.terminal.as_ref().expect("terminal evidence");
+        assert_eq!(terminal.output_digest.as_ref(), Some(&output_digest));
+        let cleaned = supervisor
+            .cleanup(&lease, terminal.completed_at_ms + 1)
+            .expect("cleanup native self release");
+        assert_eq!(cleaned.state, WorkflowLaunchStateV1::Cleaned);
+        assert!(
+            cleaned
+                .cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.operation_state.as_ref())
+                .is_some_and(|operation_state| operation_state.reusable)
+        );
+    }
+
+    #[test]
     fn durable_acceptance_precedes_slow_launch_input_resolution() {
         let fixture = fixture();
         let journal = WorkflowLaunchJournalV1::open(
@@ -4653,6 +4783,53 @@ mod tests {
         assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.terminate_count.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.operation_states.counts(), (1, 1));
+    }
+
+    #[test]
+    fn invalid_process_exit_becomes_reconciliation_debt() {
+        let fixture = fixture();
+        let journal = WorkflowLaunchJournalV1::open(
+            &fixture.journal_root,
+            fixture.owner_uid,
+            fixture.policy.max_journal_records,
+            100,
+        )
+        .expect("open journal");
+        let (runtime, exit_sender) = runtime();
+        let supervisor = WorkflowLaunchSupervisorV1::new(
+            fixture.policy.clone(),
+            fixture.reader.clone(),
+            fixture.titanium.clone(),
+            journal,
+            fixture.operation_states.clone(),
+            runtime,
+        )
+        .expect("supervisor");
+        let grant = fixture
+            .signer
+            .issue(&fixture.lease, 101, Uuid::from_u128(59))
+            .expect("grant");
+
+        supervisor
+            .launch(&fixture.lease, &grant, 101)
+            .expect("launch");
+        exit_sender
+            .send(WorkflowProcessExitV1 {
+                exit_code: Some(0),
+                signal: None,
+                failure_digest: None,
+                output_digest: Some(EvidenceDigest::sha256("invalid bare-bin-ci output")),
+            })
+            .expect("finish with invalid typed output");
+        wait_for_lease_state(
+            &supervisor,
+            &fixture.lease,
+            WorkflowLaunchStateV1::NeedsReconcile,
+        );
+        let cleaned = supervisor
+            .cleanup(&fixture.lease, crate::unix_time_ms().expect("cleanup time"))
+            .expect("cleanup uncertain launch");
+        assert_eq!(cleaned.state, WorkflowLaunchStateV1::Cleaned);
     }
 
     #[test]
