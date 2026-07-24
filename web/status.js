@@ -106,18 +106,6 @@ const workflowAttemptLabels = Object.freeze({
   needs_reconcile: { state: "needs_reconcile", label: "△ Требует сверки" },
 });
 
-const workflowMutationLabels = Object.freeze({
-  not_started: { state: "unknown", label: "Не начата" },
-  owned: { state: "running", label: "Выполняется" },
-  needs_reconcile: { state: "needs_reconcile", label: "Требует сверки" },
-  complete: { state: "succeeded", label: "Завершена" },
-});
-
-const workflowCleanupLabels = Object.freeze({
-  complete: { state: "succeeded", label: "Завершён" },
-  pending: { state: "error", label: "Требуется" },
-});
-
 const workflowNodeKindLabels = Object.freeze({
   source_admission: "Приём исходников",
   host_prepare: "Подготовка окружения",
@@ -133,27 +121,8 @@ const workflowNodeKindLabels = Object.freeze({
   rollback: "Откат",
 });
 
-const workflowNodeStates = new Set([
-  "dormant",
-  "blocked",
-  "ready",
-  "leased",
-  "succeeded",
-  "failed",
-  "cancelled",
-  "needs_reconcile",
-]);
-const workflowWorkerPools = new Set([
-  "controller",
-  "vps_required",
-  "build_compute",
-  "privileged_executor",
-]);
-const workflowExecutionModes = new Set(["deploy", "shadow"]);
 const workflowIdentifierPattern = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const commitPattern = /^[0-9a-f]{40}$/;
-const digestPattern = /^[0-9a-f]{64}$/;
 
 export function evaluateHostObservation(snapshot, ageMs) {
   if (
@@ -258,133 +227,67 @@ export function workflowAttemptPresentation(state) {
   return value ? presentation(value.state, value.label) : presentation("unknown", "? Неизвестно");
 }
 
-export function workflowMutationPresentation(state) {
-  const value = workflowMutationLabels[state];
-  return value ? presentation(value.state, value.label) : presentation("unknown", "Неизвестно");
-}
-
-export function workflowCleanupPresentation(state) {
-  const value = workflowCleanupLabels[state];
-  return value ? presentation(value.state, value.label) : presentation("unknown", "Неизвестно");
-}
-
-export function workflowCurrentStepLabel(attempt) {
-  if (!Array.isArray(attempt?.nodes)) return "Неизвестный этап";
-  const priorities = ["needs_reconcile", "failed", "leased", "ready", "blocked"];
-  for (const state of priorities) {
-    const matching = attempt.nodes.filter((node) => node.state === state);
-    if (matching.length > 0) {
-      const labels = matching.slice(0, 2).map(
-        (node) => workflowNodeKindLabels[node.kind] ?? "Неизвестный этап",
-      );
-      if (matching.length > labels.length) labels.push(`ещё ${matching.length - labels.length}`);
-      return labels.join(" · ");
-    }
+export function workflowCurrentStepLabel(deployment) {
+  if (deployment?.current_stage !== null) {
+    return workflowNodeKindLabels[deployment?.current_stage] ?? "Неизвестный этап";
   }
-  return attempt.state === "succeeded" ? "Все этапы завершены" : "Нет активного этапа";
+  return deployment?.state === "succeeded" ? "Завершён" : "Нет активного этапа";
 }
 
 export function validWorkflowOverview(payload) {
   if (
-    !hasExactKeys(payload, ["schema_version", "generated_at_ms", "truncated", "attempts"])
-    || payload.schema_version !== 1
+    !hasExactKeys(payload, ["schema_version", "generated_at_ms", "truncated", "deployments"])
+    || payload.schema_version !== 2
     || !safeNonnegativeInteger(payload.generated_at_ms)
     || typeof payload.truncated !== "boolean"
-    || !Array.isArray(payload.attempts)
-    || payload.attempts.length > 50
+    || !Array.isArray(payload.deployments)
+    || payload.deployments.length > 50
   ) return false;
-  const attemptIds = new Set();
+  const identities = new Set();
   let previousUpdatedAt = Number.MAX_SAFE_INTEGER;
-  for (const attempt of payload.attempts) {
+  for (const deployment of payload.deployments) {
+    const identity = `${deployment.project_id}:${deployment.source_sha}:${deployment.attempt_number}`;
     if (
-      !validWorkflowAttempt(attempt, payload.generated_at_ms)
-      || attemptIds.has(attempt.attempt_id)
-      || attempt.updated_at_ms > previousUpdatedAt
+      !validWorkflowDeployment(deployment, payload.generated_at_ms)
+      || identities.has(identity)
+      || deployment.updated_at_ms > previousUpdatedAt
     ) return false;
-    attemptIds.add(attempt.attempt_id);
-    previousUpdatedAt = attempt.updated_at_ms;
+    identities.add(identity);
+    previousUpdatedAt = deployment.updated_at_ms;
   }
   return true;
 }
 
-function validWorkflowAttempt(attempt, generatedAtMs) {
-  if (!hasExactKeys(attempt, [
-    "request_id",
-    "attempt_id",
-    "attempt_number",
+function validWorkflowDeployment(deployment, generatedAtMs) {
+  if (!hasExactKeys(deployment, [
     "project_id",
     "source_sha",
-    "source_sequence",
-    "workflow_policy_digest",
-    "source_attestation_digest",
-    "preparation_key",
-    "priority",
-    "execution_mode",
+    "attempt_number",
     "state",
-    "mutation_state",
-    "cleanup_state",
-    "created_at_ms",
+    "current_stage",
+    "completed_stages",
+    "total_stages",
+    "duration_ms",
+    "test_duration_ms",
+    "release_size_bytes",
     "updated_at_ms",
-    "terminal_at_ms",
-    "nodes",
   ])) return false;
-  if (
-    !uuidPattern.test(attempt.request_id)
-    || !uuidPattern.test(attempt.attempt_id)
-    || !safePositiveInteger(attempt.attempt_number)
-    || !workflowIdentifierPattern.test(attempt.project_id)
-    || !commitPattern.test(attempt.source_sha)
-    || !safePositiveInteger(attempt.source_sequence)
-    || !digestPattern.test(attempt.workflow_policy_digest)
-    || !digestPattern.test(attempt.source_attestation_digest)
-    || !digestPattern.test(attempt.preparation_key)
-    || !safeNonnegativeInteger(attempt.priority)
-    || attempt.priority > 3
-    || !workflowExecutionModes.has(attempt.execution_mode)
-    || !Object.hasOwn(workflowAttemptLabels, attempt.state)
-    || !Object.hasOwn(workflowMutationLabels, attempt.mutation_state)
-    || !Object.hasOwn(workflowCleanupLabels, attempt.cleanup_state)
-    || !safeNonnegativeInteger(attempt.created_at_ms)
-    || !safeNonnegativeInteger(attempt.updated_at_ms)
-    || attempt.updated_at_ms < attempt.created_at_ms
-    || attempt.updated_at_ms > generatedAtMs
-    || !(attempt.terminal_at_ms === null
-      || (safeNonnegativeInteger(attempt.terminal_at_ms)
-        && attempt.terminal_at_ms >= attempt.created_at_ms
-        && attempt.terminal_at_ms <= attempt.updated_at_ms))
-    || !Array.isArray(attempt.nodes)
-    || attempt.nodes.length === 0
-    || attempt.nodes.length > 64
-  ) return false;
-  const nodeIds = new Set();
-  for (const node of attempt.nodes) {
-    if (!validWorkflowNode(node) || nodeIds.has(node.node_id)) return false;
-    nodeIds.add(node.node_id);
-  }
-  return true;
-}
-
-function validWorkflowNode(node) {
-  return hasExactKeys(node, [
-    "node_id",
-    "kind",
-    "profile_id",
-    "worker_pool",
-    "state",
-    "lease_generation",
-    "output_digest",
-    "receipt_digest",
-    "completed_at_ms",
-  ])
-    && workflowIdentifierPattern.test(node.node_id)
-    && Object.hasOwn(workflowNodeKindLabels, node.kind)
-    && workflowIdentifierPattern.test(node.profile_id)
-    && workflowWorkerPools.has(node.worker_pool)
-    && workflowNodeStates.has(node.state)
-    && safeNonnegativeInteger(node.lease_generation)
-    && (node.output_digest === null || digestPattern.test(node.output_digest))
-    && (node.receipt_digest === null || digestPattern.test(node.receipt_digest))
-    && (node.completed_at_ms === null || safeNonnegativeInteger(node.completed_at_ms));
+  return safePositiveInteger(deployment.attempt_number)
+    && workflowIdentifierPattern.test(deployment.project_id)
+    && commitPattern.test(deployment.source_sha)
+    && Object.hasOwn(workflowAttemptLabels, deployment.state)
+    && (deployment.current_stage === null
+      || Object.hasOwn(workflowNodeKindLabels, deployment.current_stage))
+    && safeNonnegativeInteger(deployment.completed_stages)
+    && safePositiveInteger(deployment.total_stages)
+    && deployment.completed_stages <= deployment.total_stages
+    && safeNonnegativeInteger(deployment.duration_ms)
+    && (deployment.test_duration_ms === null
+      || safeNonnegativeInteger(deployment.test_duration_ms))
+    && (deployment.release_size_bytes === null
+      || safePositiveInteger(deployment.release_size_bytes))
+    && safeNonnegativeInteger(deployment.updated_at_ms)
+    && deployment.updated_at_ms <= generatedAtMs;
 }
 
 export function repositorySizeChange(samples, periodMs) {

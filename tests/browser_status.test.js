@@ -15,9 +15,7 @@ import {
   repositorySizeChange,
   validWorkflowOverview,
   workflowAttemptPresentation,
-  workflowCleanupPresentation,
   workflowCurrentStepLabel,
-  workflowMutationPresentation,
 } from "../web/status.js";
 
 function snapshot(status = "fresh") {
@@ -172,79 +170,47 @@ test("notification delivery preserves ambiguous and terminal outcomes", () => {
   assert.equal(notificationKindLabel("invented"), "Неизвестное событие");
 });
 
-test("workflow overview is strict and keeps recovery and cleanup visible", () => {
-  const attempt = {
-    request_id: "11111111-1111-4111-8111-111111111111",
-    attempt_id: "22222222-2222-4222-8222-222222222222",
-    attempt_number: 1,
+test("workflow overview accepts only compact deployment summaries", () => {
+  const deployment = {
     project_id: "rimg",
     source_sha: "a".repeat(40),
-    source_sequence: 1,
-    workflow_policy_digest: "b".repeat(64),
-    source_attestation_digest: "c".repeat(64),
-    preparation_key: "d".repeat(64),
-    priority: 2,
-    execution_mode: "deploy",
+    attempt_number: 1,
     state: "needs_reconcile",
-    mutation_state: "needs_reconcile",
-    cleanup_state: "pending",
-    created_at_ms: 10,
+    current_stage: "cutover",
+    completed_stages: 3,
+    total_stages: 5,
+    duration_ms: 12_000,
+    test_duration_ms: 4_000,
+    release_size_bytes: 1_048_576,
     updated_at_ms: 20,
-    terminal_at_ms: null,
-    nodes: [{
-      node_id: "cutover",
-      kind: "cutover",
-      profile_id: "cutover-v1",
-      worker_pool: "privileged_executor",
-      state: "needs_reconcile",
-      lease_generation: 1,
-      output_digest: null,
-      receipt_digest: null,
-      completed_at_ms: null,
-    }],
   };
   const overview = {
-    schema_version: 1,
+    schema_version: 2,
     generated_at_ms: 30,
     truncated: false,
-    attempts: [attempt],
+    deployments: [deployment],
   };
   assert.equal(validWorkflowOverview(overview), true);
   assert.deepEqual(workflowAttemptPresentation("needs_reconcile"), {
     state: "needs_reconcile",
     label: "△ Требует сверки",
   });
-  assert.deepEqual(workflowMutationPresentation("needs_reconcile"), {
-    state: "needs_reconcile",
-    label: "Требует сверки",
-  });
-  assert.deepEqual(workflowCleanupPresentation("pending"), {
-    state: "error",
-    label: "Требуется",
-  });
-  assert.equal(workflowCurrentStepLabel(attempt), "Переключение трафика");
+  assert.equal(workflowCurrentStepLabel(deployment), "Переключение трафика");
   assert.equal(workflowCurrentStepLabel({
-    ...attempt,
+    ...deployment,
     state: "failed",
-    nodes: [
-      { ...attempt.nodes[0], state: "ready", kind: "rollback", node_id: "rollback" },
-      { ...attempt.nodes[0], state: "failed", kind: "candidate_health", node_id: "health" },
-    ],
+    current_stage: "candidate_health",
   }), "Проверка кандидата");
 
   assert.equal(validWorkflowOverview({ ...overview, unexpected: true }), false);
   assert.equal(validWorkflowOverview({ ...overview, generated_at_ms: 19 }), false);
   assert.equal(validWorkflowOverview({
     ...overview,
-    attempts: [{ ...attempt, execution_mode: "invented" }],
+    deployments: [{ ...deployment, current_stage: "invented" }],
   }), false);
   assert.equal(validWorkflowOverview({
     ...overview,
-    attempts: [{ ...attempt, execution_mode: "shadow" }],
-  }), true);
-  assert.equal(validWorkflowOverview({
-    ...overview,
-    attempts: [attempt, { ...attempt }],
+    deployments: [deployment, { ...deployment }],
   }), false);
   assert.deepEqual(workflowAttemptPresentation("invented"), {
     state: "unknown",

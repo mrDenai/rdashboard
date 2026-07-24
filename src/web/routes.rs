@@ -24,6 +24,7 @@ use crate::{
     domain::{
         BlockingReason, DashboardSnapshot, GitCommitId, OperationKind, OperationPhase,
         OperationRecord, OperationResult, ProjectId, ProjectRepositorySample, ReleaseClass,
+        WorkflowNodeKindV1,
     },
     executor_intent::{
         ExecutorIntentConsequenceV1, ExecutorIntentRequiredRoleV1,
@@ -34,7 +35,10 @@ use crate::{
         ExecuteMutationGrantV1, ObserveMutationStatusV1, PrepareMutationIntentV1,
     },
     notifier_socket::{NotifierClientV1, NotifierProjectRecordsV1},
-    scheduler::{WorkflowAttemptPageV1, WorkflowJournalReaderV1},
+    scheduler::{
+        WorkflowAttemptPageV1, WorkflowAttemptSnapshotV1, WorkflowAttemptStateV1,
+        WorkflowJournalReaderV1, WorkflowNodeStateV1,
+    },
     store::{
         IntegrationStore, IntegrationStoreError, MetricsStore,
         PROJECT_REPOSITORY_SAMPLE_INTERVAL_MS, StoreError,
@@ -527,25 +531,113 @@ struct WorkflowOverviewResponse {
     schema_version: u16,
     generated_at_ms: i64,
     truncated: bool,
-    attempts: Vec<crate::scheduler::WorkflowAttemptSnapshotV1>,
+    deployments: Vec<WorkflowOverviewDeploymentResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowOverviewDeploymentResponse {
+    project_id: ProjectId,
+    source_sha: GitCommitId,
+    attempt_number: u32,
+    state: WorkflowAttemptStateV1,
+    current_stage: Option<WorkflowNodeKindV1>,
+    completed_stages: usize,
+    total_stages: usize,
+    duration_ms: u64,
+    test_duration_ms: Option<u64>,
+    release_size_bytes: Option<u64>,
+    updated_at_ms: i64,
 }
 
 impl WorkflowOverviewResponse {
     fn from_page(generated_at_ms: i64, page: WorkflowAttemptPageV1) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             generated_at_ms,
             truncated: page.truncated,
-            attempts: page.attempts,
+            deployments: page
+                .attempts
+                .into_iter()
+                .map(|attempt| {
+                    WorkflowOverviewDeploymentResponse::from_attempt(attempt, generated_at_ms)
+                })
+                .collect(),
         }
     }
+}
+
+impl WorkflowOverviewDeploymentResponse {
+    fn from_attempt(attempt: WorkflowAttemptSnapshotV1, generated_at_ms: i64) -> Self {
+        let duration_end_ms = attempt.terminal_at_ms.unwrap_or(generated_at_ms);
+        let duration_ms = elapsed_milliseconds(attempt.created_at_ms, duration_end_ms).unwrap_or(0);
+        let current_stage = current_workflow_stage(&attempt);
+        let completed_stages = attempt
+            .nodes
+            .iter()
+            .filter(|node| node.state == WorkflowNodeStateV1::Succeeded)
+            .count();
+        let total_stages = attempt.nodes.len();
+        let test_duration_ms = attempt
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::Verification)
+            .and_then(|node| {
+                node.started_at_ms.and_then(|started_at_ms| {
+                    elapsed_milliseconds(
+                        started_at_ms,
+                        node.completed_at_ms.unwrap_or(generated_at_ms),
+                    )
+                })
+            });
+        let release_size_bytes = attempt
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .and_then(|node| node.output_size_bytes);
+        Self {
+            project_id: attempt.project_id,
+            source_sha: attempt.source_sha,
+            attempt_number: attempt.attempt_number,
+            state: attempt.state,
+            current_stage,
+            completed_stages,
+            total_stages,
+            duration_ms,
+            test_duration_ms,
+            release_size_bytes,
+            updated_at_ms: attempt.updated_at_ms,
+        }
+    }
+}
+
+fn elapsed_milliseconds(started_at_ms: i64, completed_at_ms: i64) -> Option<u64> {
+    completed_at_ms
+        .checked_sub(started_at_ms)
+        .and_then(|elapsed| u64::try_from(elapsed).ok())
+}
+
+fn current_workflow_stage(attempt: &WorkflowAttemptSnapshotV1) -> Option<WorkflowNodeKindV1> {
+    let priorities = [
+        WorkflowNodeStateV1::NeedsReconcile,
+        WorkflowNodeStateV1::Failed,
+        WorkflowNodeStateV1::Leased,
+        WorkflowNodeStateV1::Ready,
+        WorkflowNodeStateV1::Blocked,
+    ];
+    priorities.into_iter().find_map(|state| {
+        attempt
+            .nodes
+            .iter()
+            .find(|node| node.state == state)
+            .map(|node| node.kind)
+    })
 }
 
 async fn workflow_overview(
     State(state): State<DashboardState>,
     Query(query): Query<WorkflowOverviewQuery>,
 ) -> Response {
-    let limit = usize::from(query.limit.unwrap_or(20));
+    let limit = usize::from(query.limit.unwrap_or(50));
     if !(1..=50).contains(&limit) {
         return ApiProblem::response(
             StatusCode::BAD_REQUEST,

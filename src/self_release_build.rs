@@ -882,6 +882,7 @@ fn validate_build_output(
 pub struct PublishedSelfReleaseV1 {
     pub descriptor: SignedSelfReleaseV1,
     pub output_digest: EvidenceDigest,
+    pub archive_bytes: u64,
 }
 
 pub struct SelfReleaseHandoffStoreV1 {
@@ -1116,6 +1117,7 @@ impl SelfReleaseHandoffStoreV1 {
         self.remove_request(request)?;
         Ok(PublishedSelfReleaseV1 {
             output_digest: descriptor.payload_digest.clone(),
+            archive_bytes: descriptor.archive_bytes,
             descriptor,
         })
     }

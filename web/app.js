@@ -12,9 +12,7 @@ import {
   repositorySizeChange,
   validWorkflowOverview,
   workflowAttemptPresentation,
-  workflowCleanupPresentation,
   workflowCurrentStepLabel,
-  workflowMutationPresentation,
 } from "./status.js";
 
 const elements = Object.freeze({
@@ -214,7 +212,7 @@ async function loadWorkflowOverview(announceResult = false) {
     elements.workflowStatus.textContent = "Загружается журнал workflow…";
   }
   try {
-    const response = await fetch("/api/v1/workflows?limit=20", {
+    const response = await fetch("/api/v1/workflows?limit=50", {
       headers: { Accept: "application/json" },
       cache: "no-store",
     });
@@ -251,64 +249,70 @@ async function loadWorkflowOverview(announceResult = false) {
 }
 
 function renderWorkflowOverview(overview) {
-  const count = overview.attempts.length;
+  const count = overview.deployments.length;
+  const projectCount = new Set(overview.deployments.map((deployment) => deployment.project_id)).size;
   const generated = new Date(overview.generated_at_ms).toLocaleString("ru-RU");
-  elements.workflowSummary.textContent = `${count} ${workflowAttemptCountLabel(count)} · ${generated}`;
+  elements.workflowSummary.textContent = `${projectCount} ${workflowProjectCountLabel(projectCount)} · ${generated}`;
   elements.workflowStatus.hidden = !overview.truncated;
   elements.workflowStatus.dataset.state = overview.truncated ? "partial" : "fresh";
   elements.workflowStatus.textContent = overview.truncated
-    ? "Показаны только 20 последних попыток. Полная история остаётся в durable journal."
+    ? "Показаны только 50 актуальных записей. Полная история остаётся в durable journal."
     : "";
   elements.workflowList.replaceChildren();
   if (count === 0) {
     renderWorkflowPlaceholder("Попытки workflow ещё не зафиксированы.");
     return;
   }
-  for (const attempt of overview.attempts) {
-    elements.workflowList.append(createWorkflowRow(attempt));
+  for (const deployment of overview.deployments) {
+    elements.workflowList.append(createWorkflowRow(deployment));
   }
 }
 
-function createWorkflowRow(attempt) {
+function createWorkflowRow(deployment) {
   const row = document.createElement("tr");
   row.className = "workflow-row";
 
   const project = document.createElement("th");
   project.scope = "row";
-  project.textContent = attempt.project_id;
-  appendProjectCellDetail(project, `SHA ${attempt.source_sha.slice(0, 10)}`);
+  project.textContent = deployment.project_id;
+  appendProjectCellDetail(project, `SHA ${deployment.source_sha.slice(0, 10)}`);
 
-  const attemptCell = document.createElement("td");
-  const attemptNumber = document.createElement("strong");
-  attemptNumber.textContent = `№ ${attempt.attempt_number}`;
-  attemptCell.append(attemptNumber);
-  appendProjectCellDetail(attemptCell, attempt.attempt_id.slice(0, 8));
-
-  const state = workflowAttemptPresentation(attempt.state);
+  const state = workflowAttemptPresentation(deployment.state);
   const stateCell = workflowStateCell(state);
+  if (deployment.attempt_number > 1) {
+    appendProjectCellDetail(stateCell, `Попытка № ${deployment.attempt_number}`);
+  }
 
   const stepCell = document.createElement("td");
-  stepCell.textContent = workflowCurrentStepLabel(attempt);
-  const completed = attempt.nodes.filter((node) => node.state === "succeeded").length;
-  appendProjectCellDetail(stepCell, `${completed} из ${attempt.nodes.length} этапов завершено`);
+  stepCell.textContent = workflowCurrentStepLabel(deployment);
+  appendProjectCellDetail(
+    stepCell,
+    `${deployment.completed_stages} из ${deployment.total_stages} этапов завершено`,
+  );
 
-  const mutationCell = workflowStateCell(workflowMutationPresentation(attempt.mutation_state));
-  const cleanupCell = workflowStateCell(workflowCleanupPresentation(attempt.cleanup_state));
+  const durationCell = document.createElement("td");
+  durationCell.textContent = formatDuration(deployment.duration_ms);
 
-  const priorityCell = document.createElement("td");
-  priorityCell.textContent = String(attempt.priority);
+  const testsCell = document.createElement("td");
+  testsCell.textContent = deployment.test_duration_ms === null
+    ? "—"
+    : formatDuration(deployment.test_duration_ms);
+
+  const releaseCell = document.createElement("td");
+  releaseCell.textContent = deployment.release_size_bytes === null
+    ? "—"
+    : formatBytes(deployment.release_size_bytes);
 
   const updatedCell = document.createElement("td");
-  updatedCell.textContent = new Date(attempt.updated_at_ms).toLocaleString("ru-RU");
+  updatedCell.textContent = new Date(deployment.updated_at_ms).toLocaleString("ru-RU");
 
   row.append(
     project,
-    attemptCell,
     stateCell,
     stepCell,
-    mutationCell,
-    cleanupCell,
-    priorityCell,
+    durationCell,
+    testsCell,
+    releaseCell,
     updatedCell,
   );
   return row;
@@ -329,19 +333,33 @@ function renderWorkflowPlaceholder(message) {
   const row = document.createElement("tr");
   const cell = document.createElement("td");
   cell.className = "empty-state";
-  cell.colSpan = 8;
+  cell.colSpan = 7;
   cell.textContent = message;
   row.append(cell);
   elements.workflowList.append(row);
 }
 
-function workflowAttemptCountLabel(count) {
+function workflowProjectCountLabel(count) {
   const modulo100 = count % 100;
   const modulo10 = count % 10;
-  if (modulo100 >= 11 && modulo100 <= 14) return "попыток";
-  if (modulo10 === 1) return "попытка";
-  if (modulo10 >= 2 && modulo10 <= 4) return "попытки";
-  return "попыток";
+  if (modulo100 >= 11 && modulo100 <= 14) return "проектов";
+  if (modulo10 === 1) return "проект";
+  if (modulo10 >= 2 && modulo10 <= 4) return "проекта";
+  return "проектов";
+}
+
+function formatDuration(value) {
+  if (!Number.isSafeInteger(value) || value < 0) return "—";
+  const totalSeconds = Math.round(value / 1_000);
+  if (totalSeconds < 60) return `${totalSeconds} с`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (totalMinutes < 60) return seconds === 0
+    ? `${totalMinutes} мин`
+    : `${totalMinutes} мин ${seconds} с`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes === 0 ? `${hours} ч` : `${hours} ч ${minutes} мин`;
 }
 
 function renderHistoryCell(cell, window) {

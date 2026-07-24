@@ -1848,6 +1848,134 @@ fn workflow_overview_is_bounded_ordered_and_consistent_after_reopen() {
 }
 
 #[test]
+fn workflow_overview_keeps_current_success_and_only_a_newer_failure_per_project() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store.clone());
+    let manifest = self_update_manifest();
+
+    let mut successful = admission(
+        &manifest,
+        'a',
+        1,
+        WorkflowTriggerChannelV1::ManualShadow,
+        "overview-success",
+    );
+    successful.execution_mode = WorkflowExecutionModeV1::Shadow;
+    scheduler
+        .admit(&manifest, &successful, 10)
+        .unwrap_or_else(|error| panic!("admit successful workflow: {error}"));
+    let (successful_id, _) = complete_reduction(&scheduler, 20);
+
+    let mut failed = admission(
+        &manifest,
+        'b',
+        2,
+        WorkflowTriggerChannelV1::ManualShadow,
+        "overview-failure",
+    );
+    failed.execution_mode = WorkflowExecutionModeV1::Shadow;
+    scheduler
+        .admit(&manifest, &failed, 100)
+        .unwrap_or_else(|error| panic!("admit failed workflow: {error}"));
+    let failed_lease = claim(&scheduler, &build_worker(), 110);
+    let failed_receipt = WorkflowNodeReceiptV1::new(
+        &failed_lease,
+        WorkflowNodeOutcomeV1::Failed,
+        None,
+        digest("overview-failed-execution"),
+        digest("overview-failed-cleanup"),
+        WorkflowCleanupResultV1::Complete,
+        120,
+    )
+    .unwrap_or_else(|error| panic!("failed overview receipt: {error}"));
+    let failed_attempt = scheduler
+        .commit_node_receipt(&failed_receipt, 121)
+        .unwrap_or_else(|error| panic!("commit failed overview receipt: {error}"));
+
+    let mut current = admission(
+        &manifest,
+        'c',
+        3,
+        WorkflowTriggerChannelV1::ManualShadow,
+        "overview-current",
+    );
+    current.execution_mode = WorkflowExecutionModeV1::Shadow;
+    let current_attempt = scheduler
+        .admit(&manifest, &current, 130)
+        .unwrap_or_else(|error| panic!("admit current workflow: {error}"));
+
+    let page = WorkflowJournalReaderV1::new(store)
+        .recent_attempts(50)
+        .unwrap_or_else(|error| panic!("read project overview: {error}"));
+    assert!(!page.truncated);
+    assert_eq!(
+        page.attempts
+            .iter()
+            .map(|attempt| attempt.attempt_id)
+            .collect::<Vec<_>>(),
+        vec![
+            current_attempt.attempt().attempt_id,
+            failed_attempt.attempt_id,
+            successful_id,
+        ]
+    );
+}
+
+#[test]
+fn workflow_overview_hides_failures_older_than_the_latest_success() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store.clone());
+    let manifest = self_update_manifest();
+
+    let mut failed = admission(
+        &manifest,
+        'a',
+        1,
+        WorkflowTriggerChannelV1::ManualShadow,
+        "overview-old-failure",
+    );
+    failed.execution_mode = WorkflowExecutionModeV1::Shadow;
+    scheduler
+        .admit(&manifest, &failed, 10)
+        .unwrap_or_else(|error| panic!("admit old failed workflow: {error}"));
+    let failed_lease = claim(&scheduler, &build_worker(), 20);
+    let failed_receipt = WorkflowNodeReceiptV1::new(
+        &failed_lease,
+        WorkflowNodeOutcomeV1::Failed,
+        None,
+        digest("overview-old-failed-execution"),
+        digest("overview-old-failed-cleanup"),
+        WorkflowCleanupResultV1::Complete,
+        30,
+    )
+    .unwrap_or_else(|error| panic!("old failed overview receipt: {error}"));
+    scheduler
+        .commit_node_receipt(&failed_receipt, 31)
+        .unwrap_or_else(|error| panic!("commit old failed overview receipt: {error}"));
+
+    let mut successful = admission(
+        &manifest,
+        'b',
+        2,
+        WorkflowTriggerChannelV1::ManualShadow,
+        "overview-new-success",
+    );
+    successful.execution_mode = WorkflowExecutionModeV1::Shadow;
+    scheduler
+        .admit(&manifest, &successful, 40)
+        .unwrap_or_else(|error| panic!("admit new successful workflow: {error}"));
+    let (successful_id, _) = complete_reduction(&scheduler, 50);
+
+    let page = WorkflowJournalReaderV1::new(store)
+        .recent_attempts(50)
+        .unwrap_or_else(|error| panic!("read recovered project overview: {error}"));
+    assert_eq!(page.attempts.len(), 1);
+    assert_eq!(page.attempts[0].attempt_id, successful_id);
+}
+
+#[test]
 fn shadow_stops_after_reduction_and_the_same_source_can_still_deploy() {
     let directory = tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
     let path = directory.path().join("shadow-control.sqlite");

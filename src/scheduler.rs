@@ -221,7 +221,9 @@ pub struct WorkflowNodeSnapshotV1 {
     pub lease_generation: u32,
     pub output_digest: Option<EvidenceDigest>,
     pub receipt_digest: Option<EvidenceDigest>,
+    pub started_at_ms: Option<i64>,
     pub completed_at_ms: Option<i64>,
+    pub output_size_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -347,7 +349,49 @@ impl WorkflowJournalReaderV1 {
             .map_err(|_| StoreError::InvalidWorkflowSchedulerInput("workflow overview limit"))?;
         self.store.read_transaction(|transaction| {
             let mut statement = transaction.prepare(
-                "SELECT attempt_id FROM workflow_attempts
+                "WITH ranked AS (
+                    SELECT attempt.attempt_id, request.project_id, attempt.state,
+                           attempt.updated_at_ms, attempt.created_at_ms,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY request.project_id
+                               ORDER BY attempt.updated_at_ms DESC,
+                                        attempt.created_at_ms DESC,
+                                        attempt.attempt_id ASC
+                           ) AS recency
+                    FROM workflow_attempts AS attempt
+                    INNER JOIN workflow_requests AS request
+                        ON request.request_id = attempt.request_id
+                    WHERE attempt.state != 'superseded'
+                 ), project_summary AS (
+                    SELECT project_id,
+                           MIN(CASE
+                               WHEN state IN ('queued', 'waiting_for_mutation', 'running')
+                               THEN recency
+                           END) AS active_recency,
+                           MIN(CASE WHEN state = 'succeeded' THEN recency END) AS success_recency,
+                           MIN(CASE
+                               WHEN state IN ('failed', 'needs_reconcile')
+                               THEN recency
+                           END) AS failure_recency
+                    FROM ranked
+                    GROUP BY project_id
+                 ), selected AS (
+                    SELECT ranked.attempt_id, ranked.updated_at_ms,
+                           ranked.created_at_ms
+                    FROM ranked
+                    INNER JOIN project_summary
+                        ON project_summary.project_id = ranked.project_id
+                    WHERE ranked.recency = project_summary.active_recency
+                       OR ranked.recency = project_summary.success_recency
+                       OR (
+                           ranked.recency = project_summary.failure_recency
+                           AND (
+                               project_summary.success_recency IS NULL
+                               OR project_summary.failure_recency < project_summary.success_recency
+                           )
+                       )
+                 )
+                 SELECT attempt_id FROM selected
                  ORDER BY updated_at_ms DESC, created_at_ms DESC, attempt_id ASC
                  LIMIT ?1",
             )?;
@@ -3300,35 +3344,72 @@ fn read_attempt_context_row(
         .ok_or(StoreError::WorkflowAttemptNotFound(attempt_id))
 }
 
+type WorkflowNodeSnapshotStorageRow = (
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+
+fn read_workflow_node_snapshot_rows(
+    connection: &rusqlite::Connection,
+    attempt_id: Uuid,
+) -> Result<Vec<WorkflowNodeSnapshotStorageRow>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT node.node_id, node.ordinal, node.node_kind, node.activation,
+                node.profile_id, node.worker_pool, node.state, node.lease_generation,
+                node.output_digest, node.receipt_digest, node.completed_at_ms,
+                COALESCE(committed_lease.leased_at_ms, active_lease.leased_at_ms),
+                receipt.receipt_json
+         FROM workflow_nodes AS node
+         LEFT JOIN workflow_node_receipts AS receipt
+           ON receipt.attempt_id = node.attempt_id AND receipt.node_id = node.node_id
+         LEFT JOIN workflow_lease_journal AS committed_lease
+           ON committed_lease.lease_id = receipt.lease_id
+         LEFT JOIN workflow_lease_journal AS active_lease
+           ON active_lease.attempt_id = node.attempt_id
+          AND active_lease.node_id = node.node_id
+          AND active_lease.state = 'active'
+         WHERE node.attempt_id = ?1 ORDER BY node.ordinal ASC",
+    )?;
+    let rows = statement
+        .query_map([attempt_id.to_string()], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 fn load_attempt_snapshot(
     connection: &rusqlite::Connection,
     attempt_id: Uuid,
 ) -> Result<WorkflowAttemptSnapshotV1, StoreError> {
     let context = load_attempt_context(connection, attempt_id)?;
     let ordered_manifest = context.manifest.workflow.ordered_nodes()?;
-    let mut statement = connection.prepare(
-        "SELECT node_id, ordinal, node_kind, activation, profile_id, worker_pool,
-                state, lease_generation, output_digest, receipt_digest, completed_at_ms
-         FROM workflow_nodes WHERE attempt_id = ?1 ORDER BY ordinal ASC",
-    )?;
-    let rows = statement
-        .query_map([attempt_id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<i64>>(10)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
+    let rows = read_workflow_node_snapshot_rows(connection, attempt_id)?;
     if rows.len() != ordered_manifest.len() {
         return Err(StoreError::CorruptWorkflowJournal("node cardinality"));
     }
@@ -3347,6 +3428,8 @@ fn load_attempt_snapshot(
             output_digest,
             receipt_digest,
             completed_at_ms,
+            started_at_ms,
+            receipt_json,
         ) = row;
         let manifest_node = ordered_manifest[index];
         let profile = context
@@ -3364,6 +3447,11 @@ fn load_attempt_snapshot(
             return Err(StoreError::CorruptWorkflowJournal("node manifest binding"));
         }
         validate_persisted_dependencies(connection, attempt_id, manifest_node)?;
+        let output_size_bytes = receipt_json
+            .as_deref()
+            .map(|value| WorkflowNodeReceiptV1::decode_canonical(value.as_bytes()))
+            .transpose()?
+            .and_then(|receipt| receipt.output_size_bytes);
         nodes.push(WorkflowNodeSnapshotV1 {
             node_id: manifest_node.node_id.clone(),
             kind: manifest_node.kind,
@@ -3380,7 +3468,9 @@ fn load_attempt_snapshot(
                 .as_deref()
                 .map(|value| parse_digest(value, "node receipt digest"))
                 .transpose()?,
+            started_at_ms,
             completed_at_ms,
+            output_size_bytes,
         });
     }
     Ok(WorkflowAttemptSnapshotV1 {

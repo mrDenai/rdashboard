@@ -41,8 +41,9 @@ use crate::{
         RootlessOciBuildRequestV1, RootlessOciBuildResultV1, RootlessOciResultStoreV1,
     },
     self_release_build::{
-        SELF_RELEASE_BUILD_EXECUTABLE, SELF_RELEASE_BUILD_REQUEST_PATH, SelfReleaseBuildError,
-        SelfReleaseBuildPolicyV1, SelfReleaseBuildRequestV1, SelfReleaseHandoffStoreV1,
+        PublishedSelfReleaseV1, SELF_RELEASE_BUILD_EXECUTABLE, SELF_RELEASE_BUILD_REQUEST_PATH,
+        SelfReleaseBuildError, SelfReleaseBuildPolicyV1, SelfReleaseBuildRequestV1,
+        SelfReleaseHandoffStoreV1,
     },
     self_update::CURRENT_WORKFLOW_JOB_EXECUTABLE,
     titanium::{
@@ -482,6 +483,8 @@ pub struct WorkflowLaunchTerminalV1 {
     pub failure_digest: Option<EvidenceDigest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_digest: Option<EvidenceDigest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_size_bytes: Option<u64>,
     pub completed_at_ms: i64,
     pub evidence_digest: EvidenceDigest,
 }
@@ -499,6 +502,8 @@ struct WorkflowLaunchTerminalPayload<'a> {
     failure_digest: &'a Option<EvidenceDigest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_digest: &'a Option<EvidenceDigest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_size_bytes: &'a Option<u64>,
     completed_at_ms: i64,
 }
 
@@ -518,6 +523,7 @@ impl WorkflowLaunchTerminalV1 {
             signal: exit.signal,
             failure_digest: exit.failure_digest,
             output_digest: exit.output_digest,
+            output_size_bytes: exit.output_size_bytes,
             completed_at_ms,
             evidence_digest: EvidenceDigest::sha256([]),
         };
@@ -541,6 +547,7 @@ impl WorkflowLaunchTerminalV1 {
             signal: None,
             failure_digest: Some(failure_digest),
             output_digest: None,
+            output_size_bytes: None,
             completed_at_ms,
             evidence_digest: EvidenceDigest::sha256([]),
         };
@@ -556,16 +563,20 @@ impl WorkflowLaunchTerminalV1 {
         launch_grant_digest: &EvidenceDigest,
         unit_name: &str,
     ) -> Result<(), WorkflowLaunchJournalError> {
+        let release_build_adapter = matches!(
+            lease.adapter_id,
+            WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
+                | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
+        );
         let shape_is_valid = match self.kind {
             WorkflowLaunchTerminalKindV1::ProcessExit => {
                 self.exit_code.is_some() != self.signal.is_some()
                     && self.succeeded == (self.exit_code == Some(0) && self.signal.is_none())
                     && (!self.succeeded || self.failure_digest.is_none())
-                    && if matches!(
-                        lease.adapter_id,
-                        WorkflowAdapterIdV1::WorkerOciReleaseBuildV1
-                            | WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1
-                    ) {
+                    && self
+                        .output_size_bytes
+                        .is_none_or(|size| release_build_adapter && self.succeeded && size > 0)
+                    && if release_build_adapter {
                         self.succeeded == self.output_digest.is_some()
                     } else {
                         self.output_digest.is_none()
@@ -577,6 +588,7 @@ impl WorkflowLaunchTerminalV1 {
                     && self.signal.is_none()
                     && self.failure_digest.is_some()
                     && self.output_digest.is_none()
+                    && self.output_size_bytes.is_none()
             }
         };
         if !shape_is_valid
@@ -608,6 +620,7 @@ impl WorkflowLaunchTerminalV1 {
                 signal: self.signal,
                 failure_digest: &self.failure_digest,
                 output_digest: &self.output_digest,
+                output_size_bytes: &self.output_size_bytes,
                 completed_at_ms: self.completed_at_ms,
             },
         )?))
@@ -1473,6 +1486,7 @@ pub struct WorkflowProcessExitV1 {
     pub signal: Option<i32>,
     pub failure_digest: Option<EvidenceDigest>,
     pub output_digest: Option<EvidenceDigest>,
+    pub output_size_bytes: Option<u64>,
 }
 
 pub trait WorkflowLaunchProcessV1: Send {
@@ -1655,7 +1669,7 @@ impl SystemdWorkflowLaunchRuntimeV1 {
         &self,
         unit_name: &str,
         request: &SelfReleaseBuildRequestV1,
-    ) -> Result<EvidenceDigest, WorkflowLaunchRuntimeError> {
+    ) -> Result<PublishedSelfReleaseV1, WorkflowLaunchRuntimeError> {
         self.validate_active_self_release(unit_name, request, false)?;
         let published = self
             .self_releases
@@ -1666,7 +1680,7 @@ impl SystemdWorkflowLaunchRuntimeV1 {
                 crate::unix_time_ms().map_err(WorkflowLaunchRuntimeError::Clock)?,
             )?;
         self.clear_active_self_release(unit_name, request)?;
-        Ok(published.output_digest)
+        Ok(published)
     }
 
     fn discard_self_release(
@@ -1764,7 +1778,10 @@ impl WorkflowLaunchProcessV1 for SystemdWorkflowLaunchProcessV1 {
         if process_succeeded {
             if let Some(request) = &self.oci_request {
                 match self.runtime.promote_oci_result(&self.unit_name, request) {
-                    Ok(result) => exit.output_digest = Some(result.result_digest),
+                    Ok(result) => {
+                        exit.output_size_bytes = Some(result.archive_bytes);
+                        exit.output_digest = Some(result.result_digest);
+                    }
                     Err(error) => {
                         mark_result_promotion_failed(
                             &mut exit,
@@ -1778,7 +1795,10 @@ impl WorkflowLaunchProcessV1 for SystemdWorkflowLaunchProcessV1 {
                 }
             } else if let Some(request) = &self.self_release_request {
                 match self.runtime.promote_self_release(&self.unit_name, request) {
-                    Ok(output_digest) => exit.output_digest = Some(output_digest),
+                    Ok(published) => {
+                        exit.output_size_bytes = Some(published.archive_bytes);
+                        exit.output_digest = Some(published.output_digest);
+                    }
                     Err(error) => {
                         mark_result_promotion_failed(
                             &mut exit,
@@ -2622,6 +2642,7 @@ fn process_exit(status: ExitStatus) -> WorkflowProcessExitV1 {
         signal: status.signal(),
         failure_digest: None,
         output_digest: None,
+        output_size_bytes: None,
     }
 }
 
@@ -3819,6 +3840,7 @@ mod tests {
                 signal: Some(15),
                 failure_digest: None,
                 output_digest: None,
+                output_size_bytes: None,
             });
             Ok(true)
         }
@@ -3858,6 +3880,16 @@ mod tests {
             }),
             sender,
         )
+    }
+
+    fn successful_process_exit() -> WorkflowProcessExitV1 {
+        WorkflowProcessExitV1 {
+            exit_code: Some(0),
+            signal: None,
+            failure_digest: None,
+            output_digest: None,
+            output_size_bytes: None,
+        }
     }
 
     fn configured_oci_policy(fixture: &LauncherFixture) -> WorkflowLauncherPolicyV1 {
@@ -4530,6 +4562,7 @@ mod tests {
                 signal: None,
                 failure_digest: None,
                 output_digest: Some(output_digest.clone()),
+                output_size_bytes: Some(12_345),
             })
             .expect("finish OCI process");
         let completed = wait_for_state(
@@ -4540,6 +4573,7 @@ mod tests {
         );
         let terminal = completed.terminal.as_ref().expect("terminal evidence");
         assert_eq!(terminal.output_digest.as_ref(), Some(&output_digest));
+        assert_eq!(terminal.output_size_bytes, Some(12_345));
         let cleaned = supervisor
             .cleanup(&lease, terminal.completed_at_ms + 1)
             .expect("cleanup OCI launch");
@@ -4590,11 +4624,13 @@ mod tests {
                 signal: None,
                 failure_digest: None,
                 output_digest: Some(output_digest.clone()),
+                output_size_bytes: Some(23_456),
             })
             .expect("finish native self release");
         let completed = wait_for_lease_state(&supervisor, &lease, WorkflowLaunchStateV1::Succeeded);
         let terminal = completed.terminal.as_ref().expect("terminal evidence");
         assert_eq!(terminal.output_digest.as_ref(), Some(&output_digest));
+        assert_eq!(terminal.output_size_bytes, Some(23_456));
         let cleaned = supervisor
             .cleanup(&lease, terminal.completed_at_ms + 1)
             .expect("cleanup native self release");
@@ -4667,12 +4703,7 @@ mod tests {
         assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
 
         exit_sender
-            .send(WorkflowProcessExitV1 {
-                exit_code: Some(0),
-                signal: None,
-                failure_digest: None,
-                output_digest: None,
-            })
+            .send(successful_process_exit())
             .expect("finish process");
         let completed = wait_for_state(
             &supervisor,
@@ -4819,6 +4850,7 @@ mod tests {
                 signal: None,
                 failure_digest: None,
                 output_digest: Some(EvidenceDigest::sha256("invalid bare-bin-ci output")),
+                output_size_bytes: None,
             })
             .expect("finish with invalid typed output");
         wait_for_lease_state(
@@ -5024,7 +5056,6 @@ mod tests {
         assert_eq!(running.state, WorkflowLaunchStateV1::Running);
         assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
         assert_active_toolchain_root(&fixture);
-
         let renewed = fixture.lease.renewed(20_000).expect("renew lease");
         let renewed_grant = fixture
             .signer
@@ -5038,12 +5069,7 @@ mod tests {
         assert_eq!(runtime.spawn_count.load(Ordering::SeqCst), 1);
 
         exit_sender
-            .send(WorkflowProcessExitV1 {
-                exit_code: Some(0),
-                signal: None,
-                failure_digest: None,
-                output_digest: None,
-            })
+            .send(successful_process_exit())
             .expect("finish process");
         let completed = wait_for_state(
             &supervisor,

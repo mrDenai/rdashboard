@@ -1484,6 +1484,8 @@ pub struct WorkflowNodeReceiptV1 {
     pub expected_input_digest: EvidenceDigest,
     pub outcome: WorkflowNodeOutcomeV1,
     pub output_digest: Option<EvidenceDigest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_size_bytes: Option<u64>,
     pub execution_receipt_digest: EvidenceDigest,
     pub cleanup_receipt_digest: EvidenceDigest,
     pub cleanup_result: WorkflowCleanupResultV1,
@@ -1511,6 +1513,8 @@ struct WorkflowNodeReceiptDigestPayload<'a> {
     expected_input_digest: &'a EvidenceDigest,
     outcome: WorkflowNodeOutcomeV1,
     output_digest: &'a Option<EvidenceDigest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_size_bytes: &'a Option<u64>,
     execution_receipt_digest: &'a EvidenceDigest,
     cleanup_receipt_digest: &'a EvidenceDigest,
     cleanup_result: WorkflowCleanupResultV1,
@@ -1547,6 +1551,7 @@ impl WorkflowNodeReceiptV1 {
             expected_input_digest: lease.expected_input_digest.clone(),
             outcome,
             output_digest,
+            output_size_bytes: None,
             execution_receipt_digest,
             cleanup_receipt_digest,
             cleanup_result,
@@ -1561,8 +1566,15 @@ impl WorkflowNodeReceiptV1 {
     pub fn validate(&self) -> Result<(), WorkflowContractError> {
         let output_matches = match self.outcome {
             WorkflowNodeOutcomeV1::Succeeded => self.output_digest.is_some(),
-            WorkflowNodeOutcomeV1::Failed => self.output_digest.is_none(),
+            WorkflowNodeOutcomeV1::Failed => {
+                self.output_digest.is_none() && self.output_size_bytes.is_none()
+            }
         };
+        let output_size_matches = self.output_size_bytes.is_none_or(|size| {
+            size > 0
+                && self.outcome == WorkflowNodeOutcomeV1::Succeeded
+                && self.node_kind == WorkflowNodeKindV1::ReleaseBuild
+        });
         let cleanup_matches = self.outcome != WorkflowNodeOutcomeV1::Succeeded
             || self.cleanup_result == WorkflowCleanupResultV1::Complete;
         if self.schema_version != WORKFLOW_NODE_RECEIPT_SCHEMA_VERSION
@@ -1574,12 +1586,23 @@ impl WorkflowNodeReceiptV1 {
             || !valid_workflow_identity(&self.worker_id)
             || !valid_workflow_identity(&self.host_id)
             || !output_matches
+            || !output_size_matches
             || !cleanup_matches
             || self.receipt_digest != self.calculate_digest()?
         {
             return Err(WorkflowContractError::InvalidNodeReceipt);
         }
         Ok(())
+    }
+
+    pub fn with_output_size_bytes(
+        mut self,
+        output_size_bytes: u64,
+    ) -> Result<Self, WorkflowContractError> {
+        self.output_size_bytes = Some(output_size_bytes);
+        self.receipt_digest = self.calculate_digest()?;
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, WorkflowContractError> {
@@ -1617,6 +1640,7 @@ impl WorkflowNodeReceiptV1 {
                 expected_input_digest: &self.expected_input_digest,
                 outcome: self.outcome,
                 output_digest: &self.output_digest,
+                output_size_bytes: &self.output_size_bytes,
                 execution_receipt_digest: &self.execution_receipt_digest,
                 cleanup_receipt_digest: &self.cleanup_receipt_digest,
                 cleanup_result: self.cleanup_result,

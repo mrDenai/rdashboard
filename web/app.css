@@ -410,13 +410,12 @@ tbody tr:last-child td {
 }
 
 .workflow-table th:nth-child(1) { width: 11%; }
-.workflow-table th:nth-child(2) { width: 9%; }
-.workflow-table th:nth-child(3) { width: 12%; }
-.workflow-table th:nth-child(4) { width: 23%; }
-.workflow-table th:nth-child(5) { width: 12%; }
-.workflow-table th:nth-child(6) { width: 10%; }
-.workflow-table th:nth-child(7) { width: 8%; }
-.workflow-table th:nth-child(8) { width: 15%; }
+.workflow-table th:nth-child(2) { width: 15%; }
+.workflow-table th:nth-child(3) { width: 22%; }
+.workflow-table th:nth-child(4) { width: 13%; }
+.workflow-table th:nth-child(5) { width: 11%; }
+.workflow-table th:nth-child(6) { width: 13%; }
+.workflow-table th:nth-child(7) { width: 15%; }
 
 .workflow-row > th {
   color: var(--text);

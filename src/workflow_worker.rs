@@ -1289,7 +1289,7 @@ impl WorkflowWorkerRuntimeV1 {
             }
             Some(terminal.evidence_digest.clone())
         };
-        let receipt = WorkflowNodeReceiptV1::new(
+        let mut receipt = WorkflowNodeReceiptV1::new(
             &lease,
             outcome,
             output_digest,
@@ -1298,6 +1298,9 @@ impl WorkflowWorkerRuntimeV1 {
             WorkflowCleanupResultV1::Complete,
             completed_at_ms,
         )?;
+        if let Some(output_size_bytes) = terminal.output_size_bytes {
+            receipt = receipt.with_output_size_bytes(output_size_bytes)?;
+        }
         self.submit_node_receipt(receipt, lease.expires_at_ms)
             .await?;
         Ok(())
@@ -2721,6 +2724,7 @@ mod tests {
             signal: None,
             failure_digest: None,
             output_digest: None,
+            output_size_bytes: None,
             completed_at_ms,
             evidence_digest: EvidenceDigest::sha256("test terminal evidence"),
         });

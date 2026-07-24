@@ -1182,9 +1182,9 @@ async fn workflow_overview_http_surface_is_empty_bounded_and_read_only() {
         .unwrap_or_else(|error| panic!("workflow response: {error}"));
     assert_eq!(response.status(), StatusCode::OK);
     let payload = json_response(response).await;
-    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["schema_version"], 2);
     assert_eq!(payload["truncated"], false);
-    assert_eq!(payload["attempts"].as_array().map(Vec::len), Some(0));
+    assert_eq!(payload["deployments"].as_array().map(Vec::len), Some(0));
     assert!(
         payload["generated_at_ms"]
             .as_i64()
@@ -1230,73 +1230,40 @@ async fn workflow_overview_serializes_the_exact_browser_contract() {
     assert_eq!(populated.status(), StatusCode::OK);
     let populated = json_response(populated).await;
     assert_eq!(populated["truncated"], false);
-    let attempt = &populated["attempts"][0];
-    assert_eq!(attempt["project_id"], "ralert");
-    assert_eq!(attempt["source_sha"], admission.source_sha.as_str());
-    assert_eq!(attempt["priority"], 2);
-    assert_eq!(attempt["execution_mode"], "deploy");
-    assert!(attempt["attempt_id"].as_str().is_some());
+    assert_eq!(populated["schema_version"], 2);
+    let deployment = &populated["deployments"][0];
+    assert_eq!(deployment["project_id"], "ralert");
+    assert_eq!(deployment["source_sha"], admission.source_sha.as_str());
+    assert_eq!(deployment["attempt_number"], 1);
+    assert_eq!(deployment["state"], "queued");
+    assert_eq!(deployment["current_stage"], "host_prepare");
+    assert_eq!(deployment["test_duration_ms"], serde_json::Value::Null);
+    assert_eq!(deployment["release_size_bytes"], serde_json::Value::Null);
     assert!(
         populated["generated_at_ms"]
             .as_i64()
-            .zip(attempt["updated_at_ms"].as_i64())
+            .zip(deployment["updated_at_ms"].as_i64())
             .is_some_and(|(generated, updated)| generated >= updated)
     );
     assert_eq!(
-        attempt
+        deployment
             .as_object()
-            .unwrap_or_else(|| panic!("workflow attempt is an object"))
+            .unwrap_or_else(|| panic!("workflow deployment is an object"))
             .keys()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
-            "attempt_id",
             "attempt_number",
-            "cleanup_state",
-            "created_at_ms",
-            "execution_mode",
-            "mutation_state",
-            "nodes",
-            "preparation_key",
-            "priority",
+            "completed_stages",
+            "current_stage",
+            "duration_ms",
             "project_id",
-            "request_id",
-            "source_attestation_digest",
-            "source_sequence",
+            "release_size_bytes",
             "source_sha",
             "state",
-            "terminal_at_ms",
+            "test_duration_ms",
+            "total_stages",
             "updated_at_ms",
-            "workflow_policy_digest",
-        ])
-    );
-    assert!(
-        attempt["workflow_policy_digest"]
-            .as_str()
-            .is_some_and(|digest| digest.len() == 64)
-    );
-    assert!(
-        attempt["nodes"]
-            .as_array()
-            .is_some_and(|nodes| !nodes.is_empty())
-    );
-    let node = &attempt["nodes"][0];
-    assert_eq!(
-        node.as_object()
-            .unwrap_or_else(|| panic!("workflow node is an object"))
-            .keys()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from([
-            "completed_at_ms",
-            "kind",
-            "lease_generation",
-            "node_id",
-            "output_digest",
-            "profile_id",
-            "receipt_digest",
-            "state",
-            "worker_pool",
         ])
     );
 }
@@ -1876,9 +1843,9 @@ fn browser_assets_use_safe_dom_updates_and_central_live_regions() {
     assert!(javascript.contains("delivered_possible_duplicate"));
     assert!(javascript.contains("/notifications"));
     assert!(html.contains("id=\"workflow-heading\">Workflow и деплои</h2>"));
-    assert!(html.contains("Последние попытки workflow для всех установленных проектов"));
+    assert!(html.contains("Текущее состояние и последние значимые деплои установленных проектов"));
     assert!(javascript.contains("validWorkflowOverview"));
-    assert!(javascript.contains("/api/v1/workflows?limit=20"));
+    assert!(javascript.contains("/api/v1/workflows?limit=50"));
     assert!(status_javascript.contains("projectConditionLabels"));
     assert!(status_javascript.contains("notificationStateLabels"));
     assert!(status_javascript.contains("workflowAttemptLabels"));
