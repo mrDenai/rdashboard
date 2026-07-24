@@ -34,7 +34,10 @@ const GRANT_KEY_EPOCH_ENV: &str = "RDASHBOARD_WORKFLOW_GRANT_KEY_EPOCH";
 const GRANT_PUBLIC_KEY_ENV: &str = "RDASHBOARD_WORKFLOW_GRANT_PUBLIC_KEY";
 const MAX_CONNECTIONS: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const LEASE_DURATION: Duration = Duration::from_secs(15);
+// This is a renewable liveness window, not the execution deadline from the project manifest.
+// Two minutes tolerates launcher settlement and a brief control-store stall without delaying
+// crashed-worker recovery for the duration of a full build.
+const LEASE_DURATION: Duration = Duration::from_mins(2);
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]

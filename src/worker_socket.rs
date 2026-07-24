@@ -44,7 +44,7 @@ pub const WORKER_SOCKET_PATH: &str = "/run/rdashboard-workflow/worker.sock";
 const MIN_REQUEST_TIMEOUT_MS: u64 = 100;
 const MAX_REQUEST_TIMEOUT_MS: u64 = 10_000;
 const MIN_LEASE_DURATION_MS: i64 = 1_000;
-const MAX_LEASE_DURATION_MS: i64 = 60_000;
+const MAX_LEASE_DURATION_MS: i64 = 5 * 60 * 1_000;
 const MAX_CONNECTIONS: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -529,6 +529,13 @@ fn store_rejection(
         }
         _ => (WorkflowWorkerRejectionCodeV1::SchedulerUnavailable, true),
     };
+    warn!(
+        request_id = %request.request_id,
+        rejection_code = ?code,
+        retryable,
+        error = %error,
+        "workflow scheduler rejected a worker request"
+    );
     WorkflowWorkerResponseEnvelopeV1 {
         version: WORKER_PROTOCOL_VERSION,
         request_id: request.request_id,

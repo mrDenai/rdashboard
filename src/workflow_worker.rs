@@ -724,7 +724,7 @@ impl WorkflowWorkerRuntimeConfigV1 {
             idle_poll_interval: Duration::from_millis(250),
             operation_poll_interval: Duration::from_millis(500),
             retry_interval: Duration::from_millis(250),
-            renewal_margin: Duration::from_secs(5),
+            renewal_margin: Duration::from_secs(30),
         };
         config.validate()?;
         Ok(config)

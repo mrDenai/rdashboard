@@ -2193,7 +2193,7 @@ impl WorkflowLaunchSupervisorV1 {
                 WorkflowLaunchRuntimeError::WaiterSpawn(error).evidence_digest(),
                 now_ms,
             )?;
-            self.settle_launch_inputs(lease, WorkflowOperationStateOutcomeV1::Failed, now_ms)?;
+            self.settle_failed_launch_inputs(lease, false, now_ms)?;
             return Ok(status);
         }
         let process = match self.runtime.spawn(launch) {
@@ -2202,7 +2202,7 @@ impl WorkflowLaunchSupervisorV1 {
                 let status =
                     self.journal
                         .mark_spawn_rejected(lease, error.evidence_digest(), now_ms)?;
-                self.settle_launch_inputs(lease, WorkflowOperationStateOutcomeV1::Failed, now_ms)?;
+                self.settle_failed_launch_inputs(lease, false, now_ms)?;
                 return Ok(status);
             }
         };
@@ -2221,11 +2221,7 @@ impl WorkflowLaunchSupervisorV1 {
                         self.contain_unowned_process(&launch.unit_name, send_error.0)
                     }
                 };
-                let settlement = self.settle_launch_inputs(
-                    lease,
-                    WorkflowOperationStateOutcomeV1::Unknown,
-                    now_ms,
-                );
+                let settlement = self.settle_failed_launch_inputs(lease, true, now_ms);
                 containment?;
                 settlement?;
                 return Err(error.into());
@@ -2238,8 +2234,7 @@ impl WorkflowLaunchSupervisorV1 {
                 now_ms,
             );
             let containment = self.contain_unowned_process(&launch.unit_name, send_error.0);
-            let settlement =
-                self.settle_launch_inputs(lease, WorkflowOperationStateOutcomeV1::Unknown, now_ms);
+            let settlement = self.settle_failed_launch_inputs(lease, true, now_ms);
             containment?;
             settlement?;
             return Ok(reconciled?);
@@ -2282,8 +2277,8 @@ impl WorkflowLaunchSupervisorV1 {
         let unit_was_loaded = self.runtime.terminate(&unit_name(lease))?;
         let outcome = match status.terminal.as_ref() {
             Some(terminal) if terminal.succeeded => WorkflowOperationStateOutcomeV1::Succeeded,
-            Some(_) => WorkflowOperationStateOutcomeV1::Failed,
-            None => WorkflowOperationStateOutcomeV1::Unknown,
+            Some(_) => operation_state_failure_outcome(lease, false),
+            None => operation_state_failure_outcome(lease, true),
         };
         let operation_state = if lease.operation_state.is_some() {
             Some(self.operation_states.release(lease, outcome, now_ms)?)
@@ -2322,6 +2317,19 @@ impl WorkflowLaunchSupervisorV1 {
         operation_state?;
         titanium_root?;
         Ok(())
+    }
+
+    fn settle_failed_launch_inputs(
+        &self,
+        lease: &WorkflowLeaseV1,
+        uncertain: bool,
+        now_ms: i64,
+    ) -> Result<(), WorkflowLaunchSupervisorError> {
+        self.settle_launch_inputs(
+            lease,
+            operation_state_failure_outcome(lease, uncertain),
+            now_ms,
+        )
     }
 
     fn remove_active_toolchain_root(
@@ -2377,7 +2385,7 @@ impl WorkflowLaunchSupervisorV1 {
         {
             self.operation_states.release(
                 lease,
-                WorkflowOperationStateOutcomeV1::Unknown,
+                operation_state_failure_outcome(lease, true),
                 now_ms,
             )?;
             self.remove_active_toolchain_root(lease)?;
@@ -2425,6 +2433,22 @@ fn lease_requires_operation_state(lease: &WorkflowLeaseV1) -> Result<bool, Workf
             .iter()
             .any(|input| input.artifact_kind == WorkflowArtifactKindV1::VerificationReceipt)),
         _ => Ok(false),
+    }
+}
+
+fn operation_state_failure_outcome(
+    lease: &WorkflowLeaseV1,
+    uncertain: bool,
+) -> WorkflowOperationStateOutcomeV1 {
+    // The native self-release adapter mounts `/operation` read-only and writes only to its
+    // generation-specific handoff staging directory. A failed or contained generation therefore
+    // cannot invalidate the verified Cargo outputs needed by the next lease generation.
+    if lease.adapter_id == WorkflowAdapterIdV1::WorkerNativeReleaseBuildV1 {
+        WorkflowOperationStateOutcomeV1::Retryable
+    } else if uncertain {
+        WorkflowOperationStateOutcomeV1::Unknown
+    } else {
+        WorkflowOperationStateOutcomeV1::Failed
     }
 }
 
@@ -3572,6 +3596,9 @@ mod tests {
                     WorkflowOperationStateDispositionV1::RemovedAfterFailure,
                     false,
                 ),
+                WorkflowOperationStateOutcomeV1::Retryable => {
+                    (WorkflowOperationStateDispositionV1::Retained, true)
+                }
                 WorkflowOperationStateOutcomeV1::Unknown => {
                     (WorkflowOperationStateDispositionV1::Reset, false)
                 }

@@ -2682,7 +2682,8 @@ fn commit_node_receipt_transaction(
     }
     validate_active_receipt_lease(transaction, receipt, recorded_at_ms)?;
     let context = load_attempt_context(transaction, receipt.attempt_id)?;
-    let handoff_publication = is_self_update_handoff_release(&context.manifest, receipt.node_kind);
+    let handoff_publication = context.execution_mode == WorkflowExecutionModeV1::Deploy
+        && is_self_update_handoff_release(&context.manifest, receipt.node_kind);
     persist_node_receipt(
         transaction,
         receipt,

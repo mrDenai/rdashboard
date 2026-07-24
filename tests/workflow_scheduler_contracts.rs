@@ -1292,6 +1292,58 @@ fn failed_self_update_publication_stays_reconcile_debt_after_job_cleanup() {
 }
 
 #[test]
+fn failed_self_update_shadow_commits_without_a_nonexistent_mutation_lock() {
+    let store = ControlStore::open(":memory:")
+        .unwrap_or_else(|error| panic!("open control store: {error}"));
+    let scheduler = DurableWorkflowScheduler::new(store);
+    let manifest = self_update_manifest();
+    let mut shadow = admission(
+        &manifest,
+        '9',
+        9,
+        WorkflowTriggerChannelV1::ManualShadow,
+        "self-update-shadow-failure-9",
+    );
+    shadow.execution_mode = WorkflowExecutionModeV1::Shadow;
+    scheduler
+        .admit(&manifest, &shadow, 1)
+        .unwrap_or_else(|error| panic!("admit self-update shadow: {error}"));
+    let worker = build_worker();
+    let prepare = claim(&scheduler, &worker, 10);
+    commit_success(&scheduler, &prepare, "failed-shadow-prepare");
+    let verify = claim(&scheduler, &worker, 30);
+    commit_success(&scheduler, &verify, "failed-shadow-verify");
+    let release = claim(&scheduler, &worker, 50);
+    assert_eq!(release.node_kind, WorkflowNodeKindV1::ReleaseBuild);
+
+    let failed = WorkflowNodeReceiptV1::new(
+        &release,
+        WorkflowNodeOutcomeV1::Failed,
+        None,
+        digest("failed-shadow-release"),
+        digest("complete-shadow-release-cleanup"),
+        WorkflowCleanupResultV1::Complete,
+        60,
+    )
+    .unwrap_or_else(|error| panic!("failed shadow receipt: {error}"));
+    let terminal = scheduler
+        .commit_node_receipt(&failed, 61)
+        .unwrap_or_else(|error| panic!("commit failed shadow receipt: {error}"));
+    assert_eq!(terminal.state, WorkflowAttemptStateV1::Failed);
+    assert_eq!(terminal.mutation_state, WorkflowMutationStateV1::NotStarted);
+    assert_eq!(terminal.cleanup_state, WorkflowCleanupStateV1::Complete);
+    assert_eq!(
+        terminal
+            .nodes
+            .iter()
+            .find(|node| node.kind == WorkflowNodeKindV1::ReleaseBuild)
+            .unwrap_or_else(|| panic!("self-update release node exists"))
+            .state,
+        WorkflowNodeStateV1::Failed
+    );
+}
+
+#[test]
 fn expired_self_update_publication_stays_reconcile_debt_and_blocks_newer_heads() {
     let store = ControlStore::open(":memory:")
         .unwrap_or_else(|error| panic!("open control store: {error}"));

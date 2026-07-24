@@ -44,6 +44,7 @@ const MIN_ADMISSION_INODES: u64 = 4_096;
 pub enum WorkflowOperationStateOutcomeV1 {
     Succeeded,
     Failed,
+    Retryable,
     Unknown,
 }
 
@@ -767,6 +768,23 @@ impl WorkflowOperationStateStoreV1 {
             .take()
             .ok_or(WorkflowOperationStateError::InvalidRecord)?;
         let over_limit = usage.allocated_bytes > state.max_bytes || usage.inodes > state.max_inodes;
+        if !over_limit && outcome == WorkflowOperationStateOutcomeV1::Retryable {
+            // Keep the record readable by the rollback release: an inactive state with data and
+            // no release marker is valid in the existing v1 on-disk schema. The launcher journal
+            // retains the exact cleanup evidence for idempotent replay of this generation.
+            record.last_release = None;
+            record.updated_at_ms = completed_at_ms.max(record.updated_at_ms);
+            record.refresh_digest()?;
+            self.write_record(directory, &record)?;
+            return WorkflowOperationStateReleaseV1::new(
+                lease,
+                WorkflowOperationStateDispositionV1::Retained,
+                true,
+                usage,
+                completed_at_ms,
+                Some(record.record_digest),
+            );
+        }
         let (disposition, reusable, remove_data) = if over_limit {
             record.terminal = Some(StateTerminalV1::Failed);
             (
@@ -798,6 +816,7 @@ impl WorkflowOperationStateStoreV1 {
                         true,
                     )
                 }
+                WorkflowOperationStateOutcomeV1::Retryable => unreachable!("handled above"),
                 WorkflowOperationStateOutcomeV1::Unknown => {
                     (WorkflowOperationStateDispositionV1::Reset, false, true)
                 }
@@ -1662,6 +1681,16 @@ mod tests {
         kind: WorkflowNodeKindV1,
         consumers: Vec<WorkflowNodeId>,
     ) -> WorkflowLeaseV1 {
+        operation_lease_generation(attempt_id, node_id, kind, consumers, 1)
+    }
+
+    fn operation_lease_generation(
+        attempt_id: Uuid,
+        node_id: &str,
+        kind: WorkflowNodeKindV1,
+        consumers: Vec<WorkflowNodeId>,
+        generation: u32,
+    ) -> WorkflowLeaseV1 {
         let node = WorkflowNodeV1 {
             node_id: node_id.parse().expect("node ID"),
             display_name: node_id.to_owned(),
@@ -1719,7 +1748,7 @@ mod tests {
         .expect("operation state");
         WorkflowLeaseV1::new(
             Uuid::new_v4(),
-            1,
+            generation,
             Uuid::new_v4(),
             attempt_id,
             project_id,
@@ -1789,6 +1818,68 @@ mod tests {
         );
         assert!(removed.reusable);
         assert!(!release.data_path.exists());
+    }
+
+    #[test]
+    fn read_only_release_failure_retains_verified_outputs_for_the_next_generation() {
+        let fixture = Fixture::new();
+        let verify = fixture
+            .store
+            .acquire(&fixture.verify, 101)
+            .expect("acquire verify");
+        fs::create_dir(verify.data_path.join("target")).expect("target directory");
+        fs::write(verify.data_path.join("target/artifact"), b"compiled")
+            .expect("compiled artifact");
+        fixture
+            .store
+            .release(
+                &fixture.verify,
+                WorkflowOperationStateOutcomeV1::Succeeded,
+                102,
+            )
+            .expect("retain verified state");
+
+        let first = fixture
+            .store
+            .acquire(&fixture.release, 103)
+            .expect("acquire first release generation");
+        let retained = fixture
+            .store
+            .release(
+                &fixture.release,
+                WorkflowOperationStateOutcomeV1::Retryable,
+                104,
+            )
+            .expect("retain read-only release input");
+        assert_eq!(
+            retained.disposition,
+            WorkflowOperationStateDispositionV1::Retained
+        );
+        assert!(retained.reusable);
+        assert_eq!(
+            fs::read(first.data_path.join("target/artifact")).expect("retained artifact"),
+            b"compiled"
+        );
+
+        let retry = operation_lease_generation(
+            fixture.release.attempt_id,
+            "release",
+            WorkflowNodeKindV1::ReleaseBuild,
+            vec![
+                WorkflowNodeId::from_str("release").expect("release ID"),
+                WorkflowNodeId::from_str("verify").expect("verify ID"),
+            ],
+            2,
+        );
+        let reacquired = fixture
+            .store
+            .acquire(&retry, 105)
+            .expect("acquire retry generation");
+        assert_eq!(
+            fs::read(reacquired.data_path.join("target/artifact"))
+                .expect("retry sees verified artifact"),
+            b"compiled"
+        );
     }
 
     #[test]

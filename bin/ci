@@ -51,3 +51,6 @@ for binary in "${release_binaries[@]}"; do
   release_arguments+=(--bin "$binary")
 done
 cargo build --workspace --all-features --release --locked "${release_arguments[@]}"
+cargo_target_dir="${CARGO_TARGET_DIR:-$root/target}"
+cargo run --quiet --locked --bin rdashboard-self-release-inventory -- \
+  --seal "$cargo_target_dir/release"

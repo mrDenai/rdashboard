@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     ffi::OsStr,
     fs::{self, DirBuilder, File, OpenOptions},
-    io::{Read as _, Write as _},
+    io::{self, Read as _, Write as _},
     os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
@@ -58,6 +58,7 @@ const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 const MAX_RESULT_BYTES: u64 = 256 * 1024;
 const MAX_HANDOFF_ENTRIES: usize = 128;
 const MAX_VALIDITY_MS: i64 = 24 * 60 * 60 * 1_000;
+const MAX_SELF_RELEASE_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const ED25519_KEY_BYTES: usize = 32;
 
 pub fn load_installed_self_release_signing_key(
@@ -151,6 +152,129 @@ pub fn versioned_self_release_binaries() -> Vec<SelfReleaseBinaryV1> {
             release_path: format!("bin/{binary_name}"),
         })
         .collect()
+}
+
+/// Turns Cargo's top-level hard links into stable, single-link release inputs.
+///
+/// Cargo commonly hard-links `target/release/<binary>` to an entry below `deps/`. The signed
+/// release builder deliberately refuses linked inputs because a second pathname could mutate the
+/// inode after verification. Sealing only the canonical inventory after the full gate preserves
+/// Cargo's efficient build layout while giving the packager immutable, independently owned inputs.
+pub fn seal_versioned_self_release_inputs(
+    release_root: &Path,
+) -> Result<(), SelfReleaseBuildError> {
+    if !release_root.is_absolute() {
+        return Err(SelfReleaseBuildError::UnsafeFile);
+    }
+    let owner_uid = rustix::process::geteuid().as_raw();
+    let root_metadata = fs::symlink_metadata(release_root)?;
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != owner_uid
+        || root_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(SelfReleaseBuildError::UnsafeFile);
+    }
+
+    for binary in versioned_self_release_binaries() {
+        seal_self_release_input(&release_root.join(binary.binary_name), owner_uid)?;
+    }
+    File::open(release_root)?.sync_all()?;
+    Ok(())
+}
+
+fn seal_self_release_input(path: &Path, owner_uid: u32) -> Result<(), SelfReleaseBuildError> {
+    let before = fs::symlink_metadata(path)?;
+    validate_sealable_input(&before, owner_uid)?;
+    if before.nlink() == 1 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555))?;
+        validate_sealed_input(&fs::symlink_metadata(path)?, owner_uid, before.len())?;
+        return Ok(());
+    }
+
+    let parent = path.parent().ok_or(SelfReleaseBuildError::UnsafeFile)?;
+    let temporary = parent.join(format!(
+        ".self-release-seal-{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        let mut source = File::open(path)?;
+        let opened = source.metadata()?;
+        if !same_file_metadata(&before, &opened) {
+            return Err(SelfReleaseBuildError::ConcurrentChange);
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o500);
+        let mut output = options.open(&temporary)?;
+        if io::copy(&mut source, &mut output)? != before.len() {
+            return Err(SelfReleaseBuildError::ConcurrentChange);
+        }
+        output.sync_all()?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o555))?;
+
+        let after_opened = source.metadata()?;
+        let after_path = fs::symlink_metadata(path)?;
+        if !same_file_metadata(&before, &after_opened) || !same_file_metadata(&before, &after_path)
+        {
+            return Err(SelfReleaseBuildError::ConcurrentChange);
+        }
+        validate_sealed_input(&fs::symlink_metadata(&temporary)?, owner_uid, before.len())?;
+        fs::rename(&temporary, path)?;
+        validate_sealed_input(&fs::symlink_metadata(path)?, owner_uid, before.len())
+    })();
+    if result.is_err() && temporary.try_exists().unwrap_or(false) {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn validate_sealable_input(
+    metadata: &fs::Metadata,
+    owner_uid: u32,
+) -> Result<(), SelfReleaseBuildError> {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != owner_uid
+        || metadata.nlink() == 0
+        || metadata.permissions().mode() & 0o111 == 0
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.len() == 0
+        || metadata.len() > MAX_SELF_RELEASE_BINARY_BYTES
+    {
+        return Err(SelfReleaseBuildError::UnsafeFile);
+    }
+    Ok(())
+}
+
+fn validate_sealed_input(
+    metadata: &fs::Metadata,
+    owner_uid: u32,
+    expected_bytes: u64,
+) -> Result<(), SelfReleaseBuildError> {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != owner_uid
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o7777 != 0o555
+        || metadata.len() != expected_bytes
+    {
+        return Err(SelfReleaseBuildError::UnsafeFile);
+    }
+    Ok(())
+}
+
+fn same_file_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.nlink() == right.nlink()
+        && left.len() == right.len()
+        && left.permissions().mode() == right.permissions().mode()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1812,6 +1936,54 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn cargo_hard_links_are_sealed_before_the_strict_release_build() {
+        let policy = policy();
+        let request = SelfReleaseBuildRequestV1::from_policy(&lease(), &policy).expect("request");
+        let fixture = Fixture::new(&request);
+        let release_root = fixture.operation.join("target/release");
+        for binary in &request.binaries {
+            let source = release_root.join(&binary.binary_name);
+            fs::hard_link(
+                &source,
+                release_root.join(format!(".deps-{}", binary.binary_name)),
+            )
+            .expect("simulate Cargo hard link");
+            assert_eq!(
+                fs::symlink_metadata(&source)
+                    .expect("linked binary metadata")
+                    .nlink(),
+                2
+            );
+        }
+
+        assert!(matches!(
+            execute_self_release_build(
+                &fixture.request,
+                &fixture.operation,
+                &fixture.output,
+                fixture.uid,
+            ),
+            Err(SelfReleaseBuildError::SelfUpdate(
+                SelfUpdateError::UnsafeBuildInput
+            ))
+        ));
+        seal_versioned_self_release_inputs(&release_root).expect("seal canonical inputs");
+        for binary in &request.binaries {
+            let metadata = fs::symlink_metadata(release_root.join(&binary.binary_name))
+                .expect("sealed binary metadata");
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o555);
+        }
+        execute_self_release_build(
+            &fixture.request,
+            &fixture.operation,
+            &fixture.output,
+            fixture.uid,
+        )
+        .expect("package sealed Cargo outputs");
     }
 
     #[test]
